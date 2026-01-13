@@ -54,21 +54,21 @@ begin
   -- begin a new logging session
   -- the last parameter refers to killing log entries which are older than the given number of days
   -- if this param is NULL, no log entry will be deleted
-  gProcessId := simpleOraLogger.new_session('my application', simpleOraLogger.logLevelWarn, 30);
+  gProcessId := SO_LOG.new_session('my application', SO_LOG.logLevelWarn, 30);
 
   -- write a log entry whenever you want
-  simpleOraLogger.info(gProcessId, 'Start');
+  SO_LOG.info(gProcessId, 'Start');
   -- for more details...
-  simpleOraLogger.debug(gProcessId, 'Function A');
+  SO_LOG.debug(gProcessId, 'Function A');
   -- e.g. informations when an exception was raised
-  simpleOraLogger.error(gProcessId, 'I made a fault');
+  SO_LOG.error(gProcessId, 'I made a fault');
 
   -- also you can change the status during your process runs
-  simpleOraLogger.set_process_status(1, 'DONE');
+  SO_LOG.set_process_status(1, 'DONE');
 
   -- last but not least end the logging session
   -- opional you can set the numbers of steps to do and steps done 
-  simpleOraLogger.close_session(gProcessId, 100, 99, 'DONE', 1);
+  SO_LOG.close_session(gProcessId, 100, 99, 'DONE', 1);
 
 end MY_DEMO_PROC;
 ```
