@@ -41,10 +41,10 @@ Depending on the selected log level, additional information is written to table 
         
 To do this, the selected log level must be >= the level implied in the logging call.
 
-> *logLevelSilent -> No details are written to table '2'
+> * logLevelSilent -> No details are written to table '2'
 >
-> *logLevelError  -> Calls to the ERROR() procedure are taken into account
-> *logLevelWarn   -> Calls to the WARN() and ERROR() procedures are taken into account
+> * logLevelError  -> Calls to the ERROR() procedure are taken into account
+> * logLevelWarn   -> Calls to the WARN() and ERROR() procedures are taken into account
 >logLevelInfo   -> Calls to the INFO(), WARN(), and ERROR() procedures are taken into account
 >
 >logLevelDebug  -> Calls to the DEBUG(), INFO(), WARN(), and ERROR() procedures are taken into account
