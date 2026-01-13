@@ -3,7 +3,8 @@
 ## About
 PL/SQL Package for simple logging of PL/SQL processes. Allows multiple and parallel logging out of the same session.
 
-Even though debug information can be written, simpleOraLogger is primarily intended for monitoring (automated) PL/SQL processes (hereinafter referred to as the processes).
+Even though debug informations can be written, simpleOraLogger is primarily intended for monitoring (automated) PL/SQL processes (hereinafter referred to as the processes).
+
 For easy daily monitoring log informations are written into two tables: one to see the status of your processes, one to see more details, e.g. something went wrong.
 Your processes can be identified by their names.
 
@@ -36,6 +37,7 @@ simpleOraLogger monitors different informations about your processes.
 * Call stack (depends to log level)
 
 ## Demo
+### Usage from your PL/SQL
 ```sql
 procedure MY_DEMO_PROC
 as
@@ -62,4 +64,35 @@ begin
 
 end MY_DEMO_PROC;
 ```
+### Check log entries
+```sql
+  -- main entries are written to the default log table LOG_PROCESS
+  -- details are writte to the default detail log table LOG_PROCESS_DETAIL
+  -- find out your process by its process name or look for the latest entry in the LOG_PROCESS
 
+  -- general status of your process
+  -- to shorten the output here in the text I simplified some values
+  select * from LOG_PROCESS where PROCESS_NAME = 'my application';
+    ID | PROCESS_NAME   | PROCESS_START         | PROCESS_END           | STEPS_TO_DO | STEPS_DONE | STATUS | INFO
+    1  | my application | 12.01.26 18:18:53,... | 12.01.26 18:18:53,... | 100         | 99         | 2      | ERROR
+
+  -- get details; the NO is the serial order of entries related to the process
+  select * from LOG_PROCESS_DETAIL where process_id = 1 order by NO;
+    PROCESS_ID | NO | INFO       | LOG_LEVEL | SESSION_TIME    | SESSION_USER | HOST_NAME | ERR_STACK | ERR_BACKTRACE || ERR_CALLSTACK
+    1          | 1  | Start      | INFO      | 13.01.26 10:... | SCOTT        | SERVER1   | NULL               | NULL             | "----- PL/SQL ..." 
+    1          | 2  | Function A | DEBUG     | 13.01.26 11:... | SCOTT        | SERVER1   | NULL               | NULL             | "----- PL/SQL ..." 
+    1          | 3  | Function B | ERROR     | 13.01.26 12:... | SCOTT        | SERVER1   | "----- PL/SQL ..." | "--- PL/SQL ..." | "----- PL/SQL ..." 
+
+394	3	function scanResponseFile	DEBUG	13.01.26 11:56:21,857280000	AVHBERICHT	bnpdba31			"----- PL/SQL Call Stack -----
+  object      line  object
+  handle    number  name
+0x21ec57560       484  package body AVHBERICHT.PCK_LOGGING.REPLACEPLACEHOLDERS
+0x21ec57560       298  package body AVHBERICHT.PCK_LOGGING.WRITE_DEBUG_INFO
+0x21ec57560       339  package body AVHBERICHT.PCK_LOGGING.DEBUG
+0x2cb0c34f0      1052  package body AVHBERICHT.PCK_ASBASG.SCANRESPONSEFILE
+0x2cb0c34f0       559  package body AVHBERICHT.PCK_ASBASG.UPDATETRACERDATEN
+0x2cb0c34f0       433  package body AVHBERICHT.PCK_ASBASG.UPDATETRACERDATEN
+0x2cb0c34f0       425  package body AVHBERICHT.PCK_ASBASG.UPDATETRACERDATEN
+0x27eb7d1d8         1  anonymous block
+"
+```
