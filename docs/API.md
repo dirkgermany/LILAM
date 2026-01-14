@@ -35,7 +35,7 @@ Logging takes place in two tables. Here I distinguish them by '1' and '2'.
 
 Table '1' is the leading table and contains the started processes, their names, and status. There is exactly one entry in this table for each process and log session.
 
-The entries in Table 2 contain further details corresponding to the entries in Table 1.
+The entries in Table '2' contain further details corresponding to the entries in Table 1.
 
 Both tables have standard names.
 At the same time, the name of table '1' is the so-called prefix for table '2'.
@@ -63,6 +63,8 @@ To do this, the selected log level must be >= the level implied in the logging c
 * logLevelWarn   -> Calls to the WARN() and ERROR() procedures are taken into account
 * logLevelInfo   -> Calls to the INFO(), WARN(), and ERROR() procedures are taken into account
 * logLevelDebug  -> Calls to the DEBUG(), INFO(), WARN(), and ERROR() procedures are taken into account
+
+If you want to suppress any logging, set logLevelSilent as active log level.
 
 ### Declaration of Log Levels
 ```sql
