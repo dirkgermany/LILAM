@@ -559,11 +559,9 @@ create or replace PACKAGE BODY SO_LOG AS
         if p_logLevel > logLevelSilent then
 	        -- Sicherstellen, dass die LOG-Tabellen existieren
 	        createLogTables(p_tabNamePrefix);
-            select seq_log.nextVal into pProcessId from dual;
-        else
-            pProcessId = 0;
         end if;
         
+        select seq_log.nextVal into pProcessId from dual;
         insertProcess (p_tabNamePrefix, pProcessId, p_logLevel);
 
 		if p_logLevel > logLevelSilent then
