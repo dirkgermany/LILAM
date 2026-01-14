@@ -54,7 +54,7 @@ Set name *detail table* is automatically = MY_LOG_TABLE_DETAIL
 Logging uses a sequence to assign process IDs. The name of the sequence is SEQ_LILA_LOG.
 
 ## Log Level
-Depending on the selected log level, additional information is written to table ‘2’ (_DETAIL).
+Depending on the selected log level, additional information is written to the *detail table*.
         
 To do this, the selected log level must be >= the level implied in the logging call.
 * logLevelSilent -> No details are written to the *detail table*
@@ -97,8 +97,8 @@ Shortcuts for parameter requirement:
 The NEW_SESSION function starts the logging session for a process.
 | Parameter | Type | Description | Required
 | --------- | ---- | ----------- | -------
-| p_processName | VARCHAR2| freely selectable name for identifying the process; is written to table ‘1’ | [`M`](#m)
-| p_logLevel | NUMBER | determines the level of detail in table ‘2’ (see above) | [`M`](#m)
+| p_processName | VARCHAR2| freely selectable name for identifying the process; is written to *master table* | [`M`](#m)
+| p_logLevel | NUMBER | determines the level of detail in *detail table* (see above) | [`M`](#m)
 | p_daysToKeep | NUMBER | max. age of entries in days; if not NULL, all entries older than p_daysToKeep and whose process name = p_processName (not case sensitive) are deleted | [`N`](#n)
 | p_tabNamePrefix | VARCHAR2 | optional prefix of the LOG table names (see above) | [`O`](#o)
 
@@ -165,7 +165,7 @@ lila.close_session(gProcessId, 100, 99, 'Problem', 2);
 #### Procedure SET_PROCESS_STATUS
 Updates the status of a process.
 
-As mentioned at the beginning, there is only one entry in table ‘1’ for a logging session and the corresponding process.
+As mentioned at the beginning, there is only one entry in the *master table* for a logging session and the corresponding process.
 The status of the process can be set using the following two variants:
 
 *Option 1 without info as text*
