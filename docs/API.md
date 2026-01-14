@@ -90,6 +90,7 @@ Shortcuts for parameter requirement:
 | [`WARN`](#general-logging-procedures) | Procedure | Writes WARN log entry               | Detail Logging
 | [`ERROR`](#general-logging-procedures) | Procedure | Writes ERROR log entry              | Detail Logging
 | [`LOG_DETAIL`](#procedure-log_detail) | Procedure | Writes log entry with any log level | Detail Logging
+| [`PROCEDURE IS_ALIVE`](#procedure-is-alive) | Procedure | Excecutes a very simple logging session | Test
 
 ### Session related Functions and Procedures
 #### Function NEW_SESSION
@@ -267,4 +268,19 @@ PROCEDURE LOG_DETAIL(p_processId NUMBER, p_stepInfo VARCHAR2, p_logLevel NUMBER)
 
 -- write a log record
 lila.log_detail(gProcessId, 'I ignore the log level');
+```
+### Testing
+Independent to other Packages you can check if LILA works in general.
+
+#### PROCEDURE IS_ALIVE
+Creates one entry in the master table and one in the detail table.
+
+This procedure needs no parameters.
+```sql
+-- execute the following statement in sql window
+execute lila.is_alive;
+-- check data and note the process_id
+select * from lila_process where process_name = 'LILA Life Check';
+-- check details using the process_id
+select * from lila_process_detail where process_id = <process id>;
 ```
