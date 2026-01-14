@@ -51,7 +51,7 @@ Selected name '1' = MY_LOG_TABLE
 Set name '2' is automatically = MY_LOG_TABLE_DETAIL
 
 ## Sequence
-Logging uses a sequence to assign process IDs. The name of the sequence is SEQ_LOG.
+Logging uses a sequence to assign process IDs. The name of the sequence is SEQ_LILA_LOG.
 
 ## Log Level
 Depending on the selected log level, additional information is written to table ‘2’ (_DETAIL).
