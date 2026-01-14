@@ -8,7 +8,7 @@
 
 ## About
 LILA **i**s **l**ogging **a**pplications. LILA is a framework.
-Written as a PL/SQL package it enables other PL/SQL processes writing logs using a simple interface. LILA enables simultaneous and multiple logging from the same session or different sessions.
+Written as a PL/SQL package for Oracle it enables other PL/SQL processes writing logs using a simple interface. LILA enables simultaneous and multiple logging from the same session or different sessions.
 Two key requirements of LILA are:
 1. Simplicity of the interface
 2. Simultaneous logging from one or multiple database sessions
