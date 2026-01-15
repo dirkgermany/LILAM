@@ -554,6 +554,58 @@ create or replace PACKAGE BODY LILA AS
 
 	------------------------------------------------------------------------------------------------
     
+    procedure SET_STEPS_TODO(p_processId number, p_stepsToDo number)
+    as
+        pragma autonomous_transaction;
+        sqlStatement varchar2(500);
+    begin
+        sqlStatement := '
+        update PH_LILA_TABLE_NAME
+        set steps_todo = PH_STEPS_TODO 
+        where id = PH_PROCESS_ID';   
+        sqlStatement := replacePlaceHolders(p_processId, sqlStatement, null, null, null, null, null, null, null);
+        sqlStatement := replace(sqlStatement, 'PH_STEPS_TODO', to_char(p_stepsToDo));
+        execute immediate sqlStatement;
+        commit;
+    end;
+
+	------------------------------------------------------------------------------------------------
+    
+    procedure SET_STEPS_DONE(p_processId number, p_stepsDone number)
+    as
+        pragma autonomous_transaction;
+        sqlStatement varchar2(500);
+    begin
+        sqlStatement := '
+        update PH_LILA_TABLE_NAME
+        set steps_todo = PH_STEPS_DONE 
+        where id = PH_PROCESS_ID';   
+        sqlStatement := replacePlaceHolders(p_processId, sqlStatement, null, null, null, null, null, null, null);
+        sqlStatement := replace(sqlStatement, 'PH_STEPS_DONE', to_char(p_stepsDone));
+        execute immediate sqlStatement;
+        commit;
+    end;
+	------------------------------------------------------------------------------------------------
+    
+    procedure STEP_COMPLETED(p_processId number)
+    as
+        pragma autonomous_transaction;
+        sqlStatement varchar2(500);
+        lStepCounter number;
+    begin
+        sqlStatement := '
+        select steps_done
+        from PH_LILA_TABLE_NAME
+        where id = PH_PROCESS_ID';   
+        sqlStatement := replacePlaceHolders(p_processId, sqlStatement, null, null, null, null, null, null, null);
+        execute immediate sqlStatement into lStepCounter;
+        
+        lStepCounter := lStepCounter +1;
+        set_steps_done(p_processId, lStepCounter);
+    end;
+
+	------------------------------------------------------------------------------------------------
+    
     -- Ends an earlier started logging session by the process ID.
     -- Important! Ignores if the process doesn't exist! No exception is thrown!
     procedure CLOSE_SESSION(p_processId number)
@@ -589,6 +641,20 @@ create or replace PACKAGE BODY LILA AS
 	        commit;
         end if;
         processList.delete(p_processId);
+    end;
+
+	------------------------------------------------------------------------------------------------
+
+    -- Opens/starts a new logging session.
+    -- The returned process id must be stored within the calling procedure because it is the reference
+    -- which is recommended for all following actions (e.g. CLOSE_SESSION, DEBUG, SET_PROCESS_STATUS).
+	function NEW_SESSION(p_processName VARCHAR2, p_logLevel NUMBER, p_stepsToDo NUMBER, p_daysToKeep NUMBER, p_tabNamePrefix VARCHAR2 DEFAULT 'LOG_PROCESS') return number
+    as
+        lProcessId number;
+    begin
+        lProcessId := new_session(p_processName, p_logLevel, p_daysToKeep, p_tabNamePrefix);
+        set_steps_todo(lProcessId, p_stepsToDo);
+        return lProcessId;
     end;
 
 	------------------------------------------------------------------------------------------------
