@@ -14,8 +14,8 @@ create or replace PACKAGE LILA AS
     ------------------------------
     -- Life cycle of a log session
     ------------------------------
-    function  NEW_SESSION(p_processName varchar2, p_logLevel number, p_daysToKeep number, p_tabNamePrefix varchar2 default 'lila_process') return number;
-    function NEW_SESSION(p_processName VARCHAR2, p_logLevel NUMBER, p_stepsToDo NUMBER, p_daysToKeep NUMBER, p_tabNamePrefix VARCHAR2 DEFAULT 'LOG_PROCESS') return number;
+    function  NEW_SESSION(p_processName varchar2, p_logLevel number, p_daysToKeep number, p_tabNamePrefix varchar2 default 'LILA_PROCESS') return number;
+    function NEW_SESSION(p_processName VARCHAR2, p_logLevel NUMBER, p_stepsToDo NUMBER, p_daysToKeep NUMBER, p_tabNamePrefix VARCHAR2 DEFAULT 'LILA_PROCESS') return number;
     procedure CLOSE_SESSION(p_processId number);
     procedure CLOSE_SESSION(p_processId number, p_stepsToDo number, p_stepsDone number, p_processInfo varchar2, p_status number);
     
