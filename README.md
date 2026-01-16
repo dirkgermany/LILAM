@@ -1,5 +1,5 @@
 # LILA
-[![Release](https://img.shields.io)](https://github.com)
+[![Release](https://img.shields.iodirkgermany/LILA-Logging)](https://github.com/dirkgermany/LILA-Logging/releases/latest)
 
 ## Content
 - [About](#about)
