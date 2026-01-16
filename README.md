@@ -20,19 +20,16 @@ Because LILA provides information about the processes, it can be used directly f
 2. Lightwight
 3. Parallel logging from one or multiple database sessions
 4. Supports monitoring per API
+5. Clear code for individual customizing
+6. Intuitive API
 
 ## Lightwight?
 LILA consists of a PL/SQL package, two tables and a sequence. That's it.
 
 ## Simplicity?
-All you need to use LILA is
-* Create Sequence and Package
-  * Create Sequence by a simple statement (see statement in documentation)
-  * Copy the package code to your database schema and compile
-* Call the logging API out of your code
-* Check process logs
-  * in the log tables
-  * per API
+* Setting up LILA means creating two database objects (sequence and package)
+* Only a few API calls are necessary for the complete logging of a process
+* Analysing or monitoring your process requires simple sql statements or API requests
 
 ## Logging
 LILA monitors different informations about your processes.
