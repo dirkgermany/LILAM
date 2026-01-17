@@ -27,7 +27,7 @@ LILA is developed by a developer who hates over-engineered tools. Focus: 5 minut
 4. **Data Integrity**: Uses autonomous transactions to guarantee log persistence regardless of the main transaction's outcome
 5. **Smart Context Capture**: Automatically records ERR_STACK,  ERR_BACKTRACE, and ERR_CALLSTACK based on log level—deep insights with zero manual effort.
 8. **Optional self-cleaning**: Automatically purges expired logs per application during session start—no background jobs or schedulers required
-7. **Future Ready**: Built for the latest Oracle 26ai (2026), and fully tested with existing 19c/21c environments
+7. **Future Ready**: Built for the latest Oracle 26ai (2026), and fully tested with existing 19c environment
 8. **Small Footprint**: Under 700 lines of logical PL/SQL code. Easy to audit, fast to compile, and zero bloat
 
 ## Fast integration
