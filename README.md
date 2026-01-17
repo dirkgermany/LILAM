@@ -1,4 +1,4 @@
-# LILA - **I**ntegrated **L**ogging **A**rchitecture
+# LILA - **LILA* **I**ntegrated **L**ogging **A**rchitecture
 [![Release](https://img.shields.io/github/v/release/dirkgermany/LILA-Logging)](https://github.com/dirkgermany/LILA-Logging/releases/latest)
 [![Lizenz](https://img.shields.io/github/license/dirkgermany/LILA-Logging)](https://github.com/dirkgermany/LILA-Logging/blob/main/LICENSE)
 [![Größe](https://img.shields.io/github/repo-size/dirkgermany/LILA-Logging)](https://https://github.com/dirkgermany/LILA-Logging)
@@ -17,11 +17,11 @@ LILA is developed by a developer who hates over-engineered tools. Focus: 5 minut
 
 
 ## Key features
-2. **Lightwight**: One Package, two Tables, one Sequence. That's it.
+2. **Lightweight**: One Package, two Tables, one Sequence. That's it.
 3. **Concurrent Logging**: Supports multiple, simultaneous log entries from the same or different sessions without blocking
 4. **Parallel Execution**: Designed for high-performance Oracle environments
 5. **Version Compatibility**: Fully tested on the latest Oracle AI Database 26ai (2026)
-7.**Monitoring**: You have the option to observe your applications per SQL or by the API
+7.**Monitoring**: You have the option to observe your applications via SQL or by the API
 
 ## Fast integration
 * Setting up LILA means creating a sequence and a package (refer [documentation file "setup.md"](docs/setup.md))
@@ -32,14 +32,14 @@ Have a look to the [sample application "learn_lila"](source/sample).
 
 ---
 ## Logging
-LILA persists different informations about your processes.
-To keep it easy the informations are stored in two tables:
+LILA persists different information about your processes.
+To keep it easy the information are stored in two tables:
 
-1. The (leading) master table with informations about the process itself (the live-dashboard). Always exactly one record per process. This table frees you from complex queries such as “group by,” “max(timestamp),” etc., which you would otherwise have to run on thousands or millions of rows to see the current status of your process.
+1. The master table contains data about the process itself (the live-dashboard). Always exactly one record per process. This table frees you from complex queries such as “group by,” “max(timestamp),” etc., which you would otherwise have to run on thousands or millions of rows to see the current status of your process.
 
-2. The table with typical detailed log informations (the process-history). This second table enables rapid monitoring because the constantly growing number of entries has no impact on the master table.
+2. The table with typical detailed log information (the process-history). This second table enables rapid monitoring because the constantly growing number of entries has no impact on the master table.
 
-***Process informations***
+***Process information***
 * Process name
 * Process ID
 * Timestamps process_start
@@ -49,7 +49,7 @@ To keep it easy the informations are stored in two tables:
 * Any info
 * (Last) status
 
-***Detailed informations***
+***Detailed information***
 * Process ID
 * Serial number
 * Any info
@@ -79,14 +79,14 @@ begin
   lila.info(lProcessId, 'Start');
   -- for more details...
   lila.debug(lProcessId, 'Function A');
-  -- e.g. informations when an exception was raised
-  lila.error(lProcessId, 'I made a fault');
+  -- e.g. information when an exception was raised
+  lila.error(lProcessId, 'An error occurred');
 
   -- also you can change the status during your process runs
   lila.set_process_status(lProcessId, 1, 'DONE');
 
   -- last but not least end the logging session
-  -- opional you can set the numbers of steps to do and steps done 
+  -- optional you can set the numbers of steps to do and steps done 
   lila.close_session(lProcessId, 100, 99, 'DONE', 1);
 
 end MY_DEMO_PROC;
@@ -108,6 +108,7 @@ Three options:
 ```sql
 SELECT id, status, last_update, ... FROM lila_process WHERE process_name = ... (provides the current status of the process)
 ```
+
 >| ID | PROCESS_NAME   | PROCESS_START         | PROCESS_END           | LAST_UPDATE           | STEPS_TO_DO | STEPS_DONE | STATUS | INFO
 >| -- | ---------------| --------------------- | --------------------- | --------------------- | ----------- | ---------- | ----- | ------
 >| 1  | my application | 12.01.26 18:17:51,... | 12.01.26 18:18:53,... | 12.01.26 18:18:53,... | 100         | 99         | 2     | ERROR
@@ -128,7 +129,7 @@ SELECT * FROM lila_process_detail WHERE process_id = ...
 
 
 #### API
-The API provides all process data which belong to the process_id (see [Logging](#logging)).
+The API provides all process data which belongs to the process_id (see [Logging](#logging)).
 ```sql
 ...
 FUNCTION getStatus(p_processId NUMBER) RETURNS VARCHAR2
