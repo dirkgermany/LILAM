@@ -142,8 +142,9 @@ create or replace PACKAGE BODY LILA AS
 			ON NEW_TABLE_NAME (process_name, process_end)';
             sqlStmt := replace(sqlStmt, 'NEW_TABLE_NAME', p_TabNamePrefix);
             execute immediate sqlStmt;
+        end if;
 
-
+        if not tableExists(p_TabNamePrefix) then
             -- Details table
             sqlStmt := '
             create table NEW_DETAIL_TABLE_NAME (
