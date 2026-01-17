@@ -25,8 +25,9 @@ LILA is developed by a developer who hates over-engineered tools. Focus: 5 minut
 2. **Concurrent Logging**: Supports multiple, simultaneous log entries from the same or different sessions without blocking
 3. **Parallel Execution**: Designed for high-performance Oracle environments
 4. **Data Integrity**: Uses autonomous transactions to guarantee log persistence regardless of the main transaction's outcome
-5. **Version Compatibility**: Fully tested on the latest Oracle AI Database 26ai (2026)
-6. **Monitoring**: You have the option to observe your applications via SQL or by the API
+5. **Smart Context Capture**: Automatically records ERR_STACK, ERR_BACKTRACE, and ERR_CALLSTACK based on the configured log level, providing deep insights for error analysis without manual overhead
+6. **Version Compatibility**: Fully tested on the latest Oracle AI Database 26ai (2026)
+7. **Monitoring**: You have the option to observe your applications via SQL or by the API
 
 ## Fast integration
 * Setting up LILA means creating a sequence and a package (refer [documentation file "setup.md"](docs/setup.md))
