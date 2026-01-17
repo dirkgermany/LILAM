@@ -19,7 +19,6 @@ LILA is developed by a developer who hates over-engineered tools. Focus: 5 minut
   - [How to log](#how-to-log)
 - [Monitoring](#monitoring)
   - [How to monitor](#how-to-monitor)
-- [Support the Project](#support-the-project)
 
 ## Key features
 1. **Lightweight**: One Package, two Tables, one Sequence. That's it.
@@ -152,7 +151,7 @@ SELECT my_app.getStatus(1) proc_status FROM dual;
 ```
 
 ---
-### 💜 Support the Project
+### Support the Project 💜
 Do you find **lila-logging** useful? Consider sponsoring the project to support its ongoing development and long-term maintenance.
 
 [![Beer](https://img.shields.io/badge/Buy%20me%20a%20beer-LILA-purple?style=for-the-badge&logo=buy-me-a-coffee)](https://github.com/sponsors/dirkgermany)
