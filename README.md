@@ -154,7 +154,7 @@ SELECT my_app.getStatus(1) proc_status FROM dual;
 
 ---
 ### Support the Project 💜
-Do you find **lila-logging** useful? Consider sponsoring the project to support its ongoing development and long-term maintenance.
+Do you find **LILA** useful? Consider sponsoring the project to support its ongoing development and long-term maintenance.
 
 [![Beer](https://img.shields.io/badge/Buy%20me%20a%20beer-LILA-purple?style=for-the-badge&logo=buy-me-a-coffee)](https://github.com/sponsors/dirkgermany)
 
