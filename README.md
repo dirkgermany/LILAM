@@ -13,7 +13,7 @@ LILA is developed by a developer who hates over-engineered tools. Focus: 5 minut
 
 >**Project Status**: Production Ready
 >
->Although LILA was only recently released as Open Source (v1.0.x), the framework was developed for and successfully deployed in real-world production environments before its migration to GitHub. Its core logic has already proven its reliability in practice. Version 1.0 represents its readiness for professional use, now enhanced with advanced features like API-based monitoring and flexible table management.
+>Although LILA was only recently released as Open Source (v1.1.x), the framework was developed for and successfully deployed in real-world production environments before its migration to GitHub. Its core logic has already proven its reliability in practice. Version 1.0 represents its readiness for professional use, now enhanced with advanced features like API-based monitoring and flexible table management.
 
 ## Content
 - [Key features](#key-features)
