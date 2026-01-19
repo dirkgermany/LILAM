@@ -808,7 +808,10 @@ create or replace PACKAGE BODY LILA AS
 	        createLogTables(p_TabNameMaster);
         end if;
 
-        select seq_lila_log.nextVal into pProcessId from dual;
+		-- as String to avoid compile errors when sequence not yet exists
+		sqlStatement := '
+        select seq_lila_log.nextVal from dual';
+		execute immediate sqlStatement into pProcessId;
         insertSession (p_TabNameMaster, pProcessId, p_logLevel);
 
 		if p_logLevel > logLevelSilent then
