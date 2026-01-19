@@ -11,7 +11,13 @@ create or replace PACKAGE BODY LEARN_LILA AS
     as
         lProcessId number(19,0);
     begin
-        lProcessId := lila.new_session('simple sample', lila.logLevelInfo, 1);
+        -- use named params for this first time API call
+        lProcessId := lila.new_session(
+            p_processName   => 'simple sample',
+            p_logLevel      => lila.logLevelInfo,
+            p_daysToKeep    => 1,
+            p_TabNameMaster => 'learn_lila_log'
+        );
         lila.info(lProcessId, 'simple sample little step');
         lila.set_process_status(lProcessId, 1, 'Perfect!');
         lila.close_session(lProcessId);
