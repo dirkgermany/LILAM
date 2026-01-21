@@ -214,7 +214,7 @@ gProcessId := lila.new_session('my application', lila.logLevelWarn, 100, 30, 'MY
 ```
 
 #### Procedure CLOSE_SESSION
-Ends a logging session with optional final informations. Two function signatures are available for different scenarios.
+Ends a logging session with optional final informations. Four function signatures are available for different scenarios.
 * Option 1 is a simple close without any additional information about the process.
 * Option 2-4 allows adding various informations to the ending process.
 
@@ -271,13 +271,26 @@ PROCEDURE CLOSE_SESSION(p_processId NUMBER, p_stepsToDo NUMBER, p_stepsDone NUMB
 --------
 -- assuming that gProcessId is the global stored process ID
 
+-- Option 1
 -- close without any information (e.g. when be set with SET_PROCESS_STATUS before)
 lila.close_session(gProcessId);
--- close without informations about process steps
-lila.close_session(gProcessId, null, null, 'Success', 1);
--- close with additional informations about steps
+
+\
+-- Option 2
+-- close with information about process status
+lila.close_session(gProcessId, 'Success', 1);
+
+\
+-- Option 3
+-- close includes number of steps done
+lila.close_session(gProcessId, 99, 'Problem', 2);
+
+\
+-- Option 4
+-- close with additional informations about steps to do and steps done
 lila.close_session(gProcessId, 100, 99, 'Problem', 2);
 ```
+
 
 #### Procedure SET_PROCESS_STATUS
 Updates the status of a process.
@@ -316,6 +329,7 @@ lila.set_process_status(gProcessId, 1);
 -- updating by using an additional information
 lila.set_process_status(gProcessId, 1, 'OK');
 ```
+
 #### Procedure SET_STEPS_TODO
 Updates the number of required steps during the process in the log entry of the *master table*.
 
