@@ -4,14 +4,13 @@
 **LILA: LILA Integrated Logging Architecture**
 Logging and monitoring pl/sql applications: https://github.com/dirkgermany/LILA-Logging
 
-This demo shows the integration of lila into the subproject 'http_util'
-of the 'alexandria-plsql-utils' tool collection on GitHub: https://github.com/mortenbra/alexandria-plsql-utils.
+This demo shows the interaction between http_util (Alexandria pl/sql Utility Library) and LILA.
+Alexandria see https://github.com/mortenbra/alexandria-plsql-utils.
 
-## The sample
-At first this sample calls up a valid web address and writes some log entries, immediately after that it calls an invalid adress.
-The results of both calls you can see in the tables lila_log and lila_log_detail.
+## This demo app
+First, it calls up a valid web address and writes some log entries. Immediately afterwards, it calls up another invalid address.The results of both calls you can see in the tables lila_log and lila_log_detail.
 
-Have a look to the procedure body and see how few calls are needed for an exact logging.
+Please have a look to the procedure body and see how few calls are needed for an exact logging.
 
 ---
 ## Prerequisites
