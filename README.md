@@ -42,7 +42,7 @@ LILA is developed by a developer who hates over-engineered tools. Focus: 5 minut
 * Analysing or monitoring your process requires simple sql statements or API requests
 
 >LILA comes ready to test right out of the box, so no custom implementation or coding is required to see the framework in action immediately after setup.
->Also please have a look to the sample applications 'learn_lila' (source/demo).
+>Also please have a look to the sample applications 'learn_lila': https://github.com/dirkgermany/LILA-Logging/tree/main/demo/first_steps.
 
 ### Demo
 Execute the following statement in the SQL editor (optionally activate dbms-output for your session beforehand):
