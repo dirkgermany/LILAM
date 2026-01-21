@@ -1,2 +1,3 @@
 # Exclude from exported ZIP-File
+.gitattributes export-ignore
 .github/ export-ignore
