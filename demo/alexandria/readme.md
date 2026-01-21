@@ -52,7 +52,7 @@ You will find http_util.pks and http_util.pkb under https://github.com/mortenbra
 Find the package under https://github.com/dirkgermany/LILA-Logging/tree/main/source/package.
 
 #### Demo
-Same directory as where you found this .md-file: https://github.com/dirkgermany/LILA-Logging/tree/demo/alexandria.
+Same directory as where you found this .md-file: https://github.com/dirkgermany/LILA-Logging/tree/main/demo/alexandria.
 
 ---
 ## Try the demo and see log results
