@@ -197,14 +197,13 @@ create or replace PACKAGE BODY LILA AS
 
     -- Kills log entries depending to their age in days and process name.
     -- Matching of process name is not case sensitive
-    procedure  deleteOldLogs(p_processId number, p_processName varchar2, p_daysToKeep number)
-    as
+	procedure deleteOldLogs(p_processId number, p_processName varchar2, p_daysToKeep number) as
         pragma autonomous_transaction;
         sqlStatement varchar2(500);
         t_rc SYS_REFCURSOR;
         sessionRec t_session_rec;
         processIdToDelete number;
-    begin
+	begin
         if p_daysToKeep is null then
             return;
         end if;
@@ -220,28 +219,29 @@ create or replace PACKAGE BODY LILA AS
 
         -- for all process IDs
         open t_rc for sqlStatement using p_daysToKeep, p_processName;
-        loop
-            fetch t_rc into processIdToDelete;
-            EXIT WHEN t_rc%NOTFOUND;
-    
-            -- kill entries from log details table first (perhaps later there is a constraint)
-            sqlStatement := '
-            delete from PH_DETAIL_TABLE
-            where process_id = :PH_ID';
-            sqlStatement := replaceNameDetailTable(sqlStatement, PARAM_DETAIL_TABLE, sessionRec.tabName_master);
-            execute immediate sqlStatement using processIdToDelete;
+	    loop
+	        fetch t_rc into processIdToDelete;
+	        EXIT WHEN t_rc%NOTFOUND;
+	        
+	        -- delete Details first (integrity)
+	        sqlStatement := 'delete from PH_DETAIL_TABLE where process_id = :1';
+	        sqlStatement := replaceNameDetailTable(sqlStatement, PARAM_DETAIL_TABLE, sessionRec.tabName_master);
+	        execute immediate sqlStatement USING processIdToDelete;
+	
+	        -- delete master
+	        sqlStatement := 'delete from PH_MASTER_TABLE where id = :1';
+	        sqlStatement := replaceNameMasterTable(sqlStatement, PARAM_MASTER_TABLE, sessionRec.tabName_master);
+	        execute immediate sqlStatement USING processIdToDelete;
+	    end loop;
+	    close t_rc;
+	    commit;
 
-            -- kill entries in main log table
-            sqlStatement := '
-            delete from PH_MASTER_TABLE
-            where id = :PH_ID';
-            sqlStatement := replaceNameMasterTable(sqlStatement, PARAM_MASTER_TABLE, sessionRec.tabName_master);
-            execute immediate sqlStatement using processIdToDelete;
-
-        end loop;
-        close t_rc;  
-        commit;
-    end;
+	exception
+	    when others then
+	        if t_rc%isopen then close t_rc; end if;
+	        rollback; -- Auch im Fehlerfall die Transaktion beenden
+	        raise;
+	end;
 
 	------------------------------------------------------------------------------------------------
 
