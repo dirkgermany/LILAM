@@ -202,7 +202,7 @@ create or replace PACKAGE BODY LILA AS
         sqlStatement varchar2(500);
         t_rc SYS_REFCURSOR;
         sessionRec t_session_rec;
-        processIdToDelete number;
+        processIdToDelete number(19,0);
 	begin
         if p_daysToKeep is null then
             return;
