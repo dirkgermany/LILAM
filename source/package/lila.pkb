@@ -20,18 +20,6 @@ create or replace PACKAGE BODY LILA AS
     TYPE t_idx IS TABLE OF PLS_INTEGER INDEX BY BINARY_INTEGER;
     v_indexSession t_idx;    
     
-    -- Record representing the process (internal and external)
-    TYPE t_process_rec IS RECORD (
-        id      NUMBER(19,0),
-        process_name varchar2(100),
-        process_start TIMESTAMP,
-        process_end TIMESTAMP,
-        last_update TIMESTAMP,
-        steps_todo PLS_INTEGER,
-        steps_done PLS_INTEGER,
-        status PLS_INTEGER,
-        info CLOB
-    );
 
     ---------------------------------------------------------------
     -- Monitoring
@@ -912,11 +900,23 @@ create or replace PACKAGE BODY LILA AS
     end;
     
 	------------------------------------------------------------------------------------------------
+    
+    FUNCTION GET_PROCESS_DATA(p_processId NUMBER) return t_process_rec
+    as
+    begin
+        if v_indexSession.EXISTS(p_processId) then
+            return getProcessRecord(p_processId);
+        else return null;
+        end if;
+    end;
 
     FUNCTION GET_STEPS_DONE(p_processId NUMBER) return PLS_INTEGER
     as
     begin
-        return getProcessRecord(p_processId).steps_done;
+        if v_indexSession.EXISTS(p_processId) then
+            return getProcessRecord(p_processId).steps_done;
+        else return 0;
+        end if;
     end;
 
 	------------------------------------------------------------------------------------------------
@@ -924,7 +924,10 @@ create or replace PACKAGE BODY LILA AS
     FUNCTION GET_STEPS_TODO(p_processId NUMBER) return PLS_INTEGER
     as
     begin
-        return getProcessRecord(p_processId).steps_todo;
+        if v_indexSession.EXISTS(p_processId) then
+            return getProcessRecord(p_processId).steps_todo;
+        else return 0;
+        end if;
     end;
 
 	------------------------------------------------------------------------------------------------
@@ -932,7 +935,10 @@ create or replace PACKAGE BODY LILA AS
     function GET_PROCESS_START(p_processId NUMBER) return timestamp
     as
     begin
-        return getProcessRecord(p_processId).process_start;
+        if v_indexSession.EXISTS(p_processId) then
+            return getProcessRecord(p_processId).process_start;
+        else return null;
+        end if;
     end;
     
 	------------------------------------------------------------------------------------------------
@@ -940,7 +946,10 @@ create or replace PACKAGE BODY LILA AS
     function GET_PROCESS_END(p_processId NUMBER) return timestamp
     as
     begin
-        return getProcessRecord(p_processId).process_end;
+        if v_indexSession.EXISTS(p_processId) then
+            return getProcessRecord(p_processId).process_end;
+        else return null;
+        end if;
     end;
 
 	------------------------------------------------------------------------------------------------
@@ -948,7 +957,10 @@ create or replace PACKAGE BODY LILA AS
     function GET_PROCESS_STATUS(p_processId number) return PLS_INTEGER
     as 
     begin
-        return getProcessRecord(p_processId).status;
+        if v_indexSession.EXISTS(p_processId) then
+            return getProcessRecord(p_processId).status;
+        else return 0;
+        end if;
     end;
 
 	------------------------------------------------------------------------------------------------
@@ -956,7 +968,10 @@ create or replace PACKAGE BODY LILA AS
     function GET_PROCESS_INFO(p_processId number) return varchar2
     as 
     begin
-        return getProcessRecord(p_processId).info;
+        if v_indexSession.EXISTS(p_processId) then
+            return getProcessRecord(p_processId).info;
+        else return null;
+        end if;
     end;
 
 	------------------------------------------------------------------------------------------------
@@ -1012,15 +1027,11 @@ create or replace PACKAGE BODY LILA AS
         if v_indexSession.EXISTS(p_processId) and logLevelSilent <= g_sessionList(v_indexSession(p_processId)).log_level then
             v_idx := v_indexSession(p_processId);
             g_sessionList(v_idx).counter_details := p_stepsDone;        
---            write_steps_done(p_processId, g_sessionList(v_idx).tabName_master, p_stepsDone);
             write_close_session(p_processId,  g_sessionList(v_idx).tabName_master, p_stepsToDo, p_stepsDone, p_processInfo, p_status);
             
             -- Eintrag aus internem Speicher entfernen
---            if v_indexSession.EXISTS(p_processId) then
-                g_sessionList.delete(v_indexSession(p_processId));
-                v_indexSession.delete(p_processId); -- Auch den Index-Eintrag entfernen!
---            end if;
-
+            g_sessionList.delete(v_indexSession(p_processId));
+            v_indexSession.delete(p_processId); -- Auch den Index-Eintrag entfernen!
         end if;
     end;
 
