@@ -42,7 +42,7 @@ create or replace PACKAGE BODY LILA AS
         avg_action_time NUMBER,        -- Umbenannt
         action_time     TIMESTAMP,     -- Startzeitpunkt der Aktion
         used_time       NUMBER,        -- Dauer der letzten Ausführung (in Sek.)
-        entry_count     PLS_INTEGER := 0, -- Hilfsvariable für Durchschnittsberechnung
+        steps_done     PLS_INTEGER := 0, -- Hilfsvariable für Durchschnittsberechnung
         is_flushed      PLS_INTEGER := 0
     );
    
@@ -55,7 +55,7 @@ create or replace PACKAGE BODY LILA AS
     
     v_cache_avg   t_cache_num; -- Speichert den aktuellen avg_action_time
     v_cache_last  t_cache_ts;  -- Speichert den letzten action_time
-    v_cache_count t_cache_int; -- Speichert die Anzahl (entry_count)
+    v_cache_count t_cache_int; -- Speichert die Anzahl (steps_done)
     
     -- Das Haupt-Objekt: Ein assoziatives Array, das für jede 
     -- Kombi (Key) eine eigene Historie-Tabelle speichert.
@@ -65,6 +65,8 @@ create or replace PACKAGE BODY LILA AS
     g_max_entries_per_monitor_action CONSTANT PLS_INTEGER := 1000; -- Max. Anzahl Einträge für eine Aktion je Action
     g_monitor_dirty_count PLS_INTEGER := 0; -- Zähler für die Monitoreinträge im Speicher
     g_flush_monitor_threshold CONSTANT PLS_INTEGER := 100; -- Max. Anzahl Monitoreinträge für das Flush
+
+    g_alert_threshold_factor NUMBER := 2.0; -- Max. Ausreißer in der Dauer eines Verarbeitungsschrittes
     
     -- general Flush Time-Duration
     g_flush_millis_threshold  CONSTANT PLS_INTEGER := 1500; 
@@ -368,6 +370,154 @@ create or replace PACKAGE BODY LILA AS
             end if;
     end;
 
+    --------------------------------------------------------------------------
+    -- Flush monitor data to detail table
+    --------------------------------------------------------------------------
+    procedure persist_log_data(
+        p_processId    number,
+        p_target_table varchar2,
+        p_seqs         sys.odcinumberlist,
+        p_levels       sys.odcinumberlist,
+        p_texts        sys.odcivarchar2list,
+        p_times        sys.odcidatelist,
+        p_stacks       sys.odcivarchar2list,
+        p_backtraces   sys.odcivarchar2list,
+        p_callstacks   sys.odcivarchar2list
+    )    
+    as
+        pragma autonomous_transaction;
+    begin
+        -- Bulk-Insert über alle gesammelten Log-Einträge
+        forall i in 1 .. p_levels.count
+            execute immediate 
+                'insert into ' || p_target_table || ' 
+                (PROCESS_ID, LOG_LEVEL, INFO, SESSION_TIME, NO, ERR_STACK, ERR_BACKTRACE, ERR_CALLSTACK, SESSION_USER, HOST_NAME)
+                values (:1, :2, :3, :4, :5, :6, :7, :8, :9, :10)'
+            USING p_processId, p_levels(i), p_texts(i), p_times(i), p_seqs(i), p_stacks(i), p_backtraces(i), p_callstacks(i),
+            SYS_CONTEXT('USERENV','SESSION_USER'), SYS_CONTEXT('USERENV','HOST');
+        commit;
+        
+    exception
+        when others then
+            rollback;
+            if should_raise_error(p_processId) then
+                raise;
+            end if;
+
+    end;
+
+	--------------------------------------------------------------------------
+    
+    procedure flushLogs(p_processId number)
+    as
+        v_key          constant varchar2(100) := to_char(p_processId);
+        v_targetTable  varchar2(150);
+        v_idx_session  pls_integer;
+        
+        -- Bulk-Listen für den Datentransfer (Schema-Level Typen)
+        v_levels       sys.odcinumberlist   := sys.odcinumberlist();
+        v_texts        sys.odcivarchar2list := sys.odcivarchar2list();
+        v_times        sys.odcidatelist     := sys.odcidatelist();
+        v_seqs         sys.odcinumberlist   := sys.odcinumberlist();
+        v_stacks       sys.odcivarchar2list := sys.odcivarchar2list();
+        v_backtraces   sys.odcivarchar2list := sys.odcivarchar2list();
+        v_callstacks   sys.odcivarchar2list := sys.odcivarchar2list();
+    begin
+        -- 1. Prüfen, ob Daten für diesen Prozess im Cache sind
+        if not g_log_groups.EXISTS(v_key) or g_log_groups(v_key).COUNT = 0 then
+            return;
+        end if;
+    
+        -- 2. Ziel-Tabelle aus der Session-Liste ermitteln
+        v_idx_session := v_indexSession(p_processId);
+        v_targetTable := g_sessionList(v_idx_session).tabName_master || '_DETAIL';
+    
+        -- 3. Daten aus der hierarchischen Map in flache Listen sammeln
+        for i in 1 .. g_log_groups(v_key).COUNT loop
+            v_levels.EXTEND;     v_levels(v_levels.LAST)     := g_log_groups(v_key)(i).log_level;
+            v_texts.EXTEND;      v_texts(v_texts.LAST)       := substrb(g_log_groups(v_key)(i).log_text, 1, 4000);
+            v_times.EXTEND;      v_times(v_times.LAST)       := cast(g_log_groups(v_key)(i).log_time as date);
+            v_seqs.EXTEND;       v_seqs(v_seqs.LAST)         := g_log_groups(v_key)(i).serial_no;
+            
+            -- Error-Stacks (begrenzt auf 4000 Byte für sys.odcivarchar2list)
+            v_stacks.EXTEND;     v_stacks(v_stacks.LAST)     := substrb(g_log_groups(v_key)(i).err_stack, 1, 4000);
+            v_backtraces.EXTEND; v_backtraces(v_backtraces.LAST) := substrb(g_log_groups(v_key)(i).err_backtrace, 1, 4000);
+            v_callstacks.EXTEND; v_callstacks(v_callstacks.LAST) := substrb(g_log_groups(v_key)(i).err_callstack, 1, 4000);
+        end loop;
+
+        -- 4. Übergabe an die autonome Bulk-Persistierung
+        persist_log_data(
+            p_processId    => p_processId,
+            p_target_table => v_targetTable,
+            p_levels       => v_levels,
+            p_texts        => v_texts,
+            p_times        => v_times,
+            p_seqs         => v_seqs,
+            p_stacks       => v_stacks,
+            p_backtraces   => v_backtraces,
+            p_callstacks   => v_callstacks
+        );
+    
+        -- 5. Cache für diesen Prozess leeren
+        g_log_groups(v_key).DELETE;
+    
+    exception
+        when others then
+            -- Zentrale Fehlerbehandlung nutzen
+            if should_raise_error(p_processId) then
+                raise;
+            end if;
+    end;
+    
+	--------------------------------------------------------------------------
+    
+    procedure write_to_log_buffer(
+        p_processId number, 
+        p_level number,
+        p_text varchar2,
+        p_errStack varchar2,
+        p_errBacktrace varchar2,
+        p_errCallstack varchar2
+    ) 
+    is
+        v_idx PLS_INTEGER;
+        v_key varchar2(100) := to_char(p_processId);
+        v_new_log t_log_buffer_rec;
+    begin
+        v_idx := v_indexSession(p_processId);
+        g_sessionList(v_idx).serial_no := nvl(g_sessionList(v_idx).serial_no, 0) + 1;
+
+        v_new_log.serial_no := g_sessionList(v_idx).serial_no;
+    
+        -- 1. Gruppe initialisieren
+        if not g_log_groups.EXISTS(v_key) then
+            g_log_groups(v_key) := t_log_history_tab();
+        end if;
+    
+        -- 2. Record befüllen
+        v_new_log.process_id    := p_processId; -- Jetzt vorhanden
+        v_new_log.log_level     := p_level;
+        v_new_log.log_text      := p_text;
+        v_new_log.log_time      := systimestamp;
+        v_new_log.serial_no     := g_sessionList(v_indexSession(p_processId)).serial_no;
+        v_new_log.err_stack     := p_errStack;
+        v_new_log.err_backtrace := p_errBacktrace;
+        v_new_log.err_callstack := p_errCallstack;
+            
+        -- 3. In den Cache hängen
+        g_log_groups(v_key).EXTEND;
+        g_log_groups(v_key)(g_log_groups(v_key).LAST) := v_new_log;
+    
+        -- 4. Globalen Dirty-Zähler erhöhen
+        g_log_dirty_count := g_log_dirty_count + 1;
+    
+        -- 5. Flush-Check
+        if g_log_dirty_count >= g_flush_log_threshold then
+            flushLogs(p_processId);
+            g_log_dirty_count := 0;
+        end if;
+    end;
+
 
     /*
         Methods dedicated to the g_monitorList
@@ -381,7 +531,7 @@ create or replace PACKAGE BODY LILA AS
         p_target_table varchar2,
         p_ids          sys.odcinumberlist,
         p_actions      sys.odcivarchar2list,
-        p_entry_counts sys.odcinumberlist,
+        p_steps_done   sys.odcinumberlist,
         p_used         sys.odcinumberlist,
         p_avgs         sys.odcinumberlist, -- NEU: Liste für avg_action_time
         p_times        sys.odcidatelist
@@ -395,7 +545,7 @@ create or replace PACKAGE BODY LILA AS
                     'insert into ' || p_target_table || ' 
                     (PROCESS_ID, MON_ACTION, MON_STEPS_DONE, MON_USED_MILLIS, MON_AVG_MILLIS, SESSION_TIME, MONITORING, SESSION_USER, HOST_NAME)
                     values (:1, :2, :3, :4, :5, :6, 1, :7, :8)'
-                using p_ids(i), p_actions(i), p_entry_counts(i), p_used(i), p_avgs(i), p_times(i),
+                using p_ids(i), p_actions(i), p_steps_done(i), p_used(i), p_avgs(i), p_times(i),
                     SYS_CONTEXT('USERENV','SESSION_USER'), SYS_CONTEXT('USERENV','HOST')
                 
                 ;
@@ -422,7 +572,7 @@ create or replace PACKAGE BODY LILA AS
         -- Sammlungen für den Datentransfer
         v_ids           sys.odcinumberlist   := sys.odcinumberlist();
         v_actions       sys.odcivarchar2list := sys.odcivarchar2list();
-        v_entry_counts  sys.odcinumberlist   := sys.odcinumberlist();
+        v_steps_done    sys.odcinumberlist   := sys.odcinumberlist();
         v_used          sys.odcinumberlist   := sys.odcinumberlist();
         v_avgs          sys.odcinumberlist   := sys.odcinumberlist(); -- NEU
         v_times         sys.odcidatelist     := sys.odcidatelist();
@@ -440,7 +590,7 @@ create or replace PACKAGE BODY LILA AS
                     if g_monitor_groups(v_key)(i).is_flushed = 0 then
                         v_ids.extend;           v_ids(v_ids.last) := g_monitor_groups(v_key)(i).process_id;
                         v_actions.extend;       v_actions(v_actions.last) := g_monitor_groups(v_key)(i).action_name;
-                        v_entry_counts.extend;  v_entry_counts(v_entry_counts.last) := g_monitor_groups(v_key)(i).entry_count;
+                        v_steps_done.extend;    v_steps_done(v_steps_done.last) := g_monitor_groups(v_key)(i).steps_done;
                         v_used.extend;          v_used(v_used.last) := g_monitor_groups(v_key)(i).used_time;
                         v_avgs.extend;          v_avgs(v_avgs.last) := g_monitor_groups(v_key)(i).avg_action_time;
                         v_times.extend;         v_times(v_times.last) := cast(g_monitor_groups(v_key)(i).action_time as date);
@@ -457,7 +607,7 @@ create or replace PACKAGE BODY LILA AS
                 p_target_table => v_targetTable,
                 p_ids          => v_ids,
                 p_actions      => v_actions,
-                p_entry_counts => v_entry_counts,
+                p_steps_done   => v_steps_done,
                 p_used         => v_used,
                 p_avgs         => v_avgs, -- NEU übergeben
                 p_times        => v_times
@@ -531,20 +681,6 @@ create or replace PACKAGE BODY LILA AS
     end;
 
     --------------------------------------------------------------------------
-    -- Performance Ermittlung zu einer Action
-    --------------------------------------------------------------------------
-    function getCurrentAvgTime(p_processId number, p_actionName varchar2) return number
-    is
-        v_key constant varchar2(100) := buildMonitorKey(p_processId, p_actionName);
-    begin
-        -- Direkter Zugriff auf den flachen Cache
-        if v_cache_avg.EXISTS(v_key) then
-            return v_cache_avg(v_key);
-        end if;
-        return 0;
-    end;
-    
-    --------------------------------------------------------------------------
     -- Calculation average time used
     --------------------------------------------------------------------------
     function calculate_avg(
@@ -566,6 +702,59 @@ create or replace PACKAGE BODY LILA AS
         -- Gleitender Durchschnitt über n Intervalle
         -- Formel: ((Schnitt_alt * (n-1)) + Wert_neu) / n
         return ((p_old_avg * (v_meas_count - 1)) + p_new_value) / v_meas_count;
+    end;
+    
+    --------------------------------------------------------------------------
+    -- Helper for raising alerts
+    --------------------------------------------------------------------------
+    procedure raise_alert(
+        p_processId number, 
+        p_action varchar2,
+        p_step PLS_INTEGER,
+        p_used_time number,
+        p_expected number
+    )
+    as
+        l_msg VARCHAR2(4000);
+    begin
+        l_msg := 'PERFORMANCE ALERT: ' || p_action || ' - Step: ' || p_step || 
+                 ' used ' || p_used_time || 'ms (expected: ' || p_expected || 'ms)';
+                 
+        -- Log to Buffer
+        write_to_log_buffer(
+            p_processId, 
+            logLevelPerformance,
+            l_msg,
+            null,
+            null,
+            null
+        );
+
+    end;
+    
+    --------------------------------------------------------------------------
+    -- Check if a single step needs more time than average over all steps per action
+    --------------------------------------------------------------------------
+    procedure validateDurationInAverage(p_processId number, p_monitor_rec t_monitor_rec)
+    as
+        l_threshold_duration NUMBER;
+    begin
+        IF p_monitor_rec.steps_done > 5 THEN 
+            
+            l_threshold_duration := p_monitor_rec.avg_action_time * g_alert_threshold_factor;
+        
+            IF p_monitor_rec.used_time > l_threshold_duration THEN
+                -- Hier wird die Alert-Aktion ausgelöst
+                raise_alert(
+                    p_processId => p_processId,
+                    p_action    => p_monitor_rec.action_name,
+                    p_step      => p_monitor_rec.steps_done,
+                    p_used_time => p_monitor_rec.used_time,
+                    p_expected  => p_monitor_rec.avg_action_time
+                );
+            END IF;
+        END IF;
+
     end;
     
     --------------------------------------------------------------------------
@@ -620,11 +809,12 @@ create or replace PACKAGE BODY LILA AS
         v_new_rec.action_time     := v_now;
         v_new_rec.used_time       := v_used_time;
         v_new_rec.avg_action_time := v_new_avg;
-        v_new_rec.entry_count     := v_new_count;
+        v_new_rec.steps_done      := v_new_count;
     
         g_monitor_groups(v_key).EXTEND;
         g_monitor_groups(v_key)(g_monitor_groups(v_key).LAST) := v_new_rec;
-          
+        
+        validateDurationInAverage(p_processId, v_new_rec);
         sync_monitor(p_processId);
         
     exception
@@ -726,50 +916,13 @@ create or replace PACKAGE BODY LILA AS
         v_rec t_monitor_rec;
     begin
         v_rec := getLastMonitorEntry(p_processId, p_actionName);
-        RETURN nvl(v_rec.entry_count, 0);
+        RETURN nvl(v_rec.steps_done, 0);
     end;
     
     
     /*
 		Methods dedicated to the g_sessionList
 	*/
-    
-    --------------------------------------------------------------------------
-    -- Flush monitor data to detail table
-    --------------------------------------------------------------------------
-    procedure persist_log_data(
-        p_processId    number,
-        p_target_table varchar2,
-        p_seqs         sys.odcinumberlist,
-        p_levels       sys.odcinumberlist,
-        p_texts        sys.odcivarchar2list,
-        p_times        sys.odcidatelist,
-        p_stacks       sys.odcivarchar2list,
-        p_backtraces   sys.odcivarchar2list,
-        p_callstacks   sys.odcivarchar2list
-    )    
-    as
-        pragma autonomous_transaction;
-    begin
-        -- Bulk-Insert über alle gesammelten Log-Einträge
-        forall i in 1 .. p_levels.count
-            execute immediate 
-                'insert into ' || p_target_table || ' 
-                (PROCESS_ID, LOG_LEVEL, INFO, SESSION_TIME, NO, ERR_STACK, ERR_BACKTRACE, ERR_CALLSTACK, SESSION_USER, HOST_NAME)
-                values (:1, :2, :3, :4, :5, :6, :7, :8, :9, :10)'
-            USING p_processId, p_levels(i), p_texts(i), p_times(i), p_seqs(i), p_stacks(i), p_backtraces(i), p_callstacks(i),
-            SYS_CONTEXT('USERENV','SESSION_USER'), SYS_CONTEXT('USERENV','HOST');
-        commit;
-        
-    exception
-        when others then
-            rollback;
-            if should_raise_error(p_processId) then
-                raise;
-            end if;
-
-    end;
-
 
     -- Delivers a record of the internal list which belongs to the process id
     -- Return value is NULL BUT! datatype RECORD cannot be validated by IS NULL.
@@ -890,7 +1043,7 @@ create or replace PACKAGE BODY LILA AS
     end;
  
 	--------------------------------------------------------------------------
-
+/*
     -- Updates the status and the info field of a log entry in the main log table.
     procedure persist_master_record(p_processId number, p_tableName varchar2, p_status PLS_INTEGER, p_processInfo varchar2)
     as
@@ -915,7 +1068,7 @@ create or replace PACKAGE BODY LILA AS
                 RAISE;
             end if;
     end;
-
+*/
 
     -------------------------------------------------------------------
     -- Ends an earlier started logging session by the process ID.
@@ -1044,117 +1197,6 @@ create or replace PACKAGE BODY LILA AS
         end if;
     end;
     
-	--------------------------------------------------------------------------
-    
-    procedure flushLogs(p_processId number)
-    as
-        v_key          constant varchar2(100) := to_char(p_processId);
-        v_targetTable  varchar2(150);
-        v_idx_session  pls_integer;
-        
-        -- Bulk-Listen für den Datentransfer (Schema-Level Typen)
-        v_levels       sys.odcinumberlist   := sys.odcinumberlist();
-        v_texts        sys.odcivarchar2list := sys.odcivarchar2list();
-        v_times        sys.odcidatelist     := sys.odcidatelist();
-        v_seqs         sys.odcinumberlist   := sys.odcinumberlist();
-        v_stacks       sys.odcivarchar2list := sys.odcivarchar2list();
-        v_backtraces   sys.odcivarchar2list := sys.odcivarchar2list();
-        v_callstacks   sys.odcivarchar2list := sys.odcivarchar2list();
-    begin
-        -- 1. Prüfen, ob Daten für diesen Prozess im Cache sind
-        if not g_log_groups.EXISTS(v_key) or g_log_groups(v_key).COUNT = 0 then
-            return;
-        end if;
-    
-        -- 2. Ziel-Tabelle aus der Session-Liste ermitteln
-        v_idx_session := v_indexSession(p_processId);
-        v_targetTable := g_sessionList(v_idx_session).tabName_master || '_DETAIL';
-    
-        -- 3. Daten aus der hierarchischen Map in flache Listen sammeln
-        for i in 1 .. g_log_groups(v_key).COUNT loop
-            v_levels.EXTEND;     v_levels(v_levels.LAST)     := g_log_groups(v_key)(i).log_level;
-            v_texts.EXTEND;      v_texts(v_texts.LAST)       := substrb(g_log_groups(v_key)(i).log_text, 1, 4000);
-            v_times.EXTEND;      v_times(v_times.LAST)       := cast(g_log_groups(v_key)(i).log_time as date);
-            v_seqs.EXTEND;       v_seqs(v_seqs.LAST)         := g_log_groups(v_key)(i).serial_no;
-            
-            -- Error-Stacks (begrenzt auf 4000 Byte für sys.odcivarchar2list)
-            v_stacks.EXTEND;     v_stacks(v_stacks.LAST)     := substrb(g_log_groups(v_key)(i).err_stack, 1, 4000);
-            v_backtraces.EXTEND; v_backtraces(v_backtraces.LAST) := substrb(g_log_groups(v_key)(i).err_backtrace, 1, 4000);
-            v_callstacks.EXTEND; v_callstacks(v_callstacks.LAST) := substrb(g_log_groups(v_key)(i).err_callstack, 1, 4000);
-        end loop;
-
-        -- 4. Übergabe an die autonome Bulk-Persistierung
-        persist_log_data(
-            p_processId    => p_processId,
-            p_target_table => v_targetTable,
-            p_levels       => v_levels,
-            p_texts        => v_texts,
-            p_times        => v_times,
-            p_seqs         => v_seqs,
-            p_stacks       => v_stacks,
-            p_backtraces   => v_backtraces,
-            p_callstacks   => v_callstacks
-        );
-    
-        -- 5. Cache für diesen Prozess leeren
-        g_log_groups(v_key).DELETE;
-    
-    exception
-        when others then
-            -- Zentrale Fehlerbehandlung nutzen
-            if should_raise_error(p_processId) then
-                raise;
-            end if;
-    end;
-    
-	--------------------------------------------------------------------------
-    
-    procedure write_to_log_buffer(
-        p_processId number, 
-        p_level number,
-        p_text varchar2,
-        p_errStack varchar2,
-        p_errBacktrace varchar2,
-        p_errCallstack varchar2
-    ) 
-    is
-        v_idx PLS_INTEGER;
-        v_key varchar2(100) := to_char(p_processId);
-        v_new_log t_log_buffer_rec;
-    begin
-        v_idx := v_indexSession(p_processId);
-        g_sessionList(v_idx).serial_no := g_sessionList(v_idx).serial_no + 1;
-        v_new_log.serial_no := g_sessionList(v_idx).serial_no;
-    
-        -- 1. Gruppe initialisieren
-        if not g_log_groups.EXISTS(v_key) then
-            g_log_groups(v_key) := t_log_history_tab();
-        end if;
-    
-        -- 2. Record befüllen
-        v_new_log.process_id    := p_processId; -- Jetzt vorhanden
-        v_new_log.log_level     := p_level;
-        v_new_log.log_text      := p_text;
-        v_new_log.log_time      := systimestamp;
-        v_new_log.serial_no     := g_sessionList(v_indexSession(p_processId)).serial_no;
-        v_new_log.err_stack     := p_errStack;
-        v_new_log.err_backtrace := p_errBacktrace;
-        v_new_log.err_callstack := p_errCallstack;
-    
-        -- 3. In den Cache hängen
-        g_log_groups(v_key).EXTEND;
-        g_log_groups(v_key)(g_log_groups(v_key).LAST) := v_new_log;
-    
-        -- 4. Globalen Dirty-Zähler erhöhen
-        g_log_dirty_count := g_log_dirty_count + 1;
-    
-        -- 5. Flush-Check
-        if g_log_dirty_count >= g_flush_log_threshold then
-            flushLogs(p_processId);
-            g_log_dirty_count := 0;
-        end if;
-    end;
-
 	--------------------------------------------------------------------------
 
     procedure sync_log(p_processId number, p_force boolean default false)
@@ -1345,8 +1387,9 @@ create or replace PACKAGE BODY LILA AS
     begin
         if v_indexSession.EXISTS(p_processId) then
             v_idx := v_indexSession(p_processId);
-            g_sessionList(v_idx).steps_done := g_sessionList(v_idx).steps_done + 1;        
-            g_process_cache(p_processId).steps_done := g_sessionList(v_idx).steps_done;
+            g_sessionList(v_idx).steps_done := g_sessionList(v_idx).steps_done + 1;   
+            g_process_cache(p_processId).steps_done := g_process_cache(p_processId).steps_done + 1;
+
             sync_master_state(p_processId);
         end if;
     end;
@@ -1476,8 +1519,6 @@ create or replace PACKAGE BODY LILA AS
     as
         v_idx PLS_INTEGER;
     begin
-        dbms_output.enable();
-
         if v_indexSession.EXISTS(p_processId) then
             sync_master_state(p_processId, true);
             sync_log(p_processId, true);
