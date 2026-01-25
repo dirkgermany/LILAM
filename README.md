@@ -69,10 +69,10 @@ LILA's decoupled architecture is designed for seamless integration with modern m
 ### Observability & AI Readiness
 
 #### Real-Time Performance Metrics
-LILA is more than just a logging tool. Through the `MARK_STEP` functionality, specific checkpoints can be integrated into the code. The framework provides out-of-the-box metrics such as:
-*   **Step Duration:** Precise execution time for specific process segments.
-*   **Average Duration:** Historical benchmarks to identify performance degradation over time.
-*   **Step Counter:** Monitoring the number of iterations or progress within a workflow.
+LILA is more than just a logging tool. Using the `MARK_STEP` functionality, named actions can be monitored independently. The framework automatically tracks metrics **per action**:
+*   **Step Duration:** Precise execution time for a specific action's segment.
+*   **Average Duration:** Historical benchmarks to detect performance degradation per action.
+*   **Step Counter:** Monitoring progress and iterations within a specific named workflow.
 
 #### Intelligent Metric Calculation
 Instead of performing expensive aggregations across millions of log records for every query, LILA uses an intelligent calculation mechanism. Metrics are updated incrementally, ensuring that monitoring dashboards (e.g., in Grafana, APEX, or Oracle Jet) remain highly responsive even with massive datasets.
