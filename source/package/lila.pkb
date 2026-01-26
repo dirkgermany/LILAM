@@ -1,9 +1,26 @@
 create or replace PACKAGE BODY LILA AS
 
     ---------------------------------------------------------------
+    -- Configuration
+    ---------------------------------------------------------------
+    TYPE t_config_rec IS RECORD (
+        -- settings dedicated to one log session
+        process_id                      NUMBER,      -- configuration is dedicated to one session (process)
+        log_level                       PLS_INTEGER, -- new log_level
+        
+        -- global settings for all log sessions
+        flush_log_threshold             PLS_INTEGER, -- max. dirty log records
+        flush_master_threshold          PLS_INTEGER, -- max. dirty CHANGES of session record
+        flush_monitor_threshold         PLS_INTEGER, -- max. dirty monitor records
+        monitor_alert_threshold_factor  PLS_INTEGER, -- max. deviation from the average processing time
+        max_entries_per_monitor_action  PLS_INTEGER  -- round robin: max. monitor actions hold in memory
+    );
+
+    ---------------------------------------------------------------
     -- Sessions
     ---------------------------------------------------------------
     -- Record representing the internal session
+    -- Per started process one session
     TYPE t_session_rec IS RECORD (
         process_id          NUMBER(19,0),
         serial_no           PLS_INTEGER := 0,
@@ -12,8 +29,8 @@ create or replace PACKAGE BODY LILA AS
         monitoring          PLS_INTEGER := 0,
         last_monitor_flush  TIMESTAMP, -- Zeitpunkt des letzten Monitor-Flushes
         last_log_flush      TIMESTAMP, -- Zeitpunkt des letzten Log-Flushes
-        monitor_dirty_count PLS_INTEGER := 0, -- PRO PROZESS Zähler
-        log_dirty_count     PLS_INTEGER := 0,  -- PRO PROZESS Zähler
+        monitor_dirty_count PLS_INTEGER := 0,  -- monitor entries per process counter
+        log_dirty_count     PLS_INTEGER := 0,  -- Logs per process counter
         tabName_master      VARCHAR2(100)
     );
 
@@ -31,12 +48,13 @@ create or replace PACKAGE BODY LILA AS
     TYPE t_process_cache_map IS TABLE OF t_process_rec INDEX BY PLS_INTEGER;
     g_process_cache t_process_cache_map;
     g_master_dirty_count PLS_INTEGER := 0; 
-    g_flush_process_threshold CONSTANT PLS_INTEGER := 100;
+    g_flush_master_threshold PLS_INTEGER := 100;
+    g_last_master_flush  TIMESTAMP;
 
     ---------------------------------------------------------------
     -- Monitoring
     ---------------------------------------------------------------
-    TYPE t_monitor_rec IS RECORD (
+    TYPE t_monitor_buffer_rec IS RECORD (
         process_id      NUMBER(19,0),
         action_name     VARCHAR2(25),
         avg_action_time NUMBER,        -- Umbenannt
@@ -47,7 +65,7 @@ create or replace PACKAGE BODY LILA AS
     );
    
     -- Eine Nested Table, die nur die Historie EINER Aktion hält
-    TYPE t_action_history_tab IS TABLE OF t_monitor_rec;
+    TYPE t_action_history_tab IS TABLE OF t_monitor_buffer_rec;
     
     TYPE t_cache_num IS TABLE OF NUMBER INDEX BY VARCHAR2(100);
     TYPE t_cache_ts  IS TABLE OF TIMESTAMP INDEX BY VARCHAR2(100);
@@ -62,15 +80,10 @@ create or replace PACKAGE BODY LILA AS
     TYPE t_monitor_map IS TABLE OF t_action_history_tab INDEX BY VARCHAR2(100);
     g_monitor_groups t_monitor_map;
     
-    g_max_entries_per_monitor_action CONSTANT PLS_INTEGER := 1000; -- Max. Anzahl Einträge für eine Aktion je Action
-    g_monitor_dirty_count PLS_INTEGER := 0; -- Zähler für die Monitoreinträge im Speicher
-    g_flush_monitor_threshold CONSTANT PLS_INTEGER := 100; -- Max. Anzahl Monitoreinträge für das Flush
-
+    g_max_entries_per_monitor_action PLS_INTEGER := 1000; -- Round Robin: Max. Anzahl Einträge für eine Aktion je Action
+    g_flush_monitor_threshold PLS_INTEGER := 100; -- Max. Anzahl Monitoreinträge für das Flush
     g_monitor_alert_threshold_factor NUMBER := 2.0; -- Max. Ausreißer in der Dauer eines Verarbeitungsschrittes
-    
-    -- general Flush Time-Duration
-    g_flush_millis_threshold  CONSTANT PLS_INTEGER := 1500; 
-        
+            
     ---------------------------------------------------------------
     -- Logging
     ---------------------------------------------------------------
@@ -96,7 +109,7 @@ create or replace PACKAGE BODY LILA AS
     
     -- Steuerungsvariablen (Analog zum Monitoring)
 --    g_log_dirty_count PLS_INTEGER := 0; 
-    g_flush_log_threshold CONSTANT PLS_INTEGER := 100;
+    g_flush_log_threshold PLS_INTEGER := 100;
     
     ---------------------------------------------------------------
     -- General Variables
@@ -105,6 +118,12 @@ create or replace PACKAGE BODY LILA AS
     -- ALERT Registration
     g_isAlertRegistered BOOLEAN := false;
     g_alertCode CONSTANT varchar2(20) := 'LILA_ALERT_CFG';
+    
+    CONFIG_TABLE constant varchar2(20) := 'LILA_CONFIG';
+
+
+    -- general Flush Time-Duration
+    g_flush_millis_threshold PLS_INTEGER := 1500; 
 
     ---------------------------------------------------------------
     -- Placeholders for tables
@@ -226,6 +245,20 @@ create or replace PACKAGE BODY LILA AS
         if not objectExists('SEQ_LILA_LOG', 'SEQUENCE') then
             sqlStmt := 'CREATE SEQUENCE SEQ_LILA_LOG MINVALUE 0 MAXVALUE 9999999999999999999999999999 INCREMENT BY 1 START WITH 1 CACHE 10 NOORDER  NOCYCLE  NOKEEP  NOSCALE  GLOBAL';
             execute immediate sqlStmt;
+        end if;
+        
+        if not objectExists(CONFIG_TABLE, 'TABLE') then
+            sqlStmt := '
+            create table ' || CONFIG_TABLE || ' (
+                process_id                      NUMBER(19,0),
+                log_level                       NUMBER,                
+                flush_log_threshold             NUMBER,
+                flush_master_threshold         NUMBER,
+                flush_monitor_threshold         NUMBER,
+                monitor_alert_threshold_factor  NUMBER,
+                max_entries_per_monitor_action  NUMBER
+            )';
+            run_sql(sqlStmt);            
         end if;
 
         if not objectExists(p_TabNameMaster, 'TABLE') then
@@ -355,7 +388,31 @@ create or replace PACKAGE BODY LILA AS
     
 	--------------------------------------------------------------------------
 
-    function getProcessRecord(p_processId number) return t_process_rec
+    function readConfigRecord(p_processId number) return t_config_rec
+    as
+        configRec t_config_rec;
+        sqlStatement varchar2(600);
+    begin
+        sqlStatement := '
+        select
+            process_id,
+            log_level,           
+            flush_log_threshold,
+            flush_master_threshold,
+            flush_monitor_threshold,
+            monitor_alert_threshold_factor,
+            max_entries_per_monitor_action
+        from ' || CONFIG_TABLE || ' 
+        where process_id = :PH_PROCESS_ID
+        ';
+        execute immediate sqlStatement into configRec USING p_processId;
+    
+    
+    end;
+    
+	--------------------------------------------------------------------------
+
+    function readProcessRecord(p_processId number) return t_process_rec
     as
         sessionRec t_session_rec;
         processRec t_process_rec;
@@ -380,7 +437,7 @@ create or replace PACKAGE BODY LILA AS
         sessionRec := getSessionRecord(p_processId);
         if sessionRec.process_id is not null then
             sqlStatement := replaceNameMasterTable(sqlStatement, PARAM_MASTER_TABLE, sessionRec.tabName_master);
-            execute immediate sqlStatement into processRec using p_processId;
+            execute immediate sqlStatement into processRec USING p_processId;
         end if;
         return processRec;
         
@@ -431,6 +488,8 @@ create or replace PACKAGE BODY LILA AS
     
 	--------------------------------------------------------------------------
     
+    -- initilizes writing to table
+    -- decouples internal memory from autonomous transaction
     procedure flushLogs(p_processId number)
     as
         v_key          constant varchar2(100) := to_char(p_processId);
@@ -758,7 +817,7 @@ create or replace PACKAGE BODY LILA AS
     --------------------------------------------------------------------------
     -- Check if a single step needs more time than average over all steps per action
     --------------------------------------------------------------------------
-    procedure validateDurationInAverage(p_processId number, p_monitor_rec t_monitor_rec)
+    procedure validateDurationInAverage(p_processId number, p_monitor_rec t_monitor_buffer_rec)
     as
         l_threshold_duration NUMBER;
     begin
@@ -791,7 +850,7 @@ create or replace PACKAGE BODY LILA AS
         v_new_avg    number := 0;
         v_new_count  pls_integer := 1;
         v_history    t_action_history_tab;
-        v_new_rec    t_monitor_rec;
+        v_new_rec    t_monitor_buffer_rec;
     begin
         -- if monitoring is not activated do nothing here
         if v_indexSession.EXISTS(p_processId) and logLevelMonitor > g_sessionList(v_indexSession(p_processId)).log_level then
@@ -873,10 +932,10 @@ create or replace PACKAGE BODY LILA AS
     --------------------------------------------------------------------------
     -- Removing a record from monitor list
     --------------------------------------------------------------------------
-    function getLastMonitorEntry(p_processId number, p_actionName varchar2) return t_monitor_rec
+    function getLastMonitorEntry(p_processId number, p_actionName varchar2) return t_monitor_buffer_rec
     as
         v_key    constant varchar2(100) := buildMonitorKey(p_processId, p_actionName);
-        v_empty  t_monitor_rec; -- Initial leerer Record als Fallback
+        v_empty  t_monitor_buffer_rec; -- Initial leerer Record als Fallback
     begin
         -- 1. Prüfen, ob die Gruppe (Action) im Cache existiert
         if g_monitor_groups.EXISTS(v_key) then
@@ -931,7 +990,7 @@ create or replace PACKAGE BODY LILA AS
 
     FUNCTION GET_METRIC_AVG_DURATION(p_processId NUMBER, p_actionName VARCHAR2) return NUMBER
     as
-        v_rec t_monitor_rec;
+        v_rec t_monitor_buffer_rec;
     begin
         v_rec := getLastMonitorEntry(p_processId, p_actionName);
         RETURN nvl(v_rec.avg_action_time, 0);
@@ -941,7 +1000,7 @@ create or replace PACKAGE BODY LILA AS
 
     FUNCTION GET_METRIC_STEPS(p_processId NUMBER, p_actionName VARCHAR2) return NUMBER
     as
-        v_rec t_monitor_rec;
+        v_rec t_monitor_buffer_rec;
     begin
         v_rec := getLastMonitorEntry(p_processId, p_actionName);
         RETURN nvl(v_rec.steps_done, 0);
@@ -1183,17 +1242,34 @@ create or replace PACKAGE BODY LILA AS
     procedure sync_master(p_processId number, p_force boolean default false)
     as
         v_idx PLS_INTEGER;
+        v_now constant timestamp := systimestamp;
+        v_ms_since_flush number;
     begin
+        -- no processes started
         if not g_process_cache.EXISTS(p_processId) then
             return;
         end if;
+
+        -- increment dirty counter
+        g_master_dirty_count := g_master_dirty_count + 1;        
+        
+        -- calculate time difference since last flush
+        -- Falls noch nie geflusht wurde (Start), setzen wir die Differenz hoch
+        if g_last_master_flush is null then
+            v_ms_since_flush := g_flush_millis_threshold + 1;
+        else
+            v_ms_since_flush := get_ms_diff(g_last_master_flush, v_now);
+        end if;
     
-        g_master_dirty_count := g_master_dirty_count + 1;
-    
-        -- Persistieren, wenn Schwellenwert erreicht oder erzwungen (z.B. bei CLOSE_SESSION)
-        if p_force or g_master_dirty_count >= g_flush_process_threshold then
-            persist_master_record(g_process_cache(p_processId));
+        -- 4. Die "Smarte" Flush-Bedingung: Menge ODER Zeit ODER Force
+        if p_force 
+           or g_master_dirty_count >= g_flush_master_threshold
+           or v_ms_since_flush >= g_flush_millis_threshold
+        then
+            persist_master_record(g_process_cache(p_processId));            
+            -- Reset der prozessspezifischen Steuerungsdaten
             g_master_dirty_count := 0;
+            g_last_master_flush := v_now;
         end if;
     end;
     
@@ -1213,7 +1289,11 @@ create or replace PACKAGE BODY LILA AS
     
         -- 3. Zeit seit dem letzten Log-Flush berechnen
         -- (get_ms_diff ist Ihre optimierte Funktion)
-        v_ms_since_flush := get_ms_diff(g_sessionList(v_idx).last_log_flush, v_now);
+        if g_sessionList(v_idx).last_log_flush is null then
+            v_ms_since_flush := g_flush_millis_threshold + 1;
+        else
+            v_ms_since_flush := get_ms_diff(g_sessionList(v_idx).last_log_flush, v_now);
+        end if;
     
         -- 4. Flush-Bedingung: Menge ODER Zeit ODER Force
         if p_force 
@@ -1228,7 +1308,7 @@ create or replace PACKAGE BODY LILA AS
             g_sessionList(v_idx).log_dirty_count := 0;
             g_sessionList(v_idx).last_log_flush  := v_now;
         end if;
-        
+                
     exception
         when others then
             -- Sicherheit für das Framework: Fehler im Flush dürfen Applikation nicht stoppen
@@ -1246,24 +1326,35 @@ create or replace PACKAGE BODY LILA AS
 	--------------------------------------------------------------------------
     procedure reloadConfiguration(p_processId number)
     as
-        p_session_rec t_session_rec;
-        p_process_rec t_process_rec;
+        p_sessionRec t_session_rec;
+        p_configRec t_config_rec;
     begin
         -- at first clean dirty memory and write to table
         sync_log(p_processId, true);
         sync_master(p_processId, true);
         sync_monitor(p_processId, true);
         
-        -- get session data
-        p_session_rec := getSessionRecord(p_processId);
-        removeSession(p_processId);
+        p_configRec := readConfigRecord(p_processId);  -- read configuration from table
+        p_sessionRec := getSessionRecord(p_processId); -- get session record from memory
         
-        p_process_rec := getProcessRecord(p_processId);
-        p_session_rec.log_level := p_process_rec.log_level;
-        p_session_rec.steps_done := p_process_rec.steps_done;
-        insertSession(p_session_rec.tabName_master, p_processId, p_session_rec.log_level); 
-        updateSessionRecord(p_session_rec);
+        -- set global parameters
+        g_flush_log_threshold := p_configRec.flush_log_threshold;
+        g_flush_master_threshold := p_configRec.flush_master_threshold;
+        g_flush_monitor_threshold := p_configRec.flush_monitor_threshold;
+        g_monitor_alert_threshold_factor := p_configRec.monitor_alert_threshold_factor;
+        g_max_entries_per_monitor_action := p_configRec.max_entries_per_monitor_action;
 
+        
+        -- set actual values to session and refresh session record in memory
+        p_sessionRec.log_level := p_configRec.log_level;
+        updateSessionRecord(p_sessionRec);        
+ 
+    exception
+        when others then
+            -- Sicherheit für das Framework: Fehler im Flush dürfen Applikation nicht stoppen
+            if should_raise_error(p_processId) then
+                raise;
+            end if;
     end;
 
     procedure checkUpdateConfiguration
@@ -1333,6 +1424,7 @@ create or replace PACKAGE BODY LILA AS
             sync_monitor(p_processId, true);        
         else
             sync_log(p_processId);
+            sync_master(p_processId); -- master also because of the last_update timestamp
         end if;
         
     exception
