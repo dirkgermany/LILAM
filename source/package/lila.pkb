@@ -133,7 +133,8 @@ create or replace PACKAGE BODY LILA AS
 
     -- ALERT Registration
     g_isAlertRegistered BOOLEAN := false;
-    g_alertCode CONSTANT varchar2(20) := 'LILA_ALERT_CFG';
+    g_alertCode_Flush CONSTANT varchar2(25) := 'LILA_ALERT_FLUSH_CFG';
+    g_alertCode_Read  CONSTANT varchar2(25) := 'LILA_ALERT_READ_CFG';
     
     CONFIG_TABLE constant varchar2(20) := 'LILA_CONFIG';
 
@@ -152,6 +153,7 @@ create or replace PACKAGE BODY LILA AS
     -- Functions and Procedures
     ---------------------------------------------------------------
     function getSessionRecord(p_processId number) return t_session_rec;
+    procedure checkUpdateConfiguration;
 
     --------------------------------------------------------------------------
     -- Millis between two timestamps
@@ -177,7 +179,8 @@ create or replace PACKAGE BODY LILA AS
     as
     begin
         if not g_isAlertRegistered then
-            DBMS_ALERT.REGISTER(g_alertCode);
+            DBMS_ALERT.REGISTER(g_alertCode_Flush);
+            DBMS_ALERT.REGISTER(g_alertCode_Read);
         end if;
     end;
 
@@ -473,7 +476,22 @@ create or replace PACKAGE BODY LILA AS
     --------------------------------------------------------------------------
     -- Persist config data
     --------------------------------------------------------------------------
-    procedure persist_config_data(p_configRec t_config_rec)
+    function getConfigRecord(p_processId PLS_INTEGER) return t_config_rec
+    as
+        listIndex number;
+    begin
+        if not v_indexConfig.EXISTS(p_processId) THEN        
+            return null;
+        else
+            listIndex := v_indexConfig(p_processId);
+            return g_configList(listIndex);
+        end if;
+
+    end;
+
+    --------------------------------------------------------------------------
+
+    procedure persist_config_record(p_configRec t_config_rec)
     as
         pragma autonomous_transaction;
     begin
@@ -492,22 +510,60 @@ create or replace PACKAGE BODY LILA AS
         execute immediate 
             'insert into ' || CONFIG_TABLE || ' 
             (PROCESS_ID, IS_ACTIVE, STEPS_TODO, LOG_LEVEL, FLUSH_LOG_THRESHOLD, FLUSH_PROCESS_THRESHOLD, FLUSH_MONITOR_THRESHOLD, MONITOR_ALERT_THRESHOLD_FACTOR, MAX_ENTRIES_PER_MONITOR_ACTION)
-            values (:1, :2, :3, :4, :5, :6, :7, :8)'
+            values (:1, :2, :3, :4, :5, :6, :7, :8, :9)'
         USING p_configRec.process_id, p_configRec.is_active, p_configRec.steps_todo, p_configRec.log_level, p_configRec.flush_log_threshold, p_configRec.flush_process_threshold,
               p_configRec.flush_monitor_threshold, p_configRec.monitor_alert_threshold_factor, p_configRec.max_entries_per_monitor_action;
+              
+        commit;
         
     exception
         when others then
+            rollback;
             if should_raise_error(p_configRec.process_id) then
                 RAISE;
             end if;
     end;
     
     -------------------------------------------------------------------------
-    procedure update_config_data(p_configRec t_config_rec)
+    
+    procedure truncateConfigTable
     as
         pragma autonomous_transaction;
     begin
+        execute immediate 'truncate table ' || CONFIG_TABLE;
+        commit;
+        
+    exception
+        when others then
+            rollback;
+--            if should_raise_error(p_configRec.process_id) then
+--                RAISE;
+--            end if;
+    end;
+    
+    -------------------------------------------------------------------------
+    
+    procedure flushConfig
+    as
+        v_idx PLS_INTEGER;
+        p_configRec t_config_rec;
+    begin
+        truncateConfigTable;
+        for i in 1 .. g_configList.count loop
+            persist_config_record(g_configList(i));
+        null;
+        end loop;
+    end;
+    
+    -------------------------------------------------------------------------
+    procedure update_config_record(p_configRec t_config_rec)
+    as
+        pragma autonomous_transaction;
+    begin
+        if p_configRec.process_id is null then
+            return;
+        end if;
+        
         execute immediate 
             'update ' || CONFIG_TABLE || ' 
             (PROCESS_ID, IS_ACTIVE, STEPS_TODO, STEPS_DONE, LOG_LEVEL, FLUSH_LOG_THRESHOLD, FLUSH_PROCESS_THRESHOLD, FLUSH_MONITOR_THRESHOLD, MONITOR_ALERT_THRESHOLD_FACTOR, MAX_ENTRIES_PER_MONITOR_ACTION)
@@ -516,8 +572,11 @@ create or replace PACKAGE BODY LILA AS
         USING p_configRec.process_id, p_configRec.is_active, p_configRec.steps_todo, p_configRec.steps_done, p_configRec.log_level, p_configRec.flush_log_threshold, p_configRec.flush_process_threshold,
               p_configRec.flush_monitor_threshold, p_configRec.monitor_alert_threshold_factor, p_configRec.max_entries_per_monitor_action;
         
+        commit;
+        
     exception
         when others then
+            rollback;
             if should_raise_error(p_configRec.process_id) then
                 RAISE;
             end if;
@@ -530,8 +589,11 @@ create or replace PACKAGE BODY LILA AS
     begin
         execute immediate 'update ' || CONFIG_TABLE || ' set IS_ACTIVE = 0 where process_id = :1'
         USING p_processId;
+        commit;
+        
     exception
         when others then
+            rollback;
             if should_raise_error(p_processId) then
                 RAISE;
             end if;
@@ -1099,19 +1161,6 @@ create or replace PACKAGE BODY LILA AS
         Methods dedicated to config
     */
     
-    function getConfigRecord(p_processId PLS_INTEGER) return t_config_rec
-    as
-        listIndex number;
-    begin
-        if not v_indexConfig.EXISTS(p_processId) THEN        
-            return null;
-        else
-            listIndex := v_indexConfig(p_processId);
-            return g_configList(listIndex);
-        end if;
-
-    end;
-
     procedure insertConfigRec(p_sessionRec t_session_rec)
     as
         v_new_idx PLS_INTEGER;
@@ -1136,6 +1185,8 @@ create or replace PACKAGE BODY LILA AS
         g_configList(v_new_idx).steps_done         := p_sessionRec.steps_done;
 
         v_indexConfig(p_sessionRec.process_id) := v_new_idx;
+        
+        persist_config_record(g_configList(v_new_idx));
 
     end;
 
@@ -1405,9 +1456,20 @@ create or replace PACKAGE BODY LILA AS
             -- Reset der prozessspezifischen Steuerungsdaten
             g_process_dirty_count := 0;
             g_last_process_flush := v_now;
+            
+            -- look if another process changed configuration or asks for update
+            checkUpdateConfiguration;   
+
         end if;
     end;
     
+	--------------------------------------------------------------------------
+
+    /*
+		Public functions and procedures
+    */
+
+
 	--------------------------------------------------------------------------
 
     procedure sync_log(p_processId number, p_force boolean default false)
@@ -1454,11 +1516,6 @@ create or replace PACKAGE BODY LILA AS
 
 	--------------------------------------------------------------------------
 
-    /*
-		Public functions and procedures
-    */
-
-	--------------------------------------------------------------------------
     procedure reloadConfiguration(p_processId number)
     as
         p_sessionRec t_session_rec;
@@ -1478,7 +1535,6 @@ create or replace PACKAGE BODY LILA AS
         g_flush_monitor_threshold := p_configRec.flush_monitor_threshold;
         g_monitor_alert_threshold_factor := p_configRec.monitor_alert_threshold_factor;
         g_max_entries_per_monitor_action := p_configRec.max_entries_per_monitor_action;
-
         
         -- set actual values to session and refresh session record in memory
         p_sessionRec.log_level := p_configRec.log_level;
@@ -1494,6 +1550,8 @@ create or replace PACKAGE BODY LILA AS
             end if;
     end;
 
+	--------------------------------------------------------------------------
+
     procedure checkUpdateConfiguration
     as
         l_msg VARCHAR2(1800);
@@ -1503,10 +1561,10 @@ create or replace PACKAGE BODY LILA AS
         l_key  VARCHAR2(20)  := 'P_ID=';
         l_start PLS_INTEGER;
         l_end   PLS_INTEGER;
-        l_val   VARCHAR2(100);
+--        l_val   VARCHAR2(100);
     begin
-        -- timeout => 0 bedeutet: Nicht warten, nur kurz gucken
-        DBMS_ALERT.WAITONE(g_alertCode, l_msg, l_status, 0);
+        -- signal for write dirty configuration records
+        DBMS_ALERT.WAITONE(g_alertCode_Flush, l_msg, l_status, 0);
         if l_status = 0 then
             l_start := INSTR(l_msg, l_key);
             -- zerlege l_msg
@@ -1514,10 +1572,27 @@ create or replace PACKAGE BODY LILA AS
             IF l_start > 0 THEN
                 l_start := l_start + LENGTH(l_key); -- Gehe zum Anfang des Wertes
                 l_end   := INSTR(l_msg, '>', l_start); -- Suche das schließende Tag
-                l_val   := to_number(SUBSTR(l_msg, l_start, l_end - l_start));
+                l_processId := to_number(SUBSTR(l_msg, l_start, l_end - l_start));
+                update_config_record(getConfigRecord(l_processId));
+            else
+                flushConfig;
+            end if;
+        END IF;
+
+        -- timeout => 0 bedeutet: Nicht warten, nur kurz gucken
+        DBMS_ALERT.WAITONE(g_alertCode_Read, l_msg, l_status, 0);
+        if l_status = 0 then
+            l_start := INSTR(l_msg, l_key);
+            -- zerlege l_msg
+            -- <Bla='Blubb><P_ID=3400><Aha=1>
+            IF l_start > 0 THEN
+                l_start := l_start + LENGTH(l_key); -- Gehe zum Anfang des Wertes
+                l_end   := INSTR(l_msg, '>', l_start); -- Suche das schließende Tag
+                l_processId   := to_number(SUBSTR(l_msg, l_start, l_end - l_start));
                 reloadConfiguration(l_processId);
             end if;
         END IF;
+
       
     exception
         when others then
@@ -1526,7 +1601,6 @@ create or replace PACKAGE BODY LILA AS
         null;
 --            end if;
     end;
-
 
     -- capsulation writing to log-buffer and synchronization of buffer
     procedure log_any(
@@ -1538,10 +1612,7 @@ create or replace PACKAGE BODY LILA AS
         p_errCallstack varchar2
     )
     as
-    begin
-        -- has something changed in configuration?
-        checkUpdateConfiguration;   
-    
+    begin    
         if v_indexSession.EXISTS(p_processId) and p_level <= g_sessionList(v_indexSession(p_processId)).log_level then
         write_to_log_buffer(
             p_processId, 
