@@ -162,48 +162,33 @@ create or replace PACKAGE BODY LILA AS
     -- Avoid throttling 
 	--------------------------------------------------------------------------
     function waitForResponse(
-        p_signalName   IN varchar2, 
-        p_signalMsg    IN varchar2,
-        p_registerName IN varchar2, 
-        p_timeoutSec   IN number
+        p_serverChannel IN varchar2, -- Der Kanal, auf dem der Server hört (LILA_REQUEST)
+        p_clientChannel IN varchar2, -- Der Kanal, auf dem der Client auf Antwort wartet (ANY_MSG)
+        p_payload       IN varchar2, 
+        p_timeoutSec    IN number
     ) return varchar2
     as
         PRAGMA AUTONOMOUS_TRANSACTION;
         l_msg       VARCHAR2(1800);
         l_status    PLS_INTEGER;
     begin
-        -- Prüfung auf Throttling (10-Sekunden-Sperre)
-        IF (SYSTIMESTAMP - g_last_signal_time) > INTERVAL '10' SECOND THEN
-            DBMS_ALERT.REGISTER(p_registerName);
-            DBMS_ALERT.SIGNAL(p_signalName, p_signalMsg);
-            COMMIT; -- Signal für andere Sessions sichtbar machen
-            
-            DBMS_ALERT.WAITONE(p_registerName, l_msg, l_status, p_timeoutSec);
-            DBMS_ALERT.REMOVE(p_registerName);
-            
-            g_last_signal_time := SYSTIMESTAMP;
-            
-            -- Falls Timeout (status 1), geben wir einen Hinweis zurück
-            IF l_status = 1 THEN
-                l_msg := 'TIMEOUT';
-            END IF;
-        ELSE
-            -- Kennung für: "Signal wurde wegen Throttling übersprungen"
-            l_msg := 'THROTTLED';
-        END IF;
+        -- 1. Zuerst registrieren, damit wir die Antwort nicht verpassen!
+        DBMS_ALERT.REGISTER(p_clientChannel);
     
-        COMMIT; -- Autonome Transaktion abschließen
-        return l_msg;
+        -- 2. Jetzt dem Server das Signal schicken
+        -- Wir schicken z.B. '<ANY_MSG>Daten'
+        DBMS_ALERT.SIGNAL(p_serverChannel, p_payload);
+        COMMIT; -- Signal für Server sichtbar machen
+    
+        -- 3. Auf Antwort vom Server auf dem Client-Kanal warten
+        DBMS_ALERT.WAITONE(p_clientChannel, l_msg, l_status, p_timeoutSec);
         
-    exception
-        when others then
-            rollback;
-            -- Im Fehlerfall sicherheitshalber das Register entfernen, 
-            -- falls es oben bereits registriert wurde
-            BEGIN DBMS_ALERT.REMOVE(p_registerName); EXCEPTION WHEN OTHERS THEN NULL; END;
-            return 'ERROR: ' || SQLERRM;
+        DBMS_ALERT.REMOVE(p_clientChannel);
+        COMMIT; 
+        
+        IF l_status = 1 THEN RETURN 'TIMEOUT'; END IF;
+        return l_msg;
     end;
-
 	--------------------------------------------------------------------------
 
     function waitForSignal(
@@ -233,7 +218,6 @@ create or replace PACKAGE BODY LILA AS
             rollback;
             return 1;
     end;
-    
     
     --------------------------------------------------------------------------
     -- Copy actual process and session data to config record
@@ -2318,6 +2302,18 @@ dbms_output.put_line('okay');
                 l_json_doc := SUBSTR(l_message, l_pos_end + 1);
                 
                 CASE l_tag
+                    WHEN 'EXIT' then
+                        DBMS_ALERT.SIGNAL('ANY_MSG', 'Bla');
+                        COMMIT; -- Wichtig: Signal und Daten werden sichtbar
+                        exit;
+                        
+                    WHEN 'ANY_MSG' then
+                        dbms_output.enable();
+                        dbms_output.put_line('logisch');
+                        DBMS_ALERT.SIGNAL('ANY_MSG', 'Bla');
+                        COMMIT; -- Wichtig: Signal und Daten werden sichtbar
+                        
+                        
                     WHEN 'NEW_SESSION' THEN
                         serverParse_req_newSession(l_message, l_json_doc);
                                         
@@ -2329,11 +2325,7 @@ dbms_output.put_line('okay');
                         null;
                 END CASE;
                 COMMIT; -- Wichtig: Signal und Daten werden sichtbar
-               
-    
-                -- 3. Antwort-Signal an den Anfragenden zurücksenden
-                DBMS_ALERT.SIGNAL('RESPONSE_NEW_SESSION', 'DATA_READY');
-                COMMIT; -- Wichtig: Signal und Daten werden sichtbar
+
     
             ELSIF l_status = 1 THEN
                 -- Timeout erreicht. Passiert, wenn 10 Minuten kein Signal kam.
@@ -2356,6 +2348,31 @@ dbms_output.put_line('okay');
     end;
     
 	--------------------------------------------------------------------------
+    
+    procedure SERVER_SEND_ANY_MSG(p_message varchar2)
+    as
+        l_response varchar2(1000);
+    begin
+        dbms_output.enable();
+        l_response := waitForResponse(
+            p_serverChannel => 'LILA_REQUEST',
+            p_clientChannel => 'ANY_MSG',
+            p_payload       => '<ANY_MSG>' || p_message,
+            p_timeoutSec    => 5
+        );
+
+        
+        l_response := waitForResponse(
+            p_serverChannel => 'LILA_REQUEST',
+            p_clientChannel => 'ANY_MSG',
+            p_payload       => '<EXIT>' || p_message,
+            p_timeoutSec    => 5
+        );
+                
+        dbms_output.put_line(l_response);
+    end;
+    
+	--------------------------------------------------------------------------    
     
     FUNCTION SERVER_NEW_SESSION(p_session_init t_session_init) RETURN NUMBER
     as
