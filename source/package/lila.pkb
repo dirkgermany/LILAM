@@ -27,14 +27,7 @@ create or replace PACKAGE BODY LILA AS
         monitor_alert_threshold_factor  PLS_INTEGER,
         max_entries_per_monitor_action  PLS_INTEGER
     );
-    
-    TYPE t_config_tab IS TABLE OF t_config_rec;
-    g_configList t_config_tab := null;
-    
-    -- Indexes for lists
-    TYPE t_idx IS TABLE OF PLS_INTEGER INDEX BY BINARY_INTEGER;
-    v_indexConfig t_idx;        
-
+        
     ---------------------------------------------------------------
     -- Sessions
     ---------------------------------------------------------------
@@ -59,8 +52,7 @@ create or replace PACKAGE BODY LILA AS
     g_sessionList t_session_tab := null;
     
     -- Indexes for lists
--- ????????????
---    TYPE t_idx IS TABLE OF PLS_INTEGER INDEX BY BINARY_INTEGER;
+    TYPE t_idx IS TABLE OF PLS_INTEGER INDEX BY BINARY_INTEGER;
     v_indexSession t_idx;        
 
     ---------------------------------------------------------------
@@ -157,9 +149,42 @@ create or replace PACKAGE BODY LILA AS
     -- Functions and Procedures
     ---------------------------------------------------------------
     function getSessionRecord(p_processId number) return t_session_rec;
+    function getProcessRecord(p_processId number) return t_process_rec;
     procedure checkUpdateConfiguration;
     procedure refreshConfiguration(p_processId number);
-    procedure refreshConfigAndSession(p_configRec t_config_rec);
+    procedure refreshSession(p_configRec t_config_rec);
+    
+    
+    --------------------------------------------------------------------------
+    -- Copy actual process and session data to config record
+    --------------------------------------------------------------------------
+    function copyToConfig(p_processId number) return t_config_rec
+    as
+        l_sessionRec t_session_rec;
+        l_processRec t_process_rec;
+        l_configRec  t_config_rec;
+    begin
+        l_sessionRec := getSessionRecord(p_processId);
+        l_processRec := getProcessRecord(p_processId);
+        
+        if l_sessionRec.process_id is null or l_processRec.id is null then return null; end if;
+
+        l_configRec.process_id := l_sessionRec.process_id;
+        l_configRec.process_name := l_processRec.process_name;
+        l_configRec.process_start := l_processRec.process_start;
+        l_configRec.is_active := 1;
+        l_configRec.steps_todo := l_processRec.steps_todo;
+        l_configRec.steps_done := l_processRec.steps_done;
+        l_configRec.log_level := l_sessionRec.log_level;
+        l_configRec.flush_log_threshold := g_flush_log_threshold;
+        l_configRec.flush_process_threshold := g_flush_process_threshold;
+        l_configRec.flush_monitor_threshold := g_flush_monitor_threshold;
+        l_configRec.monitor_alert_threshold_factor := g_monitor_alert_threshold_factor;
+        l_configRec.max_entries_per_monitor_action := g_max_entries_per_monitor_action;
+        
+        return l_configRec;
+
+    end;
 
     --------------------------------------------------------------------------
     -- Millis between two timestamps
@@ -417,58 +442,6 @@ create or replace PACKAGE BODY LILA AS
 	end;
     
 	--------------------------------------------------------------------------
-    
-    procedure refreshAllConfigurations
-    as
-        l_configRec    t_config_rec;
-        l_cursor       sys_refcursor;
-        l_sqlStatement varchar2(1000);
-    begin
-        -- Das SQL-Statement ohne WHERE-Klausel für die Prozess-ID
-        l_sqlStatement := '
-        select
-            process_id,
-            process_name,
-            process_start,
-            is_active,
-            steps_todo,
-            steps_done,
-            log_level,
-            flush_log_threshold,
-            flush_process_threshold,
-            flush_monitor_threshold,
-            monitor_alert_threshold_factor,
-            max_entries_per_monitor_action
-        from ' || CONFIG_TABLE;
-        
-        -- Öffnen des dynamischen Cursors
-        open l_cursor for l_sqlStatement;
-        
-        loop
-            -- Einlesen des nächsten Datensatzes direkt in den Record-Typ
-            fetch l_cursor into l_configRec;
-            exit when l_cursor%NOTFOUND;
-            
-            -- Aufruf der Refresh-Logik für jeden gefundenen Prozess
-            if l_configRec.process_id is not null then
-                refreshConfigAndSession(l_configRec);
-            end if;
-        end loop;
-        
-        close l_cursor;
-    
-    exception
-        when OTHERS then
-            if l_cursor%ISOPEN then
-                close l_cursor;
-            end if;
-            -- Da wir hier keinen p_processId haben, nutzen wir eine neutrale ID für die Prüfung
-            if should_raise_error(-1) then 
-                RAISE;
-            end if;
-    end;
-
-	--------------------------------------------------------------------------
 
     procedure refreshConfiguration(p_processId number)
     as
@@ -496,7 +469,7 @@ create or replace PACKAGE BODY LILA AS
         execute immediate sqlStatement into l_configRec USING p_processId;
         
         if l_configRec.process_id is not null then
-            refreshConfigAndSession(l_configRec);
+            refreshSession(l_configRec);
         end if;
                 
     exception
@@ -509,6 +482,18 @@ create or replace PACKAGE BODY LILA AS
             end if;
     end;
     
+	--------------------------------------------------------------------------
+    
+    function getProcessRecord(p_processId number) return t_process_rec
+    as
+    begin
+        if g_process_cache(p_processId).id is not null then
+            return g_process_cache(p_processId);
+        else
+            return null;
+        end if;
+    end;
+
 	--------------------------------------------------------------------------
 
     function readProcessRecord(p_processId number) return t_process_rec
@@ -551,20 +536,6 @@ create or replace PACKAGE BODY LILA AS
 
     --------------------------------------------------------------------------
     -- Persist config data
-    --------------------------------------------------------------------------
-    function getConfigRecord(p_processId PLS_INTEGER) return t_config_rec
-    as
-        listIndex number;
-    begin
-        if not v_indexConfig.EXISTS(p_processId) THEN        
-            return null;
-        else
-            listIndex := v_indexConfig(p_processId);
-            return g_configList(listIndex);
-        end if;
-
-    end;
-
     --------------------------------------------------------------------------
 
     procedure persist_config_record(p_configRec t_config_rec)
@@ -624,11 +595,12 @@ create or replace PACKAGE BODY LILA AS
     procedure flushConfig
     as
         v_idx PLS_INTEGER;
-        p_configRec t_config_rec;
+        l_configRec t_config_rec;
     begin
         truncateConfigTable;
-        for i in 1 .. g_configList.count loop
-            persist_config_record(g_configList(i));
+        for i in 1 .. g_sessionList.count loop
+            l_configRec := copyToConfig(g_sessionList(i).process_id);
+            persist_config_record(l_configRec);
         null;
         end loop;
     end;
@@ -1242,63 +1214,8 @@ create or replace PACKAGE BODY LILA AS
         Methods dedicated to config
     */
     
-    procedure insertOrUpdateConfigRecToList(p_configRec t_config_rec)
-    as
-        v_new_idx PLS_INTEGER;
-    begin
-        if g_configList is null then
-                g_configList := t_config_tab(); 
-        end if;
-        if getConfigRecord(p_configRec.process_id).process_id is null then
-            -- neuer Datensatz
-            g_configList.extend;
-            v_new_idx := g_configList.last;
-        else
-            v_new_idx := v_indexConfig(p_configRec.process_id);
-        end if;
-        
-        g_configList(v_new_idx) := p_configRec;
-        v_indexConfig(p_configRec.process_id) := v_new_idx;
-    end;
-
     --------------------------------------------------------------------------
-    
-    procedure insertConfigRec(p_processId number, p_session_init t_session_init)
-    as
-        v_new_idx PLS_INTEGER;
-    begin
-    
-        if g_configList is null then
-                g_configList := t_config_tab(); 
-        end if;
-
-        if getConfigRecord(p_processId).process_id is null then
-            -- neuer Datensatz
-            g_configList.extend;
-            v_new_idx := g_configList.last;
-        else
-            v_new_idx := v_indexConfig(p_processId);
-        end if;
-
-        g_configList(v_new_idx).process_id         := p_processId;
-        g_configList(v_new_idx).process_name       := p_session_init.processName;
-        g_configList(v_new_idx).process_start      := systimestamp;
-        g_configList(v_new_idx).is_active          := 1; -- process is active
-        g_configList(v_new_idx).log_level          := p_session_init.logLevel;
-        g_configList(v_new_idx).steps_todo         := p_session_init.stepsToDo;
-        g_configList(v_new_idx).steps_done         := 0;
-        g_configList(v_new_idx).flush_log_threshold            := g_flush_log_threshold; -- max. dirty log records
-        g_configList(v_new_idx).flush_process_threshold        := g_flush_process_threshold; -- max. dirty CHANGES of session record
-        g_configList(v_new_idx).flush_monitor_threshold        := g_flush_monitor_threshold; -- max. dirty monitor records
-        g_configList(v_new_idx).monitor_alert_threshold_factor := g_monitor_alert_threshold_factor; -- max. deviation from the average processing time
-        g_configList(v_new_idx).max_entries_per_monitor_action := g_max_entries_per_monitor_action; -- round robin: max. monitor actions hold in memory
-
-        v_indexConfig(p_processId) := v_new_idx;
         
-        persist_config_record(g_configList(v_new_idx));
-
-    end;
-    
     
     /*
 		Methods dedicated to the g_sessionList
@@ -1621,20 +1538,15 @@ create or replace PACKAGE BODY LILA AS
 
 	--------------------------------------------------------------------------
 
-    procedure refreshConfigAndSession(p_configRec t_config_rec)
+    procedure refreshSession(p_configRec t_config_rec)
     as
         p_sessionRec t_session_rec;
     begin
-dbms_output.enable();
-dbms_output.put_line('p_configRec.process_id: ' || p_configRec.process_id);
-
         -- at first clean dirty memory and write to table
         sync_log(p_configRec.process_id, true);
         sync_process(p_configRec.process_id, true);
         sync_monitor(p_configRec.process_id, true);
                 
-        insertOrUpdateConfigRecToList(p_configRec);
-dbms_output.put_line('g_configList.count : ' || g_configList.count);
         p_sessionRec := getSessionRecord(p_configRec.process_id); -- get session record from memory
         if p_sessionRec.process_id = p_configRec.process_id then
             -- set actual values to session and refresh session record in memory
@@ -1662,11 +1574,7 @@ dbms_output.put_line('okay');
     end;
     
 	--------------------------------------------------------------------------
-    
 
-
-
-	--------------------------------------------------------------------------
     
 --    procedure loadConfiguration
 	--------------------------------------------------------------------------
@@ -1680,23 +1588,13 @@ dbms_output.put_line('okay');
         l_key  VARCHAR2(20)  := 'P_ID=';
         l_start PLS_INTEGER;
         l_end   PLS_INTEGER;
---        l_val   VARCHAR2(100);
+        l_configRec t_config_rec;
     begin
         -- signal for write dirty configuration records
         DBMS_ALERT.WAITONE(g_alertCode_Flush, l_msg, l_status, 0);
         if l_status = 0 then
-            l_start := INSTR(l_msg, l_key);
-            -- zerlege l_msg
-            -- <Bla='Blubb><P_ID=3400><Aha=1>
-            IF l_start > 0 THEN
-                l_start := l_start + LENGTH(l_key); -- Gehe zum Anfang des Wertes
-                l_end   := INSTR(l_msg, '>', l_start); -- Suche das schließende Tag
-                l_processId := to_number(SUBSTR(l_msg, l_start, l_end - l_start));
-                update_config_record(getConfigRecord(l_processId));
-            else
-                flushConfig;
-            end if;
-        END IF;
+            flushConfig;
+        end if;
 
         -- timeout => 0 bedeutet: Nicht warten, nur kurz gucken
         DBMS_ALERT.WAITONE(g_alertCode_Read, l_msg, l_status, 0);
@@ -2066,9 +1964,6 @@ dbms_output.put_line('okay');
         select seq_lila_log.nextVal into pProcessId from dual;
         -- persist to session internal table
         insertSession (p_session_init.tabNameMaster, pProcessId, p_session_init.logLevel);
-        -- persist to internal config table AND database table
-        insertConfigRec(pProcessId, p_session_init);
-        
 
 		if p_session_init.logLevel > logLevelSilent and p_session_init.daysToKeep is not null then
 --	        deleteOldLogs(pProcessId, upper(trim(p_session_init.processName)), p_session_init.daysToKeep);
