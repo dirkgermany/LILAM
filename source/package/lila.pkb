@@ -202,15 +202,11 @@ create or replace PACKAGE BODY LILA AS
         l_data  := '"payload":{' || p_payLoad || '}';
         
         l_msg := '{' || l_header || ', ' || l_meta || ', ' || l_data || '}';
-        
-dbms_output.enable();
-dbms_output.put_line(l_msg);
     
         -- 1. Zuerst registrieren, damit wir die Antwort nicht verpassen!
         DBMS_ALERT.REGISTER(l_clientChannel);
     
         -- 2. Jetzt dem Server das Signal schicken
-        -- Wir schicken z.B. '<ANY_MSG>Daten'
         DBMS_ALERT.SIGNAL(p_serverChannel, l_msg);
         COMMIT; -- Signal für Server sichtbar machen
     
@@ -2267,6 +2263,14 @@ dbms_output.put_line('okay');
         l_report := l_report || l_line;        
         RETURN l_report;
     END;
+    
+    --------------------------------------------------------------------------
+    function extractFromJson(l_json_doc varchar2, jsonPath varchar2) return varchar2
+    as
+        l_value varchar2(1800);
+    begin
+        return JSON_VALUE(l_json_doc, '$.' || jsonPath);
+    end;
    
 	--------------------------------------------------------------------------
     
@@ -2274,17 +2278,7 @@ dbms_output.put_line('okay');
     as
         l_clientChannel varchar2(30);
     begin
-        SELECT j.clientChannel
-        INTO
-            l_clientChannel
-        FROM JSON_TABLE(l_json_doc, '$'
-            COLUMNS (
-                clientChannel varchar(30)  PATH '$.header.response'
-            )
-        ) j;
-        
-        return l_clientChannel;
-
+        return JSON_VALUE(l_json_doc, '$.header.response');
     end;        
     
     --------------------------------------------------------------------------
@@ -2293,17 +2287,7 @@ dbms_output.put_line('okay');
     as
         l_clientRequest varchar2(30);
     begin
-        SELECT j.clientRequest
-        INTO
-            l_clientRequest
-        FROM JSON_TABLE(l_json_doc, '$'
-            COLUMNS (
-                clientRequest varchar(30)  PATH '$.header.request'
-            )
-        ) j;
-        
-        return l_clientRequest;
-
+        return JSON_VALUE(l_json_doc, '$.header.request');
     end;
     
 	--------------------------------------------------------------------------
@@ -2337,7 +2321,21 @@ dbms_output.put_line('okay');
 
     end;    
     
-	--------------------------------------------------------------------------   
+	-------------------------------------------------------------------------- 
+        procedure SERVER_SEND_EXIT(p_message varchar2)
+    as
+        l_response varchar2(1000);
+    begin
+        l_response := waitForResponse(
+            p_serverChannel => 'LILA_REQUEST',
+            p_request       => 'EXIT',
+            p_payload       => p_message,
+            p_timeoutSec    => 2
+        );
+                
+        dbms_output.put_line(l_response);
+    end;
+
     
     procedure SERVER_SEND_ANY_MSG(p_message varchar2)
     as
@@ -2348,18 +2346,9 @@ dbms_output.put_line('okay');
             p_serverChannel => 'LILA_REQUEST',
             p_request       => 'ANY_MSG',
             p_payload       => p_message,
-            p_timeoutSec    => 2
+            p_timeoutSec    => 5
         );
 
-        dbms_output.put_line(l_response);
-        
-        l_response := waitForResponse(
-            p_serverChannel => 'LILA_REQUEST',
-            p_request       => 'EXIT',
-            p_payload       => p_message,
-            p_timeoutSec    => 2
-        );
-                
         dbms_output.put_line(l_response);
     end;
     
@@ -2421,11 +2410,12 @@ dbms_output.put_line('okay');
         l_clientChannel  varchar2(30);
         l_message   VARCHAR2(1800);
         l_status    INTEGER;
-        l_timeout   NUMBER := 30; --600; -- Timeout nach 10 Minuten Warten
-        l_command       VARCHAR2(100);
+        l_timeout   NUMBER := 600; -- Timeout nach 10 Minuten Warten
+        l_command   VARCHAR2(100);
         l_json_doc  VARCHAR2(2000);
         
     begin
+dbms_output.enable();
         DBMS_ALERT.REGISTER('LILA_REQUEST');
     
         LOOP -- DIES IST DIE ENDLOSSCHLEIFE
@@ -2434,23 +2424,21 @@ dbms_output.put_line('okay');
             DBMS_ALERT.WAITONE('LILA_REQUEST', l_message, l_status, l_timeout);
     
             IF l_status = 0 THEN                
---                l_json_doc := SUBSTR(l_message, l_pos_end + 1);
                 l_clientChannel := extractClientChannel(l_message);
                 l_command := extractClientRequest(l_message);
-                
+                                
                 CASE l_command
                     WHEN 'EXIT' then
                         dbms_output.enable();
-                        dbms_output.put_line('Exit ist eingetroffen');
---                        DBMS_ALERT.SIGNAL(l_clientChannel, 'Bla');
---                        COMMIT; -- Wichtig: Signal und Daten werden sichtbar
---                        exit;
+                        dbms_output.put_line(extractFromJson(l_message, 'payload.msg'));
+                        DBMS_ALERT.SIGNAL(l_clientChannel, 'Bla');
+                        COMMIT;
+                        exit;
                         
                     WHEN 'ANY_MSG' then
                         dbms_output.enable();
-                        dbms_output.put_line('logisch');
---                        DBMS_ALERT.SIGNAL(l_clientChannel, 'Bla');
---                        COMMIT; -- Wichtig: Signal und Daten werden sichtbar
+                        DBMS_ALERT.SIGNAL(l_clientChannel, extractFromJson(l_message, 'payload.msg'));
+                        COMMIT;
                         
                         
                     WHEN 'NEW_SESSION' THEN
@@ -2475,7 +2463,7 @@ dbms_output.put_line('okay');
                 -- Anderer Fehler
                 DBMS_OUTPUT.PUT_LINE('Fehler beim Warten: ' || l_status);
             END IF;
-exit;    
+--exit;    
         END LOOP;
     
         -- Dieser Teil wird nie erreicht, solange die DB-Session aktiv ist
