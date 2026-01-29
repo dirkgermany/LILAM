@@ -1,3 +1,5 @@
+## Flushs auslagern in den Server-Loop
+
 ## Adaptive Timeouts: 
 In Oracle 23ai kannst du die Flush-Intervalle dynamisch an die Last anpassen. Wenn der Dirty-Zähler sehr schnell steigt, verkürzt LILA das Zeit-Intervall automatisch.
 
@@ -16,3 +18,21 @@ Wenn ein Prozess hart abstürzt, bleibt bei vielen Frameworks der Status in der 
 Da Clients (trotz bester Dokumentation) manchmal einfach „sterben“ (z. B. Netzwerkabbruch, Timeout), ohne CLOSE_SESSION zu rufen, wäre eine "Zombie-Logik" im Server das i-Tüpfelchen:
 1. Prüfe beim regelmäßigen Timer-Flush, ob Sessions seit X Stunden inaktiv sind.
 2. Falls ja: Automatisch flushen und die Session im Speicher löschen.
+
+## Die Singleton-Herausforderung (Server-Lock)
+Damit nicht zwei Prozesse gleichzeitig DBMS_ALERT.WAITONE auf denselben Kanal machen (was zu unvorhersehbarem Verhalten führt), ist DBMS_LOCK (oder in neueren Versionen DBMS_APPLICATION_INFO) dein Freund.
+### Einfachste Lösung:
+Bevor der LOOP startet, versucht der Server einen exklusiven Lock zu setzen:
+```sql
+l_lock_result := DBMS_LOCK.REQUEST(
+    lockhandle => l_lock_handle,
+    lockmode   => DBMS_LOCK.X_MODE,
+    timeout    => 0, -- Sofort fehlschlagen, wenn besetzt
+    release_on_commit => FALSE
+);
+
+IF l_lock_result != 0 THEN
+    raise_application_error(-20001, 'LILA-Server läuft bereits.');
+END IF;
+```
+
