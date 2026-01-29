@@ -11,3 +11,8 @@ So würde ein solcher Sicherheits-Trigger für LILA aussehen:
 Du könntest eine Prozedur lila.enable_safety_trigger anbieten, die das dynamisch per EXECUTE IMMEDIATE erledigt.
 Warum das Monitoring davon profitiert:
 Wenn ein Prozess hart abstürzt, bleibt bei vielen Frameworks der Status in der Monitoring-Tabelle auf "Running" stehen (eine "Leiche"). Mit dem Logoff-Flush oder einem Cleanup-Trigger kannst du den Status beim Abbruch der Verbindung automatisch auf "ABORTED" setzen. Das macht dein Monitoring-Level (Level 3) wesentlich zuverlässiger.
+
+## Server-Seitige Absicherung (Dead Session Cleanup):
+Da Clients (trotz bester Dokumentation) manchmal einfach „sterben“ (z. B. Netzwerkabbruch, Timeout), ohne CLOSE_SESSION zu rufen, wäre eine "Zombie-Logik" im Server das i-Tüpfelchen:
+1. Prüfe beim regelmäßigen Timer-Flush, ob Sessions seit X Stunden inaktiv sind.
+2. Falls ja: Automatisch flushen und die Session im Speicher löschen.
