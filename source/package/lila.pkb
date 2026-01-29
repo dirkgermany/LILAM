@@ -141,9 +141,6 @@ create or replace PACKAGE BODY LILA AS
     
     -- Throttling for SIGNALs
     g_last_signal_time TIMESTAMP := SYSTIMESTAMP - INTERVAL '1' DAY;
-    
-    -- Id for Server communication
-    g_clientId number := 10;
 
     ---------------------------------------------------------------
     -- Placeholders for tables
@@ -180,7 +177,6 @@ create or replace PACKAGE BODY LILA AS
     -- Avoid throttling 
 	--------------------------------------------------------------------------
     function waitForResponse(
-        p_serverChannel IN varchar2, -- Der Kanal, auf dem der Server hört (LILA_REQUEST)
         p_request       in varchar2, -- Wird für die Zuordnung/Verzweigung im Server benötigt
         p_payload       IN varchar2, 
         p_timeoutSec    IN number
@@ -199,15 +195,17 @@ create or replace PACKAGE BODY LILA AS
         
         l_header := '"header":{"request":"' || p_request || '", "response":"' || l_clientChannel ||'"}';
         l_meta  := '"meta":{"param":"value"}';
-        l_data  := '"payload":{' || p_payLoad || '}';
+        l_data  := '"payload":' || p_payLoad;
         
         l_msg := '{' || l_header || ', ' || l_meta || ', ' || l_data || '}';
+        
+dbms_output.put_line(l_msg);
     
         -- 1. Zuerst registrieren, damit wir die Antwort nicht verpassen!
         DBMS_ALERT.REGISTER(l_clientChannel);
     
         -- 2. Jetzt dem Server das Signal schicken
-        DBMS_ALERT.SIGNAL(p_serverChannel, l_msg);
+        DBMS_ALERT.SIGNAL('LILA_REQUEST', l_msg); -- Der Kanal, auf dem der Server hört (LILA_REQUEST)
         COMMIT; -- Signal für Server sichtbar machen
     
         -- 3. Auf Antwort vom Server auf dem Client-Kanal warten
@@ -387,6 +385,7 @@ create or replace PACKAGE BODY LILA AS
     as
         sqlStmt varchar2(1500);
     begin
+dbms_output.put_line('createLogTables');
         if not objectExists('SEQ_LILA_LOG', 'SEQUENCE') then
             sqlStmt := 'CREATE SEQUENCE SEQ_LILA_LOG MINVALUE 0 MAXVALUE 9999999999999999999999999999 INCREMENT BY 1 START WITH 1 CACHE 10 NOORDER  NOCYCLE  NOKEEP  NOSCALE  GLOBAL';
             execute immediate sqlStmt;
@@ -411,6 +410,8 @@ create or replace PACKAGE BODY LILA AS
             )';
             run_sql(sqlStmt);            
         end if;
+        
+dbms_output.put_line('... 4');
 
         if not objectExists(p_TabNameMaster, 'TABLE') then
             -- Master table
@@ -475,6 +476,8 @@ create or replace PACKAGE BODY LILA AS
 
     exception      
         when others then
+dbms_output.enable();
+dbms_output.put_line(SQLERRM);
             -- creating log files mustn't fail
             RAISE;
      end;
@@ -2035,6 +2038,7 @@ dbms_output.put_line('okay');
         v_new_rec t_process_rec;
     begin
 
+dbms_output.put_line('function new_session - logLevel = ' || p_session_init.logLevel);
        -- If silent log mode don't do anything
         if p_session_init.logLevel > logLevelSilent then
 	        -- Sicherstellen, dass die LOG-Tabellen existieren
@@ -2042,9 +2046,10 @@ dbms_output.put_line('okay');
         end if;
 
         select seq_lila_log.nextVal into pProcessId from dual;
+dbms_output.put_line('... 2');
         -- persist to session internal table
         insertSession (p_session_init.tabNameMaster, pProcessId, p_session_init.logLevel);
-
+dbms_output.put_line('... 3 daysToKeep = ' || p_session_init.daysToKeep );
 		if p_session_init.logLevel > logLevelSilent and p_session_init.daysToKeep is not null then
 --	        deleteOldLogs(pProcessId, upper(trim(p_session_init.processName)), p_session_init.daysToKeep);
             persist_new_session(pProcessId, p_session_init.processName, p_session_init.logLevel, 
@@ -2137,7 +2142,6 @@ dbms_output.put_line('okay');
         l_report := l_line || ' LATEST ACTIVE CONFIGURATION REPORT' || CHR(10) || l_line;
         
         l_response := waitForResponse(
-            p_serverChannel => 'LILA_REQUEST', -- Der Kanal, auf dem der Server hört (LILA_REQUEST)
             p_request       => 'GET_LATEST_CONFIG',
             p_payload       => '{"info":"REQUEST_FROM_' || USER || '"}',
             p_timeoutSec   => 5
@@ -2265,58 +2269,57 @@ dbms_output.put_line('okay');
     END;
     
     --------------------------------------------------------------------------
-    function extractFromJson(l_json_doc varchar2, jsonPath varchar2) return varchar2
+    
+    function extractFromJsonStr(p_json_doc varchar2, jsonPath varchar2) return varchar2
     as
-        l_value varchar2(1800);
     begin
-        return JSON_VALUE(l_json_doc, '$.' || jsonPath);
+        return JSON_VALUE(p_json_doc, '$.' || jsonPath);
+    end;
+    
+    --------------------------------------------------------------------------
+    
+    function extractFromJsonNum(p_json_doc varchar2, jsonPath varchar2) return number
+    as
+    begin
+        return JSON_VALUE(p_json_doc, '$.' || jsonPath returning NUMBER);
+    exception 
+        when others then return null; -- Oder Fehlerbehandlung
     end;
    
 	--------------------------------------------------------------------------
     
-    function extractClientChannel(l_json_doc varchar2) return varchar2
+    function extractClientChannel(p_json_doc varchar2) return varchar2
     as
-        l_clientChannel varchar2(30);
     begin
-        return JSON_VALUE(l_json_doc, '$.header.response');
+        return JSON_VALUE(p_json_doc, '$.header.response');
     end;        
     
     --------------------------------------------------------------------------
     
-    function extractClientRequest(l_json_doc varchar2) return varchar2
+    function extractClientRequest(p_json_doc varchar2) return varchar2
     as
-        l_clientRequest varchar2(30);
     begin
-        return JSON_VALUE(l_json_doc, '$.header.request');
+        return JSON_VALUE(p_json_doc, '$.header.request');
     end;
     
 	--------------------------------------------------------------------------
     
-    procedure serverProcessReq_newSession(l_clientId PLS_INTEGER, l_message VARCHAR2, l_json_doc VARCHAR2)
+    procedure serverProcessReq_newSession(p_clientChannel varchar2, p_message VARCHAR2, p_json_doc VARCHAR2)
     as
         l_processId number;
+        l_payload varchar2(1600);
         l_session_init t_session_init;
     begin
-        SELECT j.processName, j.logLevel, stepsToDo, daysToKeep, tabNameMaster
-        INTO
-            l_session_init.processName,
-            l_session_init.logLevel,
-            l_session_init.stepsToDo,
-            l_session_init.daysToKeep,
-            l_session_init.tabNameMaster
+        -- {header{}, meta{}, payload{"process_name":"mein_prozess", "log_level": 1}}
+        l_payload := JSON_QUERY(p_message, '$.payload');
+        l_session_init.processName := extractFromJsonStr(l_payload, 'process_name');
+        l_session_init.logLevel    := extractFromJsonNum(l_payload, 'log_level');
+        l_session_init.stepsToDo   := extractFromJsonNum(l_payload, 'steps_todo');
+        l_session_init.daysToKeep  := extractFromJsonNum(l_payload, 'days_to_keep');
+        l_session_init.tabNameMaster := extractFromJsonStr(l_payload, 'tabname_master');        
 
-        FROM JSON_TABLE(l_json_doc, '$'
-            COLUMNS (
-                processName VARCHAR2(100)   PATH '$.PROCESS_NAME',
-                logLevel INTEGER            PATH '$.LOG_LEVEL',
-                stepsToDo INTEGER           PATH '$.STEPS_TODO',
-                daysToKeep INTEGER          PATH '$.LOG_LEVEL',
-                tabNameMaster VARCHAR2(100) PATH '$.LOG_LEVEL'
-            )
-        ) j;
-        
         l_processId := NEW_SESSION(l_session_init);
-        DBMS_ALERT.SIGNAL('LILA_NEW_SESSION->' || l_clientId, '{"PROCESS_ID" : ' || l_processId || '}');
+        DBMS_ALERT.SIGNAL(p_clientChannel, '{"process_id" : ' || l_processId || '}');
         COMMIT; -- Wichtig: Signal und Daten werden sichtbar
 
     end;    
@@ -2327,7 +2330,6 @@ dbms_output.put_line('okay');
         l_response varchar2(1000);
     begin
         l_response := waitForResponse(
-            p_serverChannel => 'LILA_REQUEST',
             p_request       => 'EXIT',
             p_payload       => p_message,
             p_timeoutSec    => 2
@@ -2343,7 +2345,6 @@ dbms_output.put_line('okay');
     begin
         dbms_output.enable();
         l_response := waitForResponse(
-            p_serverChannel => 'LILA_REQUEST',
             p_request       => 'ANY_MSG',
             p_payload       => p_message,
             p_timeoutSec    => 5
@@ -2354,23 +2355,30 @@ dbms_output.put_line('okay');
     
 	--------------------------------------------------------------------------    
     
-    FUNCTION SERVER_NEW_SESSION(p_session_init t_session_init) RETURN NUMBER
-    as
-        -- Response: {"PROCESS_ID" : 2000}
-        l_ProcessId number(19,0) := -500;   
-        l_request   varchar2(1800);
-        l_response  varchar2(1800);
-        l_json_doc  VARCHAR2(2000);
-    begin
+    /*
+        p_payload im JSON Format mit folgenden Key-Values:
+        {
+            "process_name":"<Prozess-Name>",
+            "log_level":<lilaLogLeel>,
+            "steps_todo":<Anzahl Schritte, darf null sein>,
+            "days_to_keep":<max. Alter Einträge>,
+            "tabname_master":"<TEST_LOGS>"
+        }
+        Dabei dürfen einige Werte auch fehlen (z.B. steps_todo).
+    */
     
---        l_request := '<NEW_SESSION>';
-        l_request := l_request || '{"CLIENT_ID" : ' || g_clientId;
-        l_request := l_request || ', "PROCESS_NAME" : "' || p_session_init.processName || '"';
-        l_request := l_request || ', "LOG_LEVEL" : ' || p_session_init.logLevel;
-        l_request := l_request || ', "STEPS_TODO" : ' || p_session_init.stepsToDo;
-        l_request := l_request || ', "TABNAME_MASTER" : "' || p_session_init.tabNameMaster || '"}';
+    FUNCTION SERVER_NEW_SESSION(p_payload varchar2) RETURN NUMBER
+    as
+        l_ProcessId number(19,0) := -500;   
+        l_payload   varchar2(1000);
+        l_response  varchar2(100);        
+        jasonObj    JSON_OBJECT_T := JSON_OBJECT_T();
+    begin
+dbms_output.enable();
+dbms_output.put_line('Function SERVER_NEW_SESSION: ' || p_payload);
         
-        l_response := waitForResponse(g_clientId, 'LILA_NEW_SESSION', l_request, 5);
+        l_response := waitForResponse('NEW_SESSION', p_payload, 5);
+        
         CASE
             WHEN l_response = 'TIMEOUT' THEN
                 l_ProcessId := -110;
@@ -2380,20 +2388,7 @@ dbms_output.put_line('okay');
                 l_ProcessId := - 100;
             else
             -- Erfolgsfall: JSON parsen
-            l_json_doc := '{' || l_response || '}';
-            BEGIN
-                SELECT j.*
-                INTO l_ProcessId
-                FROM JSON_TABLE(l_json_doc, '$'
-                    COLUMNS (
-                        f_processId NUMBER PATH '$.PROCESS_ID'
-                    )
-                ) j;
-                    
-            EXCEPTION
-                WHEN OTHERS THEN
-                    l_ProcessId := -200;
-            END;
+            l_ProcessId := extractFromJsonNum(l_response, 'process_id');
         end case;
 
         RETURN l_ProcessId;
@@ -2414,6 +2409,8 @@ dbms_output.put_line('okay');
         l_command   VARCHAR2(100);
         l_json_doc  VARCHAR2(2000);
         
+        l_localSession number(19,0);
+        l_stop_server_exception EXCEPTION;
     begin
 dbms_output.enable();
         DBMS_ALERT.REGISTER('LILA_REQUEST');
@@ -2423,25 +2420,27 @@ dbms_output.enable();
             -- Der Prozess verbraucht hier keine CPU!
             DBMS_ALERT.WAITONE('LILA_REQUEST', l_message, l_status, l_timeout);
     
-            IF l_status = 0 THEN                
+            IF l_status = 0 THEN  
+            BEGIN 
                 l_clientChannel := extractClientChannel(l_message);
                 l_command := extractClientRequest(l_message);
                                 
                 CASE l_command
                     WHEN 'EXIT' then
                         dbms_output.enable();
-                        dbms_output.put_line(extractFromJson(l_message, 'payload.msg'));
+                        dbms_output.put_line(extractFromJsonStr(l_message, 'payload.msg'));
                         DBMS_ALERT.SIGNAL(l_clientChannel, 'Bla');
                         COMMIT;
                         exit;
                         
                     WHEN 'ANY_MSG' then
                         dbms_output.enable();
-                        DBMS_ALERT.SIGNAL(l_clientChannel, extractFromJson(l_message, 'payload.msg'));
+                        DBMS_ALERT.SIGNAL(l_clientChannel, extractFromJsonStr(l_message, 'payload.msg'));
                         COMMIT;
                         
                         
                     WHEN 'NEW_SESSION' THEN
+            dbms_output.put_line('WHEN NEW_SESSION: ' || l_message);
                         serverProcessReq_newSession(l_clientChannel, l_message, l_json_doc);
                                         
                     WHEN 'FLUSH_CONF'  THEN 
@@ -2453,6 +2452,20 @@ dbms_output.enable();
                 END CASE;
                 COMMIT; -- Wichtig: Signal und Daten werden sichtbar
 
+                EXCEPTION
+                    WHEN l_stop_server_exception THEN
+                        -- Diese Exception wird NICHT hier abgefangen, 
+                        -- sondern nach außen an den Loop gereicht.
+                        RAISE;
+                        
+                    WHEN OTHERS THEN
+                        -- WICHTIG: Fehler loggen, aber die Schleife NICHT verlassen!
+                        l_localSession := NEW_SESSION('LILA_SERVER', logLevelDebug);
+                        ERROR(l_localSession, 'Kritischer Fehler bei Verarbeitung eines Kommandos: ' || SQLERRM);
+                        CLOSE_SESSION(l_localSession);
+                        DBMS_OUTPUT.PUT_LINE('Kritischer Fehler bei Verarbeitung eines Kommandos: ' || SQLERRM);
+                        ROLLBACK;
+                END;
     
             ELSIF l_status = 1 THEN
                 -- Timeout erreicht. Passiert, wenn 10 Minuten kein Signal kam.
@@ -2463,13 +2476,21 @@ dbms_output.enable();
                 -- Anderer Fehler
                 DBMS_OUTPUT.PUT_LINE('Fehler beim Warten: ' || l_status);
             END IF;
---exit;    
+            
         END LOOP;
     
         -- Dieser Teil wird nie erreicht, solange die DB-Session aktiv ist
         DBMS_ALERT.REMOVEALL;
+        
     EXCEPTION
-        WHEN OTHERS THEN
+    WHEN l_stop_server_exception THEN
+        -- Hier landen wir nur, wenn der Server gezielt beendet werden soll
+        l_localSession := NEW_SESSION('LILA_SERVER', logLevelDebug);
+        ERROR(l_localSession, 'Kritischer Fehler bei Verarbeitung eines Kommandos: ' || SQLERRM);
+        CLOSE_SESSION(l_localSession);
+        DBMS_ALERT.REMOVE('LILA_REQUEST');
+    
+    WHEN OTHERS THEN
             DBMS_OUTPUT.PUT_LINE('Kritischer Fehler in der Daemon-Schleife: ' || SQLERRM);
             -- Hier müsste man ggf. Loggen und entscheiden, ob man RAISE; macht oder die Schleife beendet.
     end;
