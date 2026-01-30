@@ -200,7 +200,6 @@ create or replace PACKAGE BODY LILA AS
         l_meta      varchar2(100);
         l_data      varchar2(1500);
     begin
-dbms_output.enable();        
         l_clientChannel := getRequestKey;
         
         l_header := '"header":{"request":"' || p_request || '", "response":"' || l_clientChannel ||'"}';
@@ -210,10 +209,9 @@ dbms_output.enable();
         
         DBMS_PIPE.PACK_MESSAGE(l_msg);
         l_status := DBMS_PIPE.SEND_MESSAGE(g_pipeName, timeout => 3);
-        l_status := DBMS_PIPE.RECEIVE_MESSAGE(l_clientChannel, timeout => p_timeoutSec);
+        l_statusReceive := DBMS_PIPE.RECEIVE_MESSAGE(l_clientChannel, timeout => p_timeoutSec);
         IF l_statusReceive = 0 THEN
             DBMS_PIPE.UNPACK_MESSAGE(l_msg);
-            dbms_output.put_line(l_msg);
         END IF;
         
         IF l_statusReceive = 1 THEN RETURN 'TIMEOUT'; END IF;
@@ -225,7 +223,7 @@ dbms_output.enable();
     procedure sendNoWait(
         p_request       in varchar2, -- Wird für die Zuordnung/Verzweigung im Server benötigt
         p_payload       IN varchar2, 
-        p_timeoutSec    IN number
+        p_timeoutSec    IN PLS_INTEGER
     )
     as        
         l_msg       VARCHAR2(1800);
@@ -239,13 +237,18 @@ dbms_output.enable();
         l_data  := '"payload":' || p_payLoad;
         
         l_msg := '{' || l_header || ', ' || l_meta || ', ' || l_data || '}';
-        DBMS_PIPE.PACK_MESSAGE(p_payload);
-        l_status := DBMS_PIPE.SEND_MESSAGE(g_pipeName, timeout => 0);
+dbms_output.put_line('sendNoWait ' || l_msg);
+        DBMS_PIPE.PACK_MESSAGE(l_msg);
+        l_status := DBMS_PIPE.SEND_MESSAGE(g_pipeName, timeout => p_timeoutSec);
 
         IF l_status != 0 THEN
             -- Optional: Fehlerbehandlung, falls Pipe voll
-            NULL; 
+            dbms_output.put_line('sendNoWait: ' || l_status); 
         END IF;
+        
+    exception
+        when others then
+            dbms_output.put_line('sendNoWait: ' || sqlErrM);
     end;
     
     --------------------------------------------------------------------------
@@ -542,6 +545,11 @@ dbms_output.enable();
     as
         pragma autonomous_transaction;
     begin
+dbms_output.put_line('persist_log_data p_levels.count für ' || p_processId || ':' || p_levels.count);
+
+for i in 1 .. p_levels.count loop
+    dbms_output.put_line(p_texts(i));
+end loop;
         -- Bulk-Insert über alle gesammelten Log-Einträge
         forall i in 1 .. p_levels.count
             execute immediate 
@@ -590,6 +598,7 @@ DBMS_OUTPUT.PUT_LINE('CRITICAL: Persistierung fehlgeschlagen: ' || SQLERRM);
         -- 2. Ziel-Tabelle aus der Session-Liste ermitteln
         v_idx_session := v_indexSession(p_processId);
         v_targetTable := g_sessionList(v_idx_session).tabName_master || '_DETAIL';
+dbms_output.put_line('Table: ' || v_targetTable);
     
         -- 3. Daten aus der hierarchischen Map in flache Listen sammeln
         for i in 1 .. g_log_groups(v_key).COUNT loop
@@ -618,10 +627,13 @@ DBMS_OUTPUT.PUT_LINE('CRITICAL: Persistierung fehlgeschlagen: ' || SQLERRM);
         );
     
         -- 5. Cache für diesen Prozess leeren
+dbms_output.put_line('Lösche groups für ' || v_key);
         g_log_groups(v_key).DELETE;
+dbms_output.put_line('gelöscht');
     
     exception
         when others then
+dbms_output.put_line('err: ' || sqlErrM);
             -- Zentrale Fehlerbehandlung nutzen
             if should_raise_error(p_processId) then
                 raise;
@@ -665,9 +677,11 @@ DBMS_OUTPUT.PUT_LINE('CRITICAL: Persistierung fehlgeschlagen: ' || SQLERRM);
         -- 3. In den Cache hängen
         g_log_groups(v_key).EXTEND;
         g_log_groups(v_key)(g_log_groups(v_key).LAST) := v_new_log;
+dbms_output.put_line('Anzahl in g_log_groups: ' || g_log_groups(v_key).Count);
         
         -- In write_to_log_buffer
         g_sessionList(v_idx).log_dirty_count := nvl(g_sessionList(v_idx).log_dirty_count, 0) + 1;
+dbms_output.put_line('Dirty: ' || g_sessionList(v_idx).log_dirty_count);
         -- ID in die Dirty-Queue werfen
         g_dirty_queue(p_processId) := TRUE;
 
@@ -726,14 +740,19 @@ DBMS_OUTPUT.PUT_LINE('CRITICAL: Persistierung fehlgeschlagen: ' || SQLERRM);
     BEGIN
         -- Wir starten am Anfang der "Dreckigen Liste"
         v_id := g_dirty_queue.FIRST;
+dbms_output.put_line('Sync all dirty v_id: ' || v_id);
         
         WHILE v_id IS NOT NULL LOOP
             -- 1. Zeiger auf das nächste Element sichern, bevor wir evtl. DELETE machen
             v_next_id := g_dirty_queue.NEXT(v_id);
+dbms_output.put_line('Next v_next_id zur Sicherheit: ' || v_next_id);
             
             -- 2. Index der Session-Metadaten holen
             -- (Wir nutzen v_indexSession, um sicherzustellen, dass die Session noch existiert)
+dbms_output.put_line('v_indexSession.Exists?');
             IF v_indexSession.EXISTS(v_id) THEN
+dbms_output.put_line('v_indexSession.Exists: Ja');
+
                 v_idx := v_indexSession(v_id);
     
                 -- 3. Synchronisation aller drei Bereiche für diesen Prozess
@@ -754,7 +773,8 @@ DBMS_OUTPUT.PUT_LINE('CRITICAL: Persistierung fehlgeschlagen: ' || SQLERRM);
                     g_dirty_queue.DELETE(v_id);
                 END IF;
             ELSE
-                -- Session existiert nicht mehr in der Master-Liste? 
+ dbms_output.put_line('v_indexSession.Exists: Nein');
+               -- Session existiert nicht mehr in der Master-Liste? 
                 -- Dann sofort aus der Queue entfernen (Cleanup).
                 g_dirty_queue.DELETE(v_id);
             END IF;
@@ -1431,7 +1451,8 @@ DBMS_OUTPUT.PUT_LINE('CRITICAL: Persistierung fehlgeschlagen: ' || SQLERRM);
     begin
         -- 1. Index der Session holen
         v_idx := v_indexSession(p_processId);
-        
+dbms_output.put_line('sync_log v_idx: ' || v_idx);
+dbms_output.put_line('last_log_flush: ' || g_sessionList(v_idx).last_log_flush);
         -- 3. Zeit seit dem letzten Log-Flush berechnen
         -- (get_ms_diff ist Ihre optimierte Funktion)
         if g_sessionList(v_idx).last_log_flush is null then
@@ -1439,14 +1460,15 @@ DBMS_OUTPUT.PUT_LINE('CRITICAL: Persistierung fehlgeschlagen: ' || SQLERRM);
         else
             v_ms_since_flush := get_ms_diff(g_sessionList(v_idx).last_log_flush, v_now);
         end if;
-            
+dbms_output.put_line('Prüfe vor flushLogs, ob notwendig');            
         -- 4. Flush-Bedingung: Menge ODER Zeit ODER Force
         if p_force 
            or g_sessionList(v_idx).log_dirty_count >= g_flush_log_threshold 
            or v_ms_since_flush >= g_flush_millis_threshold
         then
             -- Alle gepufferten Logs dieses Prozesses in die DB schreiben
-            flushLogs(p_processId);
+ dbms_output.put_line('YEP');            
+           flushLogs(p_processId);
             
             -- Steuerungsdaten für diesen Prozess zurücksetzen
             g_sessionList(v_idx).log_dirty_count := 0;
@@ -1455,6 +1477,7 @@ DBMS_OUTPUT.PUT_LINE('CRITICAL: Persistierung fehlgeschlagen: ' || SQLERRM);
                 
     exception
         when others then
+    dbms_output.put_line('err: ' || sqlErrM);
             -- Sicherheit für das Framework: Fehler im Flush dürfen Applikation nicht stoppen
             if should_raise_error(p_processId) then
                 raise;
@@ -1485,7 +1508,7 @@ DBMS_OUTPUT.PUT_LINE('CRITICAL: Persistierung fehlgeschlagen: ' || SQLERRM);
             returning varchar2
         )
         into l_payload from dual;
-        sendNoWait('LOG_ANY', l_payload, 5);
+        sendNoWait('LOG_ANY', l_payload, 0);
                 
     EXCEPTION
         WHEN OTHERS THEN
@@ -1509,23 +1532,25 @@ DBMS_OUTPUT.PUT_LINE('CRITICAL: Persistierung fehlgeschlagen: ' || SQLERRM);
     )
     as
     begin
-        if is_remote(p_processId) then
 dbms_output.enable();
+        if is_remote(p_processId) then
 dbms_output.put_line('DEBUG: log_any remote path for ID ' || p_processId);
-            log_anyRemote(p_processId, p_level, p_logText, SUBSTRB(p_errStack, 1, 400), SUBSTRB(p_errBacktrace, 1, 400), SUBSTRB(p_errCallstack, 1, 400));
+            log_anyRemote(p_processId, p_level, p_logText, p_errStack, p_errBacktrace, p_errCallstack);
             return;
         end if;
+dbms_output.put_line('DEBUG: log_any lokal path for ID ' || p_processId);
 
         -- Hier nur weiter, wenn nicht remote
+dbms_output.put_line('Prüfe auf exists: ');
         if v_indexSession.EXISTS(p_processId) and p_level <= g_sessionList(v_indexSession(p_processId)).log_level then
-        write_to_log_buffer(
-            p_processId, 
-            p_level,
-            p_logText,
-            null,
-            null,
-            DBMS_UTILITY.FORMAT_CALL_STACK
-        );
+            write_to_log_buffer(
+                p_processId, 
+                p_level,
+                p_logText,
+                null,
+                null,
+                DBMS_UTILITY.FORMAT_CALL_STACK
+            );
         end if;
 
         if p_level = logLevelError then
@@ -1817,6 +1842,7 @@ dbms_output.put_line('DEBUG: log_any remote path for ID ' || p_processId);
         v_idx PLS_INTEGER;
     begin
         if v_indexSession.EXISTS(p_processId) then
+dbms_output.put_line('CLOSE_Session ruft SYNC_ALL_DIRTY auf');
             SYNC_ALL_DIRTY(true);
 
 --            if  logLevelSilent <= g_sessionList(v_indexSession(p_processId)).log_level then
@@ -1948,7 +1974,10 @@ dbms_output.put_line('DEBUG: log_any remote path for ID ' || p_processId);
     
     function extractClientRequest(p_json_doc varchar2) return varchar2
     as
+    val varchar2(100);
     begin
+        val := 'X'|| JSON_VALUE(p_json_doc, '$.header.request') || 'X';
+        dbms_output.put_line('extractClientRequest:' || val);
         return JSON_VALUE(p_json_doc, '$.header.request');
     end;
     
@@ -1984,10 +2013,11 @@ dbms_output.put_line('DEBUG: log_any remote path for ID ' || p_processId);
     begin
         l_payload := JSON_QUERY(p_message, '$.payload');
         l_processId := extractFromJsonStr(l_payload, 'process_id');
+        l_session_init.processName := extractFromJsonStr(l_payload, 'process_name');
         l_session_init.logLevel    := extractFromJsonNum(l_payload, 'log_level');
         l_session_init.stepsToDo   := extractFromJsonNum(l_payload, 'steps_todo');
         l_session_init.daysToKeep  := extractFromJsonNum(l_payload, 'days_to_keep');
-        l_session_init.tabNameMaster := extractFromJsonStr(l_payload, 'tabname_master');        
+        l_session_init.tabNameMaster := extractFromJsonStr(l_payload, 'tabname_master');
 
         l_processId := NEW_SESSION(l_session_init);
         DBMS_PIPE.RESET_BUFFER; -- Koffer leeren
@@ -2005,6 +2035,7 @@ dbms_output.put_line('DEBUG: log_any remote path for ID ' || p_processId);
             p_payload       => p_message,
             p_timeoutSec    => 5
         );
+        dbms_output.enable();
         dbms_output.put_line('Antwort vom Server: ' || l_response);
     end;
 
@@ -2030,6 +2061,8 @@ dbms_output.put_line('DEBUG: log_any remote path for ID ' || p_processId);
         jasonObj    JSON_OBJECT_T := JSON_OBJECT_T();
     begin        
         l_response := waitForResponse('NEW_SESSION', p_payload, 5);
+dbms_output.enable();
+dbms_output.put_line('l_response: ' || l_response);
         
         CASE
             WHEN l_response = 'TIMEOUT' THEN
@@ -2144,7 +2177,6 @@ dbms_output.enable();
         -- Pipe erstellen (Public oder Private, Kapazität hier 1MB für High-Load)
         l_dummyRes := DBMS_PIPE.REMOVE_PIPE(g_pipeName);
         l_dummyRes := DBMS_PIPE.CREATE_PIPE(pipename => g_pipeName, maxpipesize => 1048576, private => false);
-        DBMS_PIPE.PURGE(g_pipeName); 
         
         LOOP -- DIES IST DIE ENDLOSSCHLEIFE
             -- Warten auf die nächste Nachricht (Timeout in Sekunden)
@@ -2152,6 +2184,7 @@ dbms_output.enable();
             IF l_status = 0 THEN
             BEGIN 
                 DBMS_PIPE.UNPACK_MESSAGE(l_message);
+dbms_output.put_line('l_message im Loop: ' || l_message);
                 l_clientChannel := extractClientChannel(l_message);
                 l_request := extractClientRequest(l_message);
                                 
@@ -2167,11 +2200,13 @@ dbms_output.enable();
                         doRemote_newSession(l_clientChannel, l_message);
 
                     WHEN 'LOG_ANY' then
+            dbms_output.put_line('WHEN LOG_ANY');
                         doRemote_logAny(l_message);
 
                     ELSE 
                         -- Unbekanntes Tag loggen
                         warn(l_localSession, 'Unknown request: ' || l_request);
+                        null;
                 END CASE;
 
                 EXCEPTION
@@ -2197,10 +2232,11 @@ dbms_output.enable();
         
         -- es könnten noch dirty buffered Einträge existieren
         sync_all_dirty(true);
+        DBMS_PIPE.PURGE(g_pipeName); 
 
         v_key := TO_CHAR(l_localSession);        
         IF g_log_groups.EXISTS(v_key) THEN
-            DBMS_OUTPUT.PUT_LINE('Logs im Buffer für '||v_key||': '|| lila.g_log_groups(v_key).COUNT);
+            DBMS_OUTPUT.PUT_LINE('Logs im Buffer für '||v_key||': '|| g_log_groups(v_key).COUNT);
         ELSE
             DBMS_OUTPUT.PUT_LINE('Keine Logs im Buffer für Server mit Prozess-ID: '||v_key);
         END IF;
@@ -2216,9 +2252,11 @@ dbms_output.enable();
         -- Hier landen wir nur, wenn der Server gezielt beendet werden soll
         dbms_output.put_line('Err: ' || sqlerrm);
         ERROR(l_localSession, 'Kritischer Fehler bei Verarbeitung eines Kommandos: ' || SQLERRM);
+        
         CLOSE_SESSION(l_localSession);
     
     WHEN OTHERS THEN
+        DBMS_PIPE.PURGE(g_pipeName); 
         dbms_output.put_line('Err: ' || sqlerrm);
     end;
 
