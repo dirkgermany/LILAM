@@ -1,0 +1,22 @@
+📋 Projekt-Status: LILA Logging-Framework
+Aktueller Stand:
+
+    Transport: Umstellung von DBMS_ALERT auf DBMS_PIPE (FIFO statt überschreibend).
+    Architektur: Dual-Mode (Standalone & Remote-Server via IPC).
+    Server-Eingang: Explizite Public Pipe mit REMOVE beim Start/Ende und PURGE im Exception-Block.
+    Rückkanal: Implizite Pipes mit Keys aus SID + Millis-Timestamp (Kollisionsfrei).
+    Buffer-Management: FIFO-Buffer mit FIRST/NEXT-Iteratoren (Sparse-Collection sicher).
+    Persistierung: FORALL mit EXECUTE IMMEDIATE in AUTONOMOUS_TRANSACTION.
+    Performance: 1.000 Logs in ~0,11s (asynchroner Pipe-Durchsatz).
+
+Wichtige Code-Konventionen:
+
+    Key-Design: LPAD(process_id, 20, '0') || '|' || action_name (sortierbar für schnellen Flush).
+    Handshake: EXIT-Signal erzwingt sync_all_dirty(p_force => TRUE) vor dem Shutdown.
+    Data Safety: insertMonitor prüft is_flushed 
+
+Nächste Schritte:
+
+    Test der Monitor-Historie (Round-Robin im Speicher vs. Tabellen-Flush).
+    Validierung der avg_action_time Berechnung bei Remote-Übertragung.
+
