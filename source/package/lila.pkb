@@ -18,6 +18,7 @@ create or replace PACKAGE BODY LILA AS
         log_dirty_count     PLS_INTEGER := 0,  -- Logs per process counter
         process_is_dirty    BOOLEAN,
         last_process_flush  TIMESTAMP,
+        last_sync_check     TIMESTAMP,
         tabName_master      VARCHAR2(100)
     );
 
@@ -45,7 +46,7 @@ create or replace PACKAGE BODY LILA AS
     ---------------------------------------------------------------
     TYPE t_monitor_buffer_rec IS RECORD (
         process_id      NUMBER(19,0),
-        action_name     VARCHAR2(25),
+        action_name     VARCHAR2(150),
         avg_action_time NUMBER,        -- Umbenannt
         action_time     TIMESTAMP,     -- Startzeitpunkt der Aktion
         used_time       NUMBER,        -- Dauer der letzten Ausführung (in Sek.)
@@ -107,16 +108,14 @@ create or replace PACKAGE BODY LILA AS
     g_pipeName      CONSTANT VARCHAR2(30) := 'LILA_REQUEST_PIPE';
 
     -- general Flush Time-Duration
-    g_flush_millis_threshold PLS_INTEGER            := 1500; 
-    g_flush_log_threshold PLS_INTEGER               := 12500;
-    g_flush_process_threshold PLS_INTEGER           := 5000;
-    g_max_entries_per_monitor_action PLS_INTEGER    := 2500; -- Round Robin: Max. Anzahl Einträge für eine Aktion je Action
-    g_flush_monitor_threshold PLS_INTEGER           := 2500; -- Max. Anzahl Monitoreinträge für das Flush
-    g_monitor_alert_threshold_factor NUMBER         := 2.0; -- Max. Ausreißer in der Dauer eines Verarbeitungsschrittes
+    g_flush_millis_threshold PLS_INTEGER            := 1500;  -- Max. Millisekunden bis zum Flush
+    g_flush_log_threshold PLS_INTEGER               := 12500; -- Max. Anzahl Logs bis zum Flush
+    g_max_entries_per_monitor_action PLS_INTEGER    := 2500;  -- Round Robin: Max. Anzahl Einträge für eine Aktion je Action
+    g_flush_monitor_threshold PLS_INTEGER           := 2500;  -- Max. Anzahl Monitoreinträge für das Flush
+    g_monitor_alert_threshold_factor NUMBER         := 2.0;   -- Max. Ausreißer in der Dauer eines Verarbeitungsschrittes
 /*
     g_flush_millis_threshold PLS_INTEGER            := 1500; 
     g_flush_log_threshold PLS_INTEGER               := 1000;
-    g_flush_process_threshold PLS_INTEGER           := 100;
     g_max_entries_per_monitor_action PLS_INTEGER    := 1000; -- Round Robin: Max. Anzahl Einträge für eine Aktion je Action
     g_flush_monitor_threshold PLS_INTEGER           := 100; -- Max. Anzahl Monitoreinträge für das Flush
     g_monitor_alert_threshold_factor NUMBER         := 2.0; -- Max. Ausreißer in der Dauer eines Verarbeitungsschrittes
@@ -141,10 +140,11 @@ create or replace PACKAGE BODY LILA AS
     function getSessionRecord(p_processId number) return t_session_rec;
     function getProcessRecord(p_processId number) return t_process_rec;
     procedure sync_log(p_processId number, p_force boolean default false);
-    procedure sync_monitor(p_processId number, p_force boolean default false);
+    procedure sync_monitor(p_processId number, p_force boolean default false, p_isShutdown boolean default false);
     procedure sync_process(p_processId number, p_force boolean default false);
     function extractFromJsonStr(p_json_doc varchar2, jsonPath varchar2) return varchar2;
     function extractFromJsonNum(p_json_doc varchar2, jsonPath varchar2) return number;
+    procedure flushMonitor(p_processId number, p_isShutdown BOOLEAN DEFAULT FALSE);
     
     ---------------------------------------------------------------
     -- Antwort Codes stabil vereinheitlichen
@@ -248,7 +248,6 @@ create or replace PACKAGE BODY LILA AS
         l_msg := '{' || l_header || ', ' || l_meta || ', ' || l_data || '}';
         DBMS_PIPE.PACK_MESSAGE(l_msg);
         l_status := DBMS_PIPE.SEND_MESSAGE(g_pipeName, timeout => p_timeoutSec);
-
         IF l_status != 0 THEN
             null;
         END IF;
@@ -727,56 +726,81 @@ create or replace PACKAGE BODY LILA AS
     --------------------------------------------------------------------
     -- Alle Dirty Einträge für alle Sessions wegschreiben
     --------------------------------------------------------------------
-    PROCEDURE SYNC_ALL_DIRTY(p_force BOOLEAN DEFAULT FALSE) 
-    IS
-        v_id      BINARY_INTEGER;
-        v_next_id BINARY_INTEGER;
-        v_idx     PLS_INTEGER;
-    BEGIN
-        -- Wir starten am Anfang der "Dreckigen Liste"
-        v_id := g_dirty_queue.FIRST;
-        
-        WHILE v_id IS NOT NULL LOOP
-            -- 1. Zeiger auf das nächste Element sichern, bevor wir evtl. DELETE machen
-            v_next_id := g_dirty_queue.NEXT(v_id);
-            
-            -- 2. Index der Session-Metadaten holen
-            -- (Wir nutzen v_indexSession, um sicherzustellen, dass die Session noch existiert)
-            IF v_indexSession.EXISTS(v_id) THEN
-                v_idx := v_indexSession(v_id);
+PROCEDURE SYNC_ALL_DIRTY(p_force BOOLEAN DEFAULT FALSE, p_isShutdown BOOLEAN DEFAULT FALSE) 
+IS
+    v_id      BINARY_INTEGER;
+    v_next_id BINARY_INTEGER;
+    v_idx     PLS_INTEGER;
+BEGIN
+    -- ======================================================================
+    -- TEIL 1: BEARBEITUNG DER DRECKIGEN LISTE (Queue)
+    -- ======================================================================
+    v_id := g_dirty_queue.FIRST;
     
-                -- 3. Synchronisation aller drei Bereiche für diesen Prozess
-                -- Falls p_force=TRUE (z.B. Shutdown), wird sofort geschrieben.
-                -- Falls FALSE, entscheiden die Prozeduren anhand ihrer Thresholds.
+    WHILE v_id IS NOT NULL LOOP
+        v_next_id := g_dirty_queue.NEXT(v_id);
+        
+        IF v_indexSession.EXISTS(v_id) THEN
+            v_idx := v_indexSession(v_id);
+
+            -- Zeitstempel-Check (Cooldown-Logik)
+            -- Bei Force oder Shutdown ignorieren wir die Wartezeit
+            IF NOT p_force AND NOT p_isShutdown
+               AND g_sessionList(v_idx).last_sync_check IS NOT NULL 
+               AND (SYSTIMESTAMP - g_sessionList(v_idx).last_sync_check) < INTERVAL '1' SECOND 
+            THEN
+                NULL; 
+            ELSE
+                g_sessionList(v_idx).last_sync_check := SYSTIMESTAMP;
+
+                -- Synchronisation (p_isShutdown wird durchgereicht)
                 sync_log(v_id, p_force);
-                sync_monitor(v_id, p_force);
+                sync_monitor(v_id, p_force, p_isShutdown);
                 sync_process(v_id, p_force);
                 
-                -- 4. Überprüfung: Ist die Session jetzt "sauber"?
-                -- Nur wenn ALLE Buffer für diesen Prozess auf 0 sind, 
-                -- darf er aus der Queue fliegen.
-                IF p_force OR (
+                -- Überprüfung: Ist die Session jetzt "sauber"?
+                IF p_force OR p_isShutdown OR (
                        nvl(g_sessionList(v_idx).log_dirty_count, 0) = 0 
                    AND nvl(g_sessionList(v_idx).monitor_dirty_count, 0) = 0
                    AND NOT g_sessionList(v_idx).process_is_dirty
                 ) THEN
                     g_dirty_queue.DELETE(v_id);
+                    g_sessionList(v_idx).last_sync_check := NULL;
                 END IF;
-            ELSE
-               -- Session existiert nicht mehr in der Master-Liste? 
-                -- Dann sofort aus der Queue entfernen (Cleanup).
-                g_dirty_queue.DELETE(v_id);
             END IF;
+        ELSE
+            g_dirty_queue.DELETE(v_id);
+        END IF;
+        
+        v_id := v_next_id;
+    END LOOP;
+
+    -- ======================================================================
+    -- TEIL 2: MASTER-CLEANUP BEI SHUTDOWN
+    -- Hier räumen wir die RAM-Reste (Round-Robin) aller bekannten Sessions weg
+    -- ======================================================================
+    IF p_isShutdown THEN
+        v_id := v_indexSession.FIRST;
+        WHILE v_id IS NOT NULL LOOP
+            -- flushMonitor direkt aufrufen, um is_flushed=1 Einträge zu löschen.
+            -- Da p_isShutdown = TRUE, greift dort g_monitor_groups.DELETE(v_key).
+            flushMonitor(v_id, p_isShutdown => TRUE);
             
-            -- 5. Zum nächsten Element springen
-            v_id := v_next_id;
+            v_id := v_indexSession.NEXT(v_id);
         END LOOP;
-    END;
+        
+        -- Falls am Ende wirklich ALLES weg soll (komplette Package-Variablen leeren):
+        -- g_monitor_groups.DELETE;
+        -- g_dirty_queue.DELETE;
+    END IF;
+
+END SYNC_ALL_DIRTY;
+
 
     --------------------------------------------------------------------------
     -- Write monitor data to detail table
     --------------------------------------------------------------------------
-    procedure flushMonitor(p_processId number)
+    procedure flushMonitor(p_processId number, p_isShutdown BOOLEAN DEFAULT FALSE)
     as
         v_sessionRec  t_session_rec;
         v_targetTable varchar2(150);
@@ -794,6 +818,12 @@ create or replace PACKAGE BODY LILA AS
         v_avgs          sys.odcinumberlist   := sys.odcinumberlist();
         v_times         sys.odcidatelist     := sys.odcidatelist();
     begin
+    
+    -- DEBUG-BLOCK ANFANG
+    DBMS_OUTPUT.PUT_LINE('--- Debug flushMonitor ---');
+    DBMS_OUTPUT.PUT_LINE('Suche Prefix: "' || v_search_prefix || '"');
+    DBMS_OUTPUT.PUT_LINE('Shutdown-Modus: ' || CASE WHEN p_isShutdown THEN 'JA' ELSE 'NEIN' END);
+DBMS_OUTPUT.PUT_LINE('Anzahl Einträge in g_monitor_groups: ' || g_monitor_groups.COUNT);
         -- Metadaten laden
         v_sessionRec := getSessionRecord(p_processId);
         if v_sessionRec.tabName_master is null then return; end if;
@@ -803,12 +833,10 @@ create or replace PACKAGE BODY LILA AS
         -- Wir starten beim ersten Key der Map
         v_key := g_monitor_groups.FIRST;
         
-        
-    
-    while v_key is not null loop
+        while v_key is not null loop
             -- OPTIMIERUNG: Da die Map sortiert ist, können wir abbrechen, 
             -- wenn der Key alphabetisch hinter unserem Prozess-Präfix liegt.
-            exit when v_key > v_search_prefix || 'zzzz';
+--            exit when v_key > v_search_prefix || 'zzzz';
             
             -- Nur verarbeiten, wenn der Key zu unserem Prozess gehört
             if v_key like v_search_prefix || '%' then
@@ -847,21 +875,45 @@ create or replace PACKAGE BODY LILA AS
             );
     
             -- SCHRITT 3: Im Speicher als geflusht markieren
+            -- oder by shutdown löschen
+DBMS_OUTPUT.PUT_LINE(' Nach Persistierung und vor v_key := g_monitor_groups.FIRST');
+
             v_key := g_monitor_groups.FIRST;
-            while v_key is not null loop
-                -- Auch hier: Abbrechen wenn wir den Bereich des Prozesses verlassen
-                exit when v_key > v_search_prefix || 'zzzz';
+        
+DBMS_OUTPUT.PUT_LINE(' Nach v_key := g_monitor_groups.FIRST und vor WHILE v_key is not null loop');
+            WHILE v_key IS NOT NULL LOOP
+                -- Optimierung: Da Keys sortiert sind, können wir abbrechen, 
+                -- wenn wir den Bereich der p_processId verlassen haben.
+--                EXIT WHEN v_key > v_search_prefix || 'zzzz';
+DBMS_OUTPUT.PUT_LINE('Erster Befehl nach while v_key is not null loop');
                 
-                if v_key like v_search_prefix || '%' then
-                    v_idx := g_monitor_groups(v_key).FIRST;
-                    while v_idx is not null loop
-                        g_monitor_groups(v_key)(v_idx).is_flushed := 1;
-                        v_idx := g_monitor_groups(v_key).NEXT(v_idx);
-                    end loop;
-                end if;
-                
+                IF v_key LIKE v_search_prefix || '%' THEN
+                    IF p_isShutdown THEN
+DBMS_OUTPUT.PUT_LINE('!!! FORCE DELETE VERSUCH FUER: ' || v_key);
+    
+    -- Test: Sofort prüfen, ob es weg ist
+                       -- Speicher löschen
+                        g_monitor_groups.DELETE(v_key);
+                        
+    IF NOT g_monitor_groups.EXISTS(v_key) THEN
+        DBMS_OUTPUT.PUT_LINE('--- Bestätigt: Key ist aus RAM gelöscht.');
+    ELSE
+        DBMS_OUTPUT.PUT_LINE('--- FEHLER: Key existiert trotz DELETE noch!');
+    END IF;                         
+                        
+                        IF v_cache_avg.EXISTS(v_key)   THEN v_cache_avg.DELETE(v_key);   END IF;
+                        IF v_cache_last.EXISTS(v_key)  THEN v_cache_last.DELETE(v_key);  END IF;
+                        IF v_cache_count.EXISTS(v_key) THEN v_cache_count.DELETE(v_key); END IF;
+                    ELSE
+                        -- Nur Markieren
+                        FOR i IN 1 .. g_monitor_groups(v_key).COUNT LOOP
+                            g_monitor_groups(v_key)(i).is_flushed := 1;
+                        END LOOP;
+                    END IF;
+                END IF;
+        
                 v_key := g_monitor_groups.NEXT(v_key);
-            end loop;
+            END LOOP;
         end if;
         
     exception
@@ -873,7 +925,7 @@ create or replace PACKAGE BODY LILA AS
 
 	--------------------------------------------------------------------------
 
-    procedure sync_monitor(p_processId number, p_force boolean default false)
+    procedure sync_monitor(p_processId number, p_force boolean default false, p_isShutdown boolean default false)
     as
         v_idx PLS_INTEGER;
         v_ms_since_flush NUMBER;
@@ -889,7 +941,6 @@ create or replace PACKAGE BODY LILA AS
         -- 2. Dirty-Zähler für diesen spezifischen Prozess erhöhen
         g_sessionList(v_idx).monitor_dirty_count := nvl(g_sessionList(v_idx).monitor_dirty_count, 0) + 1;
         g_dirty_queue(p_processId) := TRUE;
-    
         -- 3. Zeitdifferenz seit letztem Flush berechnen
         -- Falls noch nie geflusht wurde (Start), setzen wir die Differenz hoch
         if g_sessionList(v_idx).last_monitor_flush is null then
@@ -903,7 +954,7 @@ create or replace PACKAGE BODY LILA AS
            or g_sessionList(v_idx).monitor_dirty_count >= g_flush_monitor_threshold 
            or v_ms_since_flush >= g_flush_millis_threshold
         then
-            flushMonitor(p_processId);
+            flushMonitor(p_processId, p_isShutdown);
             
             -- Reset der prozessspezifischen Steuerungsdaten
             g_sessionList(v_idx).monitor_dirty_count := 0;
@@ -999,22 +1050,60 @@ create or replace PACKAGE BODY LILA AS
     
     --------------------------------------------------------------------------
     -- Creating and adding/updating a record in the monitor list
+	--------------------------------------------------------------------------    
+    procedure insertMonitorRemote(p_processId number, p_actionName varchar2, p_timestamp timestamp default systimestamp)
+    as
+        l_payload varchar2(32767); -- Puffer für den JSON-String
+    begin
+        -- Da das über die PIPE läuft und damit nicht gewährleistet ist, dass bei
+        -- späterem Aufruf von insertMonitor im Server der Zeitpunkt 'in time' ist,
+        -- muss der Zeitpunkt vom Client bei Aufruf gesetzt werden.
+        -- Erzeugung des JSON-Objekts
+        select json_object(
+            'process_id'    value p_processId,
+            'action_name'   value p_actionName,
+            'timestamp'     value p_timestamp
+            returning varchar2
+        )
+        into l_payload from dual;
+        sendNoWait('MARK_STEP', l_payload, 0);
+                
+    EXCEPTION
+        WHEN OTHERS THEN
+            if should_raise_error(p_processId) then
+                raise;
+            end if;
+
+    end;
+    
     --------------------------------------------------------------------------
-    procedure insertMonitor (p_processId number, p_actionName varchar2)
+    
+    procedure insertMonitor (p_processId number, p_actionName varchar2, p_timestamp timestamp)
     as
         -- Key-Präfix sollte idealerweise p_processId enthalten für schnelleren Flush-Zugriff
         v_key        constant varchar2(100) := buildMonitorKey(p_processId, p_actionName);
-        v_now        constant timestamp := systimestamp;
+        v_now        timestamp;
         v_used_time  number := 0;
         v_new_avg    number := 0;
-        v_new_count  pls_integer := 1;
+        v_new_count  PLS_INTEGER := 1;
         v_new_rec    t_monitor_buffer_rec;
-        v_first_idx  pls_integer;
+        v_first_idx  PLS_INTEGER;
+        v_idx        PLS_INTEGER; 
     begin
+        if is_remote(p_processId) then
+            insertMonitorRemote(p_processId, p_actionName, p_timestamp);
+            return;
+        end if;
+
         -- 0. Monitoring-Check (Log-Level Prüfung)
         if v_indexSession.EXISTS(p_processId) and 
            logLevelMonitor > g_sessionList(v_indexSession(p_processId)).log_level then
             return;
+        end if;
+        if p_timestamp is null then -- abhängig davon, ob der client den Zeitpunkt vorgibt
+            v_now := systimestamp;
+        else
+            v_now := p_timestamp;
         end if;
     
         -- 1. Durchschnittsberechnungen (Cache-Logik)
@@ -1068,10 +1157,22 @@ create or replace PACKAGE BODY LILA AS
         v_new_rec.avg_action_time := v_new_avg;
         v_new_rec.steps_done      := v_new_count;
         v_new_rec.is_flushed      := 0; -- explizit als dirty markieren
-    
+
         -- 5. In Collection einfügen
         g_monitor_groups(v_key).EXTEND;
         g_monitor_groups(v_key)(g_monitor_groups(v_key).LAST) := v_new_rec;
+        
+        if v_indexSession.EXISTS(p_processId) then
+            v_idx := v_indexSession(p_processId);
+            
+            -- Counter erhöhen
+            g_sessionList(v_idx).monitor_dirty_count := nvl(g_sessionList(v_idx).monitor_dirty_count, 0) + 1;
+            
+            -- In die Queue eintragen (p_processId als Index reicht aus)
+            -- Falls g_dirty_queue als TABLE OF BOOLEAN definiert ist, nimm := TRUE;
+            -- Falls sie TABLE OF NUMBER ist, nimm := p_processId;
+            g_dirty_queue(p_processId) := TRUE; 
+        end if;
                 
         -- 6. Validierung und automatische Synchronisation
         validateDurationInAverage(p_processId, v_new_rec);
@@ -1155,10 +1256,10 @@ create or replace PACKAGE BODY LILA AS
     --------------------------------------------------------------------------
     -- Monitoring a step
     --------------------------------------------------------------------------
-    PROCEDURE MARK_STEP(p_processId NUMBER, p_actionName VARCHAR2)
+    PROCEDURE MARK_STEP(p_processId NUMBER, p_actionName VARCHAR2, p_timestamp timestamp default NULL)
     as
     begin
-        insertMonitor (p_processId, p_actionName);     
+        insertMonitor (p_processId, p_actionName, p_timestamp);     
     end;
 
     --------------------------------------------------------------------------
@@ -1535,7 +1636,7 @@ create or replace PACKAGE BODY LILA AS
         else
             l_serverMsg := extractFromJsonStr(l_response, 'payload.server_message');
         end if;
-            dbms_output.put_line('close_sessionRemote: ' || l_serverMsg);
+        dbms_output.put_line('close_sessionRemote: ' || l_serverMsg);
         
                 
     EXCEPTION
@@ -1909,11 +2010,7 @@ create or replace PACKAGE BODY LILA AS
                 g_sessionList.delete(v_indexSession(p_processId));
                 v_indexSession.delete(p_processId); -- Auch den Index-Eintrag entfernen!
                 
-    dbms_output.enable();
-    dbms_output.put_line('Anzahl Processe im Cache vor Löschen: ' || g_process_cache.count);
-    dbms_output.put_line('Löschen g_process_cache für ' || p_processId);
                 g_process_cache.delete(p_processId);
-    dbms_output.put_line('Anzahl Processe im Cache nach Löschen: ' || g_process_cache.count);
 --            end if;
         end if;
     end;
@@ -2022,6 +2119,16 @@ create or replace PACKAGE BODY LILA AS
     exception 
         when others then return null; -- Oder Fehlerbehandlung
     end;
+    
+    --------------------------------------------------------------------------
+    
+    function extractFromJsonTime(p_json_doc varchar2, jsonPath varchar2) return TIMESTAMP
+    as
+    begin
+        return JSON_VALUE(p_json_doc, '$.' || jsonPath returning TIMESTAMP);
+    exception 
+        when others then return null; -- Oder Fehlerbehandlung
+    end;
    
 	--------------------------------------------------------------------------
     
@@ -2039,6 +2146,23 @@ create or replace PACKAGE BODY LILA AS
         return JSON_VALUE(p_json_doc, '$.header.request');
     end;
     
+	--------------------------------------------------------------------------
+    
+    procedure doRemote_markStep(p_message varchar2)
+    as
+        l_processId number;
+        l_actionName varchar2(100);
+        l_timestamp timestamp;
+        l_payload varchar2(1600);
+    begin
+        l_payload := JSON_QUERY(p_message, '$.payload');
+        l_processId := extractFromJsonNum(l_payload, 'process_id');
+        l_actionName := extractFromJsonStr(l_payload, 'action_name');
+        l_timestamp := extractFromJsonTime(l_payload, 'timestamp');
+        
+        insertMonitor(l_processId, l_actionName, l_timestamp);
+    end;
+
 	--------------------------------------------------------------------------
         
     procedure doRemote_logAny(p_message varchar2)
@@ -2200,6 +2324,7 @@ create or replace PACKAGE BODY LILA AS
         -- 2. Monitore zählen
         v_key := g_monitor_groups.FIRST;
         WHILE v_key IS NOT NULL LOOP
+    DBMS_OUTPUT.PUT_LINE('Gefundener Key im Speicher: "' || v_key || '"');
             v_mon_total := v_mon_total + g_monitor_groups(v_key).COUNT;
             v_key := g_monitor_groups.NEXT(v_key);
         END LOOP;
@@ -2255,14 +2380,14 @@ create or replace PACKAGE BODY LILA AS
         l_clientChannel  varchar2(30);
         l_message       VARCHAR2(32767);
         l_status    PLS_INTEGER;
-        l_timeout   NUMBER := 1; -- Timeout nach Sekunden Warten auf Nachricht
+        l_timeout   NUMBER := 1.5; -- Timeout nach Sekunden Warten auf Nachricht
         l_request   VARCHAR2(100);
         l_json_doc  VARCHAR2(2000);        
         l_dummyRes PLS_INTEGER;
         l_shutdownSignal BOOLEAN := FALSE;
         l_stop_server_exception EXCEPTION;
     begin
-        g_serverProcessId := new_session('LILA_REMOTE_SERVER', logLevelWarn);
+        g_serverProcessId := new_session('LILA_REMOTE_SERVER', logLevelMonitor);
         -- Pipe erstellen (Public oder Private, Kapazität hier 1MB für High-Load)
         g_remote_sessions.DELETE;
         DBMS_PIPE.RESET_BUFFER;
@@ -2295,6 +2420,9 @@ create or replace PACKAGE BODY LILA AS
 
                     WHEN 'LOG_ANY' then
                         doRemote_logAny(l_message);
+                        
+                    WHEN 'MARK_STEP' then
+                        doRemote_markStep(l_message);
 
                     ELSE 
                         -- Unbekanntes Tag loggen
@@ -2325,7 +2453,7 @@ create or replace PACKAGE BODY LILA AS
         DBMS_OUTPUT.ENABLE();
         
         -- es könnten noch dirty buffered Einträge existieren
-        sync_all_dirty(true);
+        sync_all_dirty(true, true);
         DBMS_PIPE.PURGE(g_pipeName); 
         g_remote_sessions.DELETE;
 
