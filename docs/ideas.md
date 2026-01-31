@@ -68,3 +68,41 @@ IF l_lock_result != 0 THEN
 END IF;
 ```
 
+## Mehrere parallele LILA-Server
+Ist es ein sinnvolles und in der Praxis gefordertes Szenario, dass mehrere LILA-Server gleichzeitig laufen?
+Ich habe überlegt, dass man im START_SERVER Aufruf einen Namen des Servers mitgibt. Das wäre gleichzeitig die Pipe oder ein Teil davon, auf den der Server lauscht.
+Optional könnte im Aufruf NEW_SESSION der Parameter dieses Namens mitgegeben werden und der Name als Teil von t_session_rec hinterlegt werden.
+Bei jedem Client-Aufruf der API könnte so überprüft werden, ob der Parameter gesetzt ist und wenn ja, würde die Kommunikation mit dem gewünschten Server erfolgen.
+
+### Enterprise-Readiness
+#### Workload-Isolation
+Du kannst einen Server für "High-Volume Traffic" (z. B. ETL-Prozesse) und einen zweiten für "Business-Critical Logs" (z. B. Finanz-Transaktionen) reservieren. Ein "voller" ETL-Server würde dann nicht die kritischen Logs blockieren.
+#### Mandantenfähigkeit
+Unterschiedliche Applikationen im selben DB-Schema können ihre eigenen Logging-Instanzen steuern, ohne sich gegenseitig in die Pipe-Quere zu kommen.
+#### Horizontal Skalierung
+Wenn eine Instanz trotz FORALL am I/O-Limit klebt, können zwei Server auf unterschiedlichen Pipes parallel in die Tabelle schreiben.
+
+Das ist ein absolut realistischer Business-Case, auch wenn er sich erst in größeren Umgebungen voll entfaltet. In der Praxis begegnen dir drei Szenarien, in denen du für diese
+#### Skalierbarkeit
+##### Dienstgüte (SLA)
+Ein riesiger Datenimport schreibt 10 Millionen Logs und "verstopft" die Pipe. Gleichzeitig läuft ein wichtiger Web-Service-Call, der nur 5 Logs schreibt, diese aber sofort im Monitor sehen muss. Ohne Trennung müsste der Web-Service warten, bis der Import-Server die 16 MB abgearbeitet hat.
+##### Applikations-Silos
+In großen Firmen nutzen oft verschiedene Teams dieselbe Datenbank. Team A möchte seine Logs nach 7 Tagen löschen, Team B braucht sie für Compliance 10 Jahre. Mit zwei Server-Instanzen (und unterschiedlichen Zieltabellen oder Flags) lässt sich das ohne Code-Änderung steuern.
+##### Debug-Isolierung
+Du kannst einen speziellen "Trace-Server" starten, der nur für eine einzige Session im DEBUG-Modus läuft, während der Haupt-Server für alle anderen weiterhin nur WARN/ERROR verarbeitet. Das schont die Performance der Gesamtanwendung.
+
+### Einordnung der Begriffe für LILA und im IT-Business-Kontext
+#### Workload-Isolation (Betriebssicherheit)
+Das fällt unter Verfügbarkeit (Availability) und Stabilität.
+Ziel: Verhindern, dass ein "Nachbar" das System lahmlegt.
+Beispiel: Ein fehlerhafter Batch-Job flutet die Pipe mit Millionen von Logs. Durch die Isolation auf einen eigenen Server bleibt der Logging-Kanal für die Online-User (Webshop) frei. Ein Problem in Bereich A darf Bereich B nicht beeinflussen.
+#### Mandantenfähigkeit (Multi-Tenancy)
+Das fällt unter Datenhaltung (Data Segregation) und Sicherheit.
+Ziel: Strikte Trennung von Daten und Konfiguration zwischen verschiedenen Kunden oder Abteilungen.
+Beispiel: Server "KUNDE_A" schreibt in Schema_A, Server "KUNDE_B" in Schema_B. Keiner sieht die Logs des anderen. In der Cloud oder bei Shared-Database-Modellen ist das die Grundvoraussetzung, um rechtliche Vorgaben (DSGVO/Compliance) einzuhalten.
+#### Horizontale Skalierung (Scale-Out)
+Das fällt unter Durchsatz (Performance).
+Ziel: Die Leistung durch Hinzufügen weiterer Einheiten erhöhen, anstatt eine einzelne Einheit immer größer zu machen (Vertical Scaling / Up).
+Beispiel: Ein einzelner LILA-Server schafft 10.000 Logs/s, weil die CPU eines Prozesses am Limit ist. Du startest drei LILA-Server parallel, verteilst die Last und schaffst plötzlich 30.000 Logs/s.
+
+
