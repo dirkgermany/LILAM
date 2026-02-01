@@ -19,6 +19,10 @@ LILA_VERSION constant varchar2(20) := 'v1.3.0';
     NUM_ACK_OK       CONSTANT PLS_INTEGER  := 1000;
     TXT_ACK_SHUTDOWN CONSTANT VARCHAR2(30) := 'SERVER_ACK_SHUTDOWN';
     NUM_ACK_SHUTDOWN CONSTANT PLS_INTEGER  := 1001;
+    TXT_PING_ECHO    CONSTANT VARCHAR2(30) := 'PING_ECHO';
+    NUM_PING_ECHO CONSTANT PLS_INTEGER  := 100;
+    TXT_SERVER_INFO    CONSTANT VARCHAR2(30) := 'SERVER_INFO';
+    NUM_SERVER_INFO CONSTANT PLS_INTEGER  := 101;
     
     -- ================================
     -- Record representing process data
@@ -89,7 +93,7 @@ LILA_VERSION constant varchar2(20) := 'v1.3.0';
     -------------
     -- Monitoring
     -------------
-    PROCEDURE MARK_STEP(p_processId NUMBER, p_actionName VARCHAR2);
+    PROCEDURE MARK_STEP(p_processId NUMBER, p_actionName VARCHAR2, p_timestamp TIMESTAMP DEFAULT NULL);
     FUNCTION GET_METRIC_AVG_DURATION(p_processId NUMBER, p_actionName VARCHAR2) return NUMBER;
     FUNCTION GET_METRIC_STEPS(p_processId NUMBER, p_actionName VARCHAR2) return NUMBER;
     
@@ -97,8 +101,16 @@ LILA_VERSION constant varchar2(20) := 'v1.3.0';
     PROCEDURE START_SERVER;
     FUNCTION SERVER_NEW_SESSION(p_payload varchar2) RETURN NUMBER;
 
-    procedure SERVER_SEND_ANY_MSG(p_message varchar2);
-    procedure SERVER_SHUTDOWN(p_message varchar2);
+    procedure SERVER_SEND_ANY_MSG(p_processId number, p_message varchar2);
+    procedure SERVER_SHUTDOWN(p_pipeName varchar2, p_message varchar2);
+    procedure SHUTDOWN_ALL_SERVERS;
+
+    
+    -- Schwellenwerte für den Schutz der SGA (besonders 23ai Free)
+    C_THROTTLE_LIMIT    CONSTANT PLS_INTEGER := 10000; -- Max Logs pro Intervall
+    C_THROTTLE_INTERVAL CONSTANT NUMBER      := 1000;   -- Mindestzeit in Millis für Limit
+    C_THROTTLE_SLEEP    CONSTANT NUMBER      := 1.0;   -- Dauer der Atempause
+
 
 
     ----------
