@@ -378,7 +378,7 @@ create or replace PACKAGE BODY LILA AS
                 if get_ms_diff(g_local_throttle_cache(p_processId).last_check, l_now) < C_THROTTLE_INTERVAL THEN
                     -- Erzwinge Synchronisation (Warten auf Server-Antwort)
                     -- Das verschafft dem Remote-Server die nötige "Atempause"
-                    dbms_session.sleep(C_THROTTLE_SLEEP);
+--                    dbms_session.sleep(C_THROTTLE_SLEEP);
                     send_sync_signal(p_processId);
                 end if ;
         
