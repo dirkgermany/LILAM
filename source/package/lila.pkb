@@ -1,4 +1,42 @@
     create or replace PACKAGE BODY LILA AS
+
+        ---------------------------------------------------------------
+        -- Tuning Parameter for development
+        ---------------------------------------------------------------
+        
+        -- Dedicated to SERVER_LOOP
+        C_SEVER_MAX_SYNC_INTERVAL       CONSTANT PLS_INTEGER := 500;
+        C_SERVER_HEARTBEAT_INTERVAL     CONSTANT PLS_INTEGER := 60000;
+        C_SERVER_MAX_LOOPS_IN_TIME      CONSTANT PLS_INTEGER := 10000;
+        C_SERVER_TIMEOUT_WAIT_FOR_MSG   CONSTANT NUMBER      := 0.2; -- Timeout nach Sekunden Warten auf Nachricht
+        C_MAX_SERVER_PIPE_SIZE          CONSTANT PLS_INTEGER := 16777216; --  16777216, 67108864 
+
+        -- Dedicated to Client
+        C_THROTTLE_LIMIT                CONSTANT PLS_INTEGER := 1000; -- Max logs until unfreeze handshake (depends to C_THROTTLE_INTERVAL)
+        C_THROTTLE_INTERVAL             CONSTANT PLS_INTEGER := 1000; -- Max logs within this interval
+        
+        -- general Flush Time-Duration
+        C_FLUSH_MILLIS_THRESHOLD        PLS_INTEGER          := 1500;  -- Max. Millis until flush
+        C_FLUSH_LOG_THRESHOLD           PLS_INTEGER          := 50000; -- Max. number of dirty buffered logs until flush
+        C_FLUSH_MONITOR_THRESHOLD       PLS_INTEGER          := 20000; -- Max. number of dirty buffered metrics until flush
+        
+        ---------------------------------------------------------------
+        -- Placeholders for tables
+        ---------------------------------------------------------------
+        C_PARAM_MASTER_TABLE              CONSTANT varchar2(20) := 'PH_MASTER_TABLE';
+        C_PARAM_DETAIL_TABLE              CONSTANT varchar2(20) := 'PH_DETAIL_TABLE';
+        C_SUFFIX_DETAIL_NAME              CONSTANT varchar2(16) := '_DETAIL';
+        C_LILA_SERVER_REGISTRY            CONSTANT VARCHAR2(20) := 'LILA_SERVER_REGISTRY';
+      
+        ---------------------------------------------------------------
+        -- Other general Parameters
+        ---------------------------------------------------------------
+        C_TIMEOUT_NEW_SESSION           CONSTANT NUMBER      := 3.0;  -- NEW_SESSION max. time waiting for server response
+        C_METRIC_ALERT_FACTOR           CONSTANT NUMBER      := 2.0;   -- Max. Ausreißer in der Dauer eines Verarbeitungsschrittes
+        
+        -- Pipe handling
+        C_PIPE_ID_PENDING               CONSTANT BINARY_INTEGER := -1; 
+        C_INTERLEAVE_PIPE_SUFFIX        CONSTANT VARCHAR2(20)   := '_INTERLEAVE';
             
         ---------------------------------------------------------------
         -- Sessions
@@ -9,8 +47,6 @@
             process_id          NUMBER(19,0),
             serial_no           PLS_INTEGER := 0,
             log_level           PLS_INTEGER := 0,
---            steps_todo          PLS_INTEGER := 0,
---            steps_done          PLS_INTEGER := 0,
             monitoring          PLS_INTEGER := 0,
             last_monitor_flush  TIMESTAMP, -- Zeitpunkt des letzten Monitor-Flushes
             last_log_flush      TIMESTAMP, -- Zeitpunkt des letzten Log-Flushes
@@ -98,7 +134,6 @@
         -- Tabelle der Clients und von ihnen verwendeter Pipes
         TYPE t_client_pipe IS TABLE OF VARCHAR2(128) INDEX BY BINARY_INTEGER;
         g_client_pipes t_client_pipe;
-        C_PIPE_ID_PENDING CONSTANT BINARY_INTEGER := -1; 
     
         ---------------------------------------------------------------
         -- General Variables
@@ -106,25 +141,7 @@
     
         -- ALERT Registration
         g_isAlertRegistered                 BOOLEAN                 := false;
-        C_LILA_ALERT_FLUSH_CFG              CONSTANT varchar2(25)   := 'LILA_ALERT_FLUSH_CFG';
-        C_LILA_ALERT_READ_CFG               CONSTANT varchar2(25)   := 'LILA_ALERT_READ_CFG';
-        
-        -- general Flush Time-Duration
-        C_FLUSH_MILLIS_THRESHOLD            PLS_INTEGER             := 1500;  -- Max. Millisekunden bis zum Flush
-        C_FLUSH_LOG_THRESHOLD               PLS_INTEGER             := 50000; -- Max. Anzahl Logs bis zum Flush
-        C_FLUSH_MONITOR_THRESHOLD           PLS_INTEGER             := 20000;  -- Max. Anzahl Monitoreinträge für das Flush
-        C_MONITOR_ALERT_THRESHOLD_FACTOR    NUMBER                  := 3.0;   -- Max. Ausreißer in der Dauer eines Verarbeitungsschrittes
-      
-        -- Throttling for SIGNALs
-        C_TIMEOUT_DISC_CLI                  CONSTANT NUMBER         := 1.5;   -- Client-Discovery (schnell)
-        C_TIMEOUT_DISC_SRV                  CONSTANT NUMBER         := 4.0;   -- Server-Startup (sicher)
-        C_TIMEOUT_HANDSHAKE                 CONSTANT NUMBER         := 3.0;  -- NEW_SESSION/Sync (geduldig)
-        C_RETRIES_HANDSHAKE                 CONSTANT PLS_INTEGER    := 3;     -- Anzahl Versuche für PING
-        C_TIMEOUT_SRV_LOOP                  CONSTANT NUMBER         := 1.5;   -- Server-Loop (Housekeeping-Intervall)
-        C_TIMEOUT_DRAIN                     CONSTANT NUMBER         := 0.1;   -- Graceful Shutdown (Nachlaufzeit)
-    
-        C_INTERLEAVE_PIPE_SUFFIX            CONSTANT VARCHAR2(20)   := '_INTERLEAVE';
-        
+            
         TYPE code_map_t IS TABLE OF PLS_INTEGER INDEX BY VARCHAR2(30);
         g_response_codes code_map_t;
         
@@ -136,12 +153,6 @@
         g_msg_counter                       PLS_INTEGER             := 0;
         g_last_check_time                   TIMESTAMP               := SYSTIMESTAMP;
         
-        ---------------------------------------------------------------
-        -- Placeholders for tables
-        ---------------------------------------------------------------
-        PARAM_MASTER_TABLE                  constant varchar2(20)   := 'PH_MASTER_TABLE';
-        PARAM_DETAIL_TABLE                  constant varchar2(20)   := 'PH_DETAIL_TABLE';
-        SUFFIX_DETAIL_NAME                  constant varchar2(16)   := '_DETAIL';
         
         ---------------------------------------------------------------
         -- Functions and Procedures
@@ -308,7 +319,7 @@
             l_counter PLS_INTEGER;
             l_sqlStmt varchar2(200);
         begin
-            l_sqlStmt := 'SELECT count(*) FROM lila_server_registry WHERE is_active = 1 and pipe_name = :1';
+            l_sqlStmt := 'SELECT count(*) FROM ' || C_LILA_SERVER_REGISTRY || ' WHERE is_active = 1 and pipe_name = :1';
             execute immediate l_sqlStmt into l_counter using p_pipeName;
             if l_counter >= 1 then return TRUE; end if;
             if l_counter = 0  then return FALSE; end if;
@@ -326,7 +337,7 @@
             
             l_sqlStmt := '
             SELECT pipe_name 
-            FROM LILA_SERVER_REGISTRY 
+            FROM ' || C_LILA_SERVER_REGISTRY || ' 
             WHERE is_active = 1 
               AND last_activity > SYSTIMESTAMP - INTERVAL ''5'' SECOND 
             ORDER BY current_load ASC, last_activity DESC 
@@ -378,7 +389,6 @@
                     if get_ms_diff(g_local_throttle_cache(p_processId).last_check, l_now) < C_THROTTLE_INTERVAL THEN
                         -- Erzwinge Synchronisation (Warten auf Server-Antwort)
                         -- Das verschafft dem Remote-Server die nötige "Atempause"
-    --                    dbms_session.sleep(C_THROTTLE_SLEEP);
                         send_sync_signal(p_processId);
                     end if ;
             
@@ -497,7 +507,7 @@
         function replaceNameDetailTable(p_sqlStatement varchar2, p_placeHolder varchar2, p_tableName varchar2) return varchar2
         as
         begin
-            return replace(p_sqlStatement, p_placeHolder, p_tableName || SUFFIX_DETAIL_NAME);
+            return replace(p_sqlStatement, p_placeHolder, p_tableName || C_SUFFIX_DETAIL_NAME);
         end;
         
         --------------------------------------------------------------------------
@@ -537,11 +547,11 @@
                     info varchar2(2000),
                     tabNameMaster varchar2(100)
                 )';
-                sqlStmt := replaceNameMasterTable(sqlStmt, PARAM_MASTER_TABLE, p_TabNameMaster);
+                sqlStmt := replaceNameMasterTable(sqlStmt, C_PARAM_MASTER_TABLE, p_TabNameMaster);
                 run_sql(sqlStmt);
             end if ;
     
-            if not objectExists(p_TabNameMaster || SUFFIX_DETAIL_NAME, 'TABLE') then
+            if not objectExists(p_TabNameMaster || C_SUFFIX_DETAIL_NAME, 'TABLE') then
                 -- Details table
                 sqlStmt := '
                 create table PH_DETAIL_TABLE (
@@ -561,13 +571,13 @@
                     "MON_AVG_MILLIS"    NUMBER(19,0),
                     "MON_STEPS_DONE"    NUMBER(19,0)
                 )';
-                sqlStmt := replaceNameDetailTable(sqlStmt, PARAM_DETAIL_TABLE, p_TabNameMaster);
+                sqlStmt := replaceNameDetailTable(sqlStmt, C_PARAM_DETAIL_TABLE, p_TabNameMaster);
                 run_sql(sqlStmt);
             end if ;
     
             if not objectExists('LILA_PIPE_REGISTRY', 'TABLE') then
                 sqlStmt := '
-                CREATE TABLE lila_server_registry (
+                CREATE TABLE ' || C_LILA_SERVER_REGISTRY || ' (
                     pipe_name      VARCHAR2(30) PRIMARY KEY,
                     last_activity  TIMESTAMP,
                     current_load   NUMBER,
@@ -580,7 +590,7 @@
                 sqlStmt := '
                 CREATE INDEX idx_lila_main_id
                 ON PH_MASTER_TABLE (id)';
-                sqlStmt := replaceNameMasterTable(sqlStmt, PARAM_MASTER_TABLE, p_TabNameMaster);
+                sqlStmt := replaceNameMasterTable(sqlStmt, C_PARAM_MASTER_TABLE, p_TabNameMaster);
                 run_sql(sqlStmt);
             end if ;
     
@@ -588,7 +598,7 @@
                 sqlStmt := '
                 CREATE INDEX idx_lila_detail_master
                 ON PH_DETAIL_TABLE (process_id)';
-                sqlStmt := replaceNameDetailTable(sqlStmt, PARAM_DETAIL_TABLE, p_TabNameMaster);
+                sqlStmt := replaceNameDetailTable(sqlStmt, C_PARAM_DETAIL_TABLE, p_TabNameMaster);
                 run_sql(sqlStmt);
             end if ;
     
@@ -596,7 +606,7 @@
                 sqlStmt := '
                 CREATE INDEX idx_lila_detail_info
                 ON PH_DETAIL_TABLE (info)';
-                sqlStmt := replaceNameDetailTable(sqlStmt, PARAM_DETAIL_TABLE, p_TabNameMaster);
+                sqlStmt := replaceNameDetailTable(sqlStmt, C_PARAM_DETAIL_TABLE, p_TabNameMaster);
                 run_sql(sqlStmt);
             end if ;
     
@@ -604,7 +614,7 @@
                 sqlStmt := '
                 CREATE INDEX idx_lila_cleanup 
                 ON PH_MASTER_TABLE (process_name, process_end)';
-                sqlStmt := replaceNameMasterTable(sqlStmt, PARAM_MASTER_TABLE, p_TabNameMaster);
+                sqlStmt := replaceNameMasterTable(sqlStmt, C_PARAM_MASTER_TABLE, p_TabNameMaster);
                 run_sql(sqlStmt);
             end if ;
     
@@ -640,7 +650,7 @@
                 return; 
             end if ;
             
-            sqlStatement := replaceNameMasterTable(sqlStatement, PARAM_MASTER_TABLE, sessionRec.tabName_master);
+            sqlStatement := replaceNameMasterTable(sqlStatement, C_PARAM_MASTER_TABLE, sessionRec.tabName_master);
     
             -- for all process IDs
             open t_rc for sqlStatement using p_daysToKeep, p_processName;
@@ -650,12 +660,12 @@
                 
                 -- delete Details first (integrity)
                 sqlStatement := 'delete from PH_DETAIL_TABLE where process_id = :1';
-                sqlStatement := replaceNameDetailTable(sqlStatement, PARAM_DETAIL_TABLE, sessionRec.tabName_master);
+                sqlStatement := replaceNameDetailTable(sqlStatement, C_PARAM_DETAIL_TABLE, sessionRec.tabName_master);
                 execute immediate sqlStatement USING processIdToDelete;
         
                 -- delete master
                 sqlStatement := 'delete from PH_MASTER_TABLE where id = :1';
-                sqlStatement := replaceNameMasterTable(sqlStatement, PARAM_MASTER_TABLE, sessionRec.tabName_master);
+                sqlStatement := replaceNameMasterTable(sqlStatement, C_PARAM_MASTER_TABLE, sessionRec.tabName_master);
                 execute immediate sqlStatement USING processIdToDelete;
             end loop;
             close t_rc;
@@ -710,7 +720,7 @@
             
             sessionRec := getSessionRecord(p_processId);
             if sessionRec.process_id is not null then
-                sqlStatement := replaceNameMasterTable(sqlStatement, PARAM_MASTER_TABLE, sessionRec.tabName_master);
+                sqlStatement := replaceNameMasterTable(sqlStatement, C_PARAM_MASTER_TABLE, sessionRec.tabName_master);
                 execute immediate sqlStatement into processRec USING p_processId;
             end if ;
             return processRec;
@@ -785,7 +795,7 @@
             end if ;
             -- 2. Ziel-Tabelle aus der Session-Liste ermitteln
             v_idx_session := v_indexSession(p_processId);
-            v_targetTable := g_sessionList(v_idx_session).tabName_master || SUFFIX_DETAIL_NAME;
+            v_targetTable := g_sessionList(v_idx_session).tabName_master || C_SUFFIX_DETAIL_NAME;
         
             -- 3. Daten aus der hierarchischen Map in flache Listen sammeln
             for i in 1 .. g_log_groups(v_key).COUNT loop
@@ -999,7 +1009,7 @@
             v_times       sys.odcidatelist     := sys.odcidatelist();
         begin
             v_idx_session := v_indexSession(p_processId);
-            v_targetTable := g_sessionList(v_idx_session).tabName_master || SUFFIX_DETAIL_NAME;
+            v_targetTable := g_sessionList(v_idx_session).tabName_master || C_SUFFIX_DETAIL_NAME;
         
             v_group_key := g_monitor_groups.FIRST;
             while v_group_key is not null loop     
@@ -1151,7 +1161,7 @@
         begin
             if p_monitor_rec.mon_steps_done > 5 THEN 
                 
-                l_threshold_duration := p_monitor_rec.avg_action_time * C_MONITOR_ALERT_THRESHOLD_FACTOR;
+                l_threshold_duration := p_monitor_rec.avg_action_time * C_METRIC_ALERT_FACTOR;
             
                 if p_monitor_rec.used_time > l_threshold_duration THEN
                     -- Hier wird die Alert-Aktion ausgelöst
@@ -1451,7 +1461,7 @@
                 info        = :PH_INFO
             where id = :PH_PROCESS_ID';  
     
-            sqlStatement := replaceNameMasterTable(sqlStatement, PARAM_MASTER_TABLE, p_process_rec.tabNameMaster);        
+            sqlStatement := replaceNameMasterTable(sqlStatement, C_PARAM_MASTER_TABLE, p_process_rec.tabNameMaster);        
             execute immediate sqlStatement
             USING   p_process_rec.status, 
                     p_process_rec.process_end,
@@ -1499,7 +1509,7 @@
             end if ;     
             
             sqlStatement := sqlStatement || ' where id = :PH_PROCESS_ID'; 
-            sqlStatement := replaceNameMasterTable(sqlStatement, PARAM_MASTER_TABLE, p_tableName);
+            sqlStatement := replaceNameMasterTable(sqlStatement, C_PARAM_MASTER_TABLE, p_tableName);
             
             -- due to the variable number of parameters using dbms_sql
             sqlCursor := DBMS_SQL.OPEN_CURSOR;
@@ -1570,7 +1580,7 @@
                 ''START'',
                 :PH_TABNAME_MASTER
             )';
-            sqlStatement := replaceNameMasterTable(sqlStatement, PARAM_MASTER_TABLE, p_TabNameMaster);
+            sqlStatement := replaceNameMasterTable(sqlStatement, C_PARAM_MASTER_TABLE, p_TabNameMaster);
             execute immediate sqlStatement USING p_processId, p_processName, p_procStepsToDo, p_logLevel, upper(p_tabNameMaster);     
             commit;
         exception
@@ -1910,14 +1920,10 @@
         begin
         
             if is_remote(p_processId) then
-dbms_output.enable();
-dbms_output.put_line('setAnyStatus is_remote: ' || p_processInfo);
                 setAnyStatusRemote(p_processId, p_status, p_processInfo, p_procStepsToDo, p_procStepsDone);
                 return;
             end if ;
             
-dbms_output.enable();
-dbms_output.put_line('setAnyStaut not_remote: ' || p_processInfo);
            if v_indexSession.EXISTS(p_processId) then
                 if p_status      is not null then g_process_cache(p_processId).status := p_status;        end if ;
                 if p_processInfo is not null then g_process_cache(p_processId).info := p_processInfo;     end if ;
@@ -1983,7 +1989,6 @@ dbms_output.put_line('setAnyStaut not_remote: ' || p_processInfo);
             end if ;
 
            if v_indexSession.EXISTS(p_processId) then
-dbms_output.put_line('STEP_DONE proc_steps_done: ' ||  g_process_cache(p_processId).proc_steps_done);
                 l_steps := nvl(g_process_cache(p_processId).proc_steps_done, 0) +1;                
                 setAnyStatus(p_processId, null, null, null, l_steps);   
             end if;
@@ -2354,9 +2359,6 @@ info(p_processId, 'persist_close_session');
         begin
             return JSON_VALUE(p_json_doc, '$.header.request');
         end;
-
-        --------------------------------------------------------------------------
-
         
         --------------------------------------------------------------------------
         
@@ -2393,9 +2395,6 @@ info(p_processId, 'persist_close_session');
             l_stepsToDo := extractFromJsonNum(l_payload, 'proc_steps_todo');
             l_procStepsDone := extractFromJsonNum(l_payload, 'proc_steps_done');
             
-dbms_output.enable();
-dbms_output.put_line(p_message);
-dbms_output.put_line('+++++++++++++++++++++++++++++++++++++++ ' || l_processInfo);
             setAnyStatus(l_processId, l_status, l_processInfo, l_stepsToDo, l_procStepsDone);
         end;
         --------------------------------------------------------------------------
@@ -2626,7 +2625,7 @@ dbms_output.put_line('+++++++++++++++++++++++++++++++++++++++ ' || l_processInfo
             jasonObj    JSON_OBJECT_T := JSON_OBJECT_T();
         begin
             -- zunächst mal schauen, welche Server bereitstehen
-            l_response := waitForResponse(null, 'NEW_SESSION', p_payload, C_TIMEOUT_HANDSHAKE);
+            l_response := waitForResponse(null, 'NEW_SESSION', p_payload, C_TIMEOUT_NEW_SESSION);
             
             CASE
                 WHEN l_response = 'TIMEOUT' THEN
@@ -2796,11 +2795,11 @@ dbms_output.put_line('+++++++++++++++++++++++++++++++++++++++ ' || l_processInfo
         begin
             -- alten Eintrag erstmal raus
             sqlStmt := '
-            delete from lila_server_registry where pipe_name = :1';
+            delete from ' || C_LILA_SERVER_REGISTRY || ' where pipe_name = :1';
             execute immediate sqlStmt using g_serverPipeName;
             
             sqlStmt := '
-            insert into lila_server_registry (
+            insert into ' || C_LILA_SERVER_REGISTRY || ' (
                 pipe_name,
                 last_activity,
                 is_active,
@@ -2834,7 +2833,7 @@ dbms_output.put_line('+++++++++++++++++++++++++++++++++++++++ ' || l_processInfo
             end case;
             
             l_sqlStmt := '
-            UPDATE lila_server_registry 
+            UPDATE ' || C_LILA_SERVER_REGISTRY || '
             SET last_activity = SYSTIMESTAMP, 
                 is_active = :1,
                 current_load = (SELECT pipe_size FROM v$db_pipes WHERE name = :2)
@@ -2856,22 +2855,15 @@ dbms_output.put_line('+++++++++++++++++++++++++++++++++++++++ ' || l_processInfo
             l_clientChannel  varchar2(50);
             l_message       VARCHAR2(32767);
             l_status    PLS_INTEGER;
-            l_timeout   NUMBER := 0.2; -- Timeout nach Sekunden Warten auf Nachricht
             l_request   VARCHAR2(500);
             l_json_doc  VARCHAR2(2000);        
             l_dummyRes PLS_INTEGER;
             l_shutdownSignal BOOLEAN := FALSE;
-            l_stop_server_exception EXCEPTION;
-            l_maxPipeSize PLS_INTEGER := 16777216; --  16777216, 67108864 
-            
+            l_stop_server_exception EXCEPTION;            
+            l_pipe     VARCHAR2(50) := p_pipeName;
             l_lastHeartbeat TIMESTAMP := sysTimestamp;
             l_lastSync TIMESTAMP := sysTimestamp;        
-            l_syncInterval constant PLS_INTEGER := 500;
-            l_heartbeatInterval constant PLS_INTEGER := 60000;
-            l_maxLoopsInTime constant PLS_INTEGER := 1000;
             l_loopCounter PLS_INTEGER := 0;
-            
-            l_pipe     VARCHAR2(50) := p_pipeName;
         begin
             g_shutdownPassword := p_password;
             g_serverPipeName := l_pipe;
@@ -2882,7 +2874,7 @@ dbms_output.put_line('+++++++++++++++++++++++++++++++++++++++ ' || l_processInfo
             DBMS_PIPE.PURGE(g_serverPipeName);
             l_dummyRes := DBMS_PIPE.REMOVE_PIPE(g_serverPipeName);
             l_dummyRes := DBMS_PIPE.REMOVE_PIPE(g_serverPipeName || C_INTERLEAVE_PIPE_SUFFIX);
-            l_dummyRes := DBMS_PIPE.CREATE_PIPE(pipename => g_serverPipeName, maxpipesize => l_maxPipeSize, private => false);
+            l_dummyRes := DBMS_PIPE.CREATE_PIPE(pipename => g_serverPipeName, maxpipesize => C_MAX_SERVER_PIPE_SIZE, private => false);
             l_dummyRes := DBMS_PIPE.CREATE_PIPE(pipename => g_serverPipeName || C_INTERLEAVE_PIPE_SUFFIX, maxpipesize => 1048576, private => false);
     
             LOOP
@@ -2897,7 +2889,7 @@ dbms_output.put_line('+++++++++++++++++++++++++++++++++++++++ ' || l_processInfo
                 END IF;
     
                 -- Warten auf die nächste Nachricht (Timeout in Sekunden)
-                l_status := DBMS_PIPE.RECEIVE_MESSAGE(g_serverPipeName, timeout => l_timeout);
+                l_status := DBMS_PIPE.RECEIVE_MESSAGE(g_serverPipeName, timeout => C_SERVER_TIMEOUT_WAIT_FOR_MSG);
                 if l_status = 0 THEN
                 BEGIN 
                     DBMS_PIPE.UNPACK_MESSAGE(l_message);
@@ -2955,17 +2947,17 @@ dbms_output.put_line('+++++++++++++++++++++++++++++++++++++++ ' || l_processInfo
                     END; 
                 end if;
                 
-                if l_status = 1 or l_loopCounter > l_maxLoopsInTime then
-                    if get_ms_diff(l_lastSync, sysTimestamp) >= l_syncInterval THEN
-                        SYNC_ALL_DIRTY;
+                if l_status = 1 or l_loopCounter > C_SERVER_MAX_LOOPS_IN_TIME then
+                    if get_ms_diff(l_lastSync, sysTimestamp) >= C_SEVER_MAX_SYNC_INTERVAL  THEN
+                        -- Housekeeping
+                         SYNC_ALL_DIRTY;
                         updateServerRegistry(TRUE);
                         l_lastSync := sysTimestamp;
                         l_loopCounter := 0;
                     end if;
                     -- Timeout erreicht. Passiert, wenn 10 Sekunden kein Signal kam.
-                    if get_ms_diff(l_lastHeartbeat, sysTimestamp) >= l_heartbeatInterval then
-                        -- Housekeeping
-                        INFO(g_serverProcessId, g_serverPipeName || '=> Housekeeping');
+                    if get_ms_diff(l_lastHeartbeat, sysTimestamp) >= C_SERVER_HEARTBEAT_INTERVAL then
+                        INFO(g_serverProcessId, g_serverPipeName || 'HEARTBEAT ' || g_serverPipeName);
                         l_lastHeartbeat := sysTimestamp;
                     end if ;
                 end if ;
