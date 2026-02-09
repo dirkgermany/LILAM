@@ -258,8 +258,10 @@ SELECT my_app.getStatus(1) proc_status FROM dual;
 - [ ] **Background Server Processing:** Start LILA servers as jobs to avoid blocking sessions
 - [ ] **External Metrics Integration:** Export LILA metrics to web services (e.g., via REST) to enable real-time visualization in Grafana, Prometheus, or ELK.
 - [ ] **Event-Driven Orchestration:**
-    * Trigger automated **Actions** based on defined metric thresholds or event types.
-    * Enable seamless **Process Chaining**, where the completion or state of one action triggers subsequent logic.
+    * Trigger automated **Actions** based on defined metric thresholds or event types
+    * Enable seamless **Process Chaining**, where the completion or state of one action triggers subsequent logic
+- [ ] **Smart Alerting Logic:** Refine anomaly detection to distinguish between insignificant micro-variations (e.g., millisecond jitter) and actual performance regressions using configurable noise floors
+
 
 
 ---
