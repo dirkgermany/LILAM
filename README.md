@@ -255,6 +255,12 @@ SELECT my_app.getStatus(1) proc_status FROM dual;
 - [ ] **Zombie Session Handling:** Detect inactive clients, release allocated memory, and update process statuses automatically
 - [ ] **Singleton Server Enforcement:** Prevent multiple servers from registering under the same name to ensure message integrity and avoid process contention
 - [ ] **Resilient Load Balancing:** LILA uses V$DB_PIPES for precision routing. If access is restricted, it seamlessly falls back to registry-based balancing or round-robin to ensure continuous operation.
+- [ ] **Background Server Processing:** Start LILA servers as jobs to avoid blocking sessions
+- [ ] **External Metrics Integration:** Export LILA metrics to web services (e.g., via REST) to enable real-time visualization in Grafana, Prometheus, or ELK.
+- [ ] **Event-Driven Orchestration:**
+    * Trigger automated **Actions** based on defined metric thresholds or event types.
+    * Enable seamless **Process Chaining**, where the completion or state of one action triggers subsequent logic.
+
 
 ---
 ### Support the Project 💜
