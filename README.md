@@ -116,7 +116,7 @@ Instead of performing expensive aggregations across millions of log records for 
 By avoiding file system dependencies (`UTL_FILE`) and focusing on native database features, LILA is 100% compatible with **Oracle Autonomous Database** and optimized for scalable cloud infrastructures.
 
 #### Developer Experience (DX)
-LILA promotes a standardized error-handling and monitoring culture within development teams. Its easy-to-use API allows for a "zero-config" start, enabling developers to implement professional observability in just a few minutes. No complex DBA grants or extensive infrastructure preparations are required—just deploy the package and start logging immediately.
+LILA promotes a standardized error-handling and monitoring culture within development teams. Its easy-to-use API allows for a "zero-config" start, enabling developers to implement professional observability in just a few minutes. No excessive DBA grants or infrastructure overhead required — just provide standard PL/SQL permissions, deploy the package, and start logging immediately.
 
 ---
 ## Demo
