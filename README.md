@@ -52,17 +52,24 @@ LILA is developed by a developer who hates over-engineered tools. Focus: 5 minut
 ## Advantages
 The following points complement the **Key Features** and provide a deeper insight into the architectural decisions and technical innovations of LILA.
 
-### Distributed Mode & Remote Logging
+### Direct Mode & Server Mode
 LILA-Logging introduces a high-performance Server-Client architecture using **Oracle Pipes**. This allows for asynchronous log processing and cross-session monitoring
-* **Hybrid Execution:** Run LILA locally within your session and offload processing to dedicated LILA-Servers **simultaneously**. Choose the best path for each log-level or event type in real-time
+* **Hybrid Execution:** Combine direct API calls within your session with decoupled processing via dedicated LILA servers. Choose the optimal execution path for each log level or event type in real-time
 * **Smart Load Balancing:** Clients automatically discover available servers via Round-Robin
 * **Auto-Synchronization:** Servers dynamically claim communication pipes, ensuring a zero-config setup
 * **Congestion Control (Throttling):** Optional protection layer that pauses hyperactive clients to ensure server stability during high-load peaks
 
 #### How it works
-1. **Server Side:** Start one or more LILA-Servers. They monitor pipes for incoming commands.
-2. **Client Side:** Register with `lila.sever_new_session;`LILA finds the best available server.
-3. **Execution:** Log calls are serialized into the pipe, processed remotely, and stored—minimizing the impact on the client's transaction time.
+LILA offers two execution models that can be used interchangeably:
+1. **In-Session Mode (Direct):** Initiated by `lila.new_session`. Log calls are executed immediately within your current database session. This is ideal for straightforward debugging and ensuring logs are persisted synchronously.
+2. **Decoupled Mode (Server-based):**
+   * Server Side: Start one or more LILA-Servers. These background processes monitor pipes for incoming commands.
+   * Client Side: Register via `lila.server_new_session`;. LILA automatically identifies the optimal available server.
+   * Execution: Log calls are serialized into a pipe and processed by the background server. This decouples the logging overhead from your application, minimizing the impact on the client's transaction time and performance.
+  
+> [!IMPORTANT]
+> **Unified API:** Regardless of the chosen mode, the logging API remains **identical**. You use the same `lila.log(...)` calls throughout your application.
+> The only difference is the initial setup (`lila.new_session` for In-Session vs. `lila.server_new_session` for Decoupled mode).
 
 ### Performance & Safety
 LILA prioritizes the stability of your application. It uses a Hybrid Model to balance speed and system integrity:
