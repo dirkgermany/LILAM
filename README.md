@@ -32,7 +32,7 @@ LILA is developed by a developer who hates over-engineered tools. Focus: 5 minut
 1. **Lightweight**: One Package, three Tables, one Sequence. That's it!
 2. **Concurrent Logging**: Supports multiple, simultaneous log entries from the same or different sessions without blocking
 3. **Monitoring**: You have the option to observe your applications via SQL or via the API
-4. **Hybrid Execution:**: Run LILA locally within your session or offload processing to a dedicated LILA-Server
+4. **Hybrid Execution:**: Run LILA **in-session** (direct) or offload processing to a dedicated LILA-Server (**decoupled**).
 5. **Data Integrity**: Uses autonomous transactions to guarantee log persistence regardless of the main transaction's outcome
 6. **Smart Context Capture**: Automatically records ERR_STACK,  ERR_BACKTRACE, and ERR_CALLSTACK based on log level—deep insights with zero manual effort
 7. **Optional self-cleaning**: Automatically purges expired logs per application during session start—no background jobs or schedulers required
@@ -77,10 +77,6 @@ LILA prioritizes the stability of your application. It uses a Hybrid Model to ba
 * Logs, metrics, and status updates are handled via Fire-and-Forget to minimize overhead. Zero latency for your business logic.
 * Active Throttling
 * As an optional safeguard, LILA rate-limits hyperactive clients during load peaks to prevent pipe flooding until the bottleneck is cleared.
-* Fail-Safe & Self-Healing
-* LILA monitors server response times. If a server times out, LILA automatically
-  1. Switches to the next available server (Round-Robin).
-  2. Falls back to Local Logging Mode if no server is reachable. Zero data loss.
 
 ### Technology
 #### Autonomous Persistence
@@ -108,7 +104,7 @@ LILA is more than just a logging tool. Using the `MARK_STEP` functionality, name
 * **Independent Statistics:** Monitor multiple activities (e.g., XML_PARSING, FILE_UPLOAD) simultaneously.
 * **Step Duration:** Precise execution time for a specific action's segment.
 * **Average Duration:** Historical benchmarks to detect performance degradation per action.
-* **Zero Client Overhead:** All statistical calculations and threshold checks are offloaded to the LILA-Server.
+* **Zero Client Overhead:** Calculations are processed within the session or offloaded to the server, depending on the chosen mode.
 
 #### Intelligent Metric Calculation
 Instead of performing expensive aggregations across millions of log records for every query, LILA uses an intelligent calculation mechanism. Metrics are updated incrementally, ensuring that monitoring dashboards (e.g., in Grafana, APEX, or Oracle Jet) remain highly responsive even with massive datasets.
@@ -169,7 +165,8 @@ as
   lProcessId number(19,0);
 
 begin
-  -- begin a new logging session
+  -- begin a new logging session (In-Session Mode)
+  -- use lila.server_new_session('NAME', ...) for Decoupled Mode
   -- the last parameter refers to killing log entries which are older than the given number of days
   -- if this param is NULL, no log entry will be deleted
   lProcessId := lila.new_session('my application', lila.logLevelWarn, 30);
@@ -244,6 +241,18 @@ return 'ID = ' || id || '; Status: ' || lProcessStatus || '; Info: ' || lProcess
 SELECT my_app.getStatus(1) proc_status FROM dual;
 > ID = 1; Status: OK; Info: 'just working'; Steps completed: 42
 ```
+
+---
+## Roadmap
+- [ ] **Automatic Fallback:**
+    * switch to the next available server or
+    * graceful degradation from Decoupled to In-Session moode
+- [ ] **Process Resumption:**
+    * Reconnect to aborted processes via `process_id`
+    * **Non-destructive Recovery:** Mark log entries as "superseded" after a re-entry point instead of deleting them, preserving a full audit trail of all attempts
+- [ ] **Adaptive Batching:** Dynamically adjust buffer sizes and flush intervals based on server load to ensure near real-time visibility during low traffic and maximum throughput during peaks
+- [ ] **Zombie Session Handling:** Detect inactive clients, release allocated memory, and update process statuses automatically
+- [ ] **Singleton Server Enforcement:** Prevent multiple servers from registering under the same name to ensure message integrity and avoid process contention
 
 ---
 ### Support the Project 💜
