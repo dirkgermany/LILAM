@@ -250,7 +250,7 @@ SELECT my_app.getStatus(1) proc_status FROM dual;
     * graceful degradation from Decoupled to In-Session mode
 - [ ] **Process Resumption:**
     * Reconnect to aborted processes via `process_id`
-    * **Non-destructive Recovery:** Mark log entries as "superseded" after a re-entry point instead of deleting them, preserving a full audit trail of all attempts
+- [ ] **Non-destructive Recovery:** Mark log entries as "superseded" after a re-entry point instead of deleting them, preserving a full audit trail of all attempts
 - [ ] **Adaptive Batching:** Dynamically adjust buffer sizes and flush intervals based on server load to ensure near real-time visibility during low traffic and maximum throughput during peaks
 - [ ] **Zombie Session Handling:** Detect inactive clients, release allocated memory, and update process statuses automatically
 - [ ] **Singleton Server Enforcement:** Prevent multiple servers from registering under the same name to ensure message integrity and avoid process contention
@@ -261,6 +261,9 @@ SELECT my_app.getStatus(1) proc_status FROM dual;
     * Trigger automated **Actions** based on defined metric thresholds or event types
     * Enable seamless **Process Chaining**, where the completion or state of one action triggers subsequent logic
 - [ ] **Smart Alerting Logic:** Refine anomaly detection to distinguish between insignificant micro-variations (e.g., millisecond jitter) and actual performance regressions using configurable noise floors
+- [ ] **Elastic Resource Management:**
+    * Automatically scale LILA-Server instances based on real-time pipe throughput
+    * Ensure Graceful Shutdown of redundant instances to free up CPU and SGA without data loss
 
 
 
