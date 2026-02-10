@@ -28,6 +28,7 @@ LILA is developed by a developer who hates over-engineered tools. Focus: 5 minut
   - [How to monitor](#how-to-monitor)
 - [Performance benchmark](#performance-benchmark)
 - [Roadmap](#roadmap)
+- [License](#license)
 
 
 ## Key features
