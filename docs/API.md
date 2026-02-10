@@ -41,11 +41,11 @@ Parameters for procedures and functions can be mandatory, nullable, or optional.
 | [`SERVER_NEW_SESSION`](#function-new_session) | Function  | Opens a new decoupled session | Session control
 | [`CLOSE_SESSION`](#procedure-close_session) | Procedure | Ends a log session | Session control
 
-All API calls are the same, independent of whether LILA is used 'locally' or in a 'decoupled' manner. One exception is the function `SERVER_NEW_SESSION`, which initializes the LILA package to function as a dedicated client, managing the communication with the LILA server seamlessly. The parameters and return value of `SERVER_NEW_SESSION` are identical to those of `NEW_SESSION`.
+All API calls are the same, independent of whether LILA is used 'locally' or in a 'decoupled' manner. One exception is the function `SERVER_NEW_SESSION`, which initializes the LILA package to function as a dedicated client, managing the communication with the LILA server seamlessly. **The parameters and return value of `SERVER_NEW_SESSION` are identical to those of `NEW_SESSION`.**
 
 #### Function NEW_SESSION
-The NEW_SESSION resp. SERVER_NEW_SESSION function starts the logging session for a process. This procedure must be called first. Calls to the API without a prior NEW_SESSION do not make sense or can (theoretically) lead to undefined states.
-NEW_SESSION and SERVER_NEW_SESSION are overloaded so various signatures are available.
+The `NEW_SESSION` resp. `SERVER_NEW_SESSION` function starts the logging session for a process. This procedure must be called first. Calls to the API without a prior `NEW_SESSION` do not make sense or can (theoretically) lead to undefined states.
+`NEW_SESSION` and `SERVER_NEW_SESSION` are overloaded so various signatures are available.
 
 \
 *Option 1*
