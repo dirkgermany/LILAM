@@ -1,4 +1,9 @@
-    create or replace PACKAGE BODY LILA AS
+    CREATE OR REPLACE PACKAGE BODY LILA AS
+    /*
+     * LILA-Logging
+     * Dual-licensed under GPLv3 or Commercial License.
+     * See LICENSE or LICENSE_ENTERPRISE for details.
+     */
 
         ---------------------------------------------------------------
         -- Tuning Parameter for development
