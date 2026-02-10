@@ -275,10 +275,10 @@ LILA is designed for high-concurrency environments. The following results were a
 - [ ] **Resilient Load Balancing:** LILA uses V$DB_PIPES for precision routing. If access is restricted, it seamlessly falls back to registry-based balancing or round-robin to ensure continuous operation.
 - [ ] **Background Server Processing:** Start LILA servers as jobs to avoid blocking sessions
 - [ ] **Advanced Metric Visualization:**
-    * Provide a pre-built Oracle APEX Dashboard to monitor real-time throughput and system health.
-    * Integration of Time-Series Charts to visualize metric trends and threshold violations over time.
-    * Support for Grafana via SQL-Plugin, enabling LILA to be part of a centralized enterprise monitoring stack.
-
+    * Provide a pre-built Oracle APEX Dashboard to monitor real-time throughput and system health
+    * Integration of Time-Series Charts to visualize metric trends and threshold violations over time
+    * Support for Grafana via SQL-Plugin, enabling LILA to be part of a centralized enterprise monitoring stack
+- [ ] **Dynamic Configuration]:** Change server configuration during runtime
 - [ ] **Event-Driven Orchestration:**
     * Trigger automated **Actions** based on defined metric thresholds or event types
     * Enable seamless **Process Chaining**, where the completion or state of one action triggers subsequent logic
