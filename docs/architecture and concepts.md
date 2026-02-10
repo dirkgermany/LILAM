@@ -94,3 +94,48 @@ But beware! The choice of tables and their names should be well-planned to avoid
 
 ### Registry Table
 The LILA_SERVER_REGISTRY is used for the coordination and assignment of LILA servers. Its name is fixed.
+
+## API
+The LILA API consists of approximately 35 procedures and functions, some of which are overloaded. Since static polymorphism does not change the outcome of the API calls, I am listing only the names of the procedures and functions below. The API can be divided into five groups:
+
+### Session Handling
+* **NEW_SESSION:** Starts a new session.
+* **SERVER_NEW_SESSION:** Starts a new session within a LILA server.
+* **CLOSE_SESSION:** Terminates the lifecycle of the session.
+
+### Process Control
+#### Setting Values
+* **SET_PROCESS_STATUS:** Sets information regarding the current state of the process.
+* **SET_PROC_STEPS_TODO:** Sets the (initial) value of the expected work steps for the process.
+* **SET_PROC_STEPS_DONE:** Sets the number of work steps completed (so far).
+* **PROC_STEP_DONE:** Increments the counter for completed work steps (Steps Done).
+
+#### Querying Values
+* **GET_PROC_STEPS_DONE:** Determines the total number of work steps completed for the process so far.
+* **GET_PROC_STEPS_TODO:** Returns the previously set value for expected work steps.
+* **GET_PROCESS_START:** Returns the start time of the process.
+* **GET_PROCESS_END:** Returns the end time of a process.
+* **GET_PROCESS_STATUS:** Returns a value previously set by the developer as needed.
+* **GET_PROCESS_INFO:** Provides process information; outside of LILA's control.
+* **GET_PROCESS_DATA:** Returns all process data in a specific structure.
+* **GET_PROCESS_DATA_JSON:** Returns all process data in JSON format.
+
+### Logging
+* **INFO:** Reports a message with severity 'Info'.
+* **DEBUG:** Reports a message with severity 'Debug'.
+* **WARN:** Reports a message with severity 'Warn'.
+* **ERROR:** Reports a message with severity 'Error'.
+
+### Metrics
+#### Setting Values
+* **MARK_STEP:** Documents a completed work step for an action and triggers the sum and time calculations for those actions.
+
+#### Querying Values
+* **GET_METRIC_AVG_DURATION:** Returns the average processing duration for actions with the same name within a process.
+* **GET_METRIC_STEPS:** Returns the current number of completed work steps for actions with the same name within a process.
+
+### Server Control
+* **START_SERVER:** Starts a LILA server.
+* **SERVER_SHUTDOWN:** Shuts down a LILA server.
+* **GET_SERVER_PIPE:** Returns the name of the pipe used to communicate with the server.
+
