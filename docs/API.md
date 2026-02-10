@@ -2,15 +2,6 @@
 <details>
 <summary>Content</summary>
 
-- [At First](#at-first)
-- [Overview](#overview)
-- [Log Session](#log-session)
-  - [What it is](#what-it-is)
-  - [Log Session Life Cycle](#log-session-life-cycle)
-- [Log Tables](#log-tables)
-- [Sequence](#sequence)
-- [LOG Level](#log-level)
-  - [Declaration of Log Levels](#declaration-of-log-levels)
 - [Functions and Procedures](#functions-and-procedures)
   - [Session related Functions and Procedures](#session-related-functions-and-procedures)
     - [Function NEW_SESSION](#function-new_session)
@@ -22,32 +13,16 @@
   - [Write Logs related Procedures](#write-logs-related-procedures)
     - [General Logging Procedures](#general-logging-procedures)
     - [Procedure LOG_DETAIL](#procedure-log_detail)
+  - [Appendix](#appendix)
+    - [Log Level](#log-level)
+        - [Declaration of Log Levels](#declaration-of-log-levels)
 
 </details>
 
 
-This document serves as the LILA API reference, providing a straightforward description of the programming interface. For those new to LILA, I recommend starting with the #architecture and concepts.md document, which (hopefully) provides a fundamental understanding of how LILA works. Furthermore, the demos and examples in the #demo folder demonstrate how easily the LILA API can be integrated.
+> [!TIP]
+> This document serves as the LILA API reference, providing a straightforward description of the programming interface. For those new to LILA, I recommend starting with the document ["architecture and concepts.md"](docs/architecture-and-concepts.md), which (hopefully) provides a fundamental understanding of how LILA works. Furthermore, the demos and examples in the #demo folder demonstrate how easily the LILA API can be integrated.
 
-## Log Level
-Depending on the selected log level, additional information is written to the *detail table*.
-        
-To do this, the selected log level must be >= the level implied in the logging call.
-* logLevelSilent -> No details are written to the *detail table*
-* logLevelError  -> Calls to the ERROR() procedure are taken into account
-* logLevelWarn   -> Calls to the WARN() and ERROR() procedures are taken into account
-* logLevelInfo   -> Calls to the INFO(), WARN(), and ERROR() procedures are taken into account
-* logLevelDebug  -> Calls to the DEBUG(), INFO(), WARN(), and ERROR() procedures are taken into account
-
-If you want to suppress any logging, set logLevelSilent as active log level.
-
-### Declaration of Log Levels
-```sql
-logLevelSilent  constant number := 0;
-logLevelError   constant number := 1;
-logLevelWarn    constant number := 2;
-logLevelInfo    constant number := 4;
-logLevelDebug   constant number := 8;
-```
     
 ## Functions and Procedures
 
@@ -428,4 +403,28 @@ execute lila.is_alive;
 select * from lila_log where process_name = 'LILA Life Check';
 -- check details using the process_id
 select * from lila_log_detail where process_id = <process id>;
+```
+
+## Appendix
+### Log Level
+Depending on the selected log level, additional information is written to the *detail table*.
+        
+To do this, the selected log level must be >= the level implied in the logging call.
+* logLevelSilent -> No details are written to the *detail table*
+* logLevelError  -> Calls to the ERROR() procedure are taken into account
+* logLevelWarn   -> Calls to the WARN() and ERROR() procedures are taken into account
+* logLevelInfo   -> Calls to the INFO(), WARN(), and ERROR() procedures are taken into account
+* logLevelDebug  -> Calls to the DEBUG(), INFO(), WARN(), and ERROR() procedures are taken into account
+
+If you want to suppress any logging, set logLevelSilent as active log level.
+
+#### Declaration of Log Levels
+To simplify usage and improve code readability, constants for the log levels are declared in the specification (lila.pks).
+
+```sql
+logLevelSilent  constant number := 0;
+logLevelError   constant number := 1;
+logLevelWarn    constant number := 2;
+logLevelInfo    constant number := 4;
+logLevelDebug   constant number := 8;
 ```
