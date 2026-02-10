@@ -26,6 +26,7 @@ LILA is developed by a developer who hates over-engineered tools. Focus: 5 minut
   - [How to log](#how-to-log)
 - [Monitoring](#monitoring)
   - [How to monitor](#how-to-monitor)
+- [Performance benchmark](#performance benchmark (real-world test))
 - [Roadmap](#roadmap)
 
 
@@ -244,7 +245,6 @@ SELECT my_app.getStatus(1) proc_status FROM dual;
 ```
 
 ## Performance Benchmark (Real-World Test)
-
 LILA is designed for high-concurrency environments. The following results were achieved on standard **Consumer Hardware** (Fujitsu LIFEBOOK A-Series) running an **Oracle Database inside VirtualBox**. This demonstrates the massive efficiency of the Pipe-to-Bulk architecture, even when facing significant virtualization overhead (I/O emulation and CPU scheduling):
 *   **Total Messages:** 9,000,000 (Logs, Metrics, and Status Updates)
 *   **Clients:** 3 parallel sessions (3M messages each)
