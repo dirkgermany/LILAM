@@ -2918,6 +2918,49 @@
                 rollback;
                 raise;
         end;
+        
+        --------------------------------------------------------------------------
+        
+        function receiveMessage(l_pipeName varchar2) return varchar2
+        as
+            l_status    PLS_INTEGER;
+            l_message   VARCHAR2(32767);
+            l_stop_server_exception EXCEPTION;            
+        begin
+            l_status := DBMS_PIPE.RECEIVE_MESSAGE(l_pipeName, timeout => C_SERVER_TIMEOUT_WAIT_FOR_MSG);
+            
+            if l_status = 0 THEN
+                begin   
+                    DBMS_PIPE.UNPACK_MESSAGE(l_message);
+                    return l_message;
+                    
+                    EXCEPTION
+                        WHEN l_stop_server_exception THEN
+                            -- Diese Exception wird NICHT hier abgefangen, 
+                            -- sondern nach außen an den Loop gereicht.
+                            RAISE;
+                        WHEN OTHERS THEN
+                            -- WICHTIG: Fehler loggen, aber die Schleife NICHT verlassen!
+                            raise;
+                            ERROR(g_serverProcessId, 'Internal START_SERVER; Critical Error while processing command: ' || SQLERRM);
+                    END; 
+            else
+                return null;
+            end if;
+        end;
+        
+        --------------------------------------------------------------------------
+
+        procedure preparePipe(p_pipeName varchar2)
+        as
+            l_dummyRes PLS_INTEGER;
+        begin
+            DBMS_PIPE.RESET_BUFFER;
+            DBMS_PIPE.PURGE(p_pipeName);
+            l_dummyRes := DBMS_PIPE.REMOVE_PIPE(p_pipeName);
+            l_dummyRes := DBMS_PIPE.REMOVE_PIPE(p_pipeName || C_INTERLEAVE_PIPE_SUFFIX);
+            l_dummyRes := DBMS_PIPE.CREATE_PIPE(pipename => p_pipeName, maxpipesize => C_MAX_SERVER_PIPE_SIZE, private => false);
+        end;
             
         --------------------------------------------------------------------------
     
@@ -2941,30 +2984,13 @@
             g_serverPipeName := l_pipe;
             g_serverProcessId := new_session('LILA_REMOTE_SERVER', logLevelDebug);
             registerServerPipe;
-            
-            DBMS_PIPE.RESET_BUFFER;
-            DBMS_PIPE.PURGE(g_serverPipeName);
-            l_dummyRes := DBMS_PIPE.REMOVE_PIPE(g_serverPipeName);
-            l_dummyRes := DBMS_PIPE.REMOVE_PIPE(g_serverPipeName || C_INTERLEAVE_PIPE_SUFFIX);
-            l_dummyRes := DBMS_PIPE.CREATE_PIPE(pipename => g_serverPipeName, maxpipesize => C_MAX_SERVER_PIPE_SIZE, private => false);
-            l_dummyRes := DBMS_PIPE.CREATE_PIPE(pipename => g_serverPipeName || C_INTERLEAVE_PIPE_SUFFIX, maxpipesize => 1048576, private => false);
-    
+            preparePipe(g_serverPipeName);
+
             LOOP
-                l_status := DBMS_PIPE.RECEIVE_MESSAGE(g_serverPipeName || C_INTERLEAVE_PIPE_SUFFIX, timeout => 0.01);
-                IF l_status = 0 THEN
-                    DBMS_PIPE.UNPACK_MESSAGE(l_message);
-                    l_clientChannel := extractClientChannel(l_message);
-                    l_request := extractClientRequest(l_message);
-    
-                    INFO(g_serverProcessId, g_serverPipeName || '=> Ping...');
-                    doRemote_pingEcho(l_clientChannel, l_message);
-                END IF;
-    
                 -- Warten auf die nächste Nachricht (Timeout in Sekunden)
-                l_status := DBMS_PIPE.RECEIVE_MESSAGE(g_serverPipeName, timeout => C_SERVER_TIMEOUT_WAIT_FOR_MSG);
-                if l_status = 0 THEN
+                l_message := receiveMessage(g_serverPipeName);    
+                if l_message is not null THEN
                 BEGIN 
-                    DBMS_PIPE.UNPACK_MESSAGE(l_message);
                     l_clientChannel := extractClientChannel(l_message);
                     l_request := extractClientRequest(l_message);
                     CASE l_request
@@ -3022,7 +3048,7 @@
                     END; 
                 end if;
                 
-                if l_status = 1 or l_loopCounter > C_SERVER_MAX_LOOPS_IN_TIME then
+                if l_message is null or l_loopCounter > C_SERVER_MAX_LOOPS_IN_TIME then
                     if get_ms_diff(l_lastSync, sysTimestamp) >= C_SEVER_MAX_SYNC_INTERVAL  THEN
                         -- Housekeeping
                          SYNC_ALL_DIRTY;
