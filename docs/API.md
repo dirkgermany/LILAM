@@ -395,20 +395,57 @@ TYPE t_process_rec IS RECORD (
     tab_name_master     VARCHAR2(100)
 );
 ```
-
-**Parameters**
-All 
-
-
 ---
 ### Logging
+Likely the most intuitive methods for a developer...
+In this regard, please also refer to the table [# Log Level](#log-level) in the appendix. It provides details on which severity levels are considered—and thus logged—at each activated log level.
+For convenience, the configurable log levels are also declared as constants within the LILA package. You can find them in the appendix under [# Declaration of Log Levels](#declaration-of-log-levels).
 
+| Name               | Type      | Description                         | Scope
+| ------------------ | --------- | ----------------------------------- | -------
+| [`INFO`](#general-logging-procedures) | Procedure | Writes INFO log entry  | Detail Logging
+| [`DEBUG`](#general-logging-procedures) | Procedure | Writes DEBUG log entry  | Detail Logging
+| [`WARN`](#general-logging-procedures) | Procedure | Writes WARN log entry  | Detail Logging
+| [`ERROR`](#general-logging-procedures) | Procedure | Writes ERROR log entry | Detail Logging
 
-| [`INFO`](#general-logging-procedures) | Procedure | Writes INFO log entry               | Detail Logging
-| [`DEBUG`](#general-logging-procedures) | Procedure | Writes DEBUG log entry              | Detail Logging
-| [`WARN`](#general-logging-procedures) | Procedure | Writes WARN log entry               | Detail Logging
-| [`ERROR`](#general-logging-procedures) | Procedure | Writes ERROR log entry              | Detail Logging
+#### Procedure ERROR
+Writes a log entry with severity ERROR. This is the lowest numerical value (highest priority). Independent of the activated log level, ERROR messages are always stored.
 
+ ```sql
+  PROCEDURE ERROR(
+    p_processId     NUMBER,
+    p_logText       VARCHAR2
+  )
+ ```
+
+#### Procedure WARN
+Writes Log with severity WARN.
+
+ ```sql
+  PROCEDURE WARN(
+    p_processId     NUMBER,
+    p_logText       VARCHAR2
+  )
+ ```
+
+#### Procedure INFO
+Writes Log with severity INFO.
+
+ ```sql
+  PROCEDURE INFO(
+    p_processId     NUMBER,
+    p_logText       VARCHAR2
+  )
+ ```
+#### Procedure DEBUG
+Writes a log entry with severity DEBUG. By default, LILA operates 'silently,' meaning it does not raise exceptions to avoid disrupting the main process. However, when log level DEBUG is activated, caught exceptions will be re-thrown.
+
+ ```sql
+  PROCEDURE LOG(
+    p_processId     NUMBER,
+    p_logText       VARCHAR2
+  )
+ ```
 
 
 **Parameters**
@@ -434,20 +471,6 @@ Depending on the log level corresponding to the desired entry, the appropriate p
 The procedures have the same signatures and differ only in their names.
 Their descriptions are therefore summarized below.
 
-* Procedure ERROR: details are written if the debug level is one of
-  - logLevelError
-  - logLevelWarn
-  - logLevelInfo
-  - logLevelDebug
-* Procedure WARN: details are written if the debug level is one of
-  - logLevelWarn
-  - logLevelInfo
-  - logLevelDebug
-* Procedure INFO: details are written if the debug level is one of
-  - logLevelInfo
-  - logLevelDebug
-* Procedure DEBUG: details are written if the debug level is one of
-  - logLevelDebug
 
 | Parameter | Type | Description | Required
 | --------- | ---- | ----------- | -------
