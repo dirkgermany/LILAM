@@ -50,6 +50,7 @@ The `NEW_SESSION` resp. `SERVER_NEW_SESSION` function starts the logging session
 `NEW_SESSION` and `SERVER_NEW_SESSION` are overloaded so various signatures are available.
 
 **Signatures**
+
 To accommodate different logging requirements, the following variants are available:
 
 <details>
@@ -91,6 +92,7 @@ FUNCTION NEW_SESSION(
  ```
 </details>
 
+**Parameters**
 
 | Parameter | Type | Description | Required
 | --------- | ---- | ----------- | -------
@@ -104,7 +106,7 @@ FUNCTION NEW_SESSION(
 * Type: NUMBER
 * Description: The new process ID; this ID is required for subsequent calls in order to be able to assign the LOG calls to the process
 
-**Example (PL/SQL)**
+**Example**
 ```sql
 DECLARE
   v_processId NUMBER;
