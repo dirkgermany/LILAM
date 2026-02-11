@@ -43,6 +43,30 @@ LILA is developed by a developer who hates over-engineered tools. Focus: 5 minut
 8. **Future Ready**: Built for the latest Oracle 26ai (2026), and fully tested with existing 19c environment
 9. **Small Footprint**:  ~3k lines of logical PL/SQL code ensures simple quality and security control, fast compilation, zero bloat and minimal Shared Pool utilization (reducing memory pressure and fragmentation)
 
+```mermaid
+graph TD
+    subgraph "Application Environment"
+        App[Your PL/SQL App] --> API[Lila API]
+    end
+
+    subgraph "Lila Communication Modes"
+        API -->|Local Mode| DB[(Local Oracle DB)]
+        API -->|Decoupled Mode| CNS[SERVER_NEW_SESSION]
+    end
+
+    subgraph "Remote Monitoring"
+        CNS -.->|Implicit & Seamless| SRV[Lila Server]
+        SRV -->|Storage| MDB[(Master Table)]
+        SRV -->|Analysis| MON[Monitoring UI / Dashboard]
+    end
+
+    %% Styles for a professional Lila-Look
+    style App fill:#f3e5f5,stroke:#7b1fa2,stroke-width:2px
+    style SRV fill:#ce93d8,stroke:#4a148c,stroke-width:2px
+    style API fill:#e1f5fe,stroke:#01579b,stroke-width:2px
+    style MDB fill:#f3e5f5,stroke:#7b1fa2
+
+
 ---
 ## Fast integration
 * Setting up LILA means creating a package by copy&paste (refer [documentation file "setup.md"](docs/setup.md))
