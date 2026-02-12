@@ -1,4 +1,4 @@
-# LILA API
+# LILA API Reference
 
 <details>
 <summary>📖<b>Content</summary>b></summary>
