@@ -51,7 +51,8 @@ The functions and procedures are organized into the following five groups:
 | [CLOSE_SESSION](#procedure-close_session) | Procedure | Ends a log session | Session control
 
 > [!NOTE]
-> All API calls are the same, independent of whether LILA is used 'locally' or in a 'decoupled' manner. One exception is the function `SERVER_NEW_SESSION`, which initializes the LILA package to function as a dedicated client, managing the communication with the LILA server seamlessly. **The parameters and return value of `SERVER_NEW_SESSION` are identical to those of `NEW_SESSION`.**
+> All API calls are the same, independent of whether LILA is used 'locally' or in a 'decoupled' manner. One exception is the function `SERVER_NEW_SESSION`, which initializes the LILA package to function as a dedicated client, managing the communication with the LILA server seamlessly.
+> **The parameters and return value of `SERVER_NEW_SESSION` are nearly identical to those of `NEW_SESSION`.** However, `SERVER_NEW_SESSION` includes an additional parameter to specify a target server. This ensures that the client connects to a specific server instance (e.g., for department-specific or multi-tenant tasks) rather than simply choosing the one with the lowest load.
 
 
 #### Function NEW_SESSION / SERVER_NEW_SESSION
@@ -101,6 +102,21 @@ FUNCTION NEW_SESSION(
  ```
 </details>
 
+<details>
+  <summary><b>4. Connecting to selected server</b> (With progress tracking)</summary>
+
+```sql
+FUNCTION SERVER_NEW_SESSION(
+  p_processName   VARCHAR2, 
+  p_logLevel      PLS_INTEGER, 
+  p_stepsToDo     PLS_INTEGER, 
+  p_daysToKeep    PLS_INTEGER, 
+  p_serverName    VARCHAR2,
+  p_TabNameMaster VARCHAR2 DEFAULT 'LILA_LOG'
+)
+ ```
+</details>
+
 **Parameters**
 
 | Parameter | Type | Description | Required
@@ -109,6 +125,7 @@ FUNCTION NEW_SESSION(
 | p_logLevel | PLS_INTEGER | determines the level of detail in *detail table* (see above) | [`M`](#m)
 | p_stepsToDo | PLS_INTEGER | defines how many steps must be done during the process | [`O`](#o)
 | p_daysToKeep | PLS_INTEGER | max. age of entries in days; if not NULL, all entries older than p_daysToKeep and whose process name = p_processName (not case sensitive) are deleted | [`O`](#o)
+| p_serverName | VARCHAR2 | Used for server affinity / multi-tenancy| [`O`](od)
 | p_TabNameMaster | VARCHAR2 | optional prefix of the LOG table names (see above) | [`D`](#d)
 
 **Returns**
@@ -250,7 +267,7 @@ This value specifies the planned number of work steps for the entire process. Th
 Increments the number of completed steps (progress). This simplifies the management of this value within the application.
 
  ```sql
-  PROCEDURE SET_STEPS_DONE(
+  PROCEDURE STEP_DONE(
     p_processId     NUMBER
   )
  ```
@@ -500,8 +517,6 @@ Returns the average duration of markers, aggregated by their respective action n
   )
  ```
 
-**Functions (Getter)**
-
 #### Function GET_METRIC_STEPS
 Returns the number of markers, grouped by their respective action names.
 
@@ -522,16 +537,60 @@ Returns the number of markers, grouped by their respective action names.
 
 ---
 ### Server Control
+In server mode, LILA acts as a central service provider to deliver several key advantages:
+* Centralized Logging & Monitoring: Consolidates all log data and metrics into a single, unified oversight layer.
+* Targeted Orchestration: Manages jobs and data specifically tailored to horizontal or vertical organizational units (e.g., department-specific or multi-tenant environments).
+* Asynchronous Decoupling: Decouples clients from synchronous database operations to improve application responsiveness and stability.
+* Efficient Load Balancing: Optimizes resource distribution across the infrastructure to ensure high performance.
+* Future-Proof Extensibility: Built-in foundation for upcoming features such as automated process chains, active messaging, and real-time alerting.
 
-| [`PROCEDURE IS_ALIVE`](#procedure-is-alive) | Procedure | Excecutes a very simple logging session | Test
+> [!IMPORTANT]
+> A server is identified by its unique name, which also serves as the identifier for the underlying Oracle Pipe (`DBMS_PIPE`) used for communication. Therefore, server names must be unique within the database instance to prevent naming conflicts.
 
-```
-### Testing
-Independent to other Packages you can check if LILA works in general.
+| Name               | Type      | Description                         | Scope
+| ------------------ | --------- | ----------------------------------- | -------
+| [`START_SERVER`](#procedure-start_server) | Procedure | Starts a LILA-Server | Server control
+| [`SERVER_SHUTDOWN`](#procedure-server_shutdown) | Procedure | Stops a LILA-Server | Server control
+| [`GET_SERVER_PIPE`](#function-get_server_pipe) | Function | Returns the servers communication pipe (`DBMS_PIPE` | Server control
 
-#### Procedure IS_ALIVE
-Creates one entry in the *master table* and one in the *detail table*.
+#### Function START_SERVER
+Starts the LILA server using a specific server (pipe) name. A password is required, which must be provided again when calling SERVER_SHUTDOWN. This security measure ensures that the shutdown cannot be triggered by unauthorized clients.
 
+ ```sql
+  Procedure START_SERVER(
+    p_pipeName      VARCHAR2,
+    p_password      VARCHAR2
+  )
+ ```
+
+#### Procedure SERVER_SHUTDOWN
+Shutting down a server requires that the executing client has previously logged into the server and knows the password provided during `SERVER_START`. The `p_processId` received by the client upon login must be used in this call.
+
+ ```sql
+  FUNCTION SERVER_SHUTDOWN(
+    p_processId     NUMBER,
+    p_pipeName      VARCHAR2,
+    p_password      VARCHAR2
+  )
+ ```
+
+#### Function GET_SERVER_PIPE
+Retrieves the server name (which also serves as the pipe name). Similar to SERVER_SHUTDOWN, the client must first connect to the server. The p_processId returned upon connection is then required for subsequent calls.
+
+ ```sql
+  FUNCTION GET_SERVER_PIPE(
+    p_processId     NUMBER,
+  )
+ ```
+
+**Parameters**
+
+| Parameter | Type | Description | Required
+| --------- | ---- | ----------- | -------
+| p_processId | NUMBER | ID of the process to which the session applies | [`M`](#m)
+| p_pipeName | VARCHAR2 | servers identity; no spaces allowed | [`M`](#m)
+| p_password | VARCHAR2 | servers identity; no spaces allowed | [`M`](#m)
+| p_serverName | VARCHAR2 | servers identity; no spaces allowed | [`M`](#m)
 
 
 ## Appendix
