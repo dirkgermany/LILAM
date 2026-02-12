@@ -51,13 +51,14 @@
 
 ---
 ## Quick Start
+### Inside Mode
 The following example shows the simplest way to initialize a session and log a message. 
-LILA uses reasonable defaults, so you only need to provide a process name.
+LILA uses reasonable defaults, so you only need to provide a process name and the logLevel setting.
 After your application ends there should be two tables:
 * LILA_LOG (the master logging table)
 * LILA_LOG_DETAILS (the detail table with logs and metrics)
 
-In LILA_LOG should be stored your first process 'MY_FIRST_SYNC' and in the LILA_LOG_DETAILS should be your first metric markers.
+And in table LILA_LOG should be stored your first process 'MY_FIRST_SYNC' and in the LILA_LOG_DETAILS should be your first metric markers.
 
 
 ```sql
@@ -80,8 +81,57 @@ BEGIN
   dbms_session.sleep(1);
   lila.mark_step(p_processId => l_processId, p_actionName => 'DATA_LOAD');
   
-  COMMIT;
+  -- Missing a COMMIT? 
+  -- Don't worry: LILA uses AUTONOMOUS TRANSACTIONS.
+  -- This ensures that logs are stored immediately and independently 
+  -- from your main transaction (even if you ROLLBACK).
 END;
+```
+
+### Decoupled (Server) Mode
+**Step 1: Start the server (Session A)**
+To use the decoupled mode, you first need to start a LILA server. For this example, use a dedicated session (e.g., a second instance of SQL Developer), as the server will block the session while it is running.
+In production environments you should start the server in background as a `DBMS_JOB`.
+
+Start the server with 
+
+```sql
+BEGIN
+  lila.start_server('MY_FIRST_LILA_SERVER', 'SECURE PASSWORD');
+END;
+/
+```
+
+**Step 2: Execute the client code (Session B)**
+In a separate session, execute the following block. Note that `SERVER_NEW_SESSION` automatically connects to your active server.
+
+```sql
+DECLARE
+  l_processId    NUMBER;
+  l_sessionInit  t_session_init;
+BEGIN
+  -- 1. Setup minimal configuration
+  l_sessionInit.processName := 'DECOUPLED_SYNC';
+  l_sessionInit.logLevel    := logLevelInfo;     -- default is logLevelMonitorr
+  
+  -- 2. Initialize the session
+  -- Use SERVER_NEW_SESSION instead of NEW_SESSION to connect to a LILA server.
+  -- LILA now acts as a dedicated client, handling communication in the background.
+  l_processId := lila.server_new_session(p_sessionInit => l_sessionInit);
+  
+  -- 3. Start logging
+  lila.info(p_processId => l_processId, p_info => 'LILA is up and running!');
+  
+  -- 4. Mark a work step
+  lila.mark_step(p_processId => l_processId, p_actionName => 'DATA_LOAD');
+  dbms_session.sleep(1);
+  lila.mark_step(p_processId => l_processId, p_actionName => 'DATA_LOAD');
+
+  -- 5. Shutdown the server
+  lila.server_shutdown(p_processId => l_processId, 'SECURE PASSWORD');
+
+END;
+/
 ```
 
 ---
