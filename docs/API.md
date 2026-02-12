@@ -93,7 +93,9 @@ END;
 **Step 1: Start the server (Session A)**
 
 To use the decoupled mode, you first need to start a LILA server. For this example, use a dedicated session (e.g., a second instance of SQL Developer), as the server will block the session while it is running. In production environments, the server is typically started as a background process via DBMS_JOB to avoid session blocking.
-By default, the client automatically identifies and connects to the server with the lowest current load. This means the client does not need to know specific server names in advance. (Note: Targeted communication with a specific server instance is an upcoming feature and will be available in a future release.)"
+
+By default, the client automatically identifies and connects to the server with the lowest current load. This means the client does not need to know specific server names in advance.
+(Note: Targeted communication with a specific server instance is an upcoming feature and will be available in a future release.)
 
 Start the server with 
 
