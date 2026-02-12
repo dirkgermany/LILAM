@@ -133,7 +133,7 @@ BEGIN
   lila.mark_step(p_processId => l_processId, p_actionName => 'DATA_LOAD');
 
   -- 5. Shutdown the server
-  lila.server_shutdown(p_processId => l_processId, 'SECURE PASSWORD');
+  lila.server_shutdown(p_processId => l_processId, p_password => 'SECURE PASSWORD');
 
 END;
 /
