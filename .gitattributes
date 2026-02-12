@@ -1,6 +1,7 @@
 # Exclude from exported ZIP-File
 .gitattributes export-ignore
 .github/ export-ignore
+_layouts/ export-ignore
 test/ export-ignore
 project/ export-ignore
 AGENTS.md export-ignore
