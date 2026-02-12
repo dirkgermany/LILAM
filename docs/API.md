@@ -28,12 +28,19 @@
     - [WARN](#procedure-warn)
     - [INFO](#procedure-error)
     - [DEBUG](#procedure-debug)
-
-    - [General Logging Procedures](#general-logging-procedures)
-    - [Procedure LOG_DETAIL](#procedure-log_detail)
+  - [Metrics](#metrics)
+    - [MARK_STEP](#procedure-mark_step)
+    - [GET_METRIC_AVG_DURATION](#function-get_metric_avg_duration)
+    - [GET_METRIC_STEPS](#function-get_metric_steps)
+  - [Server control](#server-control)
+    - [START_SERVER](#procedure-start_server)
+    - [SERVER_SHUTDOWN](#procedure-server_shutdown)
+    - [GET_SERVER_PIPE](#function-get_server_pipe)
   - [Appendix](#appendix)
     - [Log Level](#log-level)
         - [Declaration of Log Levels](#declaration-of-log-levels)
+    - [Record Type t_session_init](#record-type-t_session_init)
+    - [Record Type t_process_rec](#record-type-t_process_rec)
 
 </details>
 
@@ -399,7 +406,7 @@ Reads the INFO-Text which is part of the process record. Likewise flexible and c
 > [!NOTE]
 > Every query for process data has an impact—albeit minor—on the overall system performance.
 > If such queries occur only sporadically or if only a few attributes are needed (e.g., the number of completed process steps), this impact is negligible. However, if queries are called frequently and several of the functions mentioned above are used (e.g., `GET_PROCESS_INFO`, `GET_PROCESS_STATUS`, `GET_PROC_STEPS_DONE`, ...), it is recommended to request this information collectively.
-> For this purpose, the function `GET_PROCESS_DATA` provides a record containing all relevant process data 'in one go'. This record serves as the exclusive way to retrieve the process name and the tab_name_master attribute. Following LILA's naming convention, the detail table's name is deterministic: it always uses the master table's name as a prefix, followed by the suffix `_DETAIL`.
+> For this purpose, the function `GET_PROCESS_DATA` provides a record containing all relevant process data 'in one go': [#t_process_rec](#record-type-t_process_rec). This record serves as the exclusive way to retrieve the process name and the tab_name_master attribute. Following LILA's naming convention, the detail table's name is deterministic: it always uses the master table's name as a prefix, followed by the suffix `_DETAIL`.
 
  ```sql
   FUNCTION GET_PROCESS_DATA(
@@ -549,7 +556,7 @@ In server mode, LILA acts as a central service provider to deliver several key a
 | ------------------ | --------- | ----------------------------------- | -------
 | [`START_SERVER`](#procedure-start_server) | Procedure | Starts a LILA-Server | Server control
 | [`SERVER_SHUTDOWN`](#procedure-server_shutdown) | Procedure | Stops a LILA-Server | Server control
-| [`GET_SERVER_PIPE`](#function-get_server_pipe) | Function | Returns the servers communication pipe (`DBMS_PIPE` | Server control
+| [`GET_SERVER_PIPE`](#function-get_server_pipe) | Function | Returns the servers communication pipe (`DBMS_PIPE`) | Server control
 
 #### Function START_SERVER
 Starts the LILA server using a specific server (pipe) name. A password is required, which must be provided again when calling SERVER_SHUTDOWN. This security measure ensures that the shutdown cannot be triggered by unauthorized clients.
@@ -615,7 +622,7 @@ logLevelInfo    constant number := 4;
 logLevelDebug   constant number := 8;
 ```
 
-### Record Type for init
+### Record Type t_session_init
 ```sql
 TYPE t_session_init IS RECORD (
     processName VARCHAR2(100),
@@ -626,7 +633,7 @@ TYPE t_session_init IS RECORD (
 );
 ```
 
-#### Record Type `t_process_rec`
+#### Record Type t_process_rec
 Usefull for getting a complete set of all process data. Using this record avoids multiple individual API calls.
 
 ```sql
