@@ -78,7 +78,6 @@ The functions and procedures are organized into the following five groups:
 > All API calls are the same, independent of whether LILA is used 'locally' or in a 'decoupled' manner. One exception is the function `SERVER_NEW_SESSION`, which initializes the LILA package to function as a dedicated client, managing the communication with the LILA server seamlessly.
 > **The parameters and return value of `SERVER_NEW_SESSION` are nearly identical to those of `NEW_SESSION`.** However, `SERVER_NEW_SESSION` includes an additional parameter to specify a target server. This ensures that the client connects to a specific server instance (e.g., for department-specific or multi-tenant tasks) rather than simply choosing the one with the lowest load.
 
-
 #### Function NEW_SESSION / SERVER_NEW_SESSION
 The `NEW_SESSION` resp. `SERVER_NEW_SESSION` function starts the logging session for a process. This procedure must be called first. Calls to the API without a prior `NEW_SESSION` do not make sense or can (theoretically) lead to undefined states.
 `NEW_SESSION` and `SERVER_NEW_SESSION` are overloaded so various signatures are available.
@@ -140,6 +139,18 @@ FUNCTION SERVER_NEW_SESSION(
 )
  ```
 </details>
+
+<details>
+  <summary><b>5. using [`t_session_init`](#record-type-t-session-init)</b> (Standard initialization)</summary>
+  This variant uses the dedicated [`t_session_init` record](#record-type-t-session-init) for initializing the new session.
+  
+ ```sql
+  FUNCTION NEW_SESSION(
+    p_session_init t_session_init
+  )
+ ```
+</details>
+
 
 **Parameters**
 
@@ -416,7 +427,7 @@ Reads the INFO-Text which is part of the process record. Likewise flexible and c
 
 **Returns**
 * Type: t_process_rec
-* Description: Record type containing all essential process metrics. 
+* Description: Returns a record of type [`t_process_rec`](#record-type-t-process-rec) containing a complete snapshot of all process data in a single call. 
 
 ---
 ### Logging
@@ -634,7 +645,7 @@ TYPE t_session_init IS RECORD (
 ```
 
 ### Record Type t_process_rec
-Usefull for getting a complete set of all process data. Using this record avoids multiple individual API calls.
+Useful for getting a complete set of all process data. Using this record avoids multiple individual API calls.
 
 ```sql
 TYPE t_process_rec IS RECORD (
