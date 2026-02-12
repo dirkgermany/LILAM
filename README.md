@@ -307,8 +307,8 @@ The monitoring table consists of two parts: the 'left' one is dedicated to loggi
 >| 1          | ... | ... | 1          | MY_ACTION  | 1              | NULL            | NULL
 >| 1          | ... | ... | 1          | MY_ACTION  | 2              | 1000            | 1000
 
-
-#### API
+---
+## API
 The API provides all process data which belongs to the process_id (see [Logging](#logging)).
 ```sql
 ...
@@ -322,7 +322,7 @@ return 'ID = ' || id || '; Status: ' || lProcessStatus || '; Info: ' || lProcess
 SELECT my_app.getStatus(1) proc_status FROM dual;
 > ID = 1; Status: OK; Info: 'just working'; Steps completed: 42
 ```
-
+---
 ## Performance Benchmark
 LILA is designed for high-concurrency environments. The following results were achieved on standard **Consumer Hardware** (Fujitsu LIFEBOOK A-Series) running an **Oracle Database inside VirtualBox**. This demonstrates the massive efficiency of the Pipe-to-Bulk architecture, even when facing significant virtualization overhead (I/O emulation and CPU scheduling):
 *   **Total Messages:** 9,000,000 (Logs, Metrics, and Status Updates)
