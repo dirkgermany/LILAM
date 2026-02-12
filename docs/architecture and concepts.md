@@ -110,7 +110,7 @@ But beware! The choice of tables and their names should be well-planned to avoid
 The LILA_SERVER_REGISTRY is used for the coordination and assignment of LILA servers. Its name is fixed.
 
 ## API
-The LILA API consists of approximately 35 procedures and functions, some of which are overloaded. Since static polymorphism does not change the outcome of the API calls, I am listing only the names of the procedures and functions below. The API can be divided into five groups. For a more detailed view, see the ["API.md"](api.md).
+The LILA API consists of approximately 35 procedures and functions, some of which are overloaded. Since static polymorphism does not change the outcome of the API calls, I am listing only the names of the procedures and functions below. The API can be divided into five groups. For a more detailed view, see the ["API.md"](API.md).
 
 **API overview:**
 
