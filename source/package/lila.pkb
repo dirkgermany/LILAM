@@ -1,4 +1,4 @@
-    CREATE OR REPLACE PACKAGE BODY LILAM AS
+create or replace PACKAGE BODY LILAM AS
     /*
      * LILAM
      * Dual-licensed under GPLv3 or Commercial License.
@@ -98,7 +98,7 @@
             avg_action_time NUMBER,        -- Umbenannt
             action_time     TIMESTAMP,     -- Startzeitpunkt der Aktion
             used_time       NUMBER,        -- Dauer der letzten Ausführung (in Sek.)
-            mon_steps_done     PLS_INTEGER := 0 -- Hilfsvariable für Durchschnittsberechnung
+            mon_steps_done  PLS_INTEGER := 0 -- Hilfsvariable für Durchschnittsberechnung
         );
         TYPE t_monitor_history_tab IS TABLE OF t_monitor_buffer_rec;    
         TYPE t_monitor_map IS TABLE OF t_monitor_history_tab INDEX BY VARCHAR2(100);
@@ -1354,13 +1354,43 @@
         begin
             write_to_monitor_buffer (p_processId, p_actionName, p_timestamp);     
         end;
-    
+        --------------------------------------------------------------------------
+        
+        function getLastMonitorEntryRemote(p_processId number, p_actionName varchar2) return t_monitor_buffer_rec
+        as
+            l_response varchar2(1000);
+            l_payload  varchar2(1000);
+            v_rec t_monitor_buffer_rec;
+        begin
+            select json_object(
+                'process_id'   value p_processId,
+                'action_name'  value p_actionName
+                returning varchar2
+            )
+            into l_payload from dual;  
+            l_response := waitForResponse(p_processId, 'GET_MONITOR_LAST_ENTRY', l_payload, 5);
+            
+            if l_response not in ('TIMEOUT', 'THROTTLED') AND l_response not like 'ERROR%' THEN
+                l_payload := JSON_QUERY(l_response, '$.payload');
+                v_rec.mon_steps_done  := extractFromJsonNum(l_payload, 'mon_steps_done');
+                v_rec.used_time  := extractFromJsonNum(l_payload, 'used_time');
+                v_rec.action_time  := extractFromJsonTime(l_payload, 'action_time');
+                v_rec.avg_action_time  := extractFromJsonNum(l_payload, 'avg_action_time');
+            end if;
+            return v_rec;
+        end;
+        
         --------------------------------------------------------------------------
     
         FUNCTION GET_METRIC_AVG_DURATION(p_processId NUMBER, p_actionName VARCHAR2) return NUMBER
         as
             v_rec t_monitor_buffer_rec;
         begin
+            if is_remote(p_processId) then
+                v_rec := getLastMonitorEntryRemote(p_processId, p_actionName);
+                return v_rec.avg_action_time;
+            end if ;
+            
             v_rec := getLastMonitorEntry(p_processId, p_actionName);
             RETURN nvl(v_rec.avg_action_time, 0);
         end;
@@ -1371,6 +1401,11 @@
         as
             v_rec t_monitor_buffer_rec;
         begin
+            if is_remote(p_processId) then
+                v_rec := getLastMonitorEntryRemote(p_processId, p_actionName);
+                return v_rec.mon_steps_done;
+            end if ;
+
             v_rec := getLastMonitorEntry(p_processId, p_actionName);
             RETURN nvl(v_rec.mon_steps_done, 0);
         end;
@@ -2000,7 +2035,6 @@
             end if;
         end;
         
-        --------------------------------------------------------------------------
 
         function getProcessDataRemote(p_processId number) return t_process_rec
         as
@@ -2500,7 +2534,7 @@
             l_processInfo := extractFromJsonNum(l_payload, 'process_info');
             l_status      := extractFromJsonNum(l_payload, 'process_status');
             
-            l_header := '"header":{"msg_type":"SERVER_RESPONSE"}';
+            l_header := '"header":{"msg_type":"SERVER_RESPONSE", "msg_name":"CLOSE_SESSION"}';
             l_meta   := '"meta":{"server_version":"' || LILAM_VERSION || '"}';
             l_data   := '"payload":{"server_message":"' || TXT_ACK_OK || '","server_code": ' || get_serverCode(TXT_ACK_OK);
             l_msg := '{' || l_header || ', ' || l_meta || ', ' || l_data || '}';
@@ -2527,7 +2561,7 @@
             l_data   varchar2(100);
             l_msg    varchar2(500);
         begin
-            l_header := '"header":{"msg_type":"SERVER_RESPONSE"}';
+            l_header := '"header":{"msg_type":"SERVER_RESPONSE", "msg_name":"PING_ECHO"}';
             l_meta   := '"meta":{"server_version":"' || LILAM_VERSION || '"}';
             l_data   := '"payload":{"server_message":"' || TXT_PING_ECHO || '","server_code":' || get_serverCode(TXT_PING_ECHO);
             l_msg := '{' || l_header || ', ' || l_meta || ', ' || l_data || '}';
@@ -2542,6 +2576,50 @@
                 null;
         end; 
         
+        -------------------------------------------------------------------------- 
+
+        procedure doRemote_getMonitorLastEntry(p_clientChannel varchar2, l_message varchar2)
+        as 
+            l_processId number;
+            l_payload varchar2(32767);
+            v_rec t_monitor_buffer_rec;
+            l_status PLS_INTEGER;
+            l_actionName varchar2(50);
+            l_header varchar2(200);
+            l_meta   varchar2(200);
+            l_msg    varchar2(2000);
+        begin
+            l_processId := extractFromJsonNum(l_message, 'payload.process_id');
+            l_actionName := extractFromJsonStr(l_message, 'payload.action_name');
+            
+            v_rec := getLastMonitorEntry(l_processId, l_actionName);   
+            select json_object(
+                'process_id'        value v_rec.process_id,
+                'action_name'      value v_rec.action_name,
+                'mon_steps_done'         value v_rec.mon_steps_done,
+                'used_time'     value v_rec.used_time,
+                'action_time'       value v_rec.action_time,
+                'avg_action_time'       value v_rec.avg_action_time
+                returning varchar2
+            )
+            into l_payload from dual;   
+  
+            l_header := '"header":{"msg_type":"SERVER_RESPONSE", "msg_name":"LAST_MONITOR_ENTRY"}';
+            l_meta   := '"meta":{"server_version":"' || LILAM_VERSION || '", "server_message":"' || TXT_DATA_ANSWER || '","server_code":' || get_serverCode(TXT_DATA_ANSWER) || '}';
+            l_payload := '"payload":' || l_payload;
+            l_msg := '{' || l_header || ', ' || l_meta || ', ' || l_payload || '}';
+             
+            -- no payload, client waits only for unfreezing
+            DBMS_PIPE.RESET_BUFFER; -- Koffer leeren
+            DBMS_PIPE.PACK_MESSAGE(l_msg);        
+            l_status := DBMS_PIPE.SEND_MESSAGE(p_clientChannel, timeout => 0);
+            
+        exception
+            when others then
+                dbms_output.enable();
+                dbms_output.put_line('Fehler in doRemote_getMonitorLastEntry: ' || sqlErrM);
+        end;    
+
         -------------------------------------------------------------------------- 
 
         procedure doRemote_getProcessData(p_clientChannel varchar2, l_message varchar2)
@@ -2573,7 +2651,7 @@
             )
             into l_payload from dual;   
                         
-            l_header := '"header":{"msg_type":"SERVER_RESPONSE"}';
+            l_header := '"header":{"msg_type":"SERVER_RESPONSE", "msg_name":"PROCESS_DATA"}';
             l_meta   := '"meta":{"server_version":"' || LILAM_VERSION || '", "server_message":"' || TXT_DATA_ANSWER || '","server_code":' || get_serverCode(TXT_DATA_ANSWER) || '}';
             l_payload := '"payload":' || l_payload;
             l_msg := '{' || l_header || ', ' || l_meta || ', ' || l_payload || '}';
@@ -2600,7 +2678,7 @@
             l_data   varchar2(100);
             l_msg    varchar2(500);
         begin
-            l_header := '"header":{"msg_type":"SERVER_RESPONSE"}';
+            l_header := '"header":{"msg_type":"SERVER_RESPONSE", "msg_name":"UNFREEZE_CLIENT"}';
             l_meta   := '"meta":{"server_version":"' || LILAM_VERSION || '"}';
             l_data   := '"payload":{"server_message":"' || TXT_ACK_OK || '","server_code":' || get_serverCode(TXT_ACK_OK);
             l_msg := '{' || l_header || ', ' || l_meta || ', ' || l_data || '}';
@@ -2797,7 +2875,7 @@
             l_payload     := JSON_QUERY(p_message, '$.payload');
             l_password   := extractFromJsonStr(l_payload, 'shutdown_password');
             
-            l_header := '"header":{"msg_type":"SERVER_RESPONSE"}';
+            l_header := '"header":{"msg_type":"SERVER_RESPONSE", "msg_name":"SERVER_SHUTDOWN"}';
             l_meta   := '"meta":{"server_version":"' || LILAM_VERSION || '"}';
     
             if l_password = g_shutdownPassword then            
@@ -3026,6 +3104,9 @@
                             
                         WHEN 'MARK_STEP' then
                             doRemote_markStep(l_message);
+                            
+                        WHEN 'GET_MONITOR_LAST_ENTRY' then
+                            doRemote_getMonitorLastEntry(l_clientChannel, l_message);
                             
                         WHEN 'UNFREEZE_REQUEST' then
                             doRemote_unfreezeClient(l_clientChannel, l_message);
