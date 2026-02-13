@@ -1,0 +1,5 @@
+create or replace PACKAGE LILAM_DEMO_HTTP AS 
+
+    PROCEDURE getBlobFromUrl;
+
+END LILAM_DEMO_HTTP;
