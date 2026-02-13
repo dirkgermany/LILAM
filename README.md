@@ -33,15 +33,15 @@ LILA is developed by a developer who hates over-engineered tools. Focus: 5 minut
 
 
 ## Key features
-1. **Lightweight**: One Package, three Tables, one Sequence. That's it!
-2. **Concurrent Logging**: Supports multiple, simultaneous log entries from the same or different sessions without blocking
-3. **Monitoring**: You have the option to observe your applications via SQL or via the API
-4. **Hybrid Execution:**: Run LILA **** (direct) or offload processing to a dedicated LILA-Server (**decoupled**).
-5. **Data Integrity**: Uses autonomous transactions to guarantee log persistence regardless of the main transaction's outcome
-6. **Smart Context Capture**: Automatically records ERR_STACK,  ERR_BACKTRACE, and ERR_CALLSTACK based on log level—deep insights with zero manual effort
-7. **Optional self-cleaning**: Automatically purges expired logs per application during session start—no background jobs or schedulers required
-8. **Future Ready**: Built for the latest Oracle 26ai (2026), and fully tested with existing 19c environment
-9. **Small Footprint**:  ~3k lines of logical PL/SQL code ensures simple quality and security control, fast compilation, zero bloat and minimal Shared Pool utilization (reducing memory pressure and fragmentation)
+1. **Lightweight:** One Package, three Tables, one Sequence. That's it!
+2. **Concurrent Logging:** Supports multiple, simultaneous log entries from the same or different sessions without blocking
+3. **Monitoring:** You have the option to observe your applications via SQL or via the API
+4. **Hybrid Execution:** Run LILA **in-session** or offload processing to a dedicated LILA-Server (**decoupled**).
+5. **Data Integrity:** Uses autonomous transactions to guarantee log persistence regardless of the main transaction's outcome
+6. **Smart Context Capture:** Automatically records ERR_STACK,  ERR_BACKTRACE, and ERR_CALLSTACK based on log level—deep insights with zero manual effort
+7. **Optional self-cleaning:** Automatically purges expired logs per application during session start—no background jobs or schedulers required
+8. **Future Ready:** Built for the latest Oracle 26ai (2026), and fully tested with existing 19c environment
+9. **Small Footprint:**  ~3k lines of logical PL/SQL code ensures simple quality and security control, fast compilation, zero bloat and minimal Shared Pool utilization (reducing memory pressure and fragmentation)
 
 ---
 
