@@ -7,25 +7,25 @@ graph LR
             direction TB
             AppA[App Team A]
             AppB[App Team B]
-            AppA & AppB --> API[Lila API]
+            AppA & AppB --> API[LILAM API]
         end
 
         %% -- VERARBEITUNG --
         subgraph MODES ["Processing Modes"]
             direction TB
-            subgraph IN-SESSION ["LILA-In-Session Mode"]
-                LI[Lila In-Session Instance]
+            subgraph IN-SESSION ["LILAM-In-Session Mode"]
+                LI[LILAM In-Session Instance]
             end
             
-            subgraph DECOUPLED ["LILA-Decoupled Mode"]
-                CNS[Decoupled Session] -.-> SRV[Lila Server Instance]
+            subgraph DECOUPLED ["LILAM-Decoupled Mode"]
+                CNS[Decoupled Session] -.-> SRV[LILAM Server Instance]
             end
         end
 
         %% -- TABELLEN-STRUKTUR --
-        MDBA[(Lila Tables Team A)]
-        MDBS[(Lila Common Repository)]
-        MDBB[(Lila Tables Team B)]
+        MDBA[(LILAM Tables Team A)]
+        MDBS[(LILAM Common Repository)]
+        MDBB[(LILAM Tables Team B)]
     end
 
     %% API Verbindungen
