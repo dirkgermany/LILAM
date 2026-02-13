@@ -220,7 +220,7 @@ LILAM is designed for high-concurrency environments. The following results were 
     * graceful degradation from Decoupled to  mode
 - [ ] **Process Resumption:**
     * Reconnect to aborted processes via `process_id`
-- [ ] **Non-destructive Recovery:** Mark log entries as "superseded" after a re-entry point instead of deleting them, preserving a full audit trail of all attempts
+- [X] **Retention:** Session data can be protected from deletion using the 'immortal' flag
 - [ ] **Adaptive Batching:** Dynamically adjust buffer sizes and flush intervals based on server load to ensure near real-time visibility during low traffic and maximum throughput during peaks
 - [ ] **Zombie Session Handling:** Detect inactive clients, release allocated memory, and update process statuses automatically
 - [ ] **Singleton Server Enforcement:** Prevent multiple servers from registering under the same name to ensure message integrity and avoid process contention
