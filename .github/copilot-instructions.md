@@ -31,7 +31,7 @@
 
 ## Coding Standards
 - When suggesting code or explaining features, always use PL/SQL syntax.
-- Ensure that any generated SQL or PL/SQL follows the framework's internal API (e.g., using `lila.info` or `lila.mark_step`).
+- Ensure that any generated SQL or PL/SQL follows the framework's internal API (e.g., using `lilam.info` or `lilam.mark_step`).
 - Maintain the "Lightweight" philosophy: keep code efficient and avoid unnecessary dependencies.
 
 ## Documentation Reference
