@@ -1,4 +1,4 @@
-create or replace PACKAGE LEARN_LILA as 
+create or replace PACKAGE LEARN_LILAM as 
 
     -- First steps
     procedure simple_sample;
@@ -11,4 +11,4 @@ create or replace PACKAGE LEARN_LILA as
     -- "select learn_lila.print_process_infos from dual;"
     function print_process_infos return varchar2;
     
-end LEARN_LILA;
+end LEARN_LILAM;
