@@ -50,7 +50,7 @@ LILAM_VERSION constant varchar2(20) := 'v1.3.0';
         processName     VARCHAR2(100),
         logLevel        PLS_INTEGER := logLevelMonitor,
         proc_stepsToDo  PLS_INTEGER,
-        daysToKeep      PLS_INTEGER,
+        daysToKeep      PLS_INTEGER := 100,
         procImmortal    PLS_INTEGER := 0,
         tab_name_master VARCHAR2(100) DEFAULT 'LILAM_LOG'
     );
@@ -108,9 +108,9 @@ LILAM_VERSION constant varchar2(20) := 'v1.3.0';
     -------------
     -- Monitoring
     -------------
-    PROCEDURE MARK_STEP(p_processId NUMBER, p_actionName VARCHAR2, p_timestamp TIMESTAMP DEFAULT NULL);
-    FUNCTION GET_METRIC_AVG_DURATION(p_processId NUMBER, p_actionName VARCHAR2) return NUMBER;
-    FUNCTION GET_METRIC_STEPS(p_processId NUMBER, p_actionName VARCHAR2) return NUMBER;
+    PROCEDURE MARK_STEP(p_processId NUMBER, p_actionName VARCHAR2, p_contextName VARCHAR2, p_timestamp TIMESTAMP DEFAULT NULL);
+    FUNCTION GET_METRIC_AVG_DURATION(p_processId NUMBER, p_actionName VARCHAR2, p_contextName VARCHAR2) return NUMBER;
+    FUNCTION GET_METRIC_STEPS(p_processId NUMBER, p_actionName VARCHAR2, p_contextName VARCHAR2) return NUMBER;
 
     -----------------
     -- Server control
