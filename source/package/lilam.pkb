@@ -161,14 +161,11 @@ create or replace PACKAGE BODY LILAM AS
             alert_severity      VARCHAR2(20)
         );
         
-        -- Das assoziative Array (Die Map)
-        -- Wir indizieren mit VARCHAR2, um direkt mit den Namen zu suchen
-        TYPE t_rule_map IS TABLE OF t_rule_rec INDEX BY VARCHAR2(250);
+
+        TYPE t_rule_list IS TABLE OF t_rule_rec;
+        TYPE t_rule_map IS TABLE OF t_rule_list INDEX BY VARCHAR2(250);
         
-        -- 1. Spezifische Regeln (Index: "ACTION|CONTEXT")
         g_rules_by_context t_rule_map;
-        
-        -- 2. Allgemeine Regeln (Index: "ACTION")
         g_rules_by_action  t_rule_map;
         
         -- Zusätzliche Variable für die aktuell geladene Version
@@ -312,9 +309,9 @@ create or replace PACKAGE BODY LILAM AS
     
         end;
         
-        --------------------------------------------------------------------------
+        -------------------------------------------------------
         -- Generate Action/Context - Key verifying Server Rules 
-        --------------------------------------------------------------------------
+        -------------------------------------------------------
         FUNCTION buildRuleKey(p_action VARCHAR2, p_context VARCHAR2 := NULL) RETURN VARCHAR2 IS
         BEGIN
             IF p_context IS NOT NULL THEN
@@ -323,6 +320,54 @@ create or replace PACKAGE BODY LILAM AS
                 RETURN p_action;
             END IF;
         END;
+        
+        ---------------------------------------------------------------------------
+        -- Identifizieren von Regeln gegen eintreffendes Prozess-Update/Event/Trace
+        ---------------------------------------------------------------------------        
+        PROCEDURE evaluateRules(p_monitorRec t_monitor_buffer_rec, p_trigger VARCHAR2) IS
+            
+            -- Interne Hilfsprozedur, um Redundanz zu vermeiden
+            PROCEDURE apply_rule_list(p_list t_rule_list) IS
+            BEGIN
+                IF p_list IS NULL OR p_list.COUNT = 0 THEN RETURN; END IF;
+        
+                FOR i IN 1 .. p_list.COUNT LOOP
+                    -- Nur Regeln für das aktuelle Ereignis prüfen (z.B. TRACE_STOP)
+                    IF p_list(i).trigger_type = p_trigger THEN
+                        
+                        CASE p_list(i).condition_operator
+                            WHEN 'GREATER_THAN_AVG_PERCENT' THEN
+                                -- Prüfung gegen den gleitenden Durchschnitt
+                                IF p_monitorRec.used_time > (p_monitorRec.avg_action_time * (1 + p_list(i).condition_value / 100)) THEN
+                    null;
+--                                    fire_alert(p_list(i), p_monitorRec);
+                                END IF;
+        
+                            WHEN 'MAX_DURATION_MS' THEN
+                                -- Absoluter Schwellwert
+                                IF p_monitorRec.used_time > p_list(i).condition_value THEN
+                    null;
+--                                    fire_alert(p_list(i), p_monitorRec);
+                                END IF;
+        
+                            -- Hier kannst du später weitere Operatoren (MAX_STEPS etc.) ergänzen
+                        END CASE;
+                    END IF;
+                END LOOP;
+            END;
+        
+        BEGIN
+            -- 1. Spezifische Kontext-Regeln prüfen (Key: Action|Context)
+            IF g_rules_by_context.EXISTS(p_monitorRec.action_name || '|' || p_monitorRec.context_name) THEN
+                apply_rule_list(g_rules_by_context(p_monitorRec.action_name || '|' || p_monitorRec.context_name));
+            END IF;
+        
+            -- 2. Allgemeine Action-Regeln prüfen (Key: Action)
+            IF g_rules_by_action.EXISTS(p_monitorRec.action_name) THEN
+                apply_rule_list(g_rules_by_action(p_monitorRec.action_name));
+            END IF;
+        END;
+
 
         --------------------------------------------------------------------------
         -- Avoid throttling 
@@ -3136,7 +3181,7 @@ create or replace PACKAGE BODY LILAM AS
             l_slotIdx    PLS_INTEGER;
         begin
             l_message := '{"rule_set_name":"' || p_ruleSetName || '", "rule_set_version":"' || p_ruleSetVersion || '"}';
-            sendNoWait(p_processId, 'NEW_UPDATE_RULE', l_message, C_TIMEOUT_NEW_SESSION);               
+            sendNoWait(p_processId, 'UPDATE_RULE', l_message, C_TIMEOUT_NEW_SESSION);               
         end;
         
         -------------------------------------------------------------------------- 
@@ -3456,10 +3501,18 @@ create or replace PACKAGE BODY LILAM AS
                     -- Entscheidung: Kontext-Regel oder allgemeine Action-Regel?
                     IF r.context IS NOT NULL THEN
                         l_key := r.action || '|' || r.context;
-                        g_rules_by_context(l_key) := l_new_rule;
+                        IF NOT g_rules_by_context.EXISTS(l_key) THEN
+                            g_rules_by_context(l_key) := t_rule_list();
+                        END IF;
+                        g_rules_by_context(l_key).EXTEND;
+                        g_rules_by_context(l_key)(g_rules_by_context(l_key).LAST) := l_new_rule;
                     ELSE
                         l_key := r.action;
-                        g_rules_by_action(l_key) := l_new_rule;
+                        IF NOT g_rules_by_action.EXISTS(l_key) THEN
+                            g_rules_by_action(l_key) := t_rule_list();
+                        END IF;
+                        g_rules_by_action(l_key).EXTEND;
+                        g_rules_by_action(l_key)(g_rules_by_action(l_key).LAST) := l_new_rule;                       
                     END IF;
                 END;
             END LOOP;
@@ -3510,15 +3563,10 @@ create or replace PACKAGE BODY LILAM AS
             l_ruleSetVersion PLS_INTEGER;
             l_sqlStmt varchar2(200);
         begin
-dbms_output.enable();
-dbms_output.put_line('--------------- MESSAGE: ' || l_message);
 
             l_payload     := JSON_QUERY(l_message, '$.payload');
             l_ruleSetName := extractFromJsonStr(l_payload, 'rule_set_name');
             l_ruleSetVersion := extractFromJsonNum(l_payload, 'rule_set_version');
-            
-dbms_output.put_line('l_ruleSetName: ' || l_ruleSetName);
-dbms_output.put_line('l_ruleSetVersion ' || l_ruleSetVersion);
 
             l_sqlStmt := 'SELECT rule_set FROM ' || C_LILAM_RULES || ' where set_name = :1 and version = :2';
             execute immediate l_sqlStmt into l_serverRuleSet using l_ruleSetName, l_ruleSetVersion;
@@ -3643,7 +3691,7 @@ dbms_output.put_line('l_ruleSetVersion ' || l_ruleSetVersion);
                                 INFO(g_serverProcessId, g_serverPipeName || '=> Shutdown by remote request');
                             end if ;
                             
-                        WHEN 'NEW_UPDATE_RULE' then
+                        WHEN 'UPDATE_RULE' then
                             updateServerRules(l_message);
                             
                         WHEN 'SERVER_PING' then
