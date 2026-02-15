@@ -1,5 +1,38 @@
 # LILAM Architecture and Concepts
 
+<details>
+<summary>📖<b>Content</b></summary>
+
+- [Technical Overview](#technical-overview)
+- [Terms](#terms)
+- [Process](#process)
+- [Session](#session)
+  - [Session Life Cycle](#session-life-cycle)
+- [Logs / Severity](#logs--severity)
+- [Log Level](#log-level)
+- [Metrics](#metrics)
+  - [Discrete Events](#discrete-events)
+  - [Transaction Tracing](#transaction-tracing)
+  - [Analysis & Outliers](#analysis--outliers)
+- [Operating Modes](#operating-modes)
+  - [In-Session](#in-session)
+  - [Decoupled](#decoupled)
+- [Tables](#tables)
+  - [Master or Process Table](#master-or-process-table)
+  - [Log Table](#log-table)
+  - [Monitor Table](#monitor-table)
+  - [Registry Table](#registry-table)
+  - [Rules Table](#rules-table)
+- [API](#api)
+  - [Session Handling](#session-handling)
+  - [Process Control](#process-control)
+  - [Logging](#logging)
+  - [Metrics](#metrics)
+  - [Server Control](#server-control)
+
+</details>
+
+
 ## Technical Overview
 LILAM utilizes the core functionalities made available by Oracle through its PL/SQL (from version 12 onwards, tested under 19c and 26 AI). LILAM itself is a PL/SQL script that can be used by other PL/SQL scripts in various modi operandi.
 
@@ -13,7 +46,7 @@ Installation requires nothing more than copying the code into a suitable DB sche
 
 In fact, there are currently no configuration table(s), startup scripts, or similar requirements to use the full scope of LILAM (as of v1.3.0).
 
-# Terms
+## Terms
 First, some important clarifications of terms within the LILAM context.
 
 ## Process
@@ -51,14 +84,16 @@ LILAM has one exception, the **Metric Level**: In the hierarchy, this level sits
 
 A different log level can be selected for each process.
 
-## **Metrics**
+## Metrics
 LILAM captures detailed process steps by measuring their **frequency** and **duration**. A process can contain any number of named actions, each occurring multiple times. 
 
-### **Two Ways of Monitoring:**
-*   **Discrete Events (`MARK_EVENT`):** Records a point-in-time milestone. LILAM measures the time spans between consecutive occurrences of the same action.
-*   **Transaction Tracing (`TRACE`):** Measures the specific duration of a work step from start to finish.
+### Discrete Events
+**MARK_EVENT:** Records a point-in-time milestone. LILAM measures the time spans between consecutive occurrences of the same action.
 
-### **Analysis & Outliers:**
+### Transaction Tracing
+**TRACE:** Measures the specific duration of a work step from start to finish.
+
+### Analysis & Outliers
 For every action, LILAM maintains a **moving average**. This average is recorded with each new entry, allowing for real-time performance tracking. If a trace significantly deviates from this baseline, LILAM generates a **warning** in the Log Table.
 
 **Example:**
@@ -115,7 +150,12 @@ In the interest of flexibility, it is possible to use dedicated LILAM logging ta
 But beware! The choice of tables and their names should be well-planned to avoid chaos caused by an excessive number of different LILAM logging tables.
 
 ### Registry Table
-The LILAM_SERVER_REGISTRY is used for the coordination and assignment of LILAM servers. Its name is fixed.
+The `LILAM_SERVER_REGISTRY` is used for the coordination and assignment of LILAM servers. Its name is fixed.
+
+### Rules Table
+**Rules** define how LILAM reacts to incoming **signals**. They are organized into **Rule Sets**, which are structured as JSON objects for maximum flexibility. 
+
+The central table `LILA_RULES` acts as the definitive repository for these configurations, storing each JSON-based rule set alongside a **version stamp**. This versioning ensures that every LILAM server can track, verify, and synchronize its active logic in real-time.
 
 ## API
 The LILAM API consists of approximately 35 procedures and functions, some of which are overloaded. Since static polymorphism does not change the outcome of the API calls, I am listing only the names of the procedures and functions below. The API can be divided into five groups. For a more detailed view, see the ["API.md"](API.md).
@@ -154,6 +194,7 @@ The LILAM API consists of approximately 35 procedures and functions, some of whi
 #### Setting Values
 * **MARK_EVENT:** Documents a completed work step for an action and triggers the sum and time calculations for those actions.
 * **TRACE_START:** Initializes a duration measurement for a specific work step (trace) by capturing the start timestamp in the session memory.
+* **TRACE_STOP:** Ends the measurement for a specific work step (trace) and persists it to the monitor table.
 
 #### Querying Values
 * **GET_METRIC_AVG_DURATION:** Returns the average processing duration for actions with the same name within a process.
@@ -163,4 +204,5 @@ The LILAM API consists of approximately 35 procedures and functions, some of whi
 * **START_SERVER:** Starts a LILAM server.
 * **SERVER_SHUTDOWN:** Shuts down a LILAM server.
 * **GET_SERVER_PIPE:** Returns the name of the pipe used to communicate with the server.
+* **SERVER_UPDATE_RULES:** Implements or changes the used rule set
 
