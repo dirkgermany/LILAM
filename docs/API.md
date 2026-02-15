@@ -706,6 +706,7 @@ Starts the LILAM server using a specific server (pipe) name. A password is requi
  ```sql
   Procedure START_SERVER(
     p_pipeName      VARCHAR2,
+    p_groupName     VARCHAR2,
     p_password      VARCHAR2
   )
  ```
@@ -730,14 +731,29 @@ Retrieves the server name (which also serves as the pipe name). Similar to SERVE
   )
  ```
 
+#### PROCEDURE SERVER_UPDATE_RULES
+The **LILAM Server** responds to signals based on predefined conditions. Supported events include process changes, marker events, and traced transactions. Rules are defined as JSON objects and persisted in the `LILAM_RULES` table. 
+The rule set can be updated dynamically using the `SERVER_UPDATE_RULES` procedure. After storing a new or modified rule set in `LILAM_RULES`, call this procedure to apply the changes. Note that an active server connection (`NEW_SESSION`) is required. Upon execution, the server implements the new rule set and logs the rule set name and version to the `LILAM_SERVER__REGISTRY`.
+
+ ```sql
+  FUNCTION SERVER_UPDATE_RULES(
+    p_processId      NUMBER,
+    p_ruleSetName    VARCHAR2,
+    p_ruleSetVersion PLS_INTEGER
+  )
+ ```
+
 **Parameters**
 
 | Parameter | Type | Description | Required
 | --------- | ---- | ----------- | -------
 | p_processId | NUMBER | ID of the process to which the session applies | [`M`](#m)
-| p_pipeName | VARCHAR2 | servers identity; no spaces allowed | [`M`](#m)
-| p_password | VARCHAR2 | servers identity; no spaces allowed | [`M`](#m)
+| p_pipeName | VARCHAR2 | pipe name supported by server; no spaces allowed | [`M`](#m)
+| p_password | VARCHAR2 | security for shutdown; | [`M`](#m)
 | p_serverName | VARCHAR2 | servers identity; no spaces allowed | [`M`](#m)
+| p_groupName | VARCHAR2 | group which server is dedicated to; no spaces allowed | [`N`](#n)
+| p_ruleSetName | VARCHAR2 | rules are organized within sets (see [architecture and concepts.md](docs/architecture%20and%20concepts.md)) | [`M`](#m)
+| p_ruleSetVersion | PLS_INTEGER | version of ruleset | [`M`](#m)
 
 [↑ Back to Top](#lilam-api-reference)
 
