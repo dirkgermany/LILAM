@@ -183,7 +183,8 @@ To accommodate different logging requirements, the following variants are availa
   
  ```sql
   FUNCTION NEW_SESSION(
-    p_processName   VARCHAR2, 
+    p_processName   VARCHAR2,
+    p_groupName     VARCHAR2,
     p_logLevel      PLS_INTEGER, 
     p_TabNameMaster VARCHAR2 DEFAULT 'LILAM_LOG'
   )
@@ -196,6 +197,7 @@ To accommodate different logging requirements, the following variants are availa
 ```sql
 FUNCTION NEW_SESSION(
   p_processName   VARCHAR2, 
+  p_groupName     VARCHAR2,
   p_logLevel      PLS_INTEGER, 
   p_daysToKeep    PLS_INTEGER, 
   p_TabNameMaster VARCHAR2 DEFAULT 'LILAM_LOG'
@@ -209,6 +211,7 @@ FUNCTION NEW_SESSION(
 ```sql
 FUNCTION NEW_SESSION(
   p_processName   VARCHAR2, 
+  p_groupName     VARCHAR2,
   p_logLevel      PLS_INTEGER, 
   p_stepsToDo     PLS_INTEGER, 
   p_daysToKeep    PLS_INTEGER, 
@@ -223,6 +226,7 @@ FUNCTION NEW_SESSION(
 ```sql
 FUNCTION SERVER_NEW_SESSION(
   p_processName   VARCHAR2, 
+  p_groupName     VARCHAR2,
   p_logLevel      PLS_INTEGER, 
   p_stepsToDo     PLS_INTEGER, 
   p_daysToKeep    PLS_INTEGER, 
@@ -248,6 +252,7 @@ FUNCTION SERVER_NEW_SESSION(
 | Parameter | Type | Description | Required
 | --------- | ---- | ----------- | -------
 | p_processName | VARCHAR2| freely selectable name for identifying the process; is written to *master table* | [`M`](#m)
+| p_groupName | VARCHAR2| used to get a dedicated server for the group | [`N`](#n)
 | p_logLevel | PLS_INTEGER | determines the level of detail in *detail table* (see above) | [`M`](#m)
 | p_stepsToDo | PLS_INTEGER | defines how many steps must be done during the process | [`O`](#o)
 | p_daysToKeep | PLS_INTEGER | max. age of entries in days; if not NULL, all entries older than p_daysToKeep and whose process name = p_processName (not case sensitive) are deleted | [`O`](#o)
@@ -587,14 +592,16 @@ Writes a log entry with severity DEBUG. By default, LILAM operates 'silently,' m
 
 | Name               | Type      | Description                         | Scope
 | ------------------ | --------- | ----------------------------------- | -------
-| [`MARK_STEP`](#procedure-mark_step) | Procedure | Sets a metric action | Metrics
+| [`MARK_EVENT`](#procedure-mark_event) | Procedure | Sets a metric action | Metrics
+| [`TRACE_START`](#procedure-trace_start) | Procedure | Begins a business transaction | Metrics
+| [`TRACE_STOP`](#procedure-trace_stop) | Procedure | Ends a business transaction | Metrics
 | [`GET_METRIC_AVG_DURATION`](#function-get_metric_avg_duration) | Function | Returns average action time | Metrics
 | [`GET_METRIC_STEPS`](#function-get_metric_steps) | Function | Returns the counter of action steps | Metrics
 
 
 **Procedures (Setter)**
 
-#### Procedure MARK_STEP
+#### Procedure MARK_EVENT
 Reports a completed work step, which typically represents an intermediate stage in the process lifecycle. For this reason, markers must not be confused with the actual process steps.
 The MARK_STEP procedure reports a completed work step. Markers are distinguished by the `p_actionName` parameter. A process can contain any number of action names, enabling highly granular monitoring.
 With every marker report, LILAM calculates:
@@ -604,9 +611,40 @@ With every marker report, LILAM calculates:
 * whether the time span between markers deviates significantly from the average.
 
  ```sql
-  PROCEDURE MARK_STEP(
+  PROCEDURE MARK_EVENT(
     p_processId     NUMBER,
     p_actionName    VARCHAR2,
+    p_context_name  VARCHAR2,
+    p_timestamp     TIMESTAMP DEFAULT NULL
+  )
+ ```
+
+
+#### Procedure TRACE_START
+Starts a transaction trace. Traces represent a work step with a defined start and end. All traces must be completed with an end timestamp before the session closes. If any traces remain open at the end of a session, LILAM will automatically generate a warning in the Log Table.
+LILAM measures the duration of each trace, maintains a moving average, and reports significant deviations as WARN entries in the Log Table.
+
+ ```sql
+  PROCEDURE TRACE_START
+    p_processId     NUMBER,
+    p_actionName    VARCHAR2,
+    p_context_name  VARCHAR2,
+    p_timestamp     TIMESTAMP DEFAULT NULL
+  )
+ ```
+
+#### Procedure TRACE_STOP
+Stops a transaction trace. The `p_action_name` and `p_context_name` must match the corresponding open trace. 
+
+> [!Important]
+> To ensure all open traces are validated and persisted, always call CLOSE_SESSION within your exception handler.
+> This guarantees that even in the event of a failure, "dangling" traces are identified and recorded in the Log Table.
+
+ ```sql
+  PROCEDURE TRACE_START
+    p_processId     NUMBER,
+    p_actionName    VARCHAR2,
+    p_context_name  VARCHAR2,
     p_timestamp     TIMESTAMP DEFAULT NULL
   )
  ```
@@ -638,7 +676,9 @@ Returns the number of markers, grouped by their respective action names.
 | Parameter | Type | Description | Required
 | --------- | ---- | ----------- | -------
 | p_processId | NUMBER | ID of the process to which the session applies | [`M`](#m)
-| p_actionName | VARCHAR2 | the log text | [`M`](#m)
+| p_actionName | VARCHAR2 | identifier of the action | [`M`](#m)
+| p_contextName | VARCHAR2 | differentiates recurring actions within a session | [`M`](#m)
+
 
 [↑ Back to Top](#lilam-api-reference)
 
