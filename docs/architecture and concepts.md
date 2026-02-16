@@ -51,14 +51,17 @@ Installation requires nothing more than copying the code into a suitable DB sche
 
 In fact, there are currently no configuration table(s), startup scripts, or similar requirements to use the full scope of LILAM (as of v1.3.0).
 
+---
 ## Terms
 First, some important clarifications of terms within the LILAM context.
 
+---
 ## Process
 LILAM is used to monitor applications that ultimately represent a process of some kind. A process is therefore something that can be mapped or represented with software. Within the meaning of LILAM, the developer determines when a process begins and when it ends. 
 
 A process specifically includes its name, lifecycle information, and planned as well as completed work steps. 
 
+---
 ## Session
 A session represents the lifecycle of a logged process. A process 'lives' within a session. A session is opened once and closed once. For clean, traceable, and consistent process states, the final closing of sessions is indispensable.
 
@@ -78,17 +81,20 @@ Ultimately, all that is required for a complete life cycle is to call the NEW_SE
 
 The session is more of a technical perspective on the workflows within LILAM, while the process is the view 'to the outside.' I believe these two terms—session and process—can be used almost synonymously in daily LILAM operations. It doesn't really hurt if they are mixed a bit.
 
+---
 ## Logs / Severity
 These are the usual suspects; SILENT, ERROR, WARN, INFO, DEBUG (in order of their weight). Need I say more? 
 Ultimately, the developer decides which severity level to assign to an event in their process flow. 
 Regarding the logging of process logs, the severity, the timestamp, and the most descriptive detail information possible are important.
 
+---
 ## Log Level
 Depending on the log level, log messages are either processed or ignored. 
 LILAM has one exception, the **Metric Level**: In the hierarchy, this level sits at the threshold for reporting directly after WARN and before INFO. This means that if 'only' WARN is activated, metric messages are ignored; if INFO is activated, If INFO is activated, all lower-level messages (like DEBUG and TRACE) are ignored (Operational Insight). 
 
 A different log level can be selected for each process.
 
+---
 ## Metrics
 LILAM captures detailed process steps by measuring their **frequency** and **duration**. A process can contain any number of named actions, each occurring multiple times. 
 
@@ -107,6 +113,7 @@ A process monitors actions **'A'** and **'B'**:
 *   Action **'B'** is a timed transaction (Trace). LILAM tracks the exact duration of each 'B' execution.
 *   **Results:** Totals, time histories, and averages for 'A' and 'B' are managed independently, providing a clear picture of process stability.
 
+---
 ## Rule Management & Event Response
 **Rules** define how LILAM servers react to incoming **signals**, transforming LILAM from a passive monitoring tool into an active **orchestrator**.
 
@@ -121,7 +128,9 @@ LILAM uses a hierarchical **Filtering Mechanism** to react to signals with high 
 *   **`TRACE_START`**: Fired when a time measurement (transaction) begins. Useful for pre-checks or initializing external dependencies.
 *   **`TRACE_STOP`**: Fired when a transaction is completed. Ideal for performance monitoring and execution-time analysis.
 *   **`MARK_EVENT`**: Reacts to the arrival of a point-in-time milestone (Marker).
+*   **`PROCESS_START`**: Triggered by beginning process.
 *   **`PROCESS_UPDATE`**: Triggered by status changes or progress reports (e.g., step counters).
+*   **`PROCESS_END`**: Triggered by ending a process.
 
 #### Filtering Mechanism
 To minimize system overhead, the LILAM server evaluates rules in a two-stage process using high-performance associative arrays in memory, following the principle of **Specific before General**:
@@ -129,6 +138,36 @@ To minimize system overhead, the LILAM server evaluates rules in a two-stage pro
 2.  **Action Filter (`Action`):** If no context-specific rule is found, the system falls back to searching for a general rule assigned only to the action. This allows for defining global thresholds across all contexts.
 
 Multiple rules can be assigned to the same trigger. LILAM processes these rule lists sequentially, enabling complex chains of reaction.
+
+### Condition & Operator Matrix
+The following metrics and operators can be defined within the JSON rule sets to trigger alerts.
+
+#### Process Metrics
+**Trigger:** PROCESS_START, PROCESS_UPDATE, PROCESS_END
+These rules evaluate the global state of a process stored in the Master Table.
+
+| Metric        | Operator Name (JSON)  | Technical Condition                             | Use Case                                      |
+| :------------ | :-------------------- | :---------------------------------------------- | :-------------------------------------------- |
+| **Runtime**   | `RUNTIME_EXCEEDED`    | `(SYSTIMESTAMP - PROCESS_START) > value`        | Detect hanging or "zombie" processes.         |
+| **Progress**  | `STEPS_LEFT_HIGH`     | `(STEPS_TODO - STEPS_DONE) > value`             | Check for unfinished work at process end.     |
+| **Efficiency**| `SUCCESS_RATE_LOW`    | `(STEPS_DONE / STEPS_TODO) * 100 < value`       | Monitor batch processing quality.             |
+| **Status**    | `STATUS_EQUALS`       | `STATUS = value`                                | React to specific error status codes.         |
+| **Info Text** | `INFO_CONTAINS`       | `UPPER(INFO) LIKE '%' \|\| UPPER(value) \|\| '%'` | Search for keywords like "FATAL" or "ERROR".  |
+
+#### Action & Context Metrics
+**Trigger:** TRACE_START, TRACE_STOP, MARK_EVENT
+These rules evaluate granular performance data from the Monitor Table.
+
+| Metric          | Operator Name (JSON)  | Technical Condition                             | Use Case                                      |
+| :-------------- | :-------------------- | :---------------------------------------------- | :-------------------------------------------- |
+| **Execution**   | `ON_EVENT`            | `Trigger fired`                                 | Trigger an orchestrator as soon as event hits.|
+| **Trace Start** | `ON_START`            | `Trigger fired`                                 | Pre-process data or lock resources.           |
+| **Trace End**   | `ON_STOP`             | `Trigger fired`                                 | Signal completion to downstream systems.      |
+| **Duration**    | `MAX_DURATION_MS`     | `used_time > value`                             | Absolute time limit for a specific action.    |
+| **Variance**    | `AVG_DEVIATION_PCT`   | `used_time > (avg_time * (1 + value/100))`      | Relative deviation from moving average.       |
+| **Frequency**   | `MAX_OCCURRENCE`      | `action_count > value`                          | Flood protection / infinite loop detection.   |
+| **Interval**    | `MAX_GAP_SECONDS`     | `(TIMESTAMP - LAST_TIMESTAMP) > value`          | Detect stall between two consecutive events.  |
+
 
 ### JSON Structure
 The JSON object is divided into a header for metadata and an array of individual rules. Alert throttling is managed in seconds:
@@ -147,8 +186,9 @@ The JSON object is divided into a header for metadata and an array of individual
       "action": "STATION_EXIT",
       "context": "Moulin Rouge",
       "condition": {
-        "operator": "GREATER_THAN_AVG_PERCENT",
-        "value": 50
+        "metric": "RUNTIME",
+        "operator": "RUNTIME_EXCEEDED",
+        "value": 300
       },
       "alert": {
         "handler": "LOG_AND_MAIL",
@@ -161,6 +201,7 @@ The JSON object is divided into a header for metadata and an array of individual
 
 ```
 
+---
 ## Operating Modes
 LILAM features two operating modes that applications can use. It is possible to address these modes in parallel from within an application—I call this 'hybrid usage.'
 
@@ -182,6 +223,7 @@ This would turn LILAM Client 'A' into a producer, the LILAM Server into a dispat
 
 With the possibility of using several LILAM Servers in parallel and simultaneously allowing individual clients to speak with multiple LILAM Servers (and additionally integrating LILAM as a library), the use of LILAM is conceivable in a wide variety of scenarios. Load balancing, separation of mission-critical and less critical applications, division into departments or teams, multi-tenancy...
 
+---
 ## Tables
 A total of four tables are required for operation and user data, one of which serves solely for the internal synchronization of multiple LILAM servers (more on this later). The detailed structure of these tables is described in the README file of the LILAM project on GitHub.
 
@@ -215,6 +257,7 @@ The `LILAM_SERVER_REGISTRY` is used for the coordination and assignment of LILAM
 
 The central table `LILA_RULES` acts as the definitive repository for these configurations, storing each JSON-based rule set alongside a **version stamp**. This versioning ensures that every LILAM server can track, verify, and synchronize its active logic in real-time.
 
+---
 ## API
 The LILAM API consists of approximately 35 procedures and functions, some of which are overloaded. Since static polymorphism does not change the outcome of the API calls, I am listing only the names of the procedures and functions below. The API can be divided into five groups. For a more detailed view, see the ["API.md"](API.md).
 
