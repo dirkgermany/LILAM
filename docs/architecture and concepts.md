@@ -143,7 +143,7 @@ Multiple rules can be assigned to the same trigger. LILAM processes these rule l
 The following metrics and operators can be defined within the JSON rule sets to trigger alerts.
 
 #### Process Metrics
-**Trigger:** PROCESS_START, PROCESS_UPDATE, PROCESS_END
+**Trigger:** PROCESS_START, PROCESS_UPDATE, PROCESS_STOP
 These rules evaluate the global state of a process stored in the Master Table.
 
 | Metric        | Operator Name (JSON)  | Technical Condition                             | Use Case                                      |
