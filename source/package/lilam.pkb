@@ -35,6 +35,7 @@ create or replace PACKAGE BODY LILAM AS
         C_SUFFIX_MON_TABLE              CONSTANT varchar2(16) := '_MON';
         C_LILAM_SERVER_REGISTRY         CONSTANT VARCHAR2(50) := 'LILAM_SERVER_REGISTRY';
         C_LILAM_RULES                   CONSTANT VARCHAR2(50) := 'LILAM_RULES';
+        C_LILAM_ALERTS                  CONSTANT VARCHAR2(50) := 'LILAM_ALERTS';
       
         ---------------------------------------------------------------
         -- Other general Parameters
@@ -111,7 +112,7 @@ create or replace PACKAGE BODY LILAM AS
             start_time      TIMESTAMP,          -- Startzeitpunkt der Aktion
             stop_time       TIMESTAMP,          -- Startzeitpunkt der Aktion
             used_time       NUMBER,             -- Dauer der letzten Ausführung (in Sek.)
-            actions_count   PLS_INTEGER := 0    -- Hilfsvariable für Durchschnittsberechnung
+            action_count   PLS_INTEGER := 0    -- Arbeitsschritt einer Action / Transaktion
         );
         TYPE t_monitor_history_tab IS TABLE OF t_monitor_buffer_rec;    
         TYPE t_monitor_map IS TABLE OF t_monitor_history_tab INDEX BY VARCHAR2(200);
@@ -155,10 +156,11 @@ create or replace PACKAGE BODY LILAM AS
             trigger_type        VARCHAR2(20),  -- TRACE_STOP, MARK_EVENT
             target_action       VARCHAR2(50),
             target_context      VARCHAR2(50),
+            condition_metric    VARCHAR2(50),
             condition_operator  VARCHAR2(30),  -- GREATER_THAN_AVG_PERCENT, etc.
-            condition_value     NUMBER,
+            condition_value     VARCHAR2(50),
             alert_handler       VARCHAR2(50),  -- LOG_AND_MAIL, etc.
-            alert_severity      VARCHAR2(20),
+            alert_severity      VARCHAR2(30),
             throttle_seconds    NUMBER         -- Warten bis zum nächsten Alarm
         );
         TYPE t_rule_list IS TABLE OF t_rule_rec;
@@ -173,6 +175,19 @@ create or replace PACKAGE BODY LILAM AS
         
         TYPE t_alert_history IS TABLE OF TIMESTAMP INDEX BY VARCHAR2(250);
         g_alert_history t_alert_history;
+        
+        ----------
+        -- TRIGGER
+        ----------
+        -- Process
+        C_PROCESS_START    CONSTANT VARCHAR2(20) := 'PROCESS_START';
+        C_PROCESS_UPDATE   CONSTANT VARCHAR2(20) := 'PROCESS_UPDATE';
+        C_PROCESS_STOP      CONSTANT VARCHAR2(20) := 'PROCESS_STOP';
+        
+        -- ACTIONS and TRANSACTIONS
+        C_MARK_EVENT       CONSTANT VARCHAR2(20) := 'MARK_EVENT';
+        C_TRACE_START      CONSTANT VARCHAR2(20) := 'TRACE_START';
+        C_TRACE_STOP       CONSTANT VARCHAR2(20) := 'TRACE_STOP';
    
         ---------------------------------------------------------------
         -- Automatisierte Lastverteilung
@@ -310,6 +325,34 @@ create or replace PACKAGE BODY LILAM AS
     
         end;
         
+        --------------------------------------------------------------------------
+        -- Hilfsfunktion (intern): Erzeugt den einheitlichen Key für den Index
+        --------------------------------------------------------------------------
+        FUNCTION buildMonitorKey(p_processId NUMBER, p_actionName VARCHAR2, p_contextName VARCHAR2) RETURN VARCHAR2 AS
+        BEGIN
+            -- Format: "0000000000000000180|MEINE_AKTION|MEIN_CONTEXT"
+            -- LPAD sorgt für eine feste Länge, was das Filtern extrem beschleunigt
+            RETURN LPAD(p_processId, 20, '0') || '|' || p_actionName || '|' || p_contextName;
+        END;
+
+        --------------------------------------------------------------------------
+        -- Check if a single step needs more time than average over all steps per action
+        --------------------------------------------------------------------------
+        function validateDurationInAverage(p_monitor_rec t_monitor_buffer_rec, p_metricFactor number) return BOOLEAN
+        as
+            l_threshold_duration NUMBER;
+        begin
+            if p_monitor_rec.action_count > 5 THEN 
+                
+                l_threshold_duration := p_monitor_rec.avg_action_time * p_metricFactor;
+            
+                if p_monitor_rec.used_time > l_threshold_duration THEN
+                    return FALSE;
+                end if ;
+            end if ;
+            return TRUE;
+        end;
+         
         -------------------------------------------------------
         -- Generate Action/Context - Key verifying Server Rules 
         -------------------------------------------------------
@@ -325,11 +368,17 @@ create or replace PACKAGE BODY LILAM AS
         ------------------------------------------------------------
         -- Alarmierung aber unter Berücksichtigung, dass Alarme nicht
         -- in kurzer Zeit zu häufig ausgelöst werden dürfen
+        -- Hier: Events und Transaktionen
         ------------------------------------------------------------
         PROCEDURE fire_alert(p_rule t_rule_rec, p_rec t_monitor_buffer_rec) IS
             v_history_key CONSTANT VARCHAR2(250) := p_rule.rule_id || '|' || p_rec.action_name || '|' || p_rec.context_name;
             v_last_fire    TIMESTAMP;
             v_throttle_sec NUMBER := nvl(p_rule.throttle_seconds, 0); -- Aus dem JSON
+            v_channel_name VARCHAR2(30); -- max. length of Alert-Name
+            v_payload      VARCHAR2(1000);
+            v_sqlStmt      VARCHAR2(2000);
+            v_procTabName  VARCHAR2(50);
+            v_monTabName   VARCHAR2(50);
         BEGIN
             -- 1. Prüfen, ob wir dieses spezifische Problem schon mal gemeldet haben
             IF g_alert_history.EXISTS(v_history_key) THEN
@@ -340,22 +389,51 @@ create or replace PACKAGE BODY LILAM AS
                     RETURN; 
                 END IF;
             END IF;
-        
-            -- 2. Wenn wir hier ankommen: Alarm auslösen!
-            -- (Hier dein existierender Code für Log/Mail)
             
- --           write_alert_to_log(p_rule, p_rec);
-        
+            v_procTabName := getSessionRecord(p_rec.process_id).tabName_master;
+            v_monTabName := v_procTabName || C_SUFFIX_MON_TABLE;
+            
+            -- 2. Kanalnamen dynamisch bestimmen
+            -- p_rule.alert_handler wäre hier z.B. 'MAIL', 'REST', 'PROCESS'
+            v_channel_name := 'LILAM_ALERT_' || p_rule.alert_handler;
+            v_payload := JSON_OBJECT(
+                'process_id'       VALUE p_rec.process_id,
+                'tab_name_process' VALUE v_procTabName,
+                'tab_name_monitor' VALUE v_monTabName,
+                'action_name'      VALUE p_rec.action_name,
+                'context_name'     VALUE p_rec.context_name,
+                'action_count'     VALUE p_rec.action_count,
+                'rule_id'          VALUE p_rule.rule_id,
+                'rule_version'     VALUE g_current_rule_set_version,
+                'alert_severity'   VALUE p_rule.alert_severity,
+                'timestamp'        VALUE TO_CHAR(SYSTIMESTAMP, 'YYYY-MM-DD"T"HH24:MI:SS.FF')
+            );
+            
+            v_sqlStmt := '
+            INSERT INTO ' || C_LILAM_ALERTS || '(
+                process_id, process_name, action_name, master_table_name, monitor_table_name, context_name, action_count, 
+                rule_id, rule_version, alert_severity, handler_type
+            ) VALUES (
+                :1, :2, :3, :4, :5, :6, :7, :8, :9, :10 :11
+            ) RETURNING alert_id INTO v_new_alert_id';
+            
+            execute immediate v_sqlStmt using p_rec.process_id, g_process_cache(p_rec.process_id).process_name, p_rec.action_name, v_procTabName, v_monTabName,
+            p_rec.context_name, p_rec.action_count, p_rule.rule_id, g_current_rule_set_version, p_rule.alert_severity, p_rule.alert_handler;
+            
+            dbms_alert.signal(v_channel_name, v_payload);
+
             -- 3. Zeitstempel aktualisieren
             g_alert_history(v_history_key) := SYSTIMESTAMP;
         END;
         
         ------------------------------------------------------------
-        -- Identifizieren von Regeln gegen eintreffendes Event/Trace
-        
-        -- !!! Das auch implementieren für die Prozess-Updates
+        -- Identifizieren von Regeln gegen eintreffendes Event/Trace        
         ------------------------------------------------------------      
-        PROCEDURE evaluateRules(p_monitorRec t_monitor_buffer_rec, p_trigger VARCHAR2) IS
+        PROCEDURE evaluateRules(p_monitorRec t_monitor_buffer_rec, p_trigger VARCHAR2)
+        as
+            v_key varchar2(200);
+            fire BOOLEAN := FALSE;
+            l_diff_ms PLS_INTEGER := 0;
             
             -- Interne Hilfsprozedur, um Redundanz zu vermeiden
             PROCEDURE apply_rule_list(p_list t_rule_list) IS
@@ -363,38 +441,56 @@ create or replace PACKAGE BODY LILAM AS
                 IF p_list IS NULL OR p_list.COUNT = 0 THEN RETURN; END IF;
         
                 FOR i IN 1 .. p_list.COUNT LOOP
+                    fire := FALSE;
                     -- Nur Regeln für das aktuelle Ereignis prüfen (z.B. TRACE_STOP)
                     IF p_list(i).trigger_type = p_trigger THEN
+                    
+                        IF p_list(i).condition_operator IN ('ON_START', 'ON_STOP', 'ON_EVENT') THEN
+                            fire := TRUE;
+                            CONTINUE; -- Nächste Regel prüfen
+                        END IF;
                         
                         CASE p_list(i).condition_operator
-                            WHEN 'GREATER_THAN_AVG_PERCENT' THEN
-                                -- Prüfung gegen den gleitenden Durchschnitt
-                                IF p_monitorRec.used_time > (p_monitorRec.avg_action_time * (1 + p_list(i).condition_value / 100)) THEN
-                    null;
---                                    fire_alert(p_list(i), p_monitorRec);
+                            WHEN 'AVG_DEVIATION_PCT' THEN
+                                if not validateDurationInAverage(p_monitorRec, p_list(i).condition_value) then
+                                    fire := TRUE;
                                 END IF;
         
                             WHEN 'MAX_DURATION_MS' THEN
                                 -- Absoluter Schwellwert
                                 IF p_monitorRec.used_time > p_list(i).condition_value THEN
-                    null;
---                                    fire_alert(p_list(i), p_monitorRec);
+                                    fire := TRUE;
                                 END IF;
-        
-                            -- Hier kannst du später weitere Operatoren (MAX_STEPS etc.) ergänzen
-                            WHEN 'ON_EVENT' THEN
-                                -- Feuert immer, wenn dieses Event registriert wird
-                null;
---                                fire_alert(p_list(i), p_rec);
                         
-                            WHEN 'MAX_COUNT' THEN
+                            WHEN 'MAX_OCCURRENCE' THEN
                                 -- Feuert, wenn die Anzahl der Aufrufe überschritten wird
-                                IF p_monitorRec.actions_count > p_list(i).condition_value THEN
-                null;
-            --                    fire_alert(p_list(i), p_rec);
+                                IF p_monitorRec.action_count > p_list(i).condition_value THEN
+                                    fire := TRUE;
                                 END IF;
+                                
+                            WHEN 'MAX_GAP_SECONDS' THEN
+                                v_key := buildMonitorKey(p_monitorRec.process_id, p_monitorRec.action_name, p_monitorRec.context_name);
+                                if g_monitor_shadows.EXISTS(v_key) then            -- Es gibt einen Vorgänger
+                                    -- Wir berechnen die Lücke zum Ende des Vorgängers
+                                    IF p_monitorRec.monitor_type = 0 THEN 
+                                        -- Aktuell ist ein EVENT: Lücke = Ende Vorgänger bis JETZT (Start/Ende identisch)
+                                        l_diff_ms := get_ms_diff(g_monitor_shadows(v_key).stop_time, p_monitorRec.start_time);
+                                    ELSE 
+                                        -- Aktuell ist eine TRANSAKTION: Lücke = Ende Vorgänger bis BEGINN des neuen Traces
+                                        l_diff_ms := get_ms_diff(g_monitor_shadows(v_key).stop_time, p_monitorRec.start_time);
+                                    END IF;
+                            
+                                    -- Prüfung gegen den Schwellenwert (Umrechnung ms in Sekunden)
+                                    IF (l_diff_ms / 1000) > TO_NUMBER(p_list(i).condition_value) THEN
+                                        fire := TRUE;
+                                    END IF;     
+                                end if;
                         END CASE;
                     END IF;
+                    
+                    if fire then
+                        fire_alert(p_list(i), p_monitorRec);
+                    end if;
                 END LOOP;
             END;
         
@@ -410,6 +506,94 @@ create or replace PACKAGE BODY LILAM AS
             END IF;
         END;
 
+        
+        ---------------------------------------------------------------
+        -- Identifizieren von Regeln gegen eintreffendes Prozess-Update
+        -- Trigger z.B. PROCESS_START
+        ---------------------------------------------------------------
+        PROCEDURE evaluateRules(p_processRec t_process_rec, p_trigger VARCHAR2)
+        as
+            fire BOOLEAN := FALSE;
+            p_monRec t_monitor_buffer_rec; -- helper to avoid double fire_alert code
+            
+            -- Interne Hilfsprozedur, um Redundanz zu vermeiden
+            PROCEDURE apply_rule_list(p_list t_rule_list) IS
+            BEGIN
+                IF p_list IS NULL OR p_list.COUNT = 0 THEN RETURN; END IF;
+        
+                FOR i IN 1 .. p_list.COUNT LOOP
+                    fire := FALSE;
+                    
+                    -- Nur Regeln für das aktuelle Ereignis prüfen (z.B. TRACE_STOP)
+                    IF p_list(i).trigger_type = p_trigger THEN
+                    
+                        IF p_list(i).condition_operator IN ('ON_START', 'ON_STOP', 'ON_UPDATE', 'ON_EVENT') THEN
+                            fire := TRUE;
+                            CONTINUE; -- Nächste Regel prüfen
+                        END IF;
+                        
+                        CASE p_list(i).condition_operator
+                            WHEN 'RUNTIME_EXCEEDED' THEN
+                                if p_processRec.process_end is null and 
+                                    get_ms_diff(nvl(p_processRec.last_update, systimestamp), systimestamp) >  to_number(p_list(i).condition_value)
+                                then
+                                    fire := TRUE;
+                                end if;
+        
+                            WHEN 'MAX_RUNTIME_EXCEEDED' THEN
+                                if p_processRec.process_end is not null and
+                                    get_ms_diff(p_processRec.process_start, p_processRec.process_end) >  to_number(p_list(i).condition_value)
+                                then
+                                    fire := TRUE;
+                                end if;
+        
+                            WHEN 'STEPS_LEFT_HIGH' THEN
+                                if p_processRec.proc_steps_todo - p_processRec.proc_steps_done > (p_list(i).condition_value) then
+                                    fire := TRUE;
+                                end if;                                
+        
+                            WHEN 'SUCCESS_RATE_LOW' THEN
+                                if nvl(p_processRec.proc_steps_todo, 0) > 0 and (
+                                    p_processRec.proc_steps_done / p_processRec.proc_steps_todo * 100 < to_number(p_list(i).condition_value)
+                                ) then
+                                    fire := TRUE;
+                                end if; 
+                                
+                            WHEN 'MAX_OCCURRENCE' THEN
+                                if p_processRec.proc_steps_todo - p_processRec.proc_steps_done > (p_list(i).condition_value) then
+                                    fire := TRUE;
+                                end if;                                
+                            
+                            WHEN 'STATUS_EQUALS' THEN
+                                if nvl(p_processRec.status, -1) = to_number(p_list(i).condition_value) then
+                                    fire := TRUE;
+                                end if; 
+                                
+                            WHEN 'INFO_CONTAINS' THEN
+                                if p_processRec.info is not null and
+                                    UPPER(p_processRec.info) LIKE '%' || UPPER(p_list(i).condition_value) || '%' then
+                                    fire := TRUE;
+                                end if;                                     
+                        END CASE;
+                    END IF;
+                    
+                    if fire then
+                        p_monRec.process_id := p_processRec.id;
+                        p_monRec.action_name := p_processRec.process_name;
+                        p_monRec.context_name := null;
+                        p_monRec.action_count := p_processRec.proc_steps_done;
+                        fire_alert(p_list(i), p_monRec);
+                    end if;
+                        
+                END LOOP;
+            END;
+        
+        BEGIN
+            -- Prozesse kennen keinen Kontext (Key: Action)
+            IF g_rules_by_action.EXISTS(p_processRec.process_name) THEN
+                apply_rule_list(g_rules_by_action(p_processRec.process_name));
+            END IF;
+        END;
 
         --------------------------------------------------------------------------
         -- Avoid throttling 
@@ -778,6 +962,31 @@ create or replace PACKAGE BODY LILAM AS
                 run_sql(sqlStmt);
             end if;
             
+
+            if not objectExists(C_LILAM_ALERTS, 'TABLE') then
+                sqlStmt := '
+                CREATE TABLE ' || C_LILAM_ALERTS || ' (
+                    alert_id           NUMBER GENERATED BY DEFAULT AS IDENTITY,
+                    process_id         NUMBER(19,0) NOT NULL,
+                    master_table_name  VARCHAR2(50), 
+                    monitor_table_name VARCHAR2(50), 
+                    action_name        VARCHAR2(100) NOT NULL,
+                    context_name       VARCHAR2(100),
+                    action_count       NUMBER NOT NULL,
+                    rule_id            VARCHAR2(20) NOT NULL,
+                    rule_version       NUMBER NOT NULL,
+                    alert_severity     VARCHAR2(20),
+                    handler_type       VARCHAR2(20),              
+                    status             VARCHAR2(20) DEFAULT ''PENDING'',
+                    error_message      CLOB,
+                    created_at         TIMESTAMP DEFAULT SYSTIMESTAMP,
+                    processed_at       TIMESTAMP,
+                    
+                    CONSTRAINT pk_lila_alerts PRIMARY KEY (alert_id)
+                )';
+                run_sql(sqlStmt);
+            end if;
+            
             if not objectExists('idx_lilam_main_id', 'INDEX') then
                 sqlStmt := '
                 CREATE INDEX idx_lilam_main_id
@@ -1104,7 +1313,7 @@ create or replace PACKAGE BODY LILAM AS
             p_actions      sys.odcivarchar2list,
             p_contexts      sys.odcivarchar2list,
             p_mon_types    sys.odcinumberlist,
-            p_actions_count   sys.odcinumberlist,
+            p_action_count   sys.odcinumberlist,
             p_used         sys.odcinumberlist,
             p_avgs         sys.odcinumberlist,
             p_timesStart        sys.odcidatelist,
@@ -1125,7 +1334,7 @@ create or replace PACKAGE BODY LILAM AS
                     'insert into ' || v_safe_table || ' 
                     (PROCESS_ID, ACTION, CONTEXT, MON_TYPE, ACTION_COUNT, USED_MILLIS, AVG_MILLIS, START_TIME, STOP_TIME, SESSION_USER, HOST_NAME)
                     values (:1, :2, :3, :4, :5, :6, :7, :8, :9, :10, :11)'
-                    using p_processId, p_actions(i), p_contexts(i), p_mon_types(i), p_actions_count(i), p_used(i), p_avgs(i), p_timesStart(i),
+                    using p_processId, p_actions(i), p_contexts(i), p_mon_types(i), p_action_count(i), p_used(i), p_avgs(i), p_timesStart(i),
                           p_timesStop(i), v_user, v_host;
                 
                 commit;
@@ -1222,7 +1431,7 @@ create or replace PACKAGE BODY LILAM AS
             v_actions     sys.odcivarchar2list := sys.odcivarchar2list();
             v_contexts    sys.odcivarchar2list := sys.odcivarchar2list();
             v_mon_types   sys.odcinumberlist  := sys.odcinumberlist();
-            v_actions_count  sys.odcinumberlist   := sys.odcinumberlist();
+            v_action_count  sys.odcinumberlist   := sys.odcinumberlist();
             v_used        sys.odcinumberlist   := sys.odcinumberlist();
             v_avgs        sys.odcinumberlist   := sys.odcinumberlist();
             v_timesStart  sys.odcidatelist     := sys.odcidatelist();
@@ -1240,7 +1449,7 @@ create or replace PACKAGE BODY LILAM AS
                             v_actions.extend;    v_actions(v_actions.last)    := g_monitor_groups(v_group_key)(i).action_name;
                             v_contexts.extend;    v_contexts(v_contexts.last)    := g_monitor_groups(v_group_key)(i).context_name;
                             v_mon_types.extend;  v_mon_types(v_mon_types.last) := g_monitor_groups(v_group_key)(i).monitor_type;
-                            v_actions_count.extend; v_actions_count(v_actions_count.last) := g_monitor_groups(v_group_key)(i).actions_count;
+                            v_action_count.extend; v_action_count(v_action_count.last) := g_monitor_groups(v_group_key)(i).action_count;
                             v_used.extend;       v_used(v_used.last)          := g_monitor_groups(v_group_key)(i).used_time;
                             v_avgs.extend;       v_avgs(v_avgs.last)          := g_monitor_groups(v_group_key)(i).avg_action_time;
                             v_timesStart.extend;      v_timesStart(v_timesStart.last) := cast(g_monitor_groups(v_group_key)(i).start_time as date);
@@ -1262,7 +1471,7 @@ create or replace PACKAGE BODY LILAM AS
                     p_actions      => v_actions,
                     p_contexts     => v_contexts,
                     p_mon_types    => v_mon_types,
-                    p_actions_count   => v_actions_count,
+                    p_action_count   => v_action_count,
                     p_used         => v_used,
                     p_avgs         => v_avgs,
                     p_timesStart   => v_timesStart,
@@ -1318,15 +1527,6 @@ create or replace PACKAGE BODY LILAM AS
         end;
                     
         --------------------------------------------------------------------------
-        -- Hilfsfunktion (intern): Erzeugt den einheitlichen Key für den Index
-        --------------------------------------------------------------------------
-        FUNCTION buildMonitorKey(p_processId NUMBER, p_actionName VARCHAR2, p_contextName VARCHAR2) RETURN VARCHAR2 AS
-        BEGIN
-            -- Format: "0000000000000000180|MEINE_AKTION|MEIN_CONTEXT"
-            -- LPAD sorgt für eine feste Länge, was das Filtern extrem beschleunigt
-            RETURN LPAD(p_processId, 20, '0') || '|' || p_actionName || '|' || p_contextName;
-        END;
-        --------------------------------------------------------------------------
         -- Calculation average time used
         --------------------------------------------------------------------------
         function calculate_avg(
@@ -1380,33 +1580,6 @@ create or replace PACKAGE BODY LILAM AS
     
         end;
             
-        --------------------------------------------------------------------------
-        -- Check if a single step needs more time than average over all steps per action
-        --------------------------------------------------------------------------
-        procedure validateDurationInAverage(p_processId number, p_monitor_rec t_monitor_buffer_rec)
-        as
-            l_threshold_duration NUMBER;
-        begin
-            if p_monitor_rec.actions_count > 5 THEN 
-                
-                l_threshold_duration := p_monitor_rec.avg_action_time * C_METRIC_ALERT_FACTOR;
-            
-                if p_monitor_rec.used_time > l_threshold_duration THEN
-                    -- Hier wird die Alert-Aktion ausgelöst
-                    raise_alert(
-                        p_processId => p_processId,
-                        p_action    => p_monitor_rec.action_name,
-                        p_context_name => p_monitor_rec.context_name,
-                        p_mon_type  => p_monitor_rec.monitor_type,
-                        p_step      => p_monitor_rec.actions_count,
-                        p_used_time => p_monitor_rec.used_time,
-                        p_expected  => p_monitor_rec.avg_action_time
-                    );
-                end if ;
-            end if ;
-    
-        end;
-         
         --------------------------------------------------------------------------
         -- Start Tracing remote
         --------------------------------------------------------------------------    
@@ -1519,16 +1692,16 @@ create or replace PACKAGE BODY LILAM AS
             -- Die nächsten Werte abhängig davon ob es einen Vorgänger gibt
             if g_monitor_shadows.EXISTS(v_key) then            -- Es gibt einen Vorgänger
                 l_prev := g_monitor_shadows(v_key);
-                g_monitor_groups(v_key)(l_new_idx).actions_count   := l_prev.actions_count + 1;
+                g_monitor_groups(v_key)(l_new_idx).action_count   := l_prev.action_count + 1;
                 g_monitor_groups(v_key)(l_new_idx).used_time       := get_ms_diff(l_prev.start_time, nvl(p_timestamp, systimestamp));
                 g_monitor_groups(v_key)(l_new_idx).avg_action_time := calculate_avg(
                                                                         l_prev.avg_action_time, 
-                                                                        g_monitor_groups(v_key)(l_new_idx).actions_count, 
+                                                                        g_monitor_groups(v_key)(l_new_idx).action_count, 
                                                                         g_monitor_groups(v_key)(l_new_idx).used_time
                                                                       );
             ELSE
                 -- Erster Eintrag der Session/Action
-                g_monitor_groups(v_key)(l_new_idx).actions_count   := 1;
+                g_monitor_groups(v_key)(l_new_idx).action_count   := 1;
                 g_monitor_groups(v_key)(l_new_idx).used_time       := 0; -- Erster Marker hat keine Dauer
                 g_monitor_groups(v_key)(l_new_idx).avg_action_time := 0;
                 g_monitor_groups(v_key)(l_new_idx).monitor_type    := C_MON_TYPE_EVENT;
@@ -1540,13 +1713,15 @@ create or replace PACKAGE BODY LILAM AS
             g_monitor_groups(v_key)(l_new_idx).monitor_type := C_MON_TYPE_EVENT;
             g_monitor_groups(v_key)(l_new_idx).start_time   := nvl(p_timestamp, systimestamp);
             
+            -- vor dem Überschreiben des shadow-Eintrags die Regeln prüfen
+            evaluateRules(g_monitor_groups(v_key)(l_new_idx), 'MARK_EVENT ');
             g_monitor_shadows(v_key) := g_monitor_groups(v_key)(g_monitor_groups(v_key).LAST);         
             
             v_idx := v_indexSession(p_processId);
             g_sessionList(v_idx).monitor_dirty_count := nvl(g_sessionList(v_idx).monitor_dirty_count, 0) + 1;
             g_dirty_queue(p_processId) := TRUE; 
             
-            validateDurationInAverage(p_processId, g_monitor_groups(v_key)(l_new_idx));
+--            validateDurationInAverage(p_processId, g_monitor_groups(v_key)(l_new_idx));
             SYNC_ALL_DIRTY;
             
         exception
@@ -1573,6 +1748,9 @@ create or replace PACKAGE BODY LILAM AS
             g_monitor_shadows(v_key).monitor_type := C_MON_TYPE_TRACE;
             g_monitor_shadows(v_key).action_name := p_actionName;
             g_monitor_shadows(v_key).context_name := p_contextName;
+            
+            -- Regeln prüfen; der Shadow-Eintrag steht für die neue Transaktion
+            evaluateRules(g_monitor_shadows(v_key), 'TRACE_START');
             
             v_idx := v_indexSession(p_processId);
         end;
@@ -1611,16 +1789,16 @@ create or replace PACKAGE BODY LILAM AS
             
             IF NOT g_monitor_averages.EXISTS(v_key) THEN
                 -- Erster Durchlauf für diese Aktion/Kontext
-                v_new_rec.actions_count   := 1;
+                v_new_rec.action_count   := 1;
                 v_new_rec.avg_action_time := v_new_rec.used_time;
             ELSE
                 -- Bestehende Werte aus dem Gedächtnis holen
-                v_new_rec.actions_count    := g_monitor_averages(v_key).actions_count + 1;
+                v_new_rec.action_count    := g_monitor_averages(v_key).action_count + 1;
                 -- Gleitender Durchschnitt berechnen
                 -- Formel: ((Alter Schnitt * Alte Anzahl) + Neue Zeit) / Neue Anzahl
                 v_new_rec.avg_action_time := 
-                    ((g_monitor_averages(v_key).avg_action_time * g_monitor_averages(v_key).actions_count) 
-                     + v_new_rec.used_time) / v_new_rec.actions_count;
+                    ((g_monitor_averages(v_key).avg_action_time * g_monitor_averages(v_key).action_count) 
+                     + v_new_rec.used_time) / v_new_rec.action_count;
             END IF;
             
             -- Gedächtnis für den nächsten Lauf aktualisieren
@@ -1632,8 +1810,9 @@ create or replace PACKAGE BODY LILAM AS
             g_monitor_groups(v_key).EXTEND;
             g_monitor_groups(v_key)(g_monitor_groups(v_key).LAST) := v_new_rec;
             
+            -- Das Event an die Regelprüfung durchreichen
+            evaluateRules(v_new_rec, 'TRACE_STOP');
             g_monitor_shadows.delete(v_key);
-            
             g_monitor_averages(v_key) := v_new_rec;
             
             v_idx := v_indexSession(p_processId);            
@@ -1755,7 +1934,7 @@ create or replace PACKAGE BODY LILAM AS
             
             if l_response not in ('TIMEOUT', 'THROTTLED') AND l_response not like 'ERROR%' THEN
                 l_payload := JSON_QUERY(l_response, '$.payload');
-                v_rec.actions_count  := extractFromJsonNum(l_payload, 'actions_count');
+                v_rec.action_count  := extractFromJsonNum(l_payload, 'action_count');
                 v_rec.used_time  := extractFromJsonNum(l_payload, 'used_time');
                 v_rec.start_time  := extractFromJsonTime(l_payload, 'start_time');
                 v_rec.stop_time  := extractFromJsonTime(l_payload, 'stop_time');
@@ -1787,11 +1966,11 @@ create or replace PACKAGE BODY LILAM AS
         begin
             if is_remote(p_processId) then
                 v_rec := getLastMonitorEntryRemote(p_processId, p_actionName, p_contextName);
-                return v_rec.actions_count;
+                return v_rec.action_count;
             end if ;
 
             v_rec := getLastMonitorEntry(p_processId, p_actionName, p_contextName);
-            RETURN nvl(v_rec.actions_count, 0);
+            RETURN nvl(v_rec.action_count, 0);
         end;
         
         --------------------------------------------------------------------------
@@ -2356,6 +2535,8 @@ create or replace PACKAGE BODY LILAM AS
     
                 g_sessionList(v_indexSession(p_processId)).process_is_dirty := TRUE;
                 g_dirty_queue(p_processId) := TRUE; -- Damit SYNC_ALL_DIRTY die Session sieht
+                
+                evaluateRules(g_process_cache(p_processId), C_PROCESS_UPDATE);
                 SYNC_ALL_DIRTY;
                 
             end if ;
@@ -2424,6 +2605,7 @@ create or replace PACKAGE BODY LILAM AS
             end if;
         end;
         
+        --------------------------------------------------------------------------
 
         function getProcessDataRemote(p_processId number) return t_process_rec
         as
@@ -2728,11 +2910,13 @@ create or replace PACKAGE BODY LILAM AS
             if v_indexSession.EXISTS(p_processId) then
                 g_dirty_queue(p_processId) := TRUE;
                 SYNC_ALL_DIRTY(true);
-    
-            v_idx := v_indexSession(p_processId);
-            persist_close_session(p_processId,  g_sessionList(v_idx).tabName_master, p_procStepsToDo, p_procStepsDone, p_processInfo, p_status);
-            checkLogsBuffer(p_processId, 'vor clearAllSessionData');
-            clearAllSessionData(p_processId);
+        
+                evaluateRules(g_process_cache(p_processId), C_PROCESS_STOP);
+                
+                v_idx := v_indexSession(p_processId);
+                persist_close_session(p_processId,  g_sessionList(v_idx).tabName_master, p_procStepsToDo, p_procStepsDone, p_processInfo, p_status);
+                checkLogsBuffer(p_processId, 'vor clearAllSessionData');
+                clearAllSessionData(p_processId);
             checkLogsBuffer(p_processId, 'nach clearAllSessionData');
     
             end if ;
@@ -2742,7 +2926,7 @@ create or replace PACKAGE BODY LILAM AS
         
         FUNCTION NEW_SESSION(p_session_init t_session_init) RETURN NUMBER
         as
-            pProcessId number(19,0);   
+            p_processId number(19,0);   
             v_new_rec t_process_rec;
         begin
     
@@ -2752,17 +2936,17 @@ create or replace PACKAGE BODY LILAM AS
                 createLogTables(p_session_init.tab_name_master);
             end if ;
     
-            execute immediate 'select seq_lilam_log.nextVal from dual' into pProcessId;
+            execute immediate 'select seq_lilam_log.nextVal from dual' into p_processId;
             -- persist to session internal table
-            insertSession (p_session_init.tab_name_master, pProcessId, p_session_init.logLevel);
+            insertSession (p_session_init.tab_name_master, p_processId, p_session_init.logLevel);
 --            if p_session_init.logLevel > logLevelSilent then -- and p_session_init.daysToKeep is not null then
-            deleteOldLogs(pProcessId, upper(trim(p_session_init.processName)), p_session_init.daysToKeep);
-            persist_new_session(pProcessId, p_session_init.processName, p_session_init.logLevel,  
-                p_session_init.proc_stepsToDo, p_session_init.daysToKeep, p_session_init.procImmortal, p_session_init.tab_name_master);
+            deleteOldLogs(p_processId, upper(trim(p_session_init.processName)), p_session_init.daysToKeep);
+            persist_new_session(p_processId, p_session_init.processName, p_session_init.logLevel,  
+            p_session_init.proc_stepsToDo, p_session_init.daysToKeep, p_session_init.procImmortal, p_session_init.tab_name_master);
 --            end if ;
     
             -- copy new details data to memory
-            v_new_rec.id              := pProcessId;
+            v_new_rec.id              := p_processId;
             v_new_rec.tab_name_master := p_session_init.tab_name_master;
             v_new_rec.process_name    := p_session_init.processName;
             v_new_rec.process_start   := current_timestamp;
@@ -2773,8 +2957,10 @@ create or replace PACKAGE BODY LILAM AS
             v_new_rec.status          := 0;
             v_new_rec.info            := 'START';
             
-            g_process_cache(pProcessId) := v_new_rec;
-            return pProcessId;
+            g_process_cache(p_processId) := v_new_rec;
+            evaluateRules(g_process_cache(p_processId), C_PROCESS_START);
+
+            return p_processId;
     
         end;
     
@@ -3077,7 +3263,7 @@ create or replace PACKAGE BODY LILAM AS
             select json_object(
                 'process_id'        value v_rec.process_id,
                 'action_name'      value v_rec.action_name,
-                'actions_count'         value v_rec.actions_count,
+                'action_count'         value v_rec.action_count,
                 'used_time'     value v_rec.used_time,
                 'start_time'       value v_rec.start_time,
                 'stop_time'       value v_rec.stop_time,
@@ -3525,8 +3711,9 @@ create or replace PACKAGE BODY LILAM AS
                         trigger_t    VARCHAR2(20) PATH '$.trigger_type',
                         action       VARCHAR2(50) PATH '$.action',
                         context      VARCHAR2(50) PATH '$.context',
+                        metric       VARCHAR2(30) PATH '$.condition.metric',
                         operator     VARCHAR2(30) PATH '$.condition.operator',
-                        value        NUMBER       PATH '$.condition.value',
+                        value        VARCHAR2(50) PATH '$.condition.value',
                         handler      VARCHAR2(50) PATH '$.alert.handler',
                         severity     VARCHAR2(20) PATH '$.alert.severity',
                         throttle_sec NUMBER       PATH '$.alert.throttle_seconds'
@@ -3542,6 +3729,7 @@ create or replace PACKAGE BODY LILAM AS
                     l_new_rule.trigger_type       := r.trigger_t;
                     l_new_rule.target_action      := r.action;
                     l_new_rule.target_context     := r.context;
+                    l_new_rule.condition_metric   := r.metric;
                     l_new_rule.condition_operator := r.operator;
                     l_new_rule.condition_value    := r.value;
                     l_new_rule.alert_handler      := r.handler;
