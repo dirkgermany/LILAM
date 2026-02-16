@@ -344,8 +344,7 @@ create or replace PACKAGE BODY LILAM AS
         begin
             if p_monitor_rec.action_count > 5 THEN 
                 
-                l_threshold_duration := p_monitor_rec.avg_action_time * p_metricFactor;
-            
+                l_threshold_duration := p_monitor_rec.avg_action_time * (1 + p_metricFactor / 100);            
                 if p_monitor_rec.used_time > l_threshold_duration THEN
                     return FALSE;
                 end if ;
@@ -468,23 +467,24 @@ create or replace PACKAGE BODY LILAM AS
                                     fire := TRUE;
                                 END IF;
                                 
+                                                                
                             WHEN 'MAX_GAP_SECONDS' THEN
                                 v_key := buildMonitorKey(p_monitorRec.process_id, p_monitorRec.action_name, p_monitorRec.context_name);
-                                if g_monitor_shadows.EXISTS(v_key) then            -- Es gibt einen Vorgänger
-                                    -- Wir berechnen die Lücke zum Ende des Vorgängers
-                                    IF p_monitorRec.monitor_type = 0 THEN 
-                                        -- Aktuell ist ein EVENT: Lücke = Ende Vorgänger bis JETZT (Start/Ende identisch)
-                                        l_diff_ms := get_ms_diff(g_monitor_shadows(v_key).stop_time, p_monitorRec.start_time);
-                                    ELSE 
-                                        -- Aktuell ist eine TRANSAKTION: Lücke = Ende Vorgänger bis BEGINN des neuen Traces
-                                        l_diff_ms := get_ms_diff(g_monitor_shadows(v_key).stop_time, p_monitorRec.start_time);
-                                    END IF;
+                                IF g_monitor_shadows.EXISTS(v_key) THEN
+                                    DECLARE
+                                        -- Wir holen den Referenzzeitpunkt des Vorgängers
+                                        -- Falls stop_time NULL ist (wie bei deinen Events), nutzen wir die start_time
+                                        l_vorganger_zeit TIMESTAMP := nvl(g_monitor_shadows(v_key).stop_time, g_monitor_shadows(v_key).start_time);
+                                    BEGIN
+                                        -- Lücke = Vom (Ende-)Zeitpunkt des Vorgängers bis zum Start von JETZT
+                                        l_diff_ms := get_ms_diff(l_vorganger_zeit, p_monitorRec.start_time);
+                                        
+                                        IF (l_diff_ms / 1000) > TO_NUMBER(p_list(i).condition_value) THEN
+                                            fire := TRUE;
+                                        END IF;
+                                    END;
+                                END IF;
                             
-                                    -- Prüfung gegen den Schwellenwert (Umrechnung ms in Sekunden)
-                                    IF (l_diff_ms / 1000) > TO_NUMBER(p_list(i).condition_value) THEN
-                                        fire := TRUE;
-                                    END IF;     
-                                end if;
                         END CASE;
                     END IF;
                     
@@ -1736,22 +1736,27 @@ create or replace PACKAGE BODY LILAM AS
         procedure startTrace (p_processId number, p_actionName varchar2, p_contextName varchar2, p_timestamp timestamp)
         as
             v_key constant varchar2(200) := buildMonitorKey(p_processId, p_actionName, p_contextName);
-            v_idx        PLS_INTEGER;
+            v_idx           PLS_INTEGER;
+            v_dummyMonRec   t_monitor_buffer_rec;
         begin
             if is_remote(p_processId) then
                 startTraceRemote(p_processId, p_actionName, p_contextName, p_timestamp);
                 return;
             end if ;
+            
+            -- Dummy nur für die Regeln            
+            v_dummyMonRec.start_time := nvl(p_timestamp, systimestamp);
+            v_dummyMonRec.stop_time := null;
+            v_dummyMonRec.monitor_type := C_MON_TYPE_TRACE;
+            v_dummyMonRec.action_name := p_actionName;
+            v_dummyMonRec.context_name := p_contextName;
 
-            g_monitor_shadows(v_key).start_time := nvl(p_timestamp, systimestamp);
-            g_monitor_shadows(v_key).stop_time := null;
-            g_monitor_shadows(v_key).monitor_type := C_MON_TYPE_TRACE;
-            g_monitor_shadows(v_key).action_name := p_actionName;
-            g_monitor_shadows(v_key).context_name := p_contextName;
+            if g_monitor_shadows.EXISTS(v_key) THEN
+                evaluateRules(v_dummyMonRec, 'TRACE_START');
+            end if;
+            g_monitor_shadows(v_key) := v_dummyMonRec;
             
-            -- Regeln prüfen; der Shadow-Eintrag steht für die neue Transaktion
-            evaluateRules(g_monitor_shadows(v_key), 'TRACE_START');
-            
+            -- Regeln prüfen; der Shadow-Eintrag steht für die neue Transaktion            
             v_idx := v_indexSession(p_processId);
         end;
         
@@ -3693,7 +3698,7 @@ create or replace PACKAGE BODY LILAM AS
         
         --------------------------------------------------------------------------
         
-        PROCEDURE load_rules_from_json(p_pipeName varchar2, p_ruleSet CLOB) IS
+        PROCEDURE load_rules_from_json(p_ruleSet CLOB) IS
             pragma autonomous_transaction; 
             l_payload varchar2(1000);
         BEGIN
@@ -3702,7 +3707,6 @@ create or replace PACKAGE BODY LILAM AS
             g_rules_by_action.DELETE;
             g_alert_history.DELETE;
 
-        
             FOR r IN (
                 SELECT *
                 FROM JSON_TABLE(p_ruleSet, '$.rules[*]'
@@ -3761,7 +3765,7 @@ create or replace PACKAGE BODY LILAM AS
             g_current_rule_set_version := extractFromJsonNum(l_payload, 'rule_set_version');
             
             execute immediate 'update ' || C_LILAM_SERVER_REGISTRY || ' set rule_set_name = :1, set_in_use = :2 where pipe_name = :3'
-            using g_current_rule_set_name, g_current_rule_set_version, p_pipeName;
+            using g_current_rule_set_name, g_current_rule_set_version, g_serverPipeName;
             commit;
         
         EXCEPTION
@@ -3793,29 +3797,56 @@ create or replace PACKAGE BODY LILAM AS
 
         --------------------------------------------------------------------------
         
+        procedure readServerRules(p_ruleSetName varchar2, p_ruleSetVersion Number)
+        as
+            l_sqlStmt varchar2(200);
+            l_serverRuleSet CLOB;
+        begin
+            l_sqlStmt := 'SELECT rule_set FROM ' || C_LILAM_RULES || ' where set_name = :1 and version = :2';
+            execute immediate l_sqlStmt into l_serverRuleSet using p_ruleSetName, p_ruleSetVersion;
+            
+            load_rules_from_json(l_serverRuleSet);
+            
+        exception
+            when NO_DATA_FOUND then
+                error(g_serverProcessId, 'Could not find server rule: ' || p_ruleSetName || '; version: ' || p_ruleSetVersion);
+            when others then
+                raise;
+        end;
+        
+        --------------------------------------------------------------------------
+
+        procedure loadServerRules
+        as
+            l_sqlStmt varchar2(200);
+            l_ruleSetName varchar2(30);
+            l_ruleSetVersion PLS_INTEGER;
+        begin
+            l_sqlStmt := 'SELECT rule_set_name, set_in_use FROM ' || C_LILAM_SERVER_REGISTRY || ' WHERE pipe_name = ''' || g_serverPipeName || '''';
+            execute immediate l_sqlStmt into l_ruleSetName,  l_ruleSetVersion;
+            readServerRules(l_ruleSetName, l_ruleSetVersion);
+            
+        exception
+            when NO_DATA_FOUND then
+                null; -- in der Registry smüssen für den Server keine Rules hinterlegt sein
+            when others then
+                raise;
+        end;
+        
+        --------------------------------------------------------------------------
+        
         procedure updateServerRules(l_message varchar2)
         as
-            l_serverRuleSet CLOB;
             l_payload  VARCHAR2(100);
             l_ruleSetName varchar2(30);
             l_ruleSetVersion PLS_INTEGER;
-            l_sqlStmt varchar2(200);
         begin
 
             l_payload     := JSON_QUERY(l_message, '$.payload');
             l_ruleSetName := extractFromJsonStr(l_payload, 'rule_set_name');
             l_ruleSetVersion := extractFromJsonNum(l_payload, 'rule_set_version');
-
-            l_sqlStmt := 'SELECT rule_set FROM ' || C_LILAM_RULES || ' where set_name = :1 and version = :2';
-            execute immediate l_sqlStmt into l_serverRuleSet using l_ruleSetName, l_ruleSetVersion;
             
-            load_rules_from_json(g_serverPipeName, l_serverRuleSet);
-            
-        exception
-            when NO_DATA_FOUND then
-                error(g_serverProcessId, 'Could not find server rule: ' || l_ruleSetName || '; version: ' || l_ruleSetVersion);
-            when others then
-                raise;
+            readServerRules(l_ruleSetName, l_ruleSetVersion);
         end;
     
         --------------------------------------------------------------------------
@@ -3913,6 +3944,7 @@ create or replace PACKAGE BODY LILAM AS
             g_serverProcessId := new_session('LILAM_REMOTE_SERVER', logLevelDebug);
             registerServerPipe;
             preparePipe(g_serverPipeName);
+            loadServerRules;
 
             LOOP
                 -- Warten auf die nächste Nachricht (Timeout in Sekunden)
