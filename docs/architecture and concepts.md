@@ -14,6 +14,11 @@
   - [Discrete Events](#discrete-events)
   - [Transaction Tracing](#transaction-tracing)
   - [Analysis & Outliers](#analysis--outliers)
+- [Rule Management & Event Response](#rule-management--event-response)
+  - [Trigger and Filter](#trigger-and-filter)
+      - [Trigger Types](#trigger-types)
+      - [Filtering Mechanism](#filtering-mechanism)
+  - [JSON Structure](#json-structure)
 - [Operating Modes](#operating-modes)
   - [In-Session](#in-session)
   - [Decoupled](#decoupled)
@@ -107,8 +112,10 @@ A process monitors actions **'A'** and **'B'**:
 
 Rules are organized into **Rule Sets**, structured as flexible JSON objects. The central table `LILA_RULES` serves as the repository for these configurations, storing each JSON-based rule set alongside a **version stamp**. This versioning allows every LILAM server to track, verify, and synchronize its active logic in real-time.
 
-### Trigger Types and Filter Mechanism
-LILAM uses a hierarchical filtering system to react to signals with high efficiency. Each rule is assigned to a specific **Trigger Type**, which defines the event that initiates the evaluation.
+### Trigger and Filter
+LILAM uses a hierarchical **Filtering Mechanism** to react to signals with high efficiency. Each rule is assigned to a specific **Trigger Type**, which defines the event that initiates the evaluation.
+
+#### Trigger Types
 
 **Available Trigger Types:**
 *   **`TRACE_START`**: Fired when a time measurement (transaction) begins. Useful for pre-checks or initializing external dependencies.
@@ -116,14 +123,14 @@ LILAM uses a hierarchical filtering system to react to signals with high efficie
 *   **`MARK_EVENT`**: Reacts to the arrival of a point-in-time milestone (Marker).
 *   **`PROCESS_UPDATE`**: Triggered by status changes or progress reports (e.g., step counters).
 
-### **Filtering Mechanism (Specific before General)**
-To minimize system overhead, the LILAM server evaluates rules in a two-stage process using high-performance associative arrays in memory:
-1.  **Context Filter (`Action|Context`):** The system first checks if a rule exists for the exact combination of action and context (e.g., `STATION_EXIT` at station `Moulin Rouge`). This allows for highly specific responses.
-2.  **Action Filter (`Action`):** If no context-specific rule is found, the system searches for a general rule assigned to the action (Fallback). This is ideal for defining global thresholds across all contexts.
+#### Filtering Mechanism
+To minimize system overhead, the LILAM server evaluates rules in a two-stage process using high-performance associative arrays in memory, following the principle of **Specific before General**:
+1.  **Context Filter (`Action|Context`):** The system first checks for a highly specific rule matching the exact combination of action and context (e.g., `STATION_EXIT` at station `Moulin Rouge`).
+2.  **Action Filter (`Action`):** If no context-specific rule is found, the system falls back to searching for a general rule assigned only to the action. This allows for defining global thresholds across all contexts.
 
 Multiple rules can be assigned to the same trigger. LILAM processes these rule lists sequentially, enabling complex chains of reaction.
 
-### **JSON Structure (Example)**
+### JSON Structure
 The JSON object is divided into a header for metadata and an array of individual rules. Alert throttling is managed in seconds:
 
 ```json
