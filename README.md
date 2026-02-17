@@ -69,7 +69,7 @@ LILAM introduces a high-performance Server-Client architecture using **Oracle Pi
 * **Auto-Synchronization:** Servers dynamically claim communication pipes, ensuring a zero-config setup
 * **Congestion Control (Throttling):** Optional protection layer that pauses hyperactive clients to ensure server stability during high-load peaks
 
----
+
 #### How it works
 LILAM offers two execution models that can be used interchangeably:
 1. **In-Session Mode (Direct):** Initiated by `lilam.new_session`. Log calls are executed immediately within your current database session. This is ideal for straightforward debugging and ensuring logs are persisted synchronously.
