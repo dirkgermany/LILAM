@@ -97,7 +97,7 @@ END;
 To use the decoupled mode, you first need to start a LILAM server. For this example, use a dedicated session (e.g., a second instance of SQL Developer), as the server will block the session while it is running. In production environments, the server is typically started as a background process via DBMS_JOB to avoid session blocking.
 
 By default, the client automatically identifies and connects to the server with the lowest current load. This means the client does not need to know specific server names in advance.
-(Note: Targeted communication with a specific server instance is an upcoming feature and will be available in a future release.)
+Additionally, it is possible to explicitly connect a client to a server assigned to a specific group. In this case, the system also automatically selects the server with the lowest current workload within that group.
 
 Start the server with 
 
@@ -715,6 +715,7 @@ Starts the LILAM server using a specific server (pipe) name. A password is requi
 
 #### Procedure SERVER_SHUTDOWN
 Shutting down a server requires that the executing client has previously logged into the server and knows the password provided during `SERVER_START`. The `p_processId` received by the client upon login must be used in this call.
+The parameter p_pipeName is used by the server to secure that really he is addressed.
 
  ```sql
   FUNCTION SERVER_SHUTDOWN(
