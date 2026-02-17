@@ -154,7 +154,13 @@ LILAM categorizes data by its intended use to ensure maximum performance for sta
 #### Monitor Actions (Metrics)
 ```sql
   -- implicits count and average duration per marker
-  lilam.mark_step(l_processId, 'MY_ACTION');                                   -- observe different actions per process
+  lilam.mark_event(l_processId, 'MY_ACTION');                                   -- observe different actions per process
+```
+#### Track Business Transactions
+```sql
+  -- Start monitoring a specific part of the business logic
+  lilam.trace_start(l_processId, 'TRACK_SEGMENT', 'Moulin Rouge');
+  lilam.trace_stop(l_processId, 'TRACK_SEGMENT', 'Moulin Rouge');
 ```
 #### Log Information (History)
 ```sql
