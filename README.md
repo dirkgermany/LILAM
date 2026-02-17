@@ -32,7 +32,7 @@ LILAM is developed by a developer who hates over-engineered tools. Focus: 5 minu
 
 
 ## Key features
-1. **Lightweight:** One Package, four Tables, one Sequence. That's it!
+1. **Lightweight:** One Package, a handful of Tables, one Sequence. That's it!
 2. **Concurrent Logging:** Supports multiple, simultaneous log entries from the same or different sessions without blocking
 3. **Monitoring:** You have the option to observe your applications via SQL or via the API
 4. **Hybrid Execution:** Run LILAM **in-session** or offload processing to a dedicated LILAM-Server (**decoupled**).
