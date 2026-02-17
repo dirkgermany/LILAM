@@ -3995,22 +3995,86 @@ dbms_output.put_line('writeEventToMonitorBuffer -> p_processId: ' || p_processId
         end;
             
         --------------------------------------------------------------------------
+        
+        function processRequest(p_request varchar2, p_message varchar2, p_clientChannel varchar2) return boolean
+        as
+        begin
+            CASE p_request
+                WHEN 'SERVER_SHUTDOWN' then
+                    if handleServerShutdown(p_clientChannel, p_message) then 
+                        -- nur wenn gültiges Passwort geschickt wurde
+--                        l_shutdownSignal := TRUE;
+                        INFO(g_serverProcessId, g_serverPipeName || '=> Shutdown by remote request');
+                        return true; -- Abbruchsignal
+                    end if ;
+                    
+                WHEN 'UPDATE_RULE' then
+                    updateServerRules(p_message);
+                    
+                WHEN 'SERVER_PING' then
+                null;
+                
+                WHEN 'NEW_SESSION' THEN
+                    INFO(g_serverProcessId, g_serverPipeName || '=> New remote session ordered');
+                    doRemote_newSession(p_clientChannel, p_message);
+                    
+                WHEN 'CLOSE_SESSION' THEN
+                    INFO(g_serverProcessId, g_serverPipeName || '=> Remote session closed');
+                    doRemote_closeSession(p_clientChannel, p_message);
+
+                WHEN 'LOG_ANY' then
+                    doRemote_logAny(p_message);
+                    
+                WHEN 'SET_ANY_STATUS' then
+                    doRemote_setAnyStatus(p_message);
+                    
+                WHEN 'PROC_STEP_DONE' then
+                    doRemote_procStepDone(p_message);
+                    
+                WHEN 'GET_PROCESS_DATA' then
+                    doRemote_getProcessData(p_clientChannel, p_message);
+                    
+                WHEN 'MARK_EVENT' then
+                    doRemote_markEvent(p_message);
+                    
+                WHEN 'START_TRACE' then
+                    doRemote_startTrace(p_message);
+                    
+                WHEN 'STOP_TRACE' then
+                    doRemote_stopTrace(p_message);
+                    
+                WHEN 'GET_MONITOR_LAST_ENTRY' then
+                    doRemote_getMonitorLastEntry(p_clientChannel, p_message);
+                    
+                WHEN 'UNFREEZE_REQUEST' then
+                    doRemote_unfreezeClient(p_clientChannel, p_message);
+                    
+                ELSE 
+                    -- Unbekanntes Tag loggen
+                    warn(g_serverProcessId, g_serverPipeName || '=> Received unknown request: ' || p_request);
+            END CASE;
+
+            return false; -- kein Abbruchsignal
+        end;
     
+        --------------------------------------------------------------------------
+
         procedure START_SERVER(p_pipeName varchar2, p_groupName varchar2, p_password varchar2)
         as
-            v_key VARCHAR2(100); 
+            v_key            VARCHAR2(100); 
             l_clientChannel  varchar2(50);
-            l_message       VARCHAR2(32767);
-            l_status    PLS_INTEGER;
-            l_request   VARCHAR2(500);
-            l_json_doc  VARCHAR2(2000);        
-            l_dummyRes PLS_INTEGER;
+            l_message        VARCHAR2(32767);
+            l_status         PLS_INTEGER;
+            l_request        VARCHAR2(500);
+            l_json_doc       VARCHAR2(2000);        
+            l_dummyRes       PLS_INTEGER;
             l_shutdownSignal BOOLEAN := FALSE;
             l_stop_server_exception EXCEPTION;            
-            l_pipe     VARCHAR2(50) := p_pipeName;
-            l_lastHeartbeat TIMESTAMP := sysTimestamp;
-            l_lastSync TIMESTAMP := sysTimestamp;  
-            l_loopCounter PLS_INTEGER := 0;
+            l_pipe           VARCHAR2(50) := p_pipeName;
+            l_lastHeartbeat  TIMESTAMP := sysTimestamp;
+            l_lastSync       TIMESTAMP := sysTimestamp;  
+            l_loopCounter    PLS_INTEGER := 0;
+            l_msgCnt         PLS_INTEGER := 0;
         begin
             g_shutdownPassword := p_password;
             g_serverPipeName := l_pipe;
@@ -4029,9 +4093,12 @@ dbms_output.put_line('writeEventToMonitorBuffer -> p_processId: ' || p_processId
                 -- Warten auf die nächste Nachricht (Timeout in Sekunden)
                 l_message := receiveMessage(g_serverPipeName);    
                 if l_message is not null THEN
+                    l_msgCnt := l_msgCnt + 1;
                 BEGIN 
                     l_clientChannel := extractClientChannel(l_message);
                     l_request := extractClientRequest(l_message);
+                    l_shutdownSignal := processRequest(l_request, l_message, l_clientChannel);
+/*
                     CASE l_request
                         WHEN 'SERVER_SHUTDOWN' then
                             if handleServerShutdown(l_clientChannel, l_message) then 
@@ -4085,7 +4152,7 @@ dbms_output.put_line('writeEventToMonitorBuffer -> p_processId: ' || p_processId
                             -- Unbekanntes Tag loggen
                             warn(g_serverProcessId, g_serverPipeName || '=> Received unknown request: ' || l_request);
                     END CASE;
-    
+*/    
                     EXCEPTION
                         WHEN l_stop_server_exception THEN
                             -- Diese Exception wird NICHT hier abgefangen, 
@@ -4103,9 +4170,10 @@ dbms_output.put_line('writeEventToMonitorBuffer -> p_processId: ' || p_processId
                     if get_ms_diff(l_lastSync, sysTimestamp) >= C_SEVER_SYNC_INTERVAL  THEN
                         -- Housekeeping
                         SYNC_ALL_DIRTY;
-                        updateServerRegistry(TRUE, l_loopCounter);
+                        updateServerRegistry(TRUE, l_msgCnt);
                         l_lastSync := sysTimestamp;
                         l_loopCounter := 0;
+                        l_msgCnt := 0;
                     end if;
                     
                     -- Timeout erreicht. Passiert, wenn 10 Sekunden kein Signal kam.
@@ -4119,20 +4187,22 @@ dbms_output.put_line('writeEventToMonitorBuffer -> p_processId: ' || p_processId
                 l_loopCounter := l_loopCounter + 1;
             END LOOP;
             -- Ab jetzt ist der Server nicht mehr erreichbar
-            updateServerRegistry(FALSE, l_loopCounter);
+            updateServerRegistry(FALSE, l_msgCnt);
             
             -- +++ NEU: DRAIN-PHASE +++
             -- Wir leeren die Pipe, falls während des Shutdowns noch Nachrichten reinkamen.
-            -- Wir nutzen ein minimales Timeout (0.1s), um dem Laptop-CPU-Scheduling Zeit zu geben.
             LOOP
                 l_status := DBMS_PIPE.RECEIVE_MESSAGE(g_serverPipeName, timeout => 0.1);
                 EXIT WHEN l_status != 0; -- Pipe ist leer (1) oder Fehler/Interrupt (!=0)
                 
                 DBMS_PIPE.UNPACK_MESSAGE(l_message);
+                l_clientChannel := extractClientChannel(l_message);
                 l_request := extractClientRequest(l_message);
                 
                 -- Im Drain verarbeiten wir nur noch Log-Daten, keine neuen Sessions/Shutdowns
                 if l_request IN ('LOG_ANY', 'MARK_EVENT', 'UNFREEZE_REQUEST') THEN
+                    l_shutdownSignal := processRequest(l_request, l_message, l_clientChannel);
+/*
                     CASE l_request
                         WHEN 'LOG_ANY' then
                             doRemote_logAny(l_message);
@@ -4144,6 +4214,7 @@ dbms_output.put_line('writeEventToMonitorBuffer -> p_processId: ' || p_processId
                             doRemote_unfreezeClient(l_clientChannel, l_message);
     
                     END CASE;
+*/
                 end if ;
             END LOOP;
             
@@ -4168,7 +4239,7 @@ dbms_output.put_line('writeEventToMonitorBuffer -> p_processId: ' || p_processId
             DUMP_BUFFER_STATS;
     
             close_session(g_serverProcessId);
-            updateServerRegistry(FALSE, l_loopCounter);
+            updateServerRegistry(FALSE, 0);
             
         EXCEPTION
         WHEN l_stop_server_exception THEN
