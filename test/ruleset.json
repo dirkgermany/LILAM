@@ -6,6 +6,16 @@
   },
   "rules": [
     {
+      "id": "SEQ-007",
+      "trigger_type": "TRACE_START",
+      "action": "PAYOUT",
+      "condition": {
+        "operator": "PRECEDED_BY_WITHIN_SECS",
+        "value": "APPROVAL|600"
+      },
+      "alert": { "handler": "LOG", "severity": "CRITICAL" }
+    },
+    {
       "id": "T001",
       "trigger_type": "TRACE_STOP",
       "action": "HEAVY_CALCULATION",
