@@ -262,13 +262,13 @@ LILAM is designed for high-concurrency environments. The following results were 
 - [ ] **Automatic Fallback:**
     * switch to the next available server or
     * graceful degradation from Decoupled to  mode
-- [ ] **Process Resumption:**
-    * Reconnect to aborted processes via `process_id`
+- [ ] **Process Resumption:** Reconnect to aborted processes via `process_id`
 - [X] **Retention:** Session data can be protected from deletion using the 'immortal' flag
 - [ ] **Adaptive Batching:** Dynamically adjust buffer sizes and flush intervals based on server load to ensure near real-time visibility during low traffic and maximum throughput during peaks
 - [ ] **Zombie Session Handling:** Detect inactive clients, release allocated memory, and update process statuses automatically
 - [ ] **Singleton Server Enforcement:** Prevent multiple servers from registering under the same name to ensure message integrity and avoid process contention
-- [ ] **Resilient Load Balancing:** LILAM uses V$DB_PIPES for precision routing. If access is restricted, it seamlessly falls back to registry-based balancing or round-robin to ensure continuous operation.
+- [ ] **Resilient Load Balancing:**
+      - Reconnect by Clients if Server sends 'DRAIN_AND_RECONNECT' or 'RECONNECT'
 - [ ] **Background Server Processing:** Start LILAM servers as jobs to avoid blocking sessions
 - [ ] **Advanced Metric Visualization:**
     * Provide a pre-built Oracle APEX Dashboard to monitor real-time throughput and system health
