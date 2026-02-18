@@ -25,8 +25,8 @@ LILAM is developed by a developer who hates over-engineered tools. Focus: 5 minu
 - [Fast integration](#fast-integration)
 - [Advantages](#advantages)
 - [Process Tracking & Monitoring](#process-tracking--monitoring)
+  - [Rule-based Observability & Orchestration](#rule-based-observability--orchestration
   - [How To - The Subway Sample](#how-to---the-subway-sample)
-  - [Rule-based Observability & Orchestration](#rule-based-observability--orchestration)
 - [Data](#data)
 - [Performance Benchmark](#performance-benchmark)
 - [Roadmap](#roadmap)
