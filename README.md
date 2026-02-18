@@ -76,7 +76,8 @@ LILAM introduces a high-performance Client-Server architecture using **Oracle Pi
 LILAM offers two execution models that can be used interchangeably:
 1. **In-Session Mode (Direct):** Initiated by `lilam.new_session`. LILAM acts as embedded library, Log and Metric calls are executed immediately within your current database session. This is ideal for straightforward debugging and ensuring data is persisted synchronously.
 2. **Decoupled Mode (Server-based):**
-   * **Server Side:** Launch one or more LILAM-Servers using `lilam.start_server('SERVER_NAME');`. LILAM serves as a proxy for the application and is executed as a dedicated worker process at the same time. These background processes register under a custom name and monitor for incoming commands. You can scale by running multiple servers for the same name or use different names for logical separation.
+   LILAM serves as a proxy for the application and is executed as a dedicated worker process at the same time. 
+   * **Server Side:** Launch one or more LILAM-Servers using `lilam.start_server('SERVER_NAME');`. These background processes register under a custom name and monitor for incoming commands. You can scale by running multiple servers for the same name or use different names for logical separation.
    * **Client Side:** Register via `lilam.server_new_session('SERVER_NAME');`. LILAM automatically identifies and connects to the specified available server.
    * **Execution:** Log calls are serialized into a pipe and processed by the background server, minimizing the impact on your transaction time.
   
