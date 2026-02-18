@@ -17,7 +17,7 @@
     },
     {
       "id": "AUDIT-99",
-      "trigger_type": "PROCESS_END",
+      "trigger_type": "PROCESS_STOP",
       "action": "NIGHTLY_DATALOAD",
       "condition": {
         "operator": "PRECEDED_BY_WITHIN_SECS",
