@@ -179,7 +179,7 @@ To illustrate how LILAM works, imagine monitoring a subway system:
   lilam.mark_event(p_processId => l_processId, p_actionName => 'CLOSE_DOOR', p_contextName => 'STATION_ID_400);
 
   -- log travel start
-  lilam.info(p_processId => l_processId, 'Line 4 leaving base');
+  lilam.info(p_processId => l_processId, p_logText => 'Line 4 leaving base');
 ```
 
 #### Track Business Transactions
@@ -193,7 +193,7 @@ To illustrate how LILAM works, imagine monitoring a subway system:
 ```sql
   -- the mission of line is very! short - only one section; so the mission ends here
   --   !  this didn't happen: lilam.step_done(p_processId => l_processId); -- increments step-counter
-  lilam.info(p_processId => l_processId, 'Line 4 is back');
+  lilam.info(p_processId => l_processId, p_logText => 'Line 4 is back');
   lilam.close_session(p_processId => l_processId);
 
   -- the step-counter is one, the rule-set awaits 2 steps here
