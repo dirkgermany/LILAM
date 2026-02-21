@@ -267,6 +267,12 @@ LILAM is designed for high-concurrency environments. The following results were 
 
 > **Key Takeaway:** Even on mobile hardware, LILAM handles millions of records without blocking the application sessions. On enterprise-grade server hardware with NVMe storage, throughput is expected to scale significantly higher.
 
+LILAM was developed and stress-tested on a consumer-grade laptop using Oracle Database 23ai Free. To provide a realistic assessment of its capabilities, a rigorous test scenario was designed to push the entire system to its physical limits under these conditions.
+
+For a detailed analysis of throughput, latency, and resource efficiency, please refer to the full reports:
+*   [Performance & Stress-Test Report (English Version)](./performance-report20%eng.md)
+*   [Performance- & Belastungstest-Bericht (Deutsche Version)](./performance-report20%deu.md)
+
 ---
 ## Roadmap
 - [ ] **Automatic Fallback:**
