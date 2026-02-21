@@ -10,9 +10,9 @@
 *   **Host-OS:** Windows 11 Home
 *   **Virtualisierung:** Oracle VM VirtualBox 7.2.4
 *   **Gast-OS:** Oracle Linux Server 8.10
-*   **Datenbank:** **Oracle AI Database 26ai Free Release 23.26.0.0.0**
+*   **Datenbank:** **Oracle AI Database 23.26.0.0.0**
 
-## 3. Datenbank-Limits (Oracle 21c Free)
+## 3. Datenbank-Limits (Oracle 23 Free)
 *   **Instanz-RAM Gesamtlimit:** **2,0 GB (Hard-Limit der Lizenz)**
 *   **SGA (System Global Area):** 1.529 MB (Optimiert auf Buffer-Caching)
 *   **PGA (verfügbarer Rest):** ca. 519 MB (Gemeinsamer Speicher für alle Sessions)
