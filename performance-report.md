@@ -103,26 +103,8 @@ Zustand des Arbeitsspeichers nach der massiven Befüllung des Library Cache.
 | **Total SGA** | **1.129,69 MB** | Fest belegter RAM-Block im Notebook |
 
 
-#### D. Latenz-Verteilung (Histogramm 100k Run)
-Die statistische Verteilung zeigt die hohe Präzision der Engine unter Normalbedingungen.
-
-
-| Latenz-Klasse | Anzahl Events | Anteil (%) |
-| :--- | :--- | :--- |
-| **< 5 ms (Echtzeit)** | 52044 | [X]% |
-| **5 - 20 ms (Sehr gut)** | 1721 | [X]% |
-| **20 - 100 ms (Gut)** | [Wert] | [X]% |
-| **> 100 ms (Ausreißer)** | [Wert] | [X]% |
-
-*Analyse:* Über 95% der Events werden in der Zielzeit von < 10ms verarbeitet. Ausreißer im Bereich > 500ms korrelieren exakt mit den physischen Log-Switches der Datenbank auf die SSD.
-
-
 #### D. Latenz-Verteilung (Analyse Mischlast)
 Die statistische Auswertung zeigt die Performance der Engine während eines parallelen Stresstests (1.300 EPS Hintergrundlast).
-
-
-#### D. Latenz-Verteilung (Statistische Analyse 100k Run)
-Die Verteilung zeigt die Performance der Engine während einer parallelen Hintergrundlast von ca. 1.300 EPS.
 
 
 | Latenz-Klasse             | Anzahl Events | Anteil (%) | Bewertung                     |
@@ -140,6 +122,7 @@ Die signifikanten Anteile in den höheren Latenz-Klassen (> 100 ms) sind direkt 
 1. **CPU-Flaschenhals:** Das 2-Thread-Limit der Oracle 21c Free Edition erzwingt bei paralleler Last (Mischlast) Wartezeiten im OS-Scheduler.
 2. **I/O-Sättigung:** Die Erzeugung von knapp 4,5 GB Redo-Daten führt zu periodischen Schreibpausen der Notebook-SSD (Log File Sync), was die Ausreißer im Bereich > 500 ms erklärt.
 
+*Analyse:* Über 95% der Events werden in der Zielzeit von < 10ms verarbeitet. Ausreißer im Bereich > 500ms korrelieren exakt mit den physischen Log-Switches der Datenbank auf die SSD.
 
 ---
 **Zusammenfassende Bewertung:**
