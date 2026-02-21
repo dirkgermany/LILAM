@@ -119,15 +119,14 @@ Die statistische Auswertung zeigt die Performance der Engine während eines para
 Trotz massiver künstlicher Überlastung durch ein paralleles Producer-Paar verarbeitet die LILAM-Engine über **52 % aller Ereignisse in echter Echtzeit (< 5 ms)**. 
 
 Die signifikanten Anteile in den höheren Latenz-Klassen (> 100 ms) sind direkt auf die physikalischen Limitierungen der Testumgebung zurückzuführen:
-1. **CPU-Flaschenhals:** Das 2-Thread-Limit der Oracle 21c Free Edition erzwingt bei paralleler Last (Mischlast) Wartezeiten im OS-Scheduler.
+1. **CPU-Flaschenhals:** Das 2-Thread-Limit der Oracle Free Edition erzwingt bei paralleler Last (Mischlast) Wartezeiten im OS-Scheduler.
 2. **I/O-Sättigung:** Die Erzeugung von knapp 4,5 GB Redo-Daten führt zu periodischen Schreibpausen der Notebook-SSD (Log File Sync), was die Ausreißer im Bereich > 500 ms erklärt.
 
-*Analyse:* Über 95% der Events werden in der Zielzeit von < 10ms verarbeitet. Ausreißer im Bereich > 500ms korrelieren exakt mit den physischen Log-Switches der Datenbank auf die SSD.
+*Analyse:* Während im unbelasteten Referenzlauf (Clean Run) über 95% der Events in unter 10ms verarbeitet wurden, belegt der Mischlast-Test, dass selbst bei extremer Hardware-Sättigung der Großteil der Daten verzögerungsfrei persistiert wird. Ausreißer korrelieren hierbei exakt mit den physischen Log-Switches der Datenbank.
 
 ---
 **Zusammenfassende Bewertung:**
-Die Metriken belegen eine **100%ige Auslastung der Oracle 21c Free Edition**. Insbesondere die hohen Werte im Bereich `library cache` verdeutlichen, dass die Software-Architektur (LILAM) die physikalischen Verwaltungsgrenzen der Datenbank-Instanz erreicht hat. Das System blieb trotz dieser massiven Sättigung zu jedem Zeitpunkt konsistent.
+Die Metriken belegen eine **100%ige Auslastung der Oracle Free Edition**. Insbesondere die hohen Werte im Bereich `library cache` verdeutlichen, dass die Software-Architektur (LILAM) die physikalischen Verwaltungsgrenzen der Datenbank-Instanz erreicht hat. Das System blieb trotz dieser massiven Sättigung zu jedem Zeitpunkt konsistent.
 
 Die LILAM-Engine weist eine hohe algorithmische Effizienz auf. Validierungstests mit und ohne aktives Regelset (7 Regeln via Assoziativem Array) zeigten identische Durchsatzraten. Dies belegt, dass die logische Verarbeitungsebene im Vergleich zum physikalischen I/O-Durchsatz der Hardware vernachlässigbar geringen Overhead erzeugt. Das System ist somit für komplexe Regelwerke skalierbar, solange die I/O-Kapazität der Storage-Anbindung gewahrt bleibt.
-
 
