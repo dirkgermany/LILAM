@@ -44,26 +44,26 @@ LILAM_VERSION constant varchar2(20) := 'v1.3.0';
     -- ================================
     TYPE t_process_rec IS RECORD (
         id              NUMBER(19,0),
-        process_name    varchar2(100),
-        log_level       PLS_INTEGER,
-        process_start   TIMESTAMP,
-        process_end     TIMESTAMP,
-        last_update     TIMESTAMP,
-        steps_todo PLS_INTEGER,
-        steps_done PLS_INTEGER,
+        processName    varchar2(100),
+        logLevel       PLS_INTEGER,
+        processStart   TIMESTAMP,
+        processEnd     TIMESTAMP,
+        lastUpdate     TIMESTAMP,
+        stepsTodo PLS_INTEGER,
+        stepsDone PLS_INTEGER,
         status          PLS_INTEGER,
         info            VARCHAR2(4000),
-        proc_immortal   PLS_INTEGER := 0,
-        tab_name_master VARCHAR2(100)
+        procImmortal   PLS_INTEGER := 0,
+        tabNameMaster VARCHAR2(100)
     );
 
     TYPE t_session_init IS RECORD (
         processName     VARCHAR2(100),
         logLevel        PLS_INTEGER := logLevelMonitor,
-        stepsToDo  PLS_INTEGER,
+        stepsToDo       PLS_INTEGER,
         daysToKeep      PLS_INTEGER := 100,
         procImmortal    PLS_INTEGER := 0,
-        tab_name_master VARCHAR2(100) DEFAULT 'LILAM_LOG'
+        tabNameMaster VARCHAR2(100) DEFAULT 'LILAM_LOG'
     );
 
 
