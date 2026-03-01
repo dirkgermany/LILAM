@@ -57,11 +57,10 @@
 ### In-Session Mode
 The following example shows the simplest way to initialize a session and log a message. 
 LILAM uses reasonable defaults, so you only need to provide a process name and the logLevel setting.
-After your application ends there should be two tables:
-* LILAM_LOG (the master logging table)
-* LILAM_LOG_DETAILS (the detail table with logs and metrics)
-
-And in table LILAM_LOG should be stored your first process 'MY_FIRST_SYNC' and in the LILAM_LOG_DETAILS should be your first metric markers.
+After your application ends there should be three tables:
+* LILAM_PROC (the process data table)
+* LILAM_LOG (table with logging data)
+* LILAM_MON (table with events and transaction metrics)
 
 
 ```sql
@@ -80,9 +79,9 @@ BEGIN
   lilam.info(p_processId => l_processId, p_info => 'LILAM is up and running!');
   
   -- 4. Mark a work step
-  lilam.mark_step(p_processId => l_processId, p_actionName => 'DATA_LOAD');
+  lilam.mark_event(p_processId => l_processId, p_actionName => 'DATA_LOAD');
   dbms_session.sleep(1);
-  lilam.mark_step(p_processId => l_processId, p_actionName => 'DATA_LOAD');
+  lilam.mark_event(p_processId => l_processId, p_actionName => 'DATA_LOAD');
   
   -- Missing a COMMIT? 
   -- Don't worry: LILAM uses AUTONOMOUS TRANSACTIONS.
@@ -268,7 +267,7 @@ FUNCTION SERVER_NEW_SESSION(
 | p_stepsToDo | PLS_INTEGER | steps_todo | defines how many steps must be done during the process | [`O`](#o)
 | p_daysToKeep | PLS_INTEGER | days_to_keep | max. age of entries in days; if not NULL, all entries older than p_daysToKeep and whose process name = p_processName (not case sensitive) are deleted | [`O`](#o)
 | p_serverName | VARCHAR2 | server_name | Used for server affinity / multi-tenancy| [`O`](od)
-| p_TabNameMaster | VARCHAR2 | tab_name_master | optional prefix of the LOG table names (see above) | [`D`](#d)
+| p_TabNameMaster | VARCHAR2 | tab_name_master | optional prefix of the PROC, LOG AND MON table names (see above) | [`D`](#d)
 
 **Returns**
 * Type: NUMBER
@@ -370,9 +369,9 @@ Documents the lifecycle of a process.
 | Name               | Type      | Description                         | Scope
 | ------------------ | --------- | ----------------------------------- | -------
 | [`SET_PROCESS_STATUS`](#procedure-set_process_status) | Procedure | Sets the state of the log status | Process
-| [`SET_STEPS_TODO`](#procedure-set_steps_todo) | Procedure | Sets the required number of actions | Process
+| [`SET_PROC_STEPS_TODO`](#procedure-set_steps_todo) | Procedure | Sets the required number of actions | Process
 | [`STEP_DONE`](#procedure-step_done) | Procedure | Increments the counter of completed steps | Process
-| [`SET_STEPS_DONE`](#procedure-set_steps_todo) | Procedure | Sets the number of completed actions | Process
+| [`SET_PROC_STEPS_DONE`](#procedure-set_steps_todo) | Procedure | Sets the number of completed actions | Process
 | [`GET_PROC_STEPS_DONE`](fFunction-get_proc_steps_done) | FUNCTION | Returns number of already finished steps | Process
 | [`GET_PROC_STEPS_TODO`](fFunction-get_proc_steps_done) | FUNCTION | Returns number of steps to do | Process
 | [`GET_PROCESS_START`](#function-get_process_start) | FUNCTION | Returns time of process start | Process
@@ -413,11 +412,11 @@ Increments the number of completed steps (progress). This simplifies the managem
   )
  ```
 
-#### Procedure SET_STEPS_DONE
+#### Procedure SET_PROC_STEPS_DONE
 Sets the total number of completed steps. Note: Calling this procedure overwrites any progress previously calculated via `STEP_DONE`.
 
  ```sql
-  PROCEDURE SET_STEPS_DONE(
+  PROCEDURE SET_PROC_STEPS_DONE(
     p_processId     NUMBER,
     p_stepsDone     PLS_INTEGER
   )
@@ -820,6 +819,7 @@ TYPE t_session_init IS RECORD (
     logLevel PLS_INTEGER := logLevelMonitor,
     stepsToDo PLS_INTEGER,
     daysToKeep PLS_INTEGER,
+    procImmortal PLS_INTEGER,
     tabNameMaster VARCHAR2(100) DEFAULT 'LILAM_LOG'
 );
 ```
