@@ -1,4 +1,5 @@
-create or replace PACKAGE BODY LILAM AS
+create or replace PACKAGE BODY LILAM
+AS
     /*
      * LILAM
      * Dual-licensed under GPLv3 or Commercial License.
@@ -186,6 +187,13 @@ create or replace PACKAGE BODY LILAM AS
         -- Zusätzliche Variable für die aktuell geladene Version
         g_current_rule_set_version NUMBER := 0;
         g_current_rule_set_name    VARCHAR2(30);
+        
+        TYPE t_avg_params IS RECORD (
+            alpha    NUMBER := 0.1,
+            warmup   PLS_INTEGER := 100
+        );
+        TYPE t_avg_params_map IS TABLE OF t_avg_params INDEX BY VARCHAR2(250);
+        g_avg_params t_avg_params_map;  
         
         TYPE t_alert_history IS TABLE OF TIMESTAMP INDEX BY VARCHAR2(250);
         g_alert_history t_alert_history;
@@ -506,6 +514,7 @@ create or replace PACKAGE BODY LILAM AS
         --------------------------------------------------------------------------
         -- Check if a single step needs more time than average over all steps per action
         --------------------------------------------------------------------------
+/*
         function validateDurationInAverage(p_monitor_rec t_monitor_buffer_rec, p_metricFactor number) return BOOLEAN
         as
             l_threshold_duration NUMBER;
@@ -519,7 +528,60 @@ create or replace PACKAGE BODY LILAM AS
             end if ;
             return TRUE;
         end;
-         
+*/
+        function validateDurationInAverage(p_monitor_rec t_monitor_buffer_rec, p_metricFactor number) return BOOLEAN
+        as
+        begin
+            -- Wenn noch kein Trend da ist (Initialstart), können wir nichts validieren.
+            if p_monitor_rec.avg_action_time is null or p_monitor_rec.avg_action_time = 0 then
+                return TRUE; 
+            end if;
+        
+            -- Vergleich gegen den bestehenden Trend
+            -- Da p_old_ewma während des Warm-ups dem Trend folgt, 
+            -- greift die 10% (oder X%) Hürde erst, wenn der EWMA sich stabilisiert.
+            if p_monitor_rec.used_time > p_monitor_rec.avg_action_time * (1 + p_metricFactor / 100) then
+                return FALSE;
+            end if;
+        
+            return TRUE;
+        end;
+        
+        --------------------------------------------------------------------------
+
+        FUNCTION extractRuleValue(p_param VARCHAR2, p_pos PLS_INTEGER) return number
+        AS
+            l_pos1  PLS_INTEGER;
+            l_pos2  PLS_INTEGER;            
+            l_val   VARCHAR2(20);
+
+        BEGIN
+            -- 1. Positionen der Trenner finden
+            l_pos1 := INSTR(p_param, ',');      -- Erstes Komma
+            l_pos2 := INSTR(p_param, ',', 1, 2); -- Zweites Komma
+        
+            if p_pos = 1 then            
+                -- Erster Wert: Alles vor dem ersten Komma
+                l_val := SUBSTR(p_param, 1, l_pos1 - 1);
+                return to_number(l_val);
+            end if;
+            
+            if p_pos = 2 then
+                -- ZWEITER WERT: Zwischen pos1 und pos2
+                -- Wir trimmen Leerzeichen direkt mit weg
+                l_val := TRIM(SUBSTR(p_param, l_pos1 + 1, l_pos2 - l_pos1 - 1));
+                return to_number(l_val);
+            end if;
+            
+            if p_pos = 3 then
+                -- DRITTER WERT (0.5): Alles nach dem zweiten Komma
+                l_val := TRIM(SUBSTR(p_param, l_pos2 + 1));
+                return to_number(l_val);
+            end if;
+            
+            return 0;
+        END;
+
         -------------------------------------------------------
         -- Generate Action/Context - Key verifying Server Rules 
         -------------------------------------------------------
@@ -540,7 +602,6 @@ create or replace PACKAGE BODY LILAM AS
         PROCEDURE fire_alert(p_rule t_rule_rec, p_rec t_monitor_buffer_rec) IS
             pragma autonomous_transaction;
             v_history_key varchar2(200) := p_rec.process_id || '|' || p_rule.rule_id || '|' || p_rec.action_name;
---            v_history_key   varchar2(200); --CONSTANT VARCHAR2(250);
             v_idx_session   PLS_INTEGER;
             v_last_fire     TIMESTAMP(6);
             v_throttle_sec  NUMBER := coalesce(p_rule.throttle_seconds, 0); -- Aus dem JSON
@@ -609,9 +670,10 @@ create or replace PACKAGE BODY LILAM AS
         ------------------------------------------------------------      
         PROCEDURE evaluateRules(p_monitorRec t_monitor_buffer_rec, p_trigger VARCHAR2)
         as
-            v_key varchar2(200);
-            fire BOOLEAN := FALSE;
-            l_diff_ms PLS_INTEGER := 0;
+            v_key       varchar2(200);
+            fire        BOOLEAN := FALSE;
+            l_diff_ms   PLS_INTEGER := 0;
+            l_condVal   NUMBER := 0;
             
             -- Interne Hilfsprozedur, um Redundanz zu vermeiden
             PROCEDURE apply_rule_list(p_list t_rule_list) IS
@@ -622,11 +684,12 @@ create or replace PACKAGE BODY LILAM AS
                     -- Nur Regeln für das aktuelle Ereignis prüfen (z.B. TRACE_STOP)
                     IF p_list(i).trigger_type = p_trigger THEN
                         CASE
-                        WHEN p_list(i).condition_operator IN ('ON_START', 'ON_STOP', 'ON_EVENT') THEN
-                            fire := TRUE;
-                        
-                        WHEN p_list(i).condition_operator = 'AVG_DEVIATION_PCT' THEN
-                                if not validateDurationInAverage(p_monitorRec, p_list(i).condition_value) then
+                            WHEN p_list(i).condition_operator IN ('ON_START', 'ON_STOP', 'ON_EVENT') THEN
+                                fire := TRUE;
+                            
+                            WHEN p_list(i).condition_operator = 'AVG_DEVIATION_PCT' THEN
+                                l_condVal := extractRuleValue(p_list(i).condition_value, 1);
+                                if not validateDurationInAverage(p_monitorRec, l_condVal) then
                                     fire := TRUE;
                                 END IF;
         
@@ -884,14 +947,14 @@ create or replace PACKAGE BODY LILAM AS
             p_pipeName   in varchar2 default null
         ) return varchar2
         as
-            l_msgSend       VARCHAR2(4000);
+--            l_msgSend       VARCHAR2(4000);
             l_msgReceive    VARCHAR2(4000);
             l_status        PLS_INTEGER;
             l_statusReceive PLS_INTEGER;
             l_clientChannel varchar2(50);
-            l_header        varchar2(200);
-            l_meta          varchar2(200);
-            l_data          varchar2(1500);
+--            l_header        varchar2(200);
+--            l_meta          varchar2(200);
+--            l_data          varchar2(1500);
             l_groupName     varchar2(50);
             l_serverPipe    varchar2(100);
             l_slotIdx PLS_INTEGER;
@@ -903,22 +966,22 @@ create or replace PACKAGE BODY LILAM AS
             l_clientChannel := getClientPipe;
             l_groupName := jsonString(p_payload, 'group_name');
             
---            l_jsonHeader := jsonPut(l_jsonHeader, 'msg_type', 'API_CALL');
---            l_jsonHeader := jsonPut(l_jsonHeader, 'request', p_request);
---            l_jsonHeader := jsonPut(l_jsonHeader, 'response', l_clientChannel);
---            l_jsonPayload := p_payLoad;
---            l_jsonMain := jsonPut(l_jsonMain, 'header', l_jsonHeader);
---            l_jsonMain := jsonPut(l_jsonMain, 'payload', l_jsonPayload);
+            l_jsonHeader := jsonPut(l_jsonHeader, 'msg_type', 'API_CALL');
+            l_jsonHeader := jsonPut(l_jsonHeader, 'request', p_request);
+            l_jsonHeader := jsonPut(l_jsonHeader, 'response', l_clientChannel);
+            l_jsonPayload := p_payLoad;
+            l_jsonMain := jsonPut(l_jsonMain, 'header', l_jsonHeader);
+            l_jsonMain := jsonPut(l_jsonMain, 'payload', l_jsonPayload);
 
-            l_header := '"header":{"msg_type":"API_CALL", "request":"' || p_request || '", "response":"' || l_clientChannel ||'"}';
-            l_meta  := '"meta":{"param":"value"}';
-            l_data  := '"payload":' || p_payLoad;
-            l_msgSend := '{' || l_header || ', ' || l_meta || ', ' || l_data || '}';
+--            l_header := '"header":{"msg_type":"API_CALL", "request":"' || p_request || '", "response":"' || l_clientChannel ||'"}';
+--            l_meta  := '"meta":{"param":"value"}';
+--            l_data  := '"payload":' || p_payLoad;
+--            l_msgSend := '{' || l_header || ', ' || l_meta || ', ' || l_data || '}';
 
             l_serverPipe := getServerPipeForSession(p_processId, l_groupName);
             
-            DBMS_PIPE.PACK_MESSAGE(l_msgSend);
---            DBMS_PIPE.PACK_MESSAGE(l_jsonMain);
+--            DBMS_PIPE.PACK_MESSAGE(l_msgSend);
+            DBMS_PIPE.PACK_MESSAGE(l_jsonMain);
             l_status := DBMS_PIPE.SEND_MESSAGE(l_serverPipe, timeout => 3);
             l_statusReceive := DBMS_PIPE.RECEIVE_MESSAGE(l_clientChannel, timeout => p_timeoutSec);
             if l_statusReceive = 0 THEN
@@ -1154,7 +1217,7 @@ create or replace PACKAGE BODY LILAM AS
     
         --------------------------------------------------------------------------
     
-        function replaceNameDetailTable(p_sqlStatement varchar2, p_placeHolder varchar2, p_tableSuffix varchar2, p_tableName varchar2) return varchar2
+        function replaceNameTable(p_sqlStatement varchar2, p_placeHolder varchar2, p_tableSuffix varchar2, p_tableName varchar2) return varchar2
         as
         begin
             return replace(p_sqlStatement, p_placeHolder, p_tableName || p_tableSuffix);
@@ -1162,11 +1225,11 @@ create or replace PACKAGE BODY LILAM AS
         
         --------------------------------------------------------------------------
     
-        function replaceNameMasterTable(p_sqlStatement varchar2, p_placeHolder varchar2, p_tableName varchar2) return varchar2
-        as
-        begin
-            return replace(p_sqlStatement, p_placeHolder, p_tableName);
-        end;
+--        function replaceNameMasterTable(p_sqlStatement varchar2, p_placeHolder varchar2, p_tableName varchar2) return varchar2
+--        as
+--        begin
+--            return replace(p_sqlStatement, p_placeHolder, p_tableName);
+--        end;
         
         --------------------------------------------------------------------------
     
@@ -1181,7 +1244,7 @@ create or replace PACKAGE BODY LILAM AS
                 execute immediate sqlStmt;
             end if ;
                     
-            if not objectExists(p_TabNameMaster, 'TABLE') then
+            if not objectExists(p_TabNameMaster || C_SUFFIX_PROC_TABLE, 'TABLE') then
                 -- Master table
                 sqlStmt := '
                 create table PH_MASTER_TABLE ( 
@@ -1198,7 +1261,7 @@ create or replace PACKAGE BODY LILAM AS
                     process_immortal NUMBER(1,0) DEFAULT 0,
                     tab_name_master  VARCHAR2(100)
                 )';
-                sqlStmt := replaceNameMasterTable(sqlStmt, C_PARAM_MASTER_TABLE, p_TabNameMaster);
+                sqlStmt := replaceNameTable(sqlStmt, C_PARAM_MASTER_TABLE, C_SUFFIX_PROC_TABLE, p_TabNameMaster);
                 run_sql(sqlStmt);
             end if ;
     
@@ -1217,7 +1280,7 @@ create or replace PACKAGE BODY LILAM AS
                     "ERR_BACKTRACE"     varchar2(4000),
                     "ERR_CALLSTACK"     varchar2(4000)
                 )';
-                sqlStmt := replaceNameDetailTable(sqlStmt, C_PARAM_LOG_TABLE, C_SUFFIX_LOG_TABLE, p_TabNameMaster);
+                sqlStmt := replaceNameTable(sqlStmt, C_PARAM_LOG_TABLE, C_SUFFIX_LOG_TABLE, p_TabNameMaster);
                 run_sql(sqlStmt);
             end if ;
     
@@ -1237,7 +1300,7 @@ create or replace PACKAGE BODY LILAM AS
                     "AVG_MILLIS"    NUMBER(19,0),
                     "ACTION_COUNT"    NUMBER(19,0)
                 )';
-                sqlStmt := replaceNameDetailTable(sqlStmt, C_PARAM_MON_TABLE, C_SUFFIX_MON_TABLE, p_TabNameMaster);
+                sqlStmt := replaceNameTable(sqlStmt, C_PARAM_MON_TABLE, C_SUFFIX_MON_TABLE, p_TabNameMaster);
                 run_sql(sqlStmt);
             end if ;
     
@@ -1300,7 +1363,7 @@ create or replace PACKAGE BODY LILAM AS
                 sqlStmt := '
                 CREATE INDEX idx_lilam_main_id
                 ON PH_MASTER_TABLE (id)';
-                sqlStmt := replaceNameMasterTable(sqlStmt, C_PARAM_MASTER_TABLE, p_TabNameMaster);
+                sqlStmt := replaceNameTable(sqlStmt, C_PARAM_MASTER_TABLE, C_SUFFIX_PROC_TABLE, p_TabNameMaster);
                 run_sql(sqlStmt);
             end if ;
     
@@ -1308,7 +1371,7 @@ create or replace PACKAGE BODY LILAM AS
                 sqlStmt := '
                 CREATE INDEX idx_lilam_LOG_master
                 ON PH_LOG_TABLE (process_id)';
-                sqlStmt := replaceNameDetailTable(sqlStmt, C_PARAM_LOG_TABLE, C_SUFFIX_LOG_TABLE, p_TabNameMaster);
+                sqlStmt := replaceNameTable(sqlStmt, C_PARAM_LOG_TABLE, C_SUFFIX_LOG_TABLE, p_TabNameMaster);
                 run_sql(sqlStmt);
             end if ;
     
@@ -1316,7 +1379,7 @@ create or replace PACKAGE BODY LILAM AS
                 sqlStmt := '
                 CREATE INDEX idx_lilam_mon_master
                 ON PH_MON_TABLE (process_id)';
-                sqlStmt := replaceNameDetailTable(sqlStmt, C_PARAM_MON_TABLE, C_SUFFIX_MON_TABLE, p_TabNameMaster);
+                sqlStmt := replaceNameTable(sqlStmt, C_PARAM_MON_TABLE, C_SUFFIX_MON_TABLE, p_TabNameMaster);
                 run_sql(sqlStmt);
             end if ;
     
@@ -1324,7 +1387,7 @@ create or replace PACKAGE BODY LILAM AS
                 sqlStmt := '
                 CREATE INDEX idx_lilam_LOG_info
                 ON PH_LOG_TABLE (info)';
-                sqlStmt := replaceNameDetailTable(sqlStmt, C_PARAM_LOG_TABLE, C_SUFFIX_LOG_TABLE, p_TabNameMaster);
+                sqlStmt := replaceNameTable(sqlStmt, C_PARAM_LOG_TABLE, C_SUFFIX_LOG_TABLE, p_TabNameMaster);
                 run_sql(sqlStmt);
             end if ;
     
@@ -1332,7 +1395,7 @@ create or replace PACKAGE BODY LILAM AS
                 sqlStmt := '
                 CREATE INDEX idx_lilam_cleanup 
                 ON PH_MASTER_TABLE (process_name, process_end)';
-                sqlStmt := replaceNameMasterTable(sqlStmt, C_PARAM_MASTER_TABLE, p_TabNameMaster);
+                sqlStmt := replaceNameTable(sqlStmt, C_PARAM_MASTER_TABLE, C_SUFFIX_PROC_TABLE, p_TabNameMaster);
                 run_sql(sqlStmt);
             end if ;
     
@@ -1377,7 +1440,7 @@ create or replace PACKAGE BODY LILAM AS
                 return; 
             end if ;
             
-            sqlStatement := replaceNameMasterTable(sqlStatement, C_PARAM_MASTER_TABLE, sessionRec.tabName_master);
+            sqlStatement := replaceNameTable(sqlStatement, C_PARAM_MASTER_TABLE, C_SUFFIX_PROC_TABLE, sessionRec.tabName_master);
     
             -- for all process IDs
             open t_rc for sqlStatement using p_daysToKeep, p_processName;
@@ -1387,16 +1450,16 @@ create or replace PACKAGE BODY LILAM AS
                 
                 -- delete Logs and Monitor-entries first (integrity)
                 sqlStatement := 'delete from PH_LOG_TABLE where process_id = :1';
-                sqlStatement := replaceNameDetailTable(sqlStatement, C_PARAM_LOG_TABLE, C_SUFFIX_LOG_TABLE, sessionRec.tabName_master);
+                sqlStatement := replaceNameTable(sqlStatement, C_PARAM_LOG_TABLE, C_SUFFIX_LOG_TABLE, sessionRec.tabName_master);
                 execute immediate sqlStatement USING processIdToDelete;
         
                 sqlStatement := 'delete from PH_MON_TABLE where process_id = :1';
-                sqlStatement := replaceNameDetailTable(sqlStatement, C_PARAM_MON_TABLE, C_SUFFIX_MON_TABLE, sessionRec.tabName_master);
+                sqlStatement := replaceNameTable(sqlStatement, C_PARAM_MON_TABLE, C_SUFFIX_MON_TABLE, sessionRec.tabName_master);
                 execute immediate sqlStatement USING processIdToDelete;
         
                 -- delete master
                 sqlStatement := 'delete from PH_MASTER_TABLE where id = :1';
-                sqlStatement := replaceNameMasterTable(sqlStatement, C_PARAM_MASTER_TABLE, sessionRec.tabName_master);
+                sqlStatement := replaceNameTable(sqlStatement, C_PARAM_MASTER_TABLE, C_SUFFIX_PROC_TABLE, sessionRec.tabName_master);
                 execute immediate sqlStatement USING processIdToDelete;
             end loop;
             close t_rc;
@@ -1452,7 +1515,7 @@ create or replace PACKAGE BODY LILAM AS
             
             sessionRec := getSessionRecord(p_processId);
             if sessionRec.process_id is not null then
-                sqlStatement := replaceNameMasterTable(sqlStatement, C_PARAM_MASTER_TABLE, sessionRec.tabName_master);
+                sqlStatement := replaceNameTable(sqlStatement, C_PARAM_MASTER_TABLE, C_SUFFIX_PROC_TABLE, sessionRec.tabname_Master);
                 execute immediate sqlStatement into processRec USING p_processId;
             end if ;
             return processRec;
@@ -1839,6 +1902,34 @@ create or replace PACKAGE BODY LILAM AS
         --------------------------------------------------------------------------
         -- Calculation average time used
         --------------------------------------------------------------------------
+        function calculate_ewma(
+            p_old_avg    number,      -- Der bisherige EWMA (aus deiner Status-Tabelle/RAM)
+            p_curr_count pls_integer, -- Laufender Zähler für dieses Ereignis
+            p_new_value  number,      -- Aktuell gemessene Latenz (ms)
+            p_warmup     pls_integer default 100, -- Schwelle für die Glättung
+            p_alpha      number      default 0.1  -- Gewichtung (0.1 = 10% neu, 90% alt)
+        ) return number is
+        begin
+            -- Fall 1: Initialisierung (Der allererste Datensatz überhaupt)
+            -- Wenn noch kein Durchschnitt da ist, ist der erste Wert unser Startpunkt.
+            if p_old_avg is null or p_old_avg = 0 or p_curr_count <= 1 then
+                return p_new_value;
+            end if;
+        
+            -- Fall 2: Warm-up Phase
+            -- Wir reichen den aktuellen Wert 1:1 durch, bis wir genug Daten für 
+            -- eine statistisch stabile Glättung haben.
+            if p_curr_count < p_warmup then
+                return p_new_value;
+            end if;
+        
+            -- Fall 3: Die echte EWMA-Berechnung (Phase 3)
+            -- Mathematisch optimierte Formel: Alt + Alpha * (Neu - Alt)
+            return p_old_avg + p_alpha * (p_new_value - p_old_avg);
+        end;
+
+        --------------------------------------------------------------------------
+
         function calculate_avg(
             p_old_avg    number,
             p_curr_count pls_integer,
@@ -1976,6 +2067,20 @@ create or replace PACKAGE BODY LILAM AS
         
         --------------------------------------------------------------------------
         
+        function findAvgRule(p_action varchar2, p_context varchar2) return t_avg_params
+        as
+            l_ruleKey varchar2(100) := p_action || p_context;
+        begin
+            IF g_avg_params.EXISTS(l_ruleKey) THEN
+                return g_avg_params(l_ruleKey);
+            ELSIF g_avg_params.EXISTS(p_action) THEN
+                return g_avg_params(p_action);
+            end if;
+            return g_avg_params('DEFAULT');
+        end;
+        
+        --------------------------------------------------------------------------
+        
         procedure writeEventToMonitorBuffer (p_processId number, p_actionName varchar2, p_contextName varchar2, p_timestamp timestamp)
         as
             -- Key-Präfix sollte idealerweise p_processId enthalten für schnelleren Flush-Zugriff
@@ -1983,6 +2088,7 @@ create or replace PACKAGE BODY LILAM AS
             l_new_idx    PLS_INTEGER;
             v_idx        PLS_INTEGER;
             l_prev       t_monitor_buffer_rec; 
+            l_avg_params t_avg_params;
         begin
             if is_remote(p_processId) then
                 insertEventMonitorRemote(p_processId, p_actionName, p_contextName, p_timestamp);
@@ -2000,16 +2106,20 @@ create or replace PACKAGE BODY LILAM AS
             end if ;
             g_monitor_groups(v_key).EXTEND;
             l_new_idx := g_monitor_groups(v_key).LAST;
-            
+
             -- Die nächsten Werte abhängig davon ob es einen Vorgänger gibt
             if g_monitor_shadows.EXISTS(v_key) then            -- Es gibt einen Vorgänger
                 l_prev := g_monitor_shadows(v_key);
                 g_monitor_groups(v_key)(l_new_idx).action_count   := l_prev.action_count + 1;
                 g_monitor_groups(v_key)(l_new_idx).used_time       := get_ms_diff(l_prev.start_time, coalesce(p_timestamp, systimestamp));
-                g_monitor_groups(v_key)(l_new_idx).avg_action_time := calculate_avg(
+                
+                l_avg_params := findAvgRule(p_actionName, p_contextName);
+                g_monitor_groups(v_key)(l_new_idx).avg_action_time := calculate_ewma( -- calculate_avg
                                                                         l_prev.avg_action_time, 
                                                                         g_monitor_groups(v_key)(l_new_idx).action_count, 
-                                                                        g_monitor_groups(v_key)(l_new_idx).used_time
+                                                                        g_monitor_groups(v_key)(l_new_idx).used_time,
+                                                                        l_avg_params.warmup,
+                                                                        l_avg_params.alpha
                                                                       );
             ELSE
                 -- Erster Eintrag der Session/Action
@@ -2084,6 +2194,7 @@ create or replace PACKAGE BODY LILAM AS
             v_first_idx  PLS_INTEGER;
             l_new_idx    PLS_INTEGER;
             v_idx        PLS_INTEGER;
+            l_avg_params t_avg_params;
         begin
             if is_remote(p_processId) then
                 insertTraceMonitorRemote(p_processId, p_actionName, p_contextName, p_timestamp);
@@ -2113,9 +2224,15 @@ create or replace PACKAGE BODY LILAM AS
                 v_new_rec.action_count    := g_monitor_averages(v_key).action_count + 1;
                 -- Gleitender Durchschnitt berechnen
                 -- Formel: ((Alter Schnitt * Alte Anzahl) + Neue Zeit) / Neue Anzahl
-                v_new_rec.avg_action_time := 
-                    ((g_monitor_averages(v_key).avg_action_time * g_monitor_averages(v_key).action_count) 
-                     + v_new_rec.used_time) / v_new_rec.action_count;
+                
+                l_avg_params := findAvgRule(p_actionName, p_contextName);                
+                v_new_rec.avg_action_time := calculate_ewma( -- calculate_avg
+                                                            g_monitor_averages(v_key).avg_action_time, 
+                                                            g_monitor_averages(v_key).action_count, 
+                                                            v_new_rec.used_time,
+                                                            l_avg_params.warmup,
+                                                            l_avg_params.alpha
+                                                          );
             END IF;
             
             -- Gedächtnis für den nächsten Lauf aktualisieren
@@ -2133,7 +2250,6 @@ create or replace PACKAGE BODY LILAM AS
             g_monitor_averages(v_key) := v_new_rec;
             
             v_idx := v_indexSession(p_processId);            
---            validateDurationInAverage(p_processId, g_monitor_groups(v_key)(l_new_idx));
             g_sessionList(v_idx).monitor_dirty_count := coalesce(g_sessionList(v_idx).monitor_dirty_count, 0) + 1;
             g_dirty_queue(p_processId) := TRUE; 
             
@@ -2391,7 +2507,7 @@ create or replace PACKAGE BODY LILAM AS
                 process_immortal = :PH_IMMORTAL
             where id = :PH_PROCESS_ID';  
     
-            sqlStatement := replaceNameMasterTable(sqlStatement, C_PARAM_MASTER_TABLE, p_process_rec.tab_name_master);        
+            sqlStatement := replaceNameTable(sqlStatement, C_PARAM_MASTER_TABLE, C_SUFFIX_PROC_TABLE, p_process_rec.tab_name_master);
             execute immediate sqlStatement
             USING   p_process_rec.status, 
                     p_process_rec.process_end,
@@ -2440,7 +2556,7 @@ create or replace PACKAGE BODY LILAM AS
             end if ;     
             
             sqlStatement := sqlStatement || ' where id = :PH_PROCESS_ID'; 
-            sqlStatement := replaceNameMasterTable(sqlStatement, C_PARAM_MASTER_TABLE, p_tableName);
+            sqlStatement := replaceNameTable(sqlStatement, C_PARAM_MASTER_TABLE, C_SUFFIX_PROC_TABLE, p_tableName);
             
             -- due to the variable number of parameters using dbms_sql
             sqlCursor := DBMS_SQL.OPEN_CURSOR;
@@ -2513,7 +2629,7 @@ create or replace PACKAGE BODY LILAM AS
                 :PH_IMMORTAL,
                 :PH_TABNAME_MASTER
             )';
-            sqlStatement := replaceNameMasterTable(sqlStatement, C_PARAM_MASTER_TABLE, p_TabNameMaster);
+            sqlStatement := replaceNameTable(sqlStatement, C_PARAM_MASTER_TABLE, C_SUFFIX_PROC_TABLE, p_TabNameMaster);
             execute immediate sqlStatement USING p_processId, p_processName, p_procStepsToDo, p_logLevel, p_procImmortal, upper(p_tabNameMaster);     
             commit;
         exception
@@ -3428,9 +3544,6 @@ create or replace PACKAGE BODY LILAM AS
             l_timestamp := jsonTime(l_payload, 'timestamp');
             l_monType := jsonNumber(l_payload, 'monitor_type');
             
-dbms_output.enable();
-dbms_output.put_line('Timestamp: ' || l_timestamp);
-
             writeEventToMonitorBuffer(l_processId, l_actionName, l_contextName, l_timestamp);
         end;
         
@@ -4063,7 +4176,6 @@ dbms_output.put_line('Timestamp: ' || l_timestamp);
                     l_new_rule.alert_severity     := r.severity;
                     l_new_rule.throttle_seconds   := r.throttle_sec;
 
-        
                     -- Entscheidung: Kontext-Regel oder allgemeine Action-Regel?
                     IF r.context IS NOT NULL THEN
                         l_key := r.action || '|' || r.context;
@@ -4072,13 +4184,23 @@ dbms_output.put_line('Timestamp: ' || l_timestamp);
                         END IF;
                         g_rules_by_context(l_key).EXTEND;
                         g_rules_by_context(l_key)(g_rules_by_context(l_key).LAST) := l_new_rule;
+                        
+                        if l_new_rule.condition_operator = 'AVG_DEVIATION_PCT' then
+                            g_avg_params(l_key).warmup := extractRuleValue(l_new_rule.condition_value, 2);
+                            g_avg_params(l_key).alpha  := extractRuleValue(l_new_rule.condition_value, 3);
+                        end if;
                     ELSE
                         l_key := r.action;
                         IF NOT g_rules_by_action.EXISTS(l_key) THEN
                             g_rules_by_action(l_key) := t_rule_list();
                         END IF;
                         g_rules_by_action(l_key).EXTEND;
-                        g_rules_by_action(l_key)(g_rules_by_action(l_key).LAST) := l_new_rule;                       
+                        g_rules_by_action(l_key)(g_rules_by_action(l_key).LAST) := l_new_rule;
+                        
+                        if l_new_rule.condition_operator = 'AVG_DEVIATION_PCT' then
+                            g_avg_params(l_key).warmup := extractRuleValue(l_new_rule.condition_value, 2);
+                            g_avg_params(l_key).alpha  := extractRuleValue(l_new_rule.condition_value, 3);
+                        end if;
                     END IF;
                 END;
             END LOOP;
@@ -4325,8 +4447,6 @@ dbms_output.put_line('Timestamp: ' || l_timestamp);
                     doRemote_getProcessData(p_clientChannel, p_message);
                     
                 WHEN 'MARK_EVENT' then
-dbms_output.enable();
-dbms_output.put_line(p_message);
                     doRemote_markEvent(p_message);
                     
                 WHEN 'START_TRACE' then
@@ -4497,7 +4617,8 @@ dbms_output.put_line(p_message);
             l_jsonHeader    JSON_OBJ_LILAM;
             l_jsonPayload   JSON_OBJ_LILAM;
             l_api_call  VARCHAR2(30);
-            l_proc_id NUMBER;        
+            l_proc_id NUMBER;  
+            p_session_init  t_session_init;
         BEGIN
             if not p_callObject IS JSON then
                 RAISE_APPLICATION_ERROR(-20005, 'In-Parameter is invalid JSON-Format');
@@ -4527,13 +4648,20 @@ dbms_output.put_line(p_message);
                     end if;
                     
                 when 'NEW_SESSION' THEN
---                    l_proc_id := NEW_SESSION(l_jsonParams);
+                    p_session_init.processName     := jsonString(l_jsonParams, 'process_name');
+                    p_session_init.logLevel        := jsonNumber(l_jsonParams, 'log_level');
+                    p_session_init.stepsToDo       := jsonNumber(l_jsonParams, 'steps_todo');
+                    p_session_init.daysToKeep      := jsonNumber(l_jsonParams, 'days_to_keep');
+                    p_session_init.procImmortal    := jsonNumber(l_jsonParams, 'process_immortal');
+                    p_session_init.tab_name_master := jsonString(l_jsonParams, 'tabname_master');
+
+                    l_proc_id := NEW_SESSION(p_session_init);
                     l_jsonHeader := jsonPut(l_jsonHeader, 'status', 'SUCCESS');
                     l_jsonPayload := jsonPut(l_jsonPayload, 'returns', 'PROCESS_ID');
                     l_jsonPayload := jsonPut(l_jsonPayload, 'value', l_proc_id);
                 
                 when 'SERVER_SHUTDOWN' then
---                    SERVER_SHUTDOWN(l_jsonParams);
+                    SERVER_SHUTDOWN(jsonNumber(l_jsonParams, 'process_id'), jsonString(l_jsonParams, 'process_name'), jsonString(l_jsonParams, 'password'));
                     l_jsonHeader := jsonPut(l_jsonHeader, 'status', NUM_ACK_OK);
                     l_jsonPayload := jsonPut(l_jsonPayload, 'returns', 'NO_VALUE');
                     l_jsonPayload := jsonPut(l_jsonPayload, 'value', 'NULL');
@@ -4542,53 +4670,40 @@ dbms_output.put_line(p_message);
                     CLOSE_SESSION(l_jsonParams);
                 
                 when 'SET_PROCESS_STATUS' THEN
-                null;
---                    SET_PROCESS_STATUS(l_jsonParams);
+                    SET_PROCESS_STATUS(jsonNumber(l_jsonParams, 'process_id'), jsonNumber(l_jsonParams, 'process_status'), jsonString(l_jsonParams, 'process_info'));
                     
-                when 'SET_steps_todo' THEN
-                null;
---                    SET_steps_todo(l_jsonParams);
+                when 'SET_STEP_TODO' THEN
+                    SET_PROC_STEPS_TODO(jsonNumber(l_jsonParams, 'process_id'), jsonNumber(l_jsonParams, 'steps_todo'));
                     
                 when 'SET_steps_done' THEN
-                null;
---                    SET_steps_done(l_jsonParams);
+                    SET_PROC_steps_done(jsonNumber(l_jsonParams, 'process_id'), jsonNumber(l_jsonParams, 'steps_done'));
                     
                 when 'PROC_STEP_DONE' THEN
-                null;
---                    PROC_STEP_DONE(l_jsonParams);
+                    PROC_STEP_DONE(jsonNumber(l_jsonParams, 'process_id'));
                     
                 when 'SET_PROC_IMMORTAL' THEN
-                null;
---                    SET_PROC_IMMORTAL(l_jsonParams);
+                    SET_PROC_IMMORTAL(jsonNumber(l_jsonParams, 'process_id'), jsonNumber(l_jsonParams, 'process_immortal'));
                     
                 when 'INFO' THEN
-                null;
---                    INFO(l_jsonParams);
+                    INFO(jsonNumber(l_jsonParams, 'process_id'), jsonString(l_jsonParams, 'process_info'));
                     
                 when 'DEBUG' THEN
-                null;
---                    DEBUG(l_jsonParams);
+                    DEBUG(jsonNumber(l_jsonParams, 'process_id'), jsonString(l_jsonParams, 'process_info'));
                     
                 when 'WARN' THEN
-null;
---                    WARN(l_jsonParams);
+                    WARN(jsonNumber(l_jsonParams, 'process_id'), jsonString(l_jsonParams, 'process_info'));
                     
                 when 'ERROR' THEN
-                null;
---                    ERROR(l_jsonParams);
+                    ERROR(jsonNumber(l_jsonParams, 'process_id'), jsonString(l_jsonParams, 'process_info'));
                     
                 when 'MARK_EVENT' THEN
-                null;
---                    MARK_EVENT(l_jsonParams);
+                    MARK_EVENT(jsonNumber(l_jsonParams, 'process_id'), jsonString(l_jsonParams, 'action_name'), jsonString(l_jsonParams, 'context_name'), jsonTime(l_jsonParams, 'timestamp'));
                     
                 when 'TRACE_START' THEN
-                null;
---                    TRACE_START(l_jsonParams);
+                    TRACE_START(jsonNumber(l_jsonParams, 'process_id'), jsonString(l_jsonParams, 'action_name'), jsonString(l_jsonParams, 'context_name'), jsonTime(l_jsonParams, 'timestamp'));
                     
                 when 'TRACE_STOP' THEN
-                null;
---                    TRACE_STOP(l_jsonParams);
-                    
+                    TRACE_STOP(jsonNumber(l_jsonParams, 'process_id'), jsonString(l_jsonParams, 'action_name'), jsonString(l_jsonParams, 'context_name'), jsonTime(l_jsonParams, 'timestamp'));                    
                     
             END CASE;
 
@@ -4629,5 +4744,8 @@ null;
             debug(pProcessName, 'First Message of LILAM');
             close_session(pProcessName, 1, 1, 'OK', 1);
         end;
+    BEGIN
+        g_avg_params('DEFAULT').alpha := 0.1;
+        g_avg_params('DEFAULT').warmup := 100; 
     
     END LILAM;
