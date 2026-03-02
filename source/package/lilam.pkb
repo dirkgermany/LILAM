@@ -15,6 +15,7 @@ AS
         C_SERVER_HEARTBEAT_INTERVAL     CONSTANT PLS_INTEGER := 60000;
         C_SERVER_MAX_LOOPS_IN_TIME      CONSTANT PLS_INTEGER := 1000; -- 1000
         C_SERVER_TIMEOUT_WAIT_FOR_MSG   CONSTANT NUMBER      := 0.2; -- Timeout nach Sekunden Warten auf Nachricht
+        C_SERVER_TIMEOUT_MAX_WAIT       CONSTANT NUMBER      := C_SEVER_SYNC_INTERVAL; -- Max. Timeout in IDLE State
         C_MAX_SERVER_PIPE_SIZE          CONSTANT PLS_INTEGER := 16777216; --  16777216, 67108864 
 
         -- Dedicated to Client
@@ -4356,15 +4357,19 @@ AS
         
         --------------------------------------------------------------------------
         
-        function receiveMessage(l_pipeName varchar2) return varchar2
+        function receiveMessage(l_pipeName IN varchar2, p_cur_timeout IN OUT NUMBER) return varchar2
         as
             l_status    PLS_INTEGER;
             l_message   VARCHAR2(32767);
-            l_stop_server_exception EXCEPTION;            
+            l_stop_server_exception EXCEPTION;
+            c_max_timeout CONSTANT NUMBER := C_SERVER_TIMEOUT_MAX_WAIT; -- Maximum für den Eco-Mode
+            c_min_timeout CONSTANT NUMBER := C_SERVER_TIMEOUT_WAIT_FOR_MSG;
         begin
-            l_status := DBMS_PIPE.RECEIVE_MESSAGE(l_pipeName, timeout => C_SERVER_TIMEOUT_WAIT_FOR_MSG);
+            l_status := DBMS_PIPE.RECEIVE_MESSAGE(l_pipeName, timeout => p_cur_timeout); --=> C_SERVER_TIMEOUT_WAIT_FOR_MSG);
             
             if l_status = 0 THEN
+                p_cur_timeout := C_SERVER_TIMEOUT_WAIT_FOR_MSG;
+
                 begin   
                     DBMS_PIPE.UNPACK_MESSAGE(l_message);
                     return l_message;
@@ -4380,6 +4385,7 @@ AS
                             ERROR(g_serverProcessId, g_serverPipeName || '=>Internal START_SERVER; Critical Error while processing command: ' || SQLERRM);
                     END; 
             else
+                 p_cur_timeout := LEAST(p_cur_timeout + C_SERVER_TIMEOUT_WAIT_FOR_MSG, c_max_timeout);
                 return null;
             end if;
         end;
@@ -4482,6 +4488,7 @@ AS
             l_lastSync       TIMESTAMP := sysTimestamp;  
             l_loopCounter    PLS_INTEGER := 0;
             l_msgCnt         PLS_INTEGER := 0;
+            l_serverTimeout  NUMBER := C_SERVER_TIMEOUT_WAIT_FOR_MSG;
         begin
             g_shutdownPassword := p_password;
             g_serverPipeName := l_pipe;
@@ -4498,7 +4505,7 @@ AS
 
             LOOP
                 -- Warten auf die nächste Nachricht (Timeout in Sekunden)
-                l_message := receiveMessage(g_serverPipeName);    
+                l_message := receiveMessage(g_serverPipeName, l_serverTimeout);    
                 if l_message is not null THEN
                     l_msgCnt := l_msgCnt + 1;
                 BEGIN 
