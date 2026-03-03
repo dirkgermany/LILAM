@@ -1,0 +1,99 @@
+{
+  "header": {
+    "rule_set": "TEST_SUITE_METRO",
+    "rule_set_version": 1,
+    "description": "Validation for Gaps, Deviations and Info-Logs"
+  },
+  "rules": [
+    {
+      "id": "SEQ-001",
+	  "_comment": "Vor Auslaufen aus dem Bahnhof sollten nicht mehr als 10 Sekunden seit Türen Schließen verstreichen.",
+      "trigger_type": "TRACE_START",
+      "action": "TRACK_SECTION",
+      "condition": {
+        "operator": "PRECEDED_BY_WITHIN_SECS",
+        "value": "CLOSE_DOOR|10"
+      },
+      "alert": { "handler": "MAIL_LOG", "severity": "INFO" }
+    },    {
+      "id": "SEQ-002",
+	  "_comment": "Der Zug kann eigentlich nicht auf der Strecke sein, wenn er den Bahnhof nicht verlassen hat; Validierung der Kontrollsysteme",
+      "trigger_type": "TRACE_START",
+      "action": "TRACK_SECTION",
+      "condition": {
+        "operator": "PRECEDED_BY",
+        "value": "LEAVE_STATION"
+      },
+      "alert": { "handler": "MAIL_LOG", "severity": "WARN" }
+    },
+    {
+      "id": "SEQ-003",
+	  "_comment": "Mehr als 25 Sekunden dauert die Fahrt nicht. Irgendetwas hat den Zug aufgehalten.",
+      "trigger_type": "TRACE_STOP",
+      "action": "TRACK_SECTION",
+      "context": "SECTION_400_001"
+      "condition": {
+        "operator": "MAX_DURATION_MS",
+        "value": "25000"
+      },
+      "alert": { "handler": "MAIL_LOG", "severity": "WARN", "throttle_seconds": 0 }
+    },
+    {
+      "id": "SEQ-004",
+	  "_comment": "Validierung der Kontrollsysteme.",
+      "trigger_type": "MARK_EVENT",
+      "action": "CLOSE_DOOR",
+      "condition": {
+        "operator": "PRECEDED_BY",
+        "value": "OPEN_DOOR"
+      },
+      "alert": { "handler": "MAIL_LOG", "severity": "WARN", "throttle_seconds": 10 }
+    },
+    {
+      "id": "SEQ-005",
+	  "_comment": "Validierung der Kontrollsysteme.",
+      "trigger_type": "MARK_EVENT",
+      "action": "OPEN_DOOR",
+      "condition": {
+        "operator": "ON_EVENT",
+        "value": ""
+      },
+      "alert": { "handler": "MAIL_LOG", "severity": "INFO", "throttle_seconds": 10 }
+    },
+    {
+      "id": "SEQ-006",
+	  "_comment": "Benachrichtigung, dass die Line 400 ihre Reise antritt.",
+      "trigger_type": "PROCESS_START",
+      "action": "Track Line 400",
+      "condition": {
+        "operator": "ON_START",
+        "value": ""
+      },
+      "alert": { "handler": "MAIL_LOG", "severity": "INFO", "throttle_seconds": 0 }
+    }
+,
+    {
+      "id": "SEQ-007",
+	  "_comment": ".",
+      "trigger_type": "MARK_EVENT",
+      "action": "OPEN_DOOR",
+      "condition": {
+        "operator": "PRECEDED_BY",
+        "value": "ARRIVE_STATION"
+      },
+      "alert": { "handler": "MAIL_LOG", "severity": "INFO", "throttle_seconds": 0 }
+    }
+,
+    {
+      "id": "SEQ-008",
+      "_comment": "Alarm, wenn die Fahrtzeit (EWMA) untypisch von der Norm abweicht.",
+      "trigger_type": "TRACE_STOP",
+      "action": "TRACK_SECTION",
+      "condition": {
+        "operator": "AVG_DEVIATION_PCT",
+        "value": "20|100|0.1" 
+    },
+    "alert": { "handler": "MAIL_LOG", "severity": "WARN", "throttle_seconds": 60 }
+}
+   ]
+}
