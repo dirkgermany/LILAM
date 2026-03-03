@@ -107,10 +107,11 @@ To minimize the impact on the main application’s overhead, LILAM features an i
 LILAM is designed to be "invisible." The framework ensures that an internal error during the logging process (e.g., table space issues or configuration errors) doesn't crash the calling application logic. Exceptions within LILAM are caught and handled internally, prioritizing the stability of your business transaction over the logging activity itself.
 
 #### Built-in Extensibility (Adapters)
-LILAMs decoupled architecture is designed for seamless integration with modern monitoring stacks. Its structured data format allows for the easy creation of adapters:
-*   **Oracle APEX:** Use native SQL queries to power APEX Charts and Dashboards for real-time application monitoring.
-*   **Grafana:** Connect LILAM via **ORDS (Oracle REST Data Services)** to visualize performance trends and system health in Grafana dashboards.
-*   **Custom Adapters:** The relational core can be extended for any REST-based or SQL-based reporting tool without modifying the core logging engine.
+LILAMs decoupled architecture is designed for seamless integration with modern monitoring stacks. Its structured data format allows for the easy creation of adapters.
+*  **Oracle APEX:** Use native SQL queries to power APEX Charts and Dashboards for real-time application monitoring.
+*  **Grafana:** Visualize performance trends and system health in Grafana dashboards. Use SQL-based or REST-based adapters to feed data directly into Grafana Dashboards.
+*  **Mail Adapter (Example Included):** LILAM comes with a nearly production-ready reference implementation for Advanced Alerting. It demonstrates how to dispatch severity-based HTML emails (e.g., Red for Critical, Orange for Warnings) via local SMTP relays without blocking the main engine.
+*  **Webhook & Messaging Hooks:** The adapter architecture is designed to easily plug in notifications for Slack, MS Teams, or Jira by simply implementing a new handler.
 
 ### High-Efficiency Monitoring
 
