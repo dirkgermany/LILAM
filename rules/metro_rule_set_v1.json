@@ -16,7 +16,8 @@
         "value": "CLOSE_DOOR|10"
       },
       "alert": { "handler": "MAIL_LOG", "severity": "INFO" }
-    },    {
+    },
+	{
       "id": "SEQ-002",
 	  "_comment": "Der Zug kann eigentlich nicht auf der Strecke sein, wenn er den Bahnhof nicht verlassen hat; Validierung der Kontrollsysteme",
       "trigger_type": "TRACE_START",
@@ -71,8 +72,7 @@
         "value": ""
       },
       "alert": { "handler": "MAIL_LOG", "severity": "INFO", "throttle_seconds": 0 }
-    }
-,
+    },
     {
       "id": "SEQ-007",
 	  "_comment": ".",
@@ -83,8 +83,7 @@
         "value": "ARRIVE_STATION"
       },
       "alert": { "handler": "MAIL_LOG", "severity": "INFO", "throttle_seconds": 0 }
-    }
-,
+    },
     {
       "id": "SEQ-008",
       "_comment": "Alarm, wenn die Fahrtzeit (EWMA) untypisch von der Norm abweicht.",
@@ -93,9 +92,9 @@
       "condition": {
         "operator": "AVG_DEVIATION_PCT",
         "value": "20|100|0.1" 
-    },
-    "alert": { "handler": "MAIL_LOG", "severity": "WARN", "throttle_seconds": 60 }
-}
+      },
+      "alert": { "handler": "MAIL_LOG", "severity": "WARN", "throttle_seconds": 60 }
+    }
    ]
 }
 ```
