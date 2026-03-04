@@ -28,7 +28,10 @@ LILAM is developed by a developer who hates over-engineered tools. Focus: 5 minu
   - [Rule-based Observability & Orchestration](#rule-based-observability--orchestration)
   - [How To - The Subway Sample](#how-to---the-subway-sample)
 - [Data](#data)
-- [API](#api)
+  - [Process data](#process-data)
+  - [Logging data](#logging-data)
+  - [Monitoring data](#monitoring-data)
+- [Repository Structure](#repository-structure)
 - [Performance Benchmark](#performance-benchmark)
 - [License](#license)
 - [Roadmap](#roadmap)
@@ -213,7 +216,7 @@ To illustrate how LILAM works, imagine monitoring a subway system:
 ```
 ---
 ## Data
-### Live-Dashboard
+### Process data
 
 ```sql
 SELECT id, status, last_update, ... FROM lilam_log WHERE process_name = ... (provides the current status of the process)
@@ -224,9 +227,7 @@ SELECT id, status, last_update, ... FROM lilam_log WHERE process_name = ... (pro
 >| 1  | my application | 12.01.26 18:17:51,... | 12.01.26 18:18:53,... | 12.01.26 18:18:53,... | 100         | 99         | 2      | ERROR
 
 
-
-#### Deep Dive
-**Logging data**
+### Logging data
 ```sql
 SELECT * FROM lilam_log_detail WHERE process_id = <id> AND monitoring = 0 
 ```
@@ -238,7 +239,7 @@ The monitoring table consists of two parts: the 'left' one is dedicated to loggi
 >| 1          | 2  | Function A         | DEBUG     | 13.01.26 11:... | SCOTT        | SERVER1   | NULL             | NULL             | "--- PL/SQL ..." | 
 >| 1          | 3  | Something happened | ERROR     | 13.01.26 12:... | SCOTT        | SERVER1   | "--- PL/SQL ..." | "--- PL/SQL ..." | "--- PL/SQL ..." | 
 
-**Monitoring data**
+### Monitoring data
 ```sql
 SELECT * FROM lilam_log_detail WHERE process_id = <id> AND monitoring = 1 
 ```
@@ -250,8 +251,13 @@ SELECT * FROM lilam_log_detail WHERE process_id = <id> AND monitoring = 1
 >| 1          | 1          | TRANS_ACT  | ROUTE_1          | 5              | 1000            | 1             | 490         | 500        | 499
 
 ---
-## API
-Please refer to [API Reference](docs/API.md). 
+## Repository Structure
+Locations of the core components:
+
+* **`/source/package`** – The PL/SQL source code for LILAM as API, Server and Proxy.
+* **`/docs`** – API reference, additional architectural deep-dives and setup guide.
+* **`/rules`** – Detailed documentation about the rules mechanic: [Rules Engine](./rules/README.md), [Rules  and [JSON example](./rules/metro_rule_set_v1.json).
+* **`/consumer`** - Basic alert consumer 'template' with a ready-to-use mail-consumer
 
 ---
 ## Performance Benchmark
