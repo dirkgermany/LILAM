@@ -55,14 +55,38 @@ The following metadata is transmitted to the consumer as a JSON object. Since LI
 | `alert_severity` | string | `rules.alert.severity` | Severity level defined in the rule. |
 | `timestamp` | string | System | ISO 8601 timestamp (`YYYY-MM-DD"T"HH24:MI:SS.FF6`). |
 
+## Missed Alerts and Reliability
+A common concern for Oracle professionals might be that `DBMS_ALERT` signals can be overwritten if they occur in rapid succession, potentially leading to missed notifications. This is technically correct regarding the signal itself.
 
-## Missed Alerts
-A very first impulse of Oracle professionals could be countering that it is not sure that every single alert will be processed because of alerts can be overwritten. Correct.
-Alerting means waking up Consumers. The Consumers themselve know their interests; they can be specialized to actions, contextes, group names, rules and rule sets and so on.
-Zusätzlich stehen aber die Daten zum Zeitpunkt der Alarmierung bereits in der Tabelle `LILAM_ALERTS`zur Verfügung. Das hat zwei Vorteile:
-1. Kein Verlust von Informationen bei Alarmierung in schneller Folge
-2. Verarbeitung von mehreren Alarmen, auch wenn nur ein DBMS_ALERT erfolgte
-3. Verarbeitung von Alarmen bei Neustart des Consumers (sofern erwünscht)
+However, LILAM ensures 100% reliability by persisting the alert metadata in the `LILAM_ALERTS` table **before** the signal is fired. This architecture offers several key advantages:
+
+1. **No Data Loss:** Even if alerts fire in rapid succession, every single event is safely stored in the database.
+2. **Batch Processing:** A consumer can process multiple pending alerts from the table even if it was only woken up by a single signal.
+3. **Recovery on Restart:** If a consumer is restarted, it can simply query the table for unprocessed alerts, ensuring no notification is lost during downtime.
 
 
 ## Table LILAM_ALERTS
+The `LILAM_ALERTS` table acts as the persistent "Source of Truth" for all detected violations. While the JSON payload provides immediate data to the consumer, this table ensures durability and auditability.
+
+| Column | Type | JSON Mapping | Description |
+| :--- | :--- | :--- | :--- |
+| **ALERT_ID** | `NUMBER` | `alert_id` | Primary Key. Unique identifier for the alert. |
+| **PROCESS_ID** | `NUMBER` | `process_id` | Reference to the monitored process. |
+| **PROCESS_NAME** | `VARCHAR2` | `action_name`¹ | The high-level name of the process. |
+| **MASTER_TABLE_NAME** | `VARCHAR2` | `tab_name_process` | The table storing the process metadata. |
+| **MONITOR_TABLE_NAME** | `VARCHAR2` | `tab_name_monitor` | The table storing the specific event data. |
+| **ACTION_NAME** | `VARCHAR2` | `action_name`¹ | The specific action/event that triggered the rule. |
+| **CONTEXT_NAME** | `VARCHAR2` | `context_name` | Optional granular detail (e.g., Segment ID). |
+| **ACTION_COUNT** | `NUMBER` | `action_count` | Exact occurrence count of the action. |
+| **RULE_SET_NAME** | `VARCHAR2` | `rule_set_name` | Name of the active rule set. |
+| **RULE_ID** | `VARCHAR2` | `rule_id` | The specific rule triggered (from the JSON set). |
+| **RULE_SET_VERSION** | `NUMBER` | `rule_set_version`| Version of the rule set used. |
+| **ALERT_SEVERITY** | `VARCHAR2` | `alert_severity` | Severity level (e.g., INFO, WARN, CRITICAL). |
+| **HANDLER_TYPE** | `VARCHAR2` | - | Intended handler (e.g., MAIL, REST, LOG). |
+| **STATUS** | `VARCHAR2` | - | Current state (e.g., PENDING, PROCESSED). |
+| **ERROR_MESSAGE** | `VARCHAR2` | - | Capture for errors during alert dispatch. |
+| **CREATED_AT** | `TIMESTAMP` | `timestamp` | Audit timestamp when the alert was generated. |
+| **PROCESSED_AT** | `TIMESTAMP` | - | Timestamp when the consumer finished handling. |
+
+¹ *Note: In the JSON payload, `action_name` provides context for the trigger, which maps to both the specific action and the parent process name in the database.*
+
