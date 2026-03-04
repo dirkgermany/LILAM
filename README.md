@@ -254,10 +254,10 @@ SELECT * FROM lilam_log_detail WHERE process_id = <id> AND monitoring = 1
 ## Repository Structure
 Locations of the core components:
 
-* **`/source/package`** – The PL/SQL source code for LILAM as API, Server and Proxy.
-* **`/docs`** – API reference, additional architectural deep-dives and setup guide.
-* **`/rules`** – Detailed documentation about the rules mechanic: [Rules Engine](./rules/README.md), [Rules  and [JSON example](./rules/metro_rule_set_v1.json).
-* **`/consumer`** - Basic alert consumer 'template' with a ready-to-use mail-consumer
+* **[`/source/package`](/source/package)** – The PL/SQL source code for LILAM as API, Server and Proxy.
+* **[`/docs`](/docs)** – API reference, additional architectural deep-dives and setup guide.
+* **[`/rules`](/rules)** – Detailed documentation about the rules mechanic: [Rules Engine](./rules/README.md), [Rules  and [JSON example](./rules/metro_rule_set_v1.json).
+* **[`/consumer`](/consumer)** - Basic alert consumer 'template' with a ready-to-use mail-consumer
 
 ---
 ## Performance Benchmark
