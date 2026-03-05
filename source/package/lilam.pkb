@@ -31,15 +31,11 @@ AS
         -- Placeholders for tables
         ---------------------------------------------------------------
         C_PARAM_MASTER_TABLE            CONSTANT varchar2(50) := 'PH_MASTER_TABLE';
-        C_PARAM_PROC_TABLE               CONSTANT varchar2(50) := 'PH_PROC_TABLE';
+        C_PARAM_PROC_TABLE              CONSTANT varchar2(50) := 'PH_PROC_TABLE';
         C_PARAM_LOG_TABLE               CONSTANT varchar2(50) := 'PH_LOG_TABLE';
         C_PARAM_MON_TABLE               CONSTANT varchar2(50) := 'PH_MON_TABLE';
-        C_SUFFIX_PROC_TABLE              CONSTANT varchar2(16) := '_PROC';
-        C_SUFFIX_LOG_TABLE              CONSTANT varchar2(16) := '_LOG';
-        C_SUFFIX_MON_TABLE              CONSTANT varchar2(16) := '_MON';
         C_LILAM_SERVER_REGISTRY         CONSTANT VARCHAR2(50) := 'LILAM_SERVER_REGISTRY';
-        C_LILAM_RULES                   CONSTANT VARCHAR2(50) := 'LILAM_RULES';
-        C_LILAM_ALERTS                  CONSTANT VARCHAR2(50) := 'LILAM_ALERTS';
+        C_LILAM_RULES_TABLE             CONSTANT VARCHAR2(50) := 'LILAM_RULES';
       
         ---------------------------------------------------------------
         -- Other general Parameters
@@ -168,12 +164,12 @@ AS
         ---------------------------------------------------------------
         -- Typ-Definition für die Regeldetails (aus dem JSON)
         TYPE t_rule_rec IS RECORD (
-            rule_id             VARCHAR2(20),
-            trigger_type        VARCHAR2(20),  -- TRACE_STOP, MARK_EVENT
+            rule_id             VARCHAR2(50),
+            trigger_type        VARCHAR2(50),  -- TRACE_STOP, MARK_EVENT
             target_action       VARCHAR2(50),
             target_context      VARCHAR2(50),
             condition_metric    VARCHAR2(50),
-            condition_operator  VARCHAR2(30),  -- GREATER_THAN_AVG_PERCENT, etc.
+            condition_operator  VARCHAR2(50),  -- GREATER_THAN_AVG_PERCENT, etc.
             condition_value     VARCHAR2(50),
             alert_handler       VARCHAR2(50),  -- LOG_AND_MAIL, etc.
             alert_severity      VARCHAR2(30),
@@ -364,39 +360,6 @@ AS
             return l_str;
         end;
 
-/*        
-        function jsonPut(p_jsonString varchar2, jsonKey varchar2, valueStr varchar2) return varchar2
-        as
-            l_str   varchar2(1000);
-            l_value varchar2(2000) := trim(valueStr);
-            l_isObj boolean;
-        begin
-            if valueStr is null or trim(valueStr) = '' then return p_jsonString; end if;
-            l_isObj := (substr(l_value, 1, 1) = '{' and substr(l_value, -1) = '}');
-
-            if not l_isObj then
-                l_value := replace(l_value, '\', '\\'); -- ZUERST Backslash
-                l_value := replace(l_value, '"', '\"');
-                l_value := replace(l_value, chr(10), '\n');
-                l_value := replace(l_value, chr(13), '\r');
-            end if;
-            
-            l_str := jsonPutPrep(p_jsonString);
-            
-            return case 
-                -- Fall A: Start eines neuen Objekts, das ein verschachteltes Objekt enthält
-                when p_jsonString is null and l_isObj then
-                    '"' || jsonKey || '": ' || l_value
-                else
-                    '{' || l_str || '"' || trim(jsonKey) || '":' || 
-                    case when l_isObj then '' else '"' end || -- Anführungszeichen davor?
-                    l_value || 
-                    case when l_isObj then '' else '"' end || -- Anführungszeichen danach?
-                    '}'
-            end;
-        end;
-*/
-
         function jsonPut(p_jsonString varchar2, jsonKey varchar2, valueStr varchar2) return varchar2
         -- Achtung! Die If-Konstruktionen sind nicht schön aber deutlich performanter, als case
         -- Auch das Arbeiten mit einem booleschen Wert am Anfang macht die Logik um vieles langsamer
@@ -515,29 +478,20 @@ AS
         --------------------------------------------------------------------------
         -- Check if a single step needs more time than average over all steps per action
         --------------------------------------------------------------------------
-/*
-        function validateDurationInAverage(p_monitor_rec t_monitor_buffer_rec, p_metricFactor number) return BOOLEAN
-        as
-            l_threshold_duration NUMBER;
-        begin
-            if p_monitor_rec.action_count > 5 THEN 
-                
-                l_threshold_duration := p_monitor_rec.avg_action_time * (1 + p_metricFactor / 100);            
-                if p_monitor_rec.used_time > l_threshold_duration THEN
-                    return FALSE;
-                end if ;
-            end if ;
-            return TRUE;
-        end;
-*/
         function validateDurationInAverage(p_monitor_rec t_monitor_buffer_rec, p_metricFactor number) return BOOLEAN
         as
         begin
             -- Wenn noch kein Trend da ist (Initialstart), können wir nichts validieren.
             if p_monitor_rec.avg_action_time is null or p_monitor_rec.avg_action_time = 0 then
+dbms_output.put_line('validateDurationInAverage avg_action_time is null or 0');
                 return TRUE; 
             end if;
-        
+dbms_output.new_line();
+dbms_output.put_line('validateDurationInAverage used_time: ' || p_monitor_rec.used_time);
+dbms_output.put_line('                    avg_action_time: ' || p_monitor_rec.avg_action_time);
+dbms_output.put_line('                    p_metricFactor:  ' || p_metricFactor);
+dbms_output.new_line();
+
             -- Vergleich gegen den bestehenden Trend
             -- Da p_old_ewma während des Warm-ups dem Trend folgt, 
             -- greift die 10% (oder X%) Hürde erst, wenn der EWMA sich stabilisiert.
@@ -559,25 +513,25 @@ AS
         BEGIN
             -- 1. Positionen der Trenner finden
             l_pos1 := INSTR(p_param, l_sep);      -- Erstes Komma
-            l_pos2 := INSTR(p_param, l_sep, 1, 2); -- Zweites Komma
+            l_pos2 := INSTR(p_param, l_sep, 1, 2); -- Zweites Komma            
         
             if p_position = 1 then            
                 -- Erster Wert: Alles vor dem ersten Komma
                 l_val := SUBSTR(p_param, 1, l_pos1 - 1);
-                return to_number(l_val);
+                return to_number(l_val, '999D99999', 'NLS_NUMERIC_CHARACTERS = ''. ''');
             end if;
             
             if p_position = 2 then
                 -- ZWEITER WERT: Zwischen pos1 und pos2
                 -- Wir trimmen Leerzeichen direkt mit weg
                 l_val := TRIM(SUBSTR(p_param, l_pos1 + 1, l_pos2 - l_pos1 - 1));
-                return to_number(l_val);
+                return to_number(l_val, '999D99999', 'NLS_NUMERIC_CHARACTERS = ''. ''');
             end if;
             
             if p_position = 3 then
                 -- DRITTER WERT (0.5): Alles nach dem zweiten Komma
                 l_val := TRIM(SUBSTR(p_param, l_pos2 + 1));
-                return to_number(l_val);
+                return to_number(l_val, '999D99999', 'NLS_NUMERIC_CHARACTERS = ''. ''');
             end if;
             
             return 0;
@@ -631,7 +585,7 @@ AS
             v_idx_session := v_indexSession(p_rec.process_id);
             
             EXECUTE IMMEDIATE v_sqlStmt
-            USING p_rec.process_id, g_process_cache(p_rec.process_id).processName, p_rec.action_Name,
+            USING p_rec.process_id, g_process_cache(p_rec.process_id).processName, p_rec.action_Name, 
             g_sessionList(v_idx_session).tabName_master, g_sessionList(v_idx_session).tabName_master || C_SUFFIX_MON_TABLE, 
             p_rec.context_name, p_rec.action_count, g_current_rule_set_name, p_rule.rule_id, g_current_rule_set_version, 
             p_rule.alert_severity, p_rule.alert_handler
@@ -640,7 +594,7 @@ AS
             v_payload := JSON_OBJECT(
                 'alert_id'         VALUE v_alert_id,
                 'process_id'       VALUE p_rec.process_id,
-                'tab_name_process' VALUE g_sessionList(v_idx_session).tabName_master,
+                'tab_name_process' VALUE g_sessionList(v_idx_session).tabName_master || C_SUFFIX_PROC_TABLE,
                 'tab_name_monitor' VALUE g_sessionList(v_idx_session).tabName_master || C_SUFFIX_MON_TABLE,
                 'action_name'      VALUE p_rec.action_name,
                 'context_name'     VALUE p_rec.context_name,
@@ -706,7 +660,6 @@ AS
                                     fire := TRUE;
                                 END IF;
                                 
-                                                                
                             WHEN p_list(i).condition_operator = 'MAX_GAP_SECONDS' THEN
                                 v_key := buildMonitorKey(p_monitorRec.process_id, p_monitorRec.action_name, p_monitorRec.context_name);
                                 IF g_monitor_shadows.EXISTS(v_key) THEN
@@ -827,7 +780,10 @@ AS
                     -- Nur Regeln für das aktuelle Ereignis prüfen (z.B. TRACE_STOP)
                     IF p_list(i).trigger_type = p_trigger THEN                    
                         CASE
-                            WHEN p_list(i).condition_operator IN ('ON_START', 'ON_STOP', 'ON_UPDATE', 'ON_EVENT', 'PROCESS_START') THEN
+                            WHEN p_list(i).condition_operator IN ('ON_START', 'ON_STOP', 'ON_UPDATE', 'ON_EVENT', C_PROCESS_STOP, C_PROCESS_START) THEN
+                                fire := TRUE;
+
+                            WHEN p_list(i).condition_operator IN ('ON_STOP', C_PROCESS_STOP) THEN
                                 fire := TRUE;
 
                             WHEN p_list(i).condition_operator = 'RUNTIME_EXCEEDED' THEN
@@ -948,14 +904,10 @@ AS
             p_pipeName   in varchar2 default null
         ) return varchar2
         as
---            l_msgSend       VARCHAR2(4000);
             l_msgReceive    VARCHAR2(4000);
             l_status        PLS_INTEGER;
             l_statusReceive PLS_INTEGER;
             l_clientChannel varchar2(50);
---            l_header        varchar2(200);
---            l_meta          varchar2(200);
---            l_data          varchar2(1500);
             l_groupName     varchar2(50);
             l_serverPipe    varchar2(100);
             l_slotIdx PLS_INTEGER;
@@ -974,14 +926,8 @@ AS
             l_jsonMain := jsonPut(l_jsonMain, 'header', l_jsonHeader);
             l_jsonMain := jsonPut(l_jsonMain, 'payload', l_jsonPayload);
 
---            l_header := '"header":{"msg_type":"API_CALL", "request":"' || p_request || '", "response":"' || l_clientChannel ||'"}';
---            l_meta  := '"meta":{"param":"value"}';
---            l_data  := '"payload":' || p_payLoad;
---            l_msgSend := '{' || l_header || ', ' || l_meta || ', ' || l_data || '}';
-
             l_serverPipe := getServerPipeForSession(p_processId, l_groupName);
             
---            DBMS_PIPE.PACK_MESSAGE(l_msgSend);
             DBMS_PIPE.PACK_MESSAGE(l_jsonMain);
             l_status := DBMS_PIPE.SEND_MESSAGE(l_serverPipe, timeout => 3);
             l_statusReceive := DBMS_PIPE.RECEIVE_MESSAGE(l_clientChannel, timeout => p_timeoutSec);
@@ -1110,12 +1056,9 @@ AS
             p_timeoutSec    IN PLS_INTEGER
         )
         as        
-            l_pipeName  VARCHAR2(100);
-            l_msg       VARCHAR2(1800);
-            l_header    varchar2(140);
-            l_meta      varchar2(140);
-            l_data      varchar2(1500);
-            l_status    PLS_INTEGER;
+            l_pipeName      VARCHAR2(100);
+            l_msg           JSON_OBJ_LILAM;
+            l_status        PLS_INTEGER;
             l_now           TIMESTAMP := SYSTIMESTAMP;
             l_retryInterval INTERVAL DAY TO SECOND := INTERVAL '30' SECOND;
             
@@ -1131,12 +1074,6 @@ AS
             l_jsonMain := jsonPut(l_jsonMain, 'header', l_jsonHeader);
             l_jsonMain := jsonPut(l_jsonMain, 'payload', l_jsonPayload);
             
---            l_header := '"header":{"msg_type":"API_CALL", "request":"' || p_request || '"}';
---            l_data  := '"payload":' || p_payLoad;
---            l_meta  := '"meta":{"param":"value"}';
-
---            l_msg := '{' || l_header || ', ' || l_meta || ', ' || l_data || '}';
---            DBMS_PIPE.PACK_MESSAGE(l_msg);
             l_pipeName := getServerPipeForSession(p_processId, null);
             DBMS_PIPE.PACK_MESSAGE(l_jsonMain);
             for i in 1 .. 3 loop
@@ -1223,14 +1160,6 @@ AS
         begin
             return replace(p_sqlStatement, p_placeHolder, p_tableName || p_tableSuffix);
         end;
-        
-        --------------------------------------------------------------------------
-    
---        function replaceNameMasterTable(p_sqlStatement varchar2, p_placeHolder varchar2, p_tableName varchar2) return varchar2
---        as
---        begin
---            return replace(p_sqlStatement, p_placeHolder, p_tableName);
---        end;
         
         --------------------------------------------------------------------------
     
@@ -1344,13 +1273,14 @@ AS
                     monitor_table_name VARCHAR2(50), 
                     action_name        VARCHAR2(100) NOT NULL,
                     context_name       VARCHAR2(100),
+                    group_name         VARCHAR2(100),
                     action_count       NUMBER NOT NULL,
                     rule_set_name      VARCHAR2(50),
-                    rule_id            VARCHAR2(20) NOT NULL,
+                    rule_id            VARCHAR2(50) NOT NULL,
                     rule_set_version   NUMBER NOT NULL,
-                    alert_severity     VARCHAR2(20),
-                    handler_type       VARCHAR2(20),              
-                    status             VARCHAR2(20) DEFAULT ''PENDING'',
+                    alert_severity     VARCHAR2(30),
+                    handler_type       VARCHAR2(50),              
+                    status             VARCHAR2(50) DEFAULT ''PENDING'',
                     error_message      CLOB,
                     created_at         TIMESTAMP DEFAULT SYSTIMESTAMP,
                     processed_at       TIMESTAMP,
@@ -1405,6 +1335,14 @@ AS
                 CREATE INDEX idx_lilam_registry_group 
                 ON C_LILAM_SERVER_REGISTRY (group_name, is_active, current_load)';
                 sqlStmt := replace(sqlStmt, 'C_LILAM_SERVER_REGISTRY', C_LILAM_SERVER_REGISTRY);
+                run_sql(sqlStmt);
+            end if ;
+            
+            if not objectExists('idx_lilam_rules', 'INDEX') then
+                sqlStmt := '
+                CREATE INDEX idx_lilam_rules 
+                ON C_LILAM_RULES_TABLE (set_name, version)';
+                sqlStmt := replace(sqlStmt, 'C_LILAM_RULES_TABLE', C_LILAM_RULES_TABLE);
                 run_sql(sqlStmt);
             end if ;
     
@@ -1951,37 +1889,7 @@ AS
             -- Formel: ((Schnitt_alt * (n-1)) + Wert_neu) / n
             return ((p_old_avg * (v_meas_count - 1)) + p_new_value) / v_meas_count;
         end;
-            
-        --------------------------------------------------------------------------
-        -- Helper for raising alerts
-        --------------------------------------------------------------------------
-        procedure raise_alert(
-            p_processId number, 
-            p_action varchar2,
-            p_context_name varchar2,
-            p_mon_type PLS_INTEGER,
-            p_step PLS_INTEGER,
-            p_used_time number,
-            p_expected number
-        )
-        as
-            l_msg VARCHAR2(4000);
-        begin
-            l_msg := 'PERFORMANCE ALERT: Process_ID=>' || p_processId || '; Action=>' || p_action || '; Context=>' || p_context_name || '; Step=>' || p_step || 
-                     ' used ' || p_used_time || 'ms (expected: ' || p_expected || 'ms)';
-                     
-            -- Log to Buffer
-            write_to_log_buffer(
-                p_processId, 
-                logLevelMonitor,
-                l_msg,
-                null,
-                null,
-                null
-            );
-    
-        end;
-            
+                        
         --------------------------------------------------------------------------
         -- Start Tracing remote
         --------------------------------------------------------------------------    
@@ -1989,6 +1897,11 @@ AS
         as
             l_payload JSON_OBJ_LILAM; -- Puffer für den JSON-String
         begin
+            l_payload := jsonPut(l_payload,'process_id', p_processId);
+            l_payload := jsonPut(l_payload,'action_name', p_actionName);
+            l_payload := jsonPut(l_payload,'context_name', p_contextName);
+            l_payload := jsonPut(l_payload,'timestamp', p_timestamp);
+/*
             select json_object(
                 'process_id'    value p_processId,
                 'action_name'   value p_actionName,
@@ -1997,6 +1910,7 @@ AS
                 returning varchar2
             )
             into l_payload from dual;
+*/
             sendNoWait(p_processId, 'START_TRACE', l_payload, 0.5);
                     
         EXCEPTION
@@ -2017,6 +1931,11 @@ AS
             -- späterem Aufruf von insertMonitor im Server der Zeitpunkt 'in time' ist,
             -- muss der Zeitpunkt vom Client bei Aufruf gesetzt werden.
             -- Erzeugung des JSON-Objekts
+            l_payload := jsonPut(l_payload, 'process_id', p_processId);
+            l_payload := jsonPut(l_payload, 'action_name', p_actionName);
+            l_payload := jsonPut(l_payload, 'context_name', p_contextName);
+            l_payload := jsonPut(l_payload, 'timestamp', p_timestamp);     
+/*            
             select json_object(
                 'process_id'    value p_processId,
                 'action_name'   value p_actionName,
@@ -2025,6 +1944,7 @@ AS
                 returning varchar2
             )
             into l_payload from dual;
+*/
             sendNoWait(p_processId, 'STOP_TRACE', l_payload, 0.5);
                     
         EXCEPTION
@@ -2041,7 +1961,7 @@ AS
         --------------------------------------------------------------------------    
         procedure insertEventMonitorRemote(p_processId number, p_actionName varchar2, p_contextName varchar2, p_timestamp timestamp)
         as
-            l_payload varchar2(8000); -- Puffer für den JSON-String
+            l_payload JSON_OBJ_LILAM; -- Puffer für den JSON-String
         begin
             if p_timestamp is null then raise_application_error(-2005, 'Event ohne Zeitangabe'); end if;
             
@@ -2049,6 +1969,11 @@ AS
             -- späterem Aufruf von insertMonitor im Server der Zeitpunkt 'in time' ist,
             -- muss der Zeitpunkt vom Client bei Aufruf gesetzt werden.
             -- Erzeugung des JSON-Objekts
+            l_payload := jsonPut(l_payload,'process_id', p_processId);
+            l_payload := jsonPut(l_payload,'action_name', p_actionName);
+            l_payload := jsonPut(l_payload,'context_name', p_contextName);
+            l_payload := jsonPut(l_payload,'timestamp', TO_CHAR(p_timestamp, 'YYYY-MM-DD"T"HH24:MI:SS.FF6'));
+/*
             select json_object(
                 'process_id'    value p_processId,
                 'action_name'   value p_actionName,
@@ -2057,7 +1982,8 @@ AS
                 returning varchar2
             )
             into l_payload from dual;
-            sendNoWait(p_processId, 'MARK_EVENT', l_payload, 0.5);
+*/
+            sendNoWait(p_processId, C_MARK_EVENT, l_payload, 0.5);
                     
         EXCEPTION
             WHEN OTHERS THEN
@@ -2137,7 +2063,7 @@ AS
             g_monitor_groups(v_key)(l_new_idx).start_time   := coalesce(p_timestamp, systimestamp);
             
             -- vor dem Überschreiben des shadow-Eintrags die Regeln prüfen
-            evaluateRules(g_monitor_groups(v_key)(l_new_idx), 'MARK_EVENT');
+            evaluateRules(g_monitor_groups(v_key)(l_new_idx), C_MARK_EVENT);
             g_monitor_shadows(v_key) := g_monitor_groups(v_key)(g_monitor_groups(v_key).LAST);         
             
             v_idx := v_indexSession(p_processId);
@@ -2173,7 +2099,7 @@ AS
             v_dummyMonRec.action_name := p_actionName;
             v_dummyMonRec.context_name := p_contextName;
 
-            evaluateRules(v_dummyMonRec, 'TRACE_START');
+            evaluateRules(v_dummyMonRec, C_TRACE_START);
             g_monitor_shadows(v_key) := v_dummyMonRec;
         end;
         
@@ -2240,7 +2166,7 @@ AS
             g_monitor_groups(v_key)(g_monitor_groups(v_key).LAST) := v_new_rec;
             
             -- Das Event an die Regelprüfung durchreichen
-            evaluateRules(v_new_rec, 'TRACE_STOP');
+            evaluateRules(v_new_rec, C_TRACE_STOP);
             g_monitor_shadows.delete(v_key);
             g_monitor_averages(v_key) := v_new_rec;
             
@@ -2795,21 +2721,29 @@ AS
 
         procedure setAnyStatusRemote(p_processId number, p_status pls_integer, p_processInfo varchar2, p_procStepsToDo pls_integer, p_procStepsDone pls_integer, p_immortal pls_integer, p_timestamp TIMESTAMP)
         as
-            l_payload varchar2(32767); -- Puffer für den JSON-String
-            l_serverMsg varchar2(100);
+            l_payload JSON_OBJ_LILAM; -- Puffer für den JSON-String
         begin
+            l_payload := jsonPut(l_payload,'process_id', p_processId);
+            l_payload := jsonPut(l_payload,'steps_todo', p_procStepsToDo);
+            l_payload := jsonPut(l_payload,'steps_done', p_procStepsDone);
+            l_payload := jsonPut(l_payload,'process_info', p_processInfo);
+            l_payload := jsonPut(l_payload,'process_status', p_status);
+            l_payload := jsonPut(l_payload,'process_immortal', p_immortal);
+            l_payload := jsonPut(l_payload,'timestamp', TO_CHAR(p_timestamp, 'YYYY-MM-DD"T"HH24:MI:SS.FF6'));
+/*
             -- Erzeugung des JSON-Objekts
             select json_object(
                 'process_id'        value p_processId,
-                'steps_todo'   value p_procStepsToDo,
-                'steps_done'   value p_procStepsDone,
+                'steps_todo'        value p_procStepsToDo,
+                'steps_done'        value p_procStepsDone,
                 'process_info'      value p_processInfo,
                 'process_status'    value p_status,
                 'process_immortal'  value p_immortal,
-                'timestamp'     value TO_CHAR(p_timestamp, 'YYYY-MM-DD"T"HH24:MI:SS.FF6')
+                'timestamp'         value TO_CHAR(p_timestamp, 'YYYY-MM-DD"T"HH24:MI:SS.FF6')
                 returning varchar2
             )
             into l_payload from dual;
+*/
             sendNoWait(p_processId, 'SET_ANY_STATUS', l_payload, 0.5);
         end;
 
@@ -2818,8 +2752,16 @@ AS
         
         procedure log_anyRemote(p_processId number, p_level number, p_logText varchar2, p_errStack varchar2, p_errBacktrace varchar2, p_errCallstack varchar2, p_timestamp TIMESTAMP)
         as
-            l_payload varchar2(32767); -- Puffer für den JSON-String
+            l_payload JSON_OBJ_LILAM; -- Puffer für den JSON-String
         begin
+            l_payload := jsonPut(l_payload,'process_id', p_processId);
+            l_payload := jsonPut(l_payload,'level', p_level);
+            l_payload := jsonPut(l_payload,'log_text', p_logText);
+            l_payload := jsonPut(l_payload,'err_stack', p_errStack);
+            l_payload := jsonPut(l_payload,'err_backtr', p_errBacktrace);
+            l_payload := jsonPut(l_payload,'err_callstack', p_errCallstack);
+            l_payload := jsonPut(l_payload,'timestamp', TO_CHAR(p_timestamp, 'YYYY-MM-DD"T"HH24:MI:SS.FF6'));
+/*
             -- Erzeugung des JSON-Objekts
             select json_object(
                 'process_id'    value p_processId,
@@ -2832,6 +2774,7 @@ AS
                 returning varchar2
             )
             into l_payload from dual;
+*/
             sendNoWait(p_processId, 'LOG_ANY', l_payload, 0.5);
                     
         EXCEPTION
@@ -3816,7 +3759,7 @@ AS
             DBMS_PIPE.PACK_MESSAGE('{"process_id":' || l_processId || '}');        
             l_status := DBMS_PIPE.SEND_MESSAGE(p_clientChannel, timeout => 1);
             
-            evaluateRules(g_process_cache(l_processId), C_PROCESS_START);
+--            evaluateRules(g_process_cache(l_processId), C_PROCESS_START);
         end;    
     
         -------------------------------------------------------------------------- 
@@ -3842,11 +3785,13 @@ AS
         
         PROCEDURE SERVER_UPDATE_RULES(p_processId NUMBER, p_ruleSetName VARCHAR2, p_ruleSetVersion PLS_INTEGER)
         as
-            l_message  varchar2(200);
+            l_message    JSON_OBJ_LILAM;
             l_serverCode PLS_INTEGER;
             l_slotIdx    PLS_INTEGER;
         begin
-            l_message := '{"rule_set_name":"' || p_ruleSetName || '", "rule_set_version":"' || p_ruleSetVersion || '"}';
+            l_message := jsonPut(l_message, 'rule_set_name', p_ruleSetName);
+            l_message := jsonPut(l_message, 'rule_set_version', p_ruleSetVersion);
+--            l_message := '{"rule_set_name":"' || p_ruleSetName || '", "rule_set_version":"' || p_ruleSetVersion || '"}';
             sendNoWait(p_processId, 'UPDATE_RULE', l_message, C_TIMEOUT_NEW_SESSION);               
         end;
         
@@ -3854,9 +3799,9 @@ AS
 
         procedure SERVER_SHUTDOWN(p_processId number, p_pipeName varchar2, p_password varchar2)
         as
-            l_response varchar2(1000);
+            l_response JSON_OBJ_LILAM;
             l_message  varchar2(200);
-            l_payload  varchar2(500);
+            l_payload  JSON_OBJ_LILAM;
             l_serverCode PLS_INTEGER;
             l_slotIdx    PLS_INTEGER;
         begin
@@ -4014,54 +3959,17 @@ AS
             DBMS_PIPE.RESET_BUFFER;
             DBMS_PIPE.PACK_MESSAGE(l_msg);        
             l_status := DBMS_PIPE.SEND_MESSAGE(p_clientChannel, timeout => 1);
-            
+
+/*            
             if l_status = 0 THEN
                 dbms_output.put_line('Antwort an Client gesendet.');
             ELSE
                 dbms_output.put_line('Fehler beim Senden der Antwort: ' || l_status);
             end if ;
-            
+*/            
             return l_password = g_shutdownPassword;
         end;
-        
-        --------------------------------------------------------------------------
-    
-        FUNCTION CREATE_SERVER(p_password varchar2) RETURN VARCHAR2
-        as
-            l_slot_idx PLS_INTEGER;
-            l_job_name VARCHAR2(30);
-            l_pipe     VARCHAR2(30);
-            l_action   VARCHAR2(1000);
-        BEGIN
-            -- 1. WICHTIG: Erst schauen, was draußen wirklich los ist!
-            -- Aktualisiert g_pipe_pool(i).is_active via Ping/Antwort
-            l_job_name := 'LILAM_SRV_SLOT_' || l_slot_idx;
-            
-                -- 2. Sicherstellen, dass kein "Leichen"-Job existiert
-            BEGIN
-                DBMS_SCHEDULER.DROP_JOB(l_job_name, force => TRUE);
-            EXCEPTION WHEN OTHERS THEN NULL; END;
-        
-            l_action := q'[BEGIN LILAM.START_SERVER(p_pipeName => ']' 
-                        || l_pipe 
-                        || q'[', p_password => ']' 
-                        || p_password 
-                        || q'['); END;]';     
-    
-            -- 3. Den Hintergrund-Prozess "zünden"
-            DBMS_SCHEDULER.CREATE_JOB (
-                job_name   => l_job_name,
-                job_type   => 'PLSQL_BLOCK',
-                -- Hier übergeben wir den Slot-Namen als Parameter an deine START_SERVER Prozedur
-                job_action => l_action,
-                enabled    => TRUE,
-                auto_drop  => TRUE,
-                comments   => 'LILAM Background Worker für Pipe ' || l_pipe
-            );
                 
-            RETURN 'LILAM-Server Pipe = ' || l_pipe;
-        END;
-        
         --------------------------------------------------------------------------
         
         function isServerPipeRegistered(p_pipeName varchar2) return BOOLEAN
@@ -4128,10 +4036,28 @@ AS
         
         --------------------------------------------------------------------------
         
-        PROCEDURE load_rules_from_json(p_ruleSet CLOB) IS
+        PROCEDURE updateRulesInRegistry(p_ruleSetName varchar2, p_ruleSetVersion pls_integer)
+        AS
             pragma autonomous_transaction; 
-            l_payload varchar2(1000);
         BEGIN
+            execute immediate 'update ' || C_LILAM_SERVER_REGISTRY || ' set rule_set_name = :1, set_in_use = :2 where pipe_name = :3'
+            using p_ruleSetName, p_ruleSetVersion, g_serverPipeName;
+            commit;
+        
+        EXCEPTION
+            WHEN OTHERS THEN
+            raise;
+                lilam.error(g_serverProcessId, g_serverPipeName || '=>Failed to parse JSON rules: ' || SQLERRM);
+                rollback;
+        END;
+        
+        --------------------------------------------------------------------------
+
+        PROCEDURE load_rules_from_json(p_ruleSet CLOB) IS
+--            pragma autonomous_transaction; 
+            l_payload VARCHAR2(32000);
+        BEGIN
+--            commit;
             -- Zuerst die alten Regeln löschen (Reset)
             g_rules_by_context.DELETE;
             g_rules_by_action.DELETE;
@@ -4141,15 +4067,15 @@ AS
                 SELECT *
                 FROM JSON_TABLE(p_ruleSet, '$.rules[*]'
                     COLUMNS (
-                        rule_id      VARCHAR2(20) PATH '$.id',
-                        trigger_t    VARCHAR2(20) PATH '$.trigger_type',
+                        rule_id      VARCHAR2(50) PATH '$.id',
+                        trigger_t    VARCHAR2(50) PATH '$.trigger_type',
                         action       VARCHAR2(50) PATH '$.action',
                         context      VARCHAR2(50) PATH '$.context',
-                        metric       VARCHAR2(30) PATH '$.condition.metric',
-                        operator     VARCHAR2(30) PATH '$.condition.operator',
+                        metric       VARCHAR2(50) PATH '$.condition.metric',
+                        operator     VARCHAR2(50) PATH '$.condition.operator',
                         value        VARCHAR2(50) PATH '$.condition.value',
                         handler      VARCHAR2(50) PATH '$.alert.handler',
-                        severity     VARCHAR2(20) PATH '$.alert.severity',
+                        severity     VARCHAR2(30) PATH '$.alert.severity',
                         throttle_sec NUMBER       PATH '$.alert.throttle_seconds'
                     )
                 )
@@ -4203,16 +4129,12 @@ AS
             l_payload := JSON_QUERY(p_ruleSet, '$.header');
             g_current_rule_set_name := jsonString(l_payload, 'rule_set');
             g_current_rule_set_version := jsonNumber(l_payload, 'rule_set_version');
-            
-            execute immediate 'update ' || C_LILAM_SERVER_REGISTRY || ' set rule_set_name = :1, set_in_use = :2 where pipe_name = :3'
-            using g_current_rule_set_name, g_current_rule_set_version, g_serverPipeName;
-            commit;
         
         EXCEPTION
             WHEN OTHERS THEN
             raise;
                 lilam.error(g_serverProcessId, g_serverPipeName || '=>Failed to parse JSON rules: ' || SQLERRM);
-                rollback;
+--                rollback;
         END;
         
         --------------------------------------------------------------------------
@@ -4243,7 +4165,7 @@ AS
             l_serverRuleSet CLOB;
         begin
             l_sqlStmt := 'SELECT rule_set FROM ' || C_LILAM_RULES || ' where set_name = :1 and version = :2';
-            execute immediate l_sqlStmt into l_serverRuleSet using p_ruleSetName, p_ruleSetVersion;           
+            execute immediate l_sqlStmt into l_serverRuleSet using p_ruleSetName, p_ruleSetVersion; 
             load_rules_from_json(l_serverRuleSet);
             
         exception
@@ -4266,6 +4188,7 @@ AS
             if l_ruleSetName is not null then
                 readServerRules(l_ruleSetName, l_ruleSetVersion);
             end if;
+
             
         exception
             when NO_DATA_FOUND then
@@ -4282,11 +4205,11 @@ AS
             l_ruleSetName varchar2(30);
             l_ruleSetVersion PLS_INTEGER;
         begin
-
             l_payload     := JSON_QUERY(l_message, '$.payload');
             l_ruleSetName := jsonString(l_payload, 'rule_set_name');
             l_ruleSetVersion := jsonNumber(l_payload, 'rule_set_version');
-            
+
+            updateRulesInRegistry(l_ruleSetName, l_ruleSetVersion);
             readServerRules(l_ruleSetName, l_ruleSetVersion);
         end;
     
@@ -4445,7 +4368,7 @@ AS
                 WHEN 'GET_PROCESS_DATA' then
                     doRemote_getProcessData(p_clientChannel, p_message);
                     
-                WHEN 'MARK_EVENT' then
+                WHEN C_MARK_EVENT then
                     doRemote_markEvent(p_message);
                     
                 WHEN 'START_TRACE' then
@@ -4696,13 +4619,13 @@ AS
                 when 'ERROR' THEN
                     ERROR(jsonNumber(l_jsonParams, 'process_id'), jsonString(l_jsonParams, 'process_info'));
                     
-                when 'MARK_EVENT' THEN
+                when C_MARK_EVENT THEN
                     MARK_EVENT(jsonNumber(l_jsonParams, 'process_id'), jsonString(l_jsonParams, 'action_name'), jsonString(l_jsonParams, 'context_name'), jsonTime(l_jsonParams, 'timestamp'));
                     
-                when 'TRACE_START' THEN
+                when C_TRACE_START THEN
                     TRACE_START(jsonNumber(l_jsonParams, 'process_id'), jsonString(l_jsonParams, 'action_name'), jsonString(l_jsonParams, 'context_name'), jsonTime(l_jsonParams, 'timestamp'));
                     
-                when 'TRACE_STOP' THEN
+                when C_TRACE_STOP THEN
                     TRACE_STOP(jsonNumber(l_jsonParams, 'process_id'), jsonString(l_jsonParams, 'action_name'), jsonString(l_jsonParams, 'context_name'), jsonTime(l_jsonParams, 'timestamp'));                    
                     
             END CASE;
@@ -4732,6 +4655,62 @@ AS
             l_callObject := p_callObject.to_string();
             CALL_BY_JSON(l_callObject, l_respObject);
             p_respObject := JSON_OBJECT_T.parse(l_respObject);
+        END;
+        
+        --------------------------------------------------------------------------
+        
+        FUNCTION quote_literal(p_text IN VARCHAR2) RETURN VARCHAR2 IS
+        BEGIN
+            -- Verdoppelt Hochkommas und umschließt den Text mit Hochkommas
+            RETURN '''' || REPLACE(p_text, '''', '''''') || '''';
+        END quote_literal;
+
+        --------------------------------------------------------------------------
+    
+        FUNCTION CREATE_SERVER(
+            p_groupName varchar2, -- Neu hinzugefügt für die Signatur
+            p_password  varchar2
+        ) RETURN VARCHAR2
+        AS
+            l_slot_idx PLS_INTEGER := 1; -- Beispielwert, sollte dynamisch ermittelt werden
+            l_job_name VARCHAR2(30);
+            l_pipe     VARCHAR2(30);
+            l_action   VARCHAR2(2000); -- Puffer leicht erhöht für längere Strings
+        BEGIN
+            -- Pipe-Name Logik (Beispiel: basierend auf Slot oder Gruppe)
+            l_pipe     := 'LILAM_PIPE_' || l_slot_idx;
+            l_job_name := 'LILAM_SRV_SLOT_' || l_slot_idx;
+        
+            -- 1. Sicherstellen, dass kein "Leichen"-Job existiert
+            -- Wir fangen gezielt ORA-27475 (Job does not exist) ab
+            BEGIN
+                DBMS_SCHEDULER.DROP_JOB(job_name => l_job_name, force => TRUE);
+            EXCEPTION 
+                WHEN OTHERS THEN 
+                    IF SQLCODE != -27475 THEN RAISE; END IF;
+            END;
+        
+            -- 2. Den PL/SQL Block für den Scheduler zusammenbauen
+            -- Wichtig: p_groupName wurde in die Action integriert
+            l_action := 'BEGIN ' ||
+                        '  LILAM.START_SERVER(' ||
+                        '    p_pipeName  => ' || quote_literal(l_pipe)      || ', ' ||
+                        '    p_groupName => ' || quote_literal(p_groupName) || ', ' ||
+                        '    p_password  => ' || quote_literal(p_password)  ||
+                        '  ); ' ||
+                        'END;';
+        
+            -- 3. Den Hintergrund-Prozess "zünden"
+            DBMS_SCHEDULER.CREATE_JOB (
+                job_name   => l_job_name,
+                job_type   => 'PLSQL_BLOCK',
+                job_action => l_action,
+                enabled    => TRUE,
+                auto_drop  => TRUE,
+                comments   => 'LILAM Background Worker [' || p_groupName || '] auf Pipe ' || l_pipe
+            );
+                
+            RETURN 'LILAM-Server gestartet: Pipe=' || l_pipe || ' (Gruppe=' || p_groupName || ')';
         END;
 
         ------------------------------------------------------------------------
