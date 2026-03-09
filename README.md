@@ -16,7 +16,7 @@
 LILAM is a high-performance logging, monitoring and event-driven orchestration framework for Oracle PL/SQL. It provides deep real-time insights into process metrics and utilizes a dynamic JSON-based rule engine to trigger autonomous responses and coordinate complex workflows.
 Its simple API allows for seamless integration into existing applications with minimal overhead.
 
-LILAM utilizes **autonomous transactions** to ensure that all **process states, log entries, and performance metrics** are persisted immediately. This decoupled persistence guarantees a complete audit trail and reliable monitoring data, even if the main business process performs a rollback.
+LILAM utilizes **autonomous transactions** to ensure that process states, log entries, and performance metrics are persisted independently of the main execution flow. This decoupled approach guarantees a complete audit trail and reliable monitoring data, even if the primary business process undergoes a rollback.
 
 LILAM is developed by a developer who hates over-engineered tools. Focus: 5 minutes to integrate, 100% visibility.
 
