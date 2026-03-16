@@ -360,6 +360,8 @@ AS
             return l_str;
         end;
 
+        ------------------------------------------------------------------------
+
         function jsonPut(p_jsonString varchar2, jsonKey varchar2, valueStr varchar2) return varchar2
         -- Achtung! Die If-Konstruktionen sind nicht schön aber deutlich performanter, als case
         -- Auch das Arbeiten mit einem booleschen Wert am Anfang macht die Logik um vieles langsamer
@@ -397,6 +399,8 @@ AS
             return l_str;
         end;
 
+        -------------------------------------------------------------------------------------
+
         function jsonPut(p_jsonString varchar2, jsonKey varchar2, valueNum Number) return varchar2
         as
             l_str varchar2(1000);
@@ -411,6 +415,14 @@ AS
                 l_str := l_str || valueNum || '}'; 
             end if;
             return l_str;
+        end;
+
+        -------------------------------------------------------------------------------------
+
+        function jsonPut(p_jsonString varchar2, jsonKey varchar2, valueTS timestamp) return varchar2
+        as
+        begin
+            return jsonPut(p_jsonString, jsonKey, TO_CHAR(valueTS, 'YYYY-MM-DD"T"HH24:MI:SS.FF6'));
         end;
 
         --------------------------------------------------------------------------
@@ -1895,16 +1907,7 @@ AS
             l_payload := jsonPut(l_payload,'action_name', p_actionName);
             l_payload := jsonPut(l_payload,'context_name', p_contextName);
             l_payload := jsonPut(l_payload,'timestamp', p_timestamp);
-/*
-            select json_object(
-                'process_id'    value p_processId,
-                'action_name'   value p_actionName,
-                'context_name'  value p_contextName,
-                'timestamp'     value p_timestamp
-                returning varchar2
-            )
-            into l_payload from dual;
-*/
+
             sendNoWait(p_processId, 'START_TRACE', l_payload, 0.5);
                     
         EXCEPTION
@@ -1929,16 +1932,7 @@ AS
             l_payload := jsonPut(l_payload, 'action_name', p_actionName);
             l_payload := jsonPut(l_payload, 'context_name', p_contextName);
             l_payload := jsonPut(l_payload, 'timestamp', p_timestamp);     
-/*            
-            select json_object(
-                'process_id'    value p_processId,
-                'action_name'   value p_actionName,
-                'context_name'  value p_contextName,
-                'timestamp'     value p_timestamp
-                returning varchar2
-            )
-            into l_payload from dual;
-*/
+
             sendNoWait(p_processId, 'STOP_TRACE', l_payload, 0.5);
                     
         EXCEPTION
@@ -1967,16 +1961,7 @@ AS
             l_payload := jsonPut(l_payload,'action_name', p_actionName);
             l_payload := jsonPut(l_payload,'context_name', p_contextName);
             l_payload := jsonPut(l_payload,'timestamp', TO_CHAR(p_timestamp, 'YYYY-MM-DD"T"HH24:MI:SS.FF6'));
-/*
-            select json_object(
-                'process_id'    value p_processId,
-                'action_name'   value p_actionName,
-                'context_name'  value p_contextName,
-                'timestamp'     value TO_CHAR(p_timestamp, 'YYYY-MM-DD"T"HH24:MI:SS.FF6')
-                returning varchar2
-            )
-            into l_payload from dual;
-*/
+
             sendNoWait(p_processId, C_MARK_EVENT, l_payload, 0.5);
                     
         EXCEPTION
@@ -2063,9 +2048,7 @@ AS
             v_idx := v_indexSession(p_processId);
             g_sessionList(v_idx).monitor_dirty_count := coalesce(g_sessionList(v_idx).monitor_dirty_count, 0) + 1;
             g_dirty_queue(p_processId) := TRUE; 
-            
---HIER            SYNC_ALL_DIRTY;
-            
+                        
         exception
             when others then
                 if should_raise_error(p_processId) then
@@ -2167,9 +2150,7 @@ AS
             v_idx := v_indexSession(p_processId);            
             g_sessionList(v_idx).monitor_dirty_count := coalesce(g_sessionList(v_idx).monitor_dirty_count, 0) + 1;
             g_dirty_queue(p_processId) := TRUE; 
-            
---HIER            SYNC_ALL_DIRTY;
-            
+                        
         exception
             when others then
                 if should_raise_error(p_processId) then
@@ -2699,16 +2680,21 @@ AS
 
         procedure procStepDoneRemote(p_processId number, p_timestamp TIMESTAMP)
         as
-            l_payload varchar2(8000); -- Puffer für den JSON-String
+            l_payload JSON_OBJ_LILAM; -- Puffer für den JSON-String
             l_serverMsg varchar2(100);
         begin
             -- Erzeugung des JSON-Objekts
+            l_payload := jsonPut(l_payload,'process_id', p_processId);
+            l_payload := jsonPut(l_payload,'timestamp', p_timestamp);
+
+/*
             select json_object(
                 'process_id'   value p_processId,
                 'timestamp'     value TO_CHAR(p_timestamp, 'YYYY-MM-DD"T"HH24:MI:SS.FF6')
                 returning varchar2
             )
             into l_payload from dual;
+*/
             sendNoWait(p_processId, 'PROC_STEP_DONE', l_payload, 0.5);
         end;
         --------------------------------------------------------------------------
@@ -2723,21 +2709,8 @@ AS
             l_payload := jsonPut(l_payload,'process_info', p_processInfo);
             l_payload := jsonPut(l_payload,'process_status', p_status);
             l_payload := jsonPut(l_payload,'process_immortal', p_immortal);
-            l_payload := jsonPut(l_payload,'timestamp', TO_CHAR(p_timestamp, 'YYYY-MM-DD"T"HH24:MI:SS.FF6'));
-/*
-            -- Erzeugung des JSON-Objekts
-            select json_object(
-                'process_id'        value p_processId,
-                'steps_todo'        value p_procStepsToDo,
-                'steps_done'        value p_procStepsDone,
-                'process_info'      value p_processInfo,
-                'process_status'    value p_status,
-                'process_immortal'  value p_immortal,
-                'timestamp'         value TO_CHAR(p_timestamp, 'YYYY-MM-DD"T"HH24:MI:SS.FF6')
-                returning varchar2
-            )
-            into l_payload from dual;
-*/
+            l_payload := jsonPut(l_payload,'timestamp', p_timestamp);
+
             sendNoWait(p_processId, 'SET_ANY_STATUS', l_payload, 0.5);
         end;
 
@@ -2754,21 +2727,8 @@ AS
             l_payload := jsonPut(l_payload,'err_stack', p_errStack);
             l_payload := jsonPut(l_payload,'err_backtr', p_errBacktrace);
             l_payload := jsonPut(l_payload,'err_callstack', p_errCallstack);
-            l_payload := jsonPut(l_payload,'timestamp', TO_CHAR(p_timestamp, 'YYYY-MM-DD"T"HH24:MI:SS.FF6'));
-/*
-            -- Erzeugung des JSON-Objekts
-            select json_object(
-                'process_id'    value p_processId,
-                'level'         value p_level,
-                'log_text'      value p_logText,
-                'err_stack'     value p_errStack,
-                'err_backtr'    value p_errBacktrace,
-                'err_callstack' value p_errCallstack,
-                'timestamp'     value TO_CHAR(p_timestamp, 'YYYY-MM-DD"T"HH24:MI:SS.FF6')
-                returning varchar2
-            )
-            into l_payload from dual;
-*/
+            l_payload := jsonPut(l_payload,'timestamp', p_timestamp);
+
             sendNoWait(p_processId, 'LOG_ANY', l_payload, 0.5);
                     
         EXCEPTION
@@ -2776,7 +2736,6 @@ AS
                 if should_raise_error(p_processId) then
                     raise;
                 end if ;
-    
         end;
         
         --------------------------------------------------------------------------
@@ -2809,9 +2768,7 @@ AS
                     DBMS_UTILITY.FORMAT_CALL_STACK
                 );
             end if ;
-    
---HIER            sync_all_dirty;
-            
+
         exception
             when others then
                 -- Sicherheit für das Framework: Fehler im Flush dürfen Applikation nicht stoppen
@@ -2917,9 +2874,7 @@ AS
                 g_sessionList(v_indexSession(p_processId)).process_is_dirty := TRUE;
                 g_dirty_queue(p_processId) := TRUE; -- Damit SYNC_ALL_DIRTY die Session sieht
                 
-                evaluateRules(g_process_cache(p_processId), C_PROCESS_UPDATE);
---HIER                SYNC_ALL_DIRTY;
-                
+                evaluateRules(g_process_cache(p_processId), C_PROCESS_UPDATE);                
             end if ;
             
         exception
@@ -3785,7 +3740,6 @@ AS
         begin
             l_message := jsonPut(l_message, 'rule_set_name', p_ruleSetName);
             l_message := jsonPut(l_message, 'rule_set_version', p_ruleSetVersion);
---            l_message := '{"rule_set_name":"' || p_ruleSetName || '", "rule_set_version":"' || p_ruleSetVersion || '"}';
             sendNoWait(p_processId, 'UPDATE_RULE', l_message, C_TIMEOUT_NEW_SESSION);               
         end;
         
