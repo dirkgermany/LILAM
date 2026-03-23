@@ -362,23 +362,22 @@ AS
 
         ------------------------------------------------------------------------
 
-        function jsonPut(p_jsonString varchar2, jsonKey varchar2, valueStr varchar2) return varchar2
+        procedure jsonPut(p_jsonString out JSON_OBJ_LILAM, jsonKey in varchar2, valueStr in varchar2) --return varchar2
         -- Achtung! Die If-Konstruktionen sind nicht schön aber deutlich performanter, als case
         -- Auch das Arbeiten mit einem booleschen Wert am Anfang macht die Logik um vieles langsamer
         as
             l_str   JSON_OBJ_LILAM;
             l_value JSON_OBJ_LILAM := trim(valueStr);
         begin
-            if valueStr is null or trim(valueStr) = '' then return p_jsonString; end if;
+            if valueStr is null or trim(valueStr) = '' then return; end if; -- p_jsonString; end if;
 
             if substr(l_value,1,1) != '{' and substr(l_value, -1) != '}' then
-
-            -- Escapen!
-            l_value := REPLACE(l_value, '\', '\\'); -- ZUERST Backslash
-            l_value := REPLACE(l_value, '"', '\"'); -- DANN Anführungszeichen
-            -- Optional: Zeilenumbrüche (JSON erlaubt keine echten Linebreaks in Strings)
-            l_value := REPLACE(l_value, CHR(10), '\n');
-            l_value := REPLACE(l_value, CHR(13), '\r');
+                -- Escapen!
+                l_value := REPLACE(l_value, '\', '\\'); -- ZUERST Backslash
+                l_value := REPLACE(l_value, '"', '\"'); -- DANN Anführungszeichen
+                -- Optional: Zeilenumbrüche (JSON erlaubt keine echten Linebreaks in Strings)
+                l_value := REPLACE(l_value, CHR(10), '\n');
+                l_value := REPLACE(l_value, CHR(13), '\r');
             end if;
 
             l_str := jsonPutPrep(p_jsonString);
@@ -396,16 +395,17 @@ AS
                     l_str := l_str || '}';
                 end if;            
             end if;
-            return l_str;
+            p_jsonString := l_str;
+--            return l_str;
         end;
 
         -------------------------------------------------------------------------------------
 
-        function jsonPut(p_jsonString varchar2, jsonKey varchar2, valueNum Number) return varchar2
+        procedure jsonPut(p_jsonString out varchar2, jsonKey varchar2, valueNum Number) -- return varchar2
         as
             l_str varchar2(1000);
         begin
-            if valueNum is null then return p_jsonString; end if;
+            if valueNum is null then return; end if; -- p_jsonString; end if;
 
             l_str := jsonPutPrep(p_jsonString);
             if p_jsonString is null and substr(valueNum, 1,1) = '{' and substr(valueNum, -1) = '}' then
@@ -414,15 +414,17 @@ AS
                 l_str := '{' || l_str || '"' || trim(jsonKey) || '":';
                 l_str := l_str || valueNum || '}'; 
             end if;
-            return l_str;
+            p_jsonString := l_str;
+--            return l_str;
         end;
 
         -------------------------------------------------------------------------------------
 
-        function jsonPut(p_jsonString varchar2, jsonKey varchar2, valueTS timestamp) return varchar2
+        procedure jsonPut(p_jsonString out JSON_OBJ_LILAM, jsonKey varchar2, valueTS timestamp) -- return varchar2
         as
         begin
-            return jsonPut(p_jsonString, jsonKey, TO_CHAR(valueTS, 'YYYY-MM-DD"T"HH24:MI:SS.FF6'));
+            jsonPut(p_jsonString, jsonKey, TO_CHAR(valueTS, 'YYYY-MM-DD"T"HH24:MI:SS.FF6'));
+--            return jsonPut(p_jsonString, jsonKey, TO_CHAR(valueTS, 'YYYY-MM-DD"T"HH24:MI:SS.FF6'));
         end;
 
         --------------------------------------------------------------------------
@@ -925,12 +927,14 @@ AS
             l_clientChannel := getClientPipe;
             l_groupName := jsonString(p_payload, 'group_name');
 
-            l_jsonHeader := jsonPut(l_jsonHeader, 'msg_type', 'API_CALL');
-            l_jsonHeader := jsonPut(l_jsonHeader, 'request', p_request);
-            l_jsonHeader := jsonPut(l_jsonHeader, 'response', l_clientChannel);
+            jsonPut(l_jsonHeader, 'msg_type', 'API_CALL');
+            jsonPut(l_jsonHeader, 'request', p_request);
+            jsonPut(l_jsonHeader, 'response', l_clientChannel);
+-- ???
             l_jsonPayload := p_payLoad;
-            l_jsonMain := jsonPut(l_jsonMain, 'header', l_jsonHeader);
-            l_jsonMain := jsonPut(l_jsonMain, 'payload', l_jsonPayload);
+-- ???
+            jsonPut(l_jsonMain, 'header', l_jsonHeader);
+            jsonPut(l_jsonMain, 'payload', l_jsonPayload);
 
             l_serverPipe := getServerPipeForSession(p_processId, l_groupName);
 
@@ -1074,11 +1078,13 @@ AS
         begin
             stabilizeInLowPerfEnvironments(p_processId);
 
-            l_jsonHeader := jsonPut(l_jsonHeader, 'msg_type', 'API_CALL');
-            l_jsonHeader := jsonPut(l_jsonHeader, 'request', p_request);
+            jsonPut(l_jsonHeader, 'msg_type', 'API_CALL');
+            jsonPut(l_jsonHeader, 'request', p_request);
+-- ???
             l_jsonPayload := p_payload;
-            l_jsonMain := jsonPut(l_jsonMain, 'header', l_jsonHeader);
-            l_jsonMain := jsonPut(l_jsonMain, 'payload', l_jsonPayload);
+-- ???
+            jsonPut(l_jsonMain, 'header', l_jsonHeader);
+            jsonPut(l_jsonMain, 'payload', l_jsonPayload);
 
             l_pipeName := getServerPipeForSession(p_processId, null);
             DBMS_PIPE.PACK_MESSAGE(l_jsonMain);
@@ -1903,10 +1909,10 @@ AS
         as
             l_payload JSON_OBJ_LILAM; -- Puffer für den JSON-String
         begin
-            l_payload := jsonPut(l_payload,'process_id', p_processId);
-            l_payload := jsonPut(l_payload,'action_name', p_actionName);
-            l_payload := jsonPut(l_payload,'context_name', p_contextName);
-            l_payload := jsonPut(l_payload,'timestamp', p_timestamp);
+            jsonPut(l_payload,'process_id', p_processId);
+            jsonPut(l_payload,'action_name', p_actionName);
+            jsonPut(l_payload,'context_name', p_contextName);
+            jsonPut(l_payload,'timestamp', p_timestamp);
 
             sendNoWait(p_processId, 'START_TRACE', l_payload, 0.5);
 
@@ -1928,10 +1934,10 @@ AS
             -- späterem Aufruf von insertMonitor im Server der Zeitpunkt 'in time' ist,
             -- muss der Zeitpunkt vom Client bei Aufruf gesetzt werden.
             -- Erzeugung des JSON-Objekts
-            l_payload := jsonPut(l_payload, 'process_id', p_processId);
-            l_payload := jsonPut(l_payload, 'action_name', p_actionName);
-            l_payload := jsonPut(l_payload, 'context_name', p_contextName);
-            l_payload := jsonPut(l_payload, 'timestamp', p_timestamp);     
+            jsonPut(l_payload, 'process_id', p_processId);
+            jsonPut(l_payload, 'action_name', p_actionName);
+            jsonPut(l_payload, 'context_name', p_contextName);
+            jsonPut(l_payload, 'timestamp', p_timestamp);     
 
             sendNoWait(p_processId, 'STOP_TRACE', l_payload, 0.5);
 
@@ -1957,10 +1963,10 @@ AS
             -- späterem Aufruf von insertMonitor im Server der Zeitpunkt 'in time' ist,
             -- muss der Zeitpunkt vom Client bei Aufruf gesetzt werden.
             -- Erzeugung des JSON-Objekts
-            l_payload := jsonPut(l_payload,'process_id', p_processId);
-            l_payload := jsonPut(l_payload,'action_name', p_actionName);
-            l_payload := jsonPut(l_payload,'context_name', p_contextName);
-            l_payload := jsonPut(l_payload,'timestamp', TO_CHAR(p_timestamp, 'YYYY-MM-DD"T"HH24:MI:SS.FF6'));
+            jsonPut(l_payload,'process_id', p_processId);
+            jsonPut(l_payload,'action_name', p_actionName);
+            jsonPut(l_payload,'context_name', p_contextName);
+            jsonPut(l_payload,'timestamp', TO_CHAR(p_timestamp, 'YYYY-MM-DD"T"HH24:MI:SS.FF6'));
 
             sendNoWait(p_processId, C_MARK_EVENT, l_payload, 0.5);
 
@@ -2650,11 +2656,11 @@ AS
             l_response PLS_INTEGER;
         begin
             -- Erzeugung des JSON-Objekts
-            l_payload := jsonPut(l_payload, 'process_id', p_processId);
-            l_payload := jsonPut(l_payload, 'steps_todo', p_procStepsToDo);
-            l_payload := jsonPut(l_payload, 'steps_done', p_procStepsDone);
-            l_payload := jsonPut(l_payload, 'process_info', p_processInfo);
-            l_payload := jsonPut(l_payload, 'process_status', p_status);
+            jsonPut(l_payload, 'process_id', p_processId);
+            jsonPut(l_payload, 'steps_todo', p_procStepsToDo);
+            jsonPut(l_payload, 'steps_done', p_procStepsDone);
+            jsonPut(l_payload, 'process_info', p_processInfo);
+            jsonPut(l_payload, 'process_status', p_status);
 
             l_response := waitForResponse(p_processId, 'CLOSE_SESSION', l_payload, 1);
 
@@ -2680,8 +2686,8 @@ AS
             l_serverMsg varchar2(100);
         begin
             -- Erzeugung des JSON-Objekts
-            l_payload := jsonPut(l_payload,'process_id', p_processId);
-            l_payload := jsonPut(l_payload,'timestamp', p_timestamp);
+            jsonPut(l_payload,'process_id', p_processId);
+            jsonPut(l_payload,'timestamp', p_timestamp);
 
             sendNoWait(p_processId, 'PROC_STEP_DONE', l_payload, 0.5);
         end;
@@ -2691,13 +2697,13 @@ AS
         as
             l_payload JSON_OBJ_LILAM; -- Puffer für den JSON-String
         begin
-            l_payload := jsonPut(l_payload,'process_id', p_processId);
-            l_payload := jsonPut(l_payload,'steps_todo', p_procStepsToDo);
-            l_payload := jsonPut(l_payload,'steps_done', p_procStepsDone);
-            l_payload := jsonPut(l_payload,'process_info', p_processInfo);
-            l_payload := jsonPut(l_payload,'process_status', p_status);
-            l_payload := jsonPut(l_payload,'process_immortal', p_immortal);
-            l_payload := jsonPut(l_payload,'timestamp', p_timestamp);
+            jsonPut(l_payload,'process_id', p_processId);
+            jsonPut(l_payload,'steps_todo', p_procStepsToDo);
+            jsonPut(l_payload,'steps_done', p_procStepsDone);
+            jsonPut(l_payload,'process_info', p_processInfo);
+            jsonPut(l_payload,'process_status', p_status);
+            jsonPut(l_payload,'process_immortal', p_immortal);
+            jsonPut(l_payload,'timestamp', p_timestamp);
 
             sendNoWait(p_processId, 'SET_ANY_STATUS', l_payload, 0.5);
         end;
@@ -2709,13 +2715,13 @@ AS
         as
             l_payload JSON_OBJ_LILAM; -- Puffer für den JSON-String
         begin
-            l_payload := jsonPut(l_payload,'process_id', p_processId);
-            l_payload := jsonPut(l_payload,'level', p_level);
-            l_payload := jsonPut(l_payload,'log_text', p_logText);
-            l_payload := jsonPut(l_payload,'err_stack', p_errStack);
-            l_payload := jsonPut(l_payload,'err_backtr', p_errBacktrace);
-            l_payload := jsonPut(l_payload,'err_callstack', p_errCallstack);
-            l_payload := jsonPut(l_payload,'timestamp', p_timestamp);
+            jsonPut(l_payload,'process_id', p_processId);
+            jsonPut(l_payload,'level', p_level);
+            jsonPut(l_payload,'log_text', p_logText);
+            jsonPut(l_payload,'err_stack', p_errStack);
+            jsonPut(l_payload,'err_backtr', p_errBacktrace);
+            jsonPut(l_payload,'err_callstack', p_errCallstack);
+            jsonPut(l_payload,'timestamp', p_timestamp);
 
             sendNoWait(p_processId, 'LOG_ANY', l_payload, 0.5);
 
@@ -3294,7 +3300,7 @@ AS
         end;
 
 
-        FUNCTION NEW_SESSION(p_processName VARCHAR2, p_logLevel PLS_INTEGER, p_procStepsToDo NUMBER, p_daysToKeep NUMBER, p_tabNameMaster varchar2 default 'LILAM') return number
+        FUNCTION NEW_SESSION(p_processName VARCHAR2, p_logLevel PLS_INTEGER, p_procStepsToDo NUMBER, p_daysToKeep NUMBER, p_tabNameMaster varchar2 default 'LILAM_LOG') return number
         as
             p_session_init t_session_init;
         begin
@@ -3310,7 +3316,7 @@ AS
 
         --------------------------------------------------------------------------
 
-        function NEW_SESSION(p_processName varchar2, p_logLevel PLS_INTEGER, p_tabNameMaster varchar2 default 'LILAM') return number
+        function NEW_SESSION(p_processName varchar2, p_logLevel PLS_INTEGER, p_tabNameMaster varchar2 default 'LILAM_LOG') return number
         as
             p_session_init t_session_init;
         begin
@@ -3327,7 +3333,7 @@ AS
         -- Opens/starts a new logging session.
         -- The returned process id must be stored within the calling procedure because it is the reference
         -- which is recommended for all following actions (e.g. CLOSE_SESSION, DEBUG, SET_PROCESS_STATUS).
-        function NEW_SESSION(p_processName varchar2, p_logLevel PLS_INTEGER, p_daysToKeep number, p_tabNameMaster varchar2 default 'LILAM') return number
+        function NEW_SESSION(p_processName varchar2, p_logLevel PLS_INTEGER, p_daysToKeep number, p_tabNameMaster varchar2 default 'LILAM_LOG') return number
         as
             p_session_init t_session_init;
         begin
@@ -3566,13 +3572,13 @@ AS
 
             v_rec := getLastMonitorEntry(l_processId, l_actionName, l_contextName);
             
-            l_payload := jsonPut(l_payload, 'process_id', v_rec.process_id);
-            l_payload := jsonPut(l_payload, 'action_name', v_rec.action_name);
-            l_payload := jsonPut(l_payload, 'action_count', v_rec.action_count);
-            l_payload := jsonPut(l_payload, 'used_time', v_rec.used_time);
-            l_payload := jsonPut(l_payload, 'start_time', v_rec.start_time);
-            l_payload := jsonPut(l_payload, 'stop_time', v_rec.stop_time);
-            l_payload := jsonPut(l_payload, 'avg_action_time', v_rec.avg_action_time); 
+            jsonPut(l_payload, 'process_id', v_rec.process_id);
+            jsonPut(l_payload, 'action_name', v_rec.action_name);
+            jsonPut(l_payload, 'action_count', v_rec.action_count);
+            jsonPut(l_payload, 'used_time', v_rec.used_time);
+            jsonPut(l_payload, 'start_time', v_rec.start_time);
+            jsonPut(l_payload, 'stop_time', v_rec.stop_time);
+            jsonPut(l_payload, 'avg_action_time', v_rec.avg_action_time); 
 
             l_header := '"header":{"msg_type":"SERVER_RESPONSE", "msg_name":"LAST_MONITOR_ENTRY"}';
             l_meta   := '"meta":{"server_version":"' || LILAM_VERSION || '", "server_message":"' || TXT_DATA_ANSWER || '","server_code":' || get_serverCode(TXT_DATA_ANSWER) || '}';
@@ -3605,27 +3611,27 @@ AS
         begin
             l_processId := jsonNumber(l_message, 'payload.process_id');
             l_process_rec := GET_PROCESS_DATA(l_processId); 
-            l_payload := jsonPut(l_payload, 'process_id', l_process_rec.id);
-            l_payload := jsonPut(l_payload, 'process_name', l_process_rec.processName);
-            l_payload := jsonPut(l_payload, 'log_level', l_process_rec.logLevel);
-            l_payload := jsonPut(l_payload, 'process_start', l_process_rec.processStart);
-            l_payload := jsonPut(l_payload, 'process_end', l_process_rec.processEnd);
-            l_payload := jsonPut(l_payload, 'last_update', l_process_rec.lastUpdate);
-            l_payload := jsonPut(l_payload, 'process_info', l_process_rec.info); 
-            l_payload := jsonPut(l_payload, 'process_status', l_process_rec.status); 
-            l_payload := jsonPut(l_payload, 'steps_todo', l_process_rec.stepsTodo); 
-            l_payload := jsonPut(l_payload, 'steps_done', l_process_rec.stepsDone); 
-            l_payload := jsonPut(l_payload, 'tabname_master', l_process_rec.tabNameMaster);
+            jsonPut(l_payload, 'process_id', l_process_rec.id);
+            jsonPut(l_payload, 'process_name', l_process_rec.processName);
+            jsonPut(l_payload, 'log_level', l_process_rec.logLevel);
+            jsonPut(l_payload, 'process_start', l_process_rec.processStart);
+            jsonPut(l_payload, 'process_end', l_process_rec.processEnd);
+            jsonPut(l_payload, 'last_update', l_process_rec.lastUpdate);
+            jsonPut(l_payload, 'process_info', l_process_rec.info); 
+            jsonPut(l_payload, 'process_status', l_process_rec.status); 
+            jsonPut(l_payload, 'steps_todo', l_process_rec.stepsTodo); 
+            jsonPut(l_payload, 'steps_done', l_process_rec.stepsDone); 
+            jsonPut(l_payload, 'tabname_master', l_process_rec.tabNameMaster);
             
-            l_header := jsonPut(l_header, 'msg_type', 'SERVER_RESPONSE');
-            l_header := jsonPut(l_header, 'msg_name', 'PROCESS_DATA');
-            l_meta   := jsonPut(l_meta, 'server_version', LILAM_VERSION);
-            l_meta   := jsonPut(l_meta, 'server_message', TXT_DATA_ANSWER);
-            l_meta   := jsonPut(l_meta, 'server_code', get_serverCode(TXT_DATA_ANSWER));
+            jsonPut(l_header, 'msg_type', 'SERVER_RESPONSE');
+            jsonPut(l_header, 'msg_name', 'PROCESS_DATA');
+            jsonPut(l_meta, 'server_version', LILAM_VERSION);
+            jsonPut(l_meta, 'server_message', TXT_DATA_ANSWER);
+            jsonPut(l_meta, 'server_code', get_serverCode(TXT_DATA_ANSWER));
 
             l_msg := jsonObject(l_header, 'header');
-            l_msg := jsonPut(l_msg, 'meta', l_meta);
-            l_msg := jsonPut(l_msg, 'payload', l_payload);
+            jsonPut(l_msg, 'meta', l_meta);
+            jsonPut(l_msg, 'payload', l_payload);
 
             -- no payload, client waits only for unfreezing
             DBMS_PIPE.RESET_BUFFER; -- Koffer leeren
@@ -3723,8 +3729,8 @@ AS
             l_serverCode PLS_INTEGER;
             l_slotIdx    PLS_INTEGER;
         begin
-            l_message := jsonPut(l_message, 'rule_set_name', p_ruleSetName);
-            l_message := jsonPut(l_message, 'rule_set_version', p_ruleSetVersion);
+            jsonPut(l_message, 'rule_set_name', p_ruleSetName);
+            jsonPut(l_message, 'rule_set_version', p_ruleSetVersion);
             sendNoWait(p_processId, 'UPDATE_RULE', l_message, C_TIMEOUT_NEW_SESSION);               
         end;
 
@@ -3879,20 +3885,20 @@ AS
             l_msgObj     := JSON_QUERY(p_message, '$.payload');
             l_password   := jsonString(l_msgObj, 'shutdown_password');
 
-            l_header := jsonPut(l_header, 'msg_type', 'SERVER_RESPONSE');
-            l_header := jsonPut(l_header, 'msg_name', 'SERVER_SHUTDOWN');
-            l_meta   := jsonPut(l_meta, 'server_version', LILAM_VERSION);
+            jsonPut(l_header, 'msg_type', 'SERVER_RESPONSE');
+            jsonPut(l_header, 'msg_name', 'SERVER_SHUTDOWN');
+            jsonPut(l_meta, 'server_version', LILAM_VERSION);
 
             if l_password = g_shutdownPassword then
-                l_payload := jsonPut(l_payload, 'server_message', TXT_ACK_SHUTDOWN);
-                l_payload := jsonPut(l_payload, 'server_code', get_serverCode(TXT_ACK_SHUTDOWN));
+                jsonPut(l_payload, 'server_message', TXT_ACK_SHUTDOWN);
+                jsonPut(l_payload, 'server_code', get_serverCode(TXT_ACK_SHUTDOWN));
             else
-                l_payload := jsonPut(l_payload, 'server_message', TXT_ACK_DECLINE);
-                l_payload := jsonPut(l_payload, 'server_code', get_serverCode(TXT_ACK_DECLINE));
+                jsonPut(l_payload, 'server_message', TXT_ACK_DECLINE);
+                jsonPut(l_payload, 'server_code', get_serverCode(TXT_ACK_DECLINE));
             end if ;
             l_msg := jsonObject(l_header, 'header');
-            l_msg := jsonPut(l_msg, 'meta', l_meta);
-            l_msg := jsonPut(l_msg, 'payload', l_payload);
+            jsonPut(l_msg, 'meta', l_meta);
+            jsonPut(l_msg, 'payload', l_payload);
 
             DBMS_PIPE.RESET_BUFFER;
             DBMS_PIPE.PACK_MESSAGE(l_msg);        
@@ -4477,27 +4483,27 @@ AS
                 RAISE_APPLICATION_ERROR(-20005, 'In-Parameter is invalid JSON-Format');
             end if;
             l_jsonHelper := jsonObject(l_InObject, 'header');
-            l_jsonHeader := jsonPut(l_jsonHeader, 'header', l_jsonHelper);
-            l_jsonHeader := jsonPut(l_jsonHeader, 'status', 'UNKNOWN');
+            jsonPut(l_jsonHeader, 'header', l_jsonHelper);
+            jsonPut(l_jsonHeader, 'status', 'UNKNOWN');
             l_api_call   := jsonString(l_jsonHeader, 'api_call');
 
             l_jsonHelper := jsonObject(l_InObject, 'params');
-            l_jsonPayload := jsonPut(l_jsonPayload, 'params', l_jsonHelper);
-            l_jsonPayload := jsonPut(l_jsonPayload, 'returns', 'RESPONSE_VALUE');
-            l_jsonPayload := jsonPut(l_jsonPayload, 'value', 0);
+            jsonPut(l_jsonPayload, 'params', l_jsonHelper);
+            jsonPut(l_jsonPayload, 'returns', 'RESPONSE_VALUE');
+            jsonPut(l_jsonPayload, 'value', 0);
 
             -- Logik-Verzweigung
             case  l_api_call
                 when 'SERVER_NEW_SESSION' THEN
                     l_proc_id := SERVER_NEW_SESSION(l_jsonParams);
                     if l_proc_id < 0 then
-                        l_jsonHeader := jsonPut(l_jsonHeader, 'status', 'ERROR');
-                        l_jsonPayload := jsonPut(l_jsonPayload, 'returns', 'ERR_NO');
-                        l_jsonPayload := jsonPut(l_jsonPayload, 'value', NUM_ERR_NO_SERVER);
+                        jsonPut(l_jsonHeader, 'status', 'ERROR');
+                        jsonPut(l_jsonPayload, 'returns', 'ERR_NO');
+                        jsonPut(l_jsonPayload, 'value', NUM_ERR_NO_SERVER);
                     else
-                        l_jsonHeader := jsonPut(l_jsonHeader, 'status', 'SUCESS');
-                        l_jsonPayload := jsonPut(l_jsonPayload, 'returns', 'PROCESS_ID');
-                        l_jsonPayload := jsonPut(l_jsonPayload, 'value', l_proc_id);
+                        jsonPut(l_jsonHeader, 'status', 'SUCESS');
+                        jsonPut(l_jsonPayload, 'returns', 'PROCESS_ID');
+                        jsonPut(l_jsonPayload, 'value', l_proc_id);
                     end if;
 
                 when 'NEW_SESSION' THEN
@@ -4509,15 +4515,15 @@ AS
                     p_session_init.tabNameMaster := jsonString(l_jsonParams, 'tabname_master');
 
                     l_proc_id := NEW_SESSION(p_session_init);
-                    l_jsonHeader := jsonPut(l_jsonHeader, 'status', 'SUCCESS');
-                    l_jsonPayload := jsonPut(l_jsonPayload, 'returns', 'PROCESS_ID');
-                    l_jsonPayload := jsonPut(l_jsonPayload, 'value', l_proc_id);
+                    jsonPut(l_jsonHeader, 'status', 'SUCCESS');
+                    jsonPut(l_jsonPayload, 'returns', 'PROCESS_ID');
+                    jsonPut(l_jsonPayload, 'value', l_proc_id);
 
                 when 'SERVER_SHUTDOWN' then
                     SERVER_SHUTDOWN(jsonNumber(l_jsonParams, 'process_id'), jsonString(l_jsonParams, 'process_name'), jsonString(l_jsonParams, 'password'));
-                    l_jsonHeader := jsonPut(l_jsonHeader, 'status', NUM_ACK_OK);
-                    l_jsonPayload := jsonPut(l_jsonPayload, 'returns', 'NO_VALUE');
-                    l_jsonPayload := jsonPut(l_jsonPayload, 'value', 'NULL');
+                    jsonPut(l_jsonHeader, 'status', NUM_ACK_OK);
+                    jsonPut(l_jsonPayload, 'returns', 'NO_VALUE');
+                    jsonPut(l_jsonPayload, 'value', 'NULL');
 
                 when 'CLOSE_SESSION' THEN
                     CLOSE_SESSION(l_jsonParams);
@@ -4560,17 +4566,17 @@ AS
 
             END CASE;
 
-            p_respObject := jsonPut(p_respObject, 'header', l_jsonHeader);
-            p_respObject := jsonPut(p_respObject, 'payload', l_jsonPayload);
+            jsonPut(p_respObject, 'header', l_jsonHeader);
+            jsonPut(p_respObject, 'payload', l_jsonPayload);
 
 
         EXCEPTION
             WHEN OTHERS THEN
-                l_jsonHeader := jsonPut(l_jsonHeader, 'status', 'ERROR');
-                l_jsonPayload := jsonPut(l_jsonPayload, 'returns', 'ERROR_MSG');
-                l_jsonPayload := jsonPut(l_jsonPayload, 'value', SQLERRM);
-            p_respObject := jsonPut(p_respObject, 'header', l_jsonHeader);
-            p_respObject := jsonPut(p_respObject, 'payload', l_jsonPayload);
+                jsonPut(l_jsonHeader, 'status', 'ERROR');
+                jsonPut(l_jsonPayload, 'returns', 'ERROR_MSG');
+                jsonPut(l_jsonPayload, 'value', SQLERRM);
+                jsonPut(p_respObject, 'header', l_jsonHeader);
+                jsonPut(p_respObject, 'payload', l_jsonPayload);
         END;
 
         PROCEDURE CALL_BY_JSON (
