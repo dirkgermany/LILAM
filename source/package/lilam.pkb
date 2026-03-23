@@ -2645,20 +2645,16 @@ AS
         
         procedure close_sessionRemote(p_processId number, p_procStepsToDo number, p_procStepsDone number, p_processInfo varchar2, p_status PLS_INTEGER)
         as
-            l_payload varchar2(32767); -- Puffer für den JSON-String
+            l_payload JSON_OBJ_LILAM; -- Puffer für den JSON-String
             l_serverMsg varchar2(100);
             l_response PLS_INTEGER;
         begin
             -- Erzeugung des JSON-Objekts
-            select json_object(
-                'process_id'   value p_processId,
-                'steps_todo'   value p_procStepsToDo,
-                'steps_done'   value p_procStepsDone,
-                'process_info' value p_processInfo,
-                'process_status'       value p_status
-                returning varchar2
-            )
-            into l_payload from dual;
+            l_payload := jsonPut(l_payload, 'process_id', p_processId);
+            l_payload := jsonPut(l_payload, 'steps_todo', p_procStepsToDo);
+            l_payload := jsonPut(l_payload, 'steps_done', p_procStepsDone);
+            l_payload := jsonPut(l_payload, 'process_info', p_processInfo);
+            l_payload := jsonPut(l_payload, 'process_status', p_status);
             
             l_response := waitForResponse(p_processId, 'CLOSE_SESSION', l_payload, 1);
             
@@ -3563,7 +3559,7 @@ AS
         procedure doRemote_getMonitorLastEntry(p_clientChannel varchar2, l_message varchar2)
         as 
             l_processId number;
-            l_payload varchar2(32767);
+            l_payload JSON_OBJ_LILAM;
             v_rec t_monitor_buffer_rec;
             l_status PLS_INTEGER;
             l_actionName varchar2(50);
@@ -3577,17 +3573,13 @@ AS
             l_contextName := jsonString(l_message, 'payload.context_name');
             
             v_rec := getLastMonitorEntry(l_processId, l_actionName, l_contextName);   
-            select json_object(
-                'process_id'        value v_rec.process_id,
-                'action_name'      value v_rec.action_name,
-                'action_count'         value v_rec.action_count,
-                'used_time'     value v_rec.used_time,
-                'start_time'       value v_rec.start_time,
-                'stop_time'       value v_rec.stop_time,
-                'avg_action_time'       value v_rec.avg_action_time
-                returning varchar2
-            )
-            into l_payload from dual;   
+            l_payload := jsonPut(l_payload, 'process_id', v_rec.process_id);
+            l_payload := jsonPut(l_payload, 'action_name', v_rec.action_name);
+            l_payload := jsonPut(l_payload, 'action_count', v_rec.action_count);
+            l_payload := jsonPut(l_payload, 'used_time', v_rec.used_time);
+            l_payload := jsonPut(l_payload, 'start_time', v_rec.start_time);
+            l_payload := jsonPut(l_payload, 'stop_time', v_rec.stop_time);
+            l_payload := jsonPut(l_payload, 'avg_action_time', v_rec.avg_action_time); 
   
             l_header := '"header":{"msg_type":"SERVER_RESPONSE", "msg_name":"LAST_MONITOR_ENTRY"}';
             l_meta   := '"meta":{"server_version":"' || LILAM_VERSION || '", "server_message":"' || TXT_DATA_ANSWER || '","server_code":' || get_serverCode(TXT_DATA_ANSWER) || '}';
@@ -3611,7 +3603,7 @@ AS
         procedure doRemote_getProcessData(p_clientChannel varchar2, l_message varchar2)
         as
             l_processId number;
-            l_payload varchar2(32767);
+            l_payload JSON_OBJ_LILAM;
             l_process_rec t_process_rec;
             l_status PLS_INTEGER;
             l_header varchar2(200);
@@ -3619,24 +3611,22 @@ AS
             l_msg    varchar2(2000);
         begin
             l_processId := jsonNumber(l_message, 'payload.process_id');
-            l_process_rec := GET_PROCESS_DATA(l_processId);   
+            l_process_rec := GET_PROCESS_DATA(l_processId);
+            l_processId := jsonNumber(l_message, 'payload.process_id');
+            l_process_rec := GET_PROCESS_DATA(l_processId); 
 
-            select json_object(
-                'process_id'        value l_process_rec.id,
-                'process_name'      value l_process_rec.processName,
-                'log_level'         value l_process_rec.logLevel,
-                'process_start'     value l_process_rec.processStart,
-                'process_end'       value l_process_rec.processEnd,
-                'last_update'       value l_process_rec.lastUpdate,
-                'process_info'      value l_process_rec.info,
-                'process_status'    value l_process_rec.status,
-                'steps_todo'   value l_process_rec.stepsTodo,
-                'steps_done'   value l_process_rec.stepsDone,
-                'tabname_master'    value l_process_rec.tabNameMaster
-                returning varchar2
-            )
-            into l_payload from dual;   
-                        
+            l_payload := jsonPut(l_payload, 'process_id', l_process_rec.id);
+            l_payload := jsonPut(l_payload, 'process_name', l_process_rec.processName);
+            l_payload := jsonPut(l_payload, 'log_level', l_process_rec.logLevel);
+            l_payload := jsonPut(l_payload, 'process_start', l_process_rec.processStart);
+            l_payload := jsonPut(l_payload, 'process_end', l_process_rec.processEnd);
+            l_payload := jsonPut(l_payload, 'last_update', l_process_rec.lastUpdate);
+            l_payload := jsonPut(l_payload, 'process_info', l_process_rec.info); 
+            l_payload := jsonPut(l_payload, 'process_status', l_process_rec.status); 
+            l_payload := jsonPut(l_payload, 'steps_todo', l_process_rec.stepsTodo); 
+            l_payload := jsonPut(l_payload, 'steps_done', l_process_rec.stepsDone); 
+            l_payload := jsonPut(l_payload, 'tabname_master', l_process_rec.tabNameMaster);
+
             l_header := '"header":{"msg_type":"SERVER_RESPONSE", "msg_name":"PROCESS_DATA"}';
             l_meta   := '"meta":{"server_version":"' || LILAM_VERSION || '", "server_message":"' || TXT_DATA_ANSWER || '","server_code":' || get_serverCode(TXT_DATA_ANSWER) || '}';
             l_payload := '"payload":' || l_payload;
@@ -4175,8 +4165,8 @@ AS
                 when false then l_booleanAsInt := 0;
             end case;
             
-            case p_eventCounter
-                when > 0 then
+            case
+                when p_eventCounter > 0 then
                     if p_ready then
                         l_status := 'PROCESSING';
                         DBMS_APPLICATION_INFO.SET_ACTION('PROCESSING');
@@ -4187,7 +4177,7 @@ AS
                         DBMS_APPLICATION_INFO.SET_CLIENT_INFO('Time:' || systimestamp);
                     end if;
                     
-                when 0 then
+                when p_eventCounter = 0 then
                     if p_ready then
                         l_status := 'PENDING';
                         DBMS_APPLICATION_INFO.SET_ACTION('PENDING');
@@ -4197,7 +4187,7 @@ AS
                         DBMS_APPLICATION_INFO.SET_MODULE(NULL, NULL);
                     end if;
                     
-                when -1 then
+                when p_eventCounter = -1 then
                     if p_ready then
                         l_status := 'UNKNOWN';
                         DBMS_APPLICATION_INFO.SET_ACTION('UNKNOWN');
