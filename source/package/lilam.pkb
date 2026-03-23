@@ -293,10 +293,12 @@ AS
 
         ------------------------------------------------------------------------
 
-        function jsonObject(p_jsonString varchar2, p_path varchar2) return varchar2
+        function jsonObject(p_jsonString out varchar2, p_path varchar2) return varchar2
         as
         begin
-            return JSON_QUERY(p_jsonString, '$.' || p_path);
+            p_jsonString := JSON_QUERY(p_jsonString, '$.' || p_path);
+            return p_jsonString;
+--            return JSON_QUERY(p_jsonString, '$.' || p_path);
         end;
 
         --------------------------------------------------------------------------
@@ -364,8 +366,8 @@ AS
         -- Achtung! Die If-Konstruktionen sind nicht schön aber deutlich performanter, als case
         -- Auch das Arbeiten mit einem booleschen Wert am Anfang macht die Logik um vieles langsamer
         as
-            l_str varchar2(1000);
-            l_value varchar2(2000) := trim(valueStr);
+            l_str   JSON_OBJ_LILAM;
+            l_value JSON_OBJ_LILAM := trim(valueStr);
         begin
             if valueStr is null or trim(valueStr) = '' then return p_jsonString; end if;
 
@@ -4461,6 +4463,8 @@ AS
             p_respObject  OUT JSON_OBJ_LILAM
         )
         AS
+            l_InObject JSON_OBJ_LILAM := p_callObject;
+            
             l_jsonHelper    JSON_OBJ_LILAM;
             l_jsonParams    JSON_OBJ_LILAM;
             l_jsonHeader    JSON_OBJ_LILAM;
@@ -4472,12 +4476,12 @@ AS
             if not p_callObject IS JSON then
                 RAISE_APPLICATION_ERROR(-20005, 'In-Parameter is invalid JSON-Format');
             end if;
-            l_jsonHelper := jsonObject(p_callObject, 'header');
+            l_jsonHelper := jsonObject(l_InObject, 'header');
             l_jsonHeader := jsonPut(l_jsonHeader, 'header', l_jsonHelper);
             l_jsonHeader := jsonPut(l_jsonHeader, 'status', 'UNKNOWN');
             l_api_call   := jsonString(l_jsonHeader, 'api_call');
 
-            l_jsonHelper := jsonObject(p_callObject, 'params');
+            l_jsonHelper := jsonObject(l_InObject, 'params');
             l_jsonPayload := jsonPut(l_jsonPayload, 'params', l_jsonHelper);
             l_jsonPayload := jsonPut(l_jsonPayload, 'returns', 'RESPONSE_VALUE');
             l_jsonPayload := jsonPut(l_jsonPayload, 'value', 0);
