@@ -105,9 +105,9 @@ create or replace PACKAGE LILAM AS
     -- Life cycle of a log session
     ------------------------------
     FUNCTION NEW_SESSION(p_session_init t_session_init) RETURN NUMBER;
-    FUNCTION NEW_SESSION(p_processName VARCHAR2, p_logLevel PLS_INTEGER, p_tabNameMaster VARCHAR2 default 'LILAM_LOG') RETURN NUMBER;
-    FUNCTION NEW_SESSION(p_processName VARCHAR2, p_logLevel PLS_INTEGER, p_daysToKeep NUMBER, p_tabNameMaster VARCHAR2 default 'LILAM_LOG') RETURN NUMBER;
-    FUNCTION NEW_SESSION(p_processName VARCHAR2, p_logLevel PLS_INTEGER, p_procStepsToDo NUMBER, p_daysToKeep NUMBER, p_tabNameMaster VARCHAR2 DEFAULT 'LILAM_LOG') RETURN NUMBER;
+    FUNCTION NEW_SESSION(p_processName VARCHAR2, p_logLevel PLS_INTEGER, p_tabNameMaster VARCHAR2 default 'LILAM') RETURN NUMBER;
+    FUNCTION NEW_SESSION(p_processName VARCHAR2, p_logLevel PLS_INTEGER, p_daysToKeep NUMBER, p_tabNameMaster VARCHAR2 default 'LILAM') RETURN NUMBER;
+    FUNCTION NEW_SESSION(p_processName VARCHAR2, p_logLevel PLS_INTEGER, p_procStepsToDo NUMBER, p_daysToKeep NUMBER, p_tabNameMaster VARCHAR2 DEFAULT 'LILAM') RETURN NUMBER;
 
     FUNCTION SERVER_NEW_SESSION(p_processName varchar2, p_groupName VARCHAR2, p_logLevel PLS_INTEGER, p_procStepsToDo PLS_INTEGER, p_daysToKeep PLS_INTEGER, p_tabNameMaster varchar2) RETURN VARCHAR2;
     FUNCTION SERVER_NEW_SESSION(p_jasonString varchar2) RETURN NUMBER;
