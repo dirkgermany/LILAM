@@ -3294,7 +3294,7 @@ AS
         end;
 
 
-        FUNCTION NEW_SESSION(p_processName VARCHAR2, p_logLevel PLS_INTEGER, p_procStepsToDo NUMBER, p_daysToKeep NUMBER, p_tabNameMaster varchar2 default 'LILAM_LOG') return number
+        FUNCTION NEW_SESSION(p_processName VARCHAR2, p_logLevel PLS_INTEGER, p_procStepsToDo NUMBER, p_daysToKeep NUMBER, p_tabNameMaster varchar2 default 'LILAM') return number
         as
             p_session_init t_session_init;
         begin
@@ -3310,7 +3310,7 @@ AS
 
         --------------------------------------------------------------------------
 
-        function NEW_SESSION(p_processName varchar2, p_logLevel PLS_INTEGER, p_tabNameMaster varchar2 default 'LILAM_LOG') return number
+        function NEW_SESSION(p_processName varchar2, p_logLevel PLS_INTEGER, p_tabNameMaster varchar2 default 'LILAM') return number
         as
             p_session_init t_session_init;
         begin
@@ -3327,7 +3327,7 @@ AS
         -- Opens/starts a new logging session.
         -- The returned process id must be stored within the calling procedure because it is the reference
         -- which is recommended for all following actions (e.g. CLOSE_SESSION, DEBUG, SET_PROCESS_STATUS).
-        function NEW_SESSION(p_processName varchar2, p_logLevel PLS_INTEGER, p_daysToKeep number, p_tabNameMaster varchar2 default 'LILAM_LOG') return number
+        function NEW_SESSION(p_processName varchar2, p_logLevel PLS_INTEGER, p_daysToKeep number, p_tabNameMaster varchar2 default 'LILAM') return number
         as
             p_session_init t_session_init;
         begin
