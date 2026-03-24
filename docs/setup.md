@@ -28,6 +28,7 @@ GRANT CREATE SEQUENCE TO USER_NAME;
 GRANT EXECUTE ON LILAM TO USER_NAME;
 
 -- Server-based Privileges (Decoupled Mode)
+GRANT EXECUTE ON DBMS_ALERT TO USER_NAME;   -- To allow LILAM send alerts
 GRANT EXECUTE ON DBMS_PIPE TO USER_NAME;
 GRANT SELECT ON V_$DB_PIPES TO USER_NAME; -- Required for precision server routing
 
