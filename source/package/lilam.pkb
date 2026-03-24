@@ -4333,14 +4333,13 @@ AS
         as
             v_key            VARCHAR2(100); 
             l_clientChannel  varchar2(50);
-            l_message        VARCHAR2(32767);
+            l_message        JSON_OBJ_LILAM;
             l_status         PLS_INTEGER;
             l_request        VARCHAR2(500);
-            l_json_doc       VARCHAR2(2000);        
             l_dummyRes       PLS_INTEGER;
             l_shutdownSignal BOOLEAN := FALSE;
             l_stop_server_exception EXCEPTION;            
-            l_pipe           VARCHAR2(50) := p_pipeName;
+--            l_pipe           VARCHAR2(50) := p_pipeName;
             l_lastHeartbeat  TIMESTAMP := sysTimestamp;
             l_lastSync       TIMESTAMP := sysTimestamp;  
             l_loopCounter    PLS_INTEGER := 0;
@@ -4348,7 +4347,7 @@ AS
             l_serverTimeout  NUMBER := C_SERVER_TIMEOUT_WAIT_FOR_MSG;
         begin
             g_shutdownPassword := p_password;
-            g_serverPipeName := l_pipe;
+            g_serverPipeName := p_pipeName; --l_pipe;
             g_serverGroupName := p_groupName;
             g_serverProcessId := new_session('LILAM_REMOTE_SERVER', logLevelDebug);
             registerServerPipe;
@@ -4604,23 +4603,18 @@ AS
         --------------------------------------------------------------------------
 
         FUNCTION CREATE_SERVER(
+            p_pipeName varchar2,
             p_groupName varchar2, -- Neu hinzugefügt für die Signatur
             p_password  varchar2
         ) RETURN VARCHAR2
         AS
             l_slot_idx PLS_INTEGER := 1; -- Beispielwert, sollte dynamisch ermittelt werden
-            l_job_name VARCHAR2(30);
-            l_pipe     VARCHAR2(30);
             l_action   VARCHAR2(2000); -- Puffer leicht erhöht für längere Strings
         BEGIN
-            -- Pipe-Name Logik (Beispiel: basierend auf Slot oder Gruppe)
-            l_pipe     := 'LILAM_PIPE_' || l_slot_idx;
-            l_job_name := 'LILAM_SRV_SLOT_' || l_slot_idx;
-
             -- 1. Sicherstellen, dass kein "Leichen"-Job existiert
             -- Wir fangen gezielt ORA-27475 (Job does not exist) ab
             BEGIN
-                DBMS_SCHEDULER.DROP_JOB(job_name => l_job_name, force => TRUE);
+                DBMS_SCHEDULER.DROP_JOB(job_name => p_pipeName, force => TRUE);
             EXCEPTION 
                 WHEN OTHERS THEN 
                     IF SQLCODE != -27475 THEN RAISE; END IF;
@@ -4630,7 +4624,7 @@ AS
             -- Wichtig: p_groupName wurde in die Action integriert
             l_action := 'BEGIN ' ||
                         '  LILAM.START_SERVER(' ||
-                        '    p_pipeName  => ' || quote_literal(l_pipe)      || ', ' ||
+                        '    p_pipeName  => ' || quote_literal(p_pipeName)      || ', ' ||
                         '    p_groupName => ' || quote_literal(p_groupName) || ', ' ||
                         '    p_password  => ' || quote_literal(p_password)  ||
                         '  ); ' ||
@@ -4638,15 +4632,15 @@ AS
 
             -- 3. Den Hintergrund-Prozess "zünden"
             DBMS_SCHEDULER.CREATE_JOB (
-                job_name   => l_job_name,
+                job_name   => p_pipeName,
                 job_type   => 'PLSQL_BLOCK',
                 job_action => l_action,
                 enabled    => TRUE,
                 auto_drop  => TRUE,
-                comments   => 'LILAM Background Worker [' || p_groupName || '] auf Pipe ' || l_pipe
+                comments   => 'LILAM Background Worker [' || p_groupName || '] auf Pipe ' || p_pipeName
             );
 
-            RETURN 'LILAM-Server gestartet: Pipe=' || l_pipe || ' (Gruppe=' || p_groupName || ')';
+            RETURN 'LILAM-Server gestartet: Pipe=' || p_pipeName || ' (Gruppe=' || p_groupName || ')';
         END;
 
         ------------------------------------------------------------------------
