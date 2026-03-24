@@ -160,7 +160,7 @@ create or replace PACKAGE LILAM AS
     -----------------
     -- Server control
     -----------------
-    FUNCTION CREATE_SERVER(p_groupName varchar2, p_password varchar2) RETURN VARCHAR2;
+    FUNCTION CREATE_SERVER(p_pipeName varchar2, p_groupName varchar2, p_password varchar2) RETURN VARCHAR2;
     PROCEDURE START_SERVER(p_pipeName varchar2, p_groupName varchar2, p_password varchar2);
     PROCEDURE SERVER_SHUTDOWN(p_processId number, p_pipeName varchar2, p_password varchar2);
     FUNCTION GET_SERVER_PIPE(p_processId NUMBER) RETURN VARCHAR2;
