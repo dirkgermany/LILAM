@@ -4203,7 +4203,7 @@ AS
                 status = :3,
                 processing = :4
             WHERE pipe_name = :5';
-            execute immediate l_sqlStmt using l_booleanAsInt, g_serverPipeName, l_status, p_ready, g_serverPipeName;
+            execute immediate l_sqlStmt using l_booleanAsInt, g_serverPipeName, l_status, l_booleanAsInt, g_serverPipeName;
             COMMIT; -- Muss autonom sein!
 
         exception
