@@ -3263,6 +3263,7 @@ raise;
     as
         p_processId number(19,0);   
         v_new_rec t_process_rec;
+        l_session_init t_session_init := p_session_init;
     begin
 
        -- if silent log mode don't do anything
@@ -3273,22 +3274,25 @@ raise;
 
         execute immediate 'select seq_lilam_log.nextVal from dual' into p_processId;
         -- persist to session internal table
-        insertSession (p_session_init.tabNameMaster, p_processId, p_session_init.logLevel);
-        deleteOldLogs(p_processId, upper(trim(p_session_init.processName)), p_session_init.daysToKeep);
-        persist_new_session(p_processId, p_session_init.processName, p_session_init.logLevel,  
-        p_session_init.stepsToDo, p_session_init.daysToKeep, p_session_init.procImmortal, p_session_init.tabNameMaster);
+        if l_session_init.logLevel is null then l_session_init.logLevel := logLevelMonitor; end if;
+        
+        insertSession (p_session_init.tabNameMaster, p_processId, l_session_init.logLevel);
+        deleteOldLogs(p_processId, upper(trim(l_session_init.processName)), l_session_init.daysToKeep);
+        
+        persist_new_session(p_processId, l_session_init.processName, l_session_init.logLevel,  
+            l_session_init.stepsToDo, l_session_init.daysToKeep, l_session_init.procImmortal, l_session_init.tabNameMaster);
 
         -- copy new details data to memory
-        v_new_rec.id              := p_processId;
-        v_new_rec.tabNameMaster := p_session_init.tabNameMaster;
-        v_new_rec.processName    := p_session_init.processName;
+        v_new_rec.id             := p_processId;
+        v_new_rec.tabNameMaster  := l_session_init.tabNameMaster;
+        v_new_rec.processName    := l_session_init.processName;
         v_new_rec.processStart   := current_timestamp;
         v_new_rec.processEnd     := null;
         v_new_rec.lastUpdate     := null;
-        v_new_rec.stepsTodo := p_session_init.stepsToDo;
-        v_new_rec.stepsDone := 0;
-        v_new_rec.status          := 0;
-        v_new_rec.info            := 'START';
+        v_new_rec.stepsTodo      := l_session_init.stepsToDo;
+        v_new_rec.stepsDone      := 0;
+        v_new_rec.status         := 0;
+        v_new_rec.info           := 'START';
 
         g_process_cache(p_processId) := v_new_rec;
         evaluateRules(g_process_cache(p_processId), C_PROCESS_START);
@@ -4191,7 +4195,7 @@ raise;
         UPDATE ' || C_LILAM_SERVER_REGISTRY || '
         SET last_activity = SYSTIMESTAMP, 
             is_active = :1,
-            current_load = (SELECT pipe_size FROM v$db_pipes WHERE upper(name) = :2),
+            current_load = nvl((SELECT pipe_size FROM v$db_pipes WHERE upper(name) = :2), 0),
             status = :3,
             processing = :4
         WHERE upper(pipe_name) = :5';
