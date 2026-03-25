@@ -293,12 +293,10 @@ AS
 
     ------------------------------------------------------------------------
 
-    function jsonObject(p_jsonString out varchar2, p_path varchar2) return varchar2
+    function jsonObject(p_jsonString varchar2, p_path varchar2) return varchar2
     as
     begin
-        p_jsonString := JSON_QUERY(p_jsonString, '$.' || p_path);
-        return p_jsonString;
---            return JSON_QUERY(p_jsonString, '$.' || p_path);
+            return JSON_QUERY(p_jsonString, '$.' || p_path);
     end;
 
     --------------------------------------------------------------------------
@@ -362,7 +360,7 @@ AS
 
     ------------------------------------------------------------------------
 
-    procedure jsonPut(p_jsonString out JSON_OBJ_LILAM, jsonKey in varchar2, valueStr in varchar2) --return varchar2
+    procedure jsonPut(p_jsonString in out JSON_OBJ_LILAM, jsonKey in varchar2, valueStr in varchar2) --return varchar2
     -- Achtung! Die If-Konstruktionen sind nicht schön aber deutlich performanter, als case
     -- Auch das Arbeiten mit einem booleschen Wert am Anfang macht die Logik um vieles langsamer
     as
@@ -393,7 +391,7 @@ AS
                 l_str := l_str || '"}';
             else
                 l_str := l_str || '}';
-            end if;            
+            end if;
         end if;
         p_jsonString := l_str;
 --            return l_str;
@@ -401,7 +399,7 @@ AS
 
     -------------------------------------------------------------------------------------
 
-    procedure jsonPut(p_jsonString out varchar2, jsonKey varchar2, valueNum Number) -- return varchar2
+    procedure jsonPut(p_jsonString in out varchar2, jsonKey varchar2, valueNum Number) -- return varchar2
     as
         l_str varchar2(1000);
     begin
@@ -420,7 +418,7 @@ AS
 
     -------------------------------------------------------------------------------------
 
-    procedure jsonPut(p_jsonString out JSON_OBJ_LILAM, jsonKey varchar2, valueTS timestamp) -- return varchar2
+    procedure jsonPut(p_jsonString in out JSON_OBJ_LILAM, jsonKey varchar2, valueTS timestamp) -- return varchar2
     as
     begin
         jsonPut(p_jsonString, jsonKey, TO_CHAR(valueTS, 'YYYY-MM-DD"T"HH24:MI:SS.FF6'));
@@ -472,7 +470,7 @@ AS
 
         l_serverPipe := getServerPipeAvailable(p_groupName);
         if l_serverPipe is null then 
-            RAISE_APPLICATION_ERROR(-20004, 'LILAM: Kein aktiver Server gefunden.');
+            RAISE_APPLICATION_ERROR(NUM_ERR_NO_SERVER, 'LILAM: Kein aktiver Server gefunden.');
         end if;
         g_client_pipes(l_key) := l_serverPipe;
         return g_client_pipes(l_key);
@@ -912,7 +910,7 @@ AS
         p_pipeName   in varchar2 default null
     ) return varchar2
     as
-        l_msgReceive    VARCHAR2(4000);
+        l_msgReceive    JSON_OBJ_LILAM;
         l_status        PLS_INTEGER;
         l_statusReceive PLS_INTEGER;
         l_clientChannel varchar2(50);
@@ -965,8 +963,8 @@ raise;
         l_counter PLS_INTEGER;
         l_sqlStmt varchar2(200);
     begin
-        l_sqlStmt := 'SELECT count(*) FROM ' || C_LILAM_SERVER_REGISTRY || ' WHERE is_active = 1 and pipe_name = :1';
-        execute immediate l_sqlStmt into l_counter using p_pipeName;
+        l_sqlStmt := 'SELECT count(*) FROM ' || C_LILAM_SERVER_REGISTRY || ' WHERE is_active = 1 and upper(pipe_name) = :1';
+        execute immediate l_sqlStmt into l_counter using upper(p_pipeName);
         if l_counter >= 1 then return TRUE; end if;
         if l_counter = 0  then return FALSE; end if;
     end;
@@ -3296,7 +3294,6 @@ raise;
         evaluateRules(g_process_cache(p_processId), C_PROCESS_START);
 
         return p_processId;
-
     end;
 
 
@@ -3304,9 +3301,13 @@ raise;
     as
         p_session_init t_session_init;
     begin
+        if p_logLevel is null then
+            p_session_init.logLevel := logLevelMonitor;
+        else
+            p_session_init.logLevel := p_logLevel;
+        end if;
 
         p_session_init.processName := p_processName;
-        p_session_init.logLevel := p_logLevel;
         p_session_init.daysToKeep := p_daysToKeep;
         p_session_init.stepsToDo := p_procStepsToDo;
         p_session_init.tabNameMaster := p_tabNameMaster;
@@ -3320,6 +3321,12 @@ raise;
     as
         p_session_init t_session_init;
     begin
+        if p_logLevel is null then
+            p_session_init.logLevel := logLevelMonitor;
+        else
+            p_session_init.logLevel := p_logLevel;
+        end if;
+
         p_session_init.processName := p_processName;
         p_session_init.logLevel := p_logLevel;
         p_session_init.daysToKeep := null;
@@ -3492,16 +3499,12 @@ raise;
 
     procedure doRemote_closeSession(p_clientChannel varchar2, p_message VARCHAR2)
     as
-        l_processId   number; 
-        l_procStepsToDo   PLS_INTEGER; 
-        l_procStepsDone   PLS_INTEGER; 
-        l_processInfo varchar2(1000);
-        l_status      PLS_INTEGER;
-        l_payload varchar2(1600);
-        l_header    varchar2(100);
-        l_meta      varchar2(100);
-        l_data      varchar2(1500);
-        l_msg       VARCHAR2(4000);
+        l_processId     number; 
+        l_procStepsToDo PLS_INTEGER; 
+        l_procStepsDone PLS_INTEGER; 
+        l_processInfo   varchar2(1000);
+        l_status        PLS_INTEGER;
+        l_payload       JSON_OBJ_LILAM;
     begin
         l_payload     := JSON_QUERY(p_message, '$.payload');
         l_processId   := jsonString(l_payload, 'process_id');
@@ -3510,16 +3513,11 @@ raise;
         l_processInfo := jsonString(l_payload, 'process_info');
         l_status      := jsonNumber(l_payload, 'process_status');
 
-        l_header := '"header":{"msg_type":"SERVER_RESPONSE", "msg_name":"CLOSE_SESSION"}';
-        l_meta   := '"meta":{"server_version":"' || LILAM_VERSION || '"}';
-        l_data   := '"payload":{"server_message":"' || TXT_ACK_OK || '","server_code": ' || get_serverCode(TXT_ACK_OK);
-        l_msg := '{' || l_header || ', ' || l_meta || ', ' || l_data || '}';
-
         checkLogsBuffer(l_processId, 'vor CLOSE_SESSION');
 
         CLOSE_SESSION(l_processId, l_procStepsToDo, l_procStepsDone, l_processInfo, l_status);
 
-        DBMS_PIPE.RESET_BUFFER; -- Koffer leeren
+        DBMS_PIPE.RESET_BUFFER;
         DBMS_PIPE.PACK_MESSAGE('{"process_id":' || l_processId || '}');        
         l_status := DBMS_PIPE.SEND_MESSAGE(p_clientChannel, timeout => 1);
 
@@ -3529,21 +3527,23 @@ raise;
 
     procedure doRemote_pingEcho(p_clientChannel varchar2, p_message VARCHAR2)
     as
-        l_payload varchar2(1600);
-        l_session_init t_session_init;
-        l_status PLS_INTEGER;
-        l_header varchar2(100);
-        l_meta   varchar2(100);
-        l_data   varchar2(100);
-        l_msg    varchar2(500);
+        l_status        PLS_INTEGER;
+        l_header        JSON_OBJ_LILAM;
+        l_meta          JSON_OBJ_LILAM;
+        l_payload       JSON_OBJ_LILAM;
+        l_msg           JSON_OBJ_LILAM;
     begin
-        l_header := '"header":{"msg_type":"SERVER_RESPONSE", "msg_name":"PING_ECHO"}';
-        l_meta   := '"meta":{"server_version":"' || LILAM_VERSION || '"}';
-        l_data   := '"payload":{"server_message":"' || TXT_PING_ECHO || '","server_code":' || get_serverCode(TXT_PING_ECHO);
-        l_msg := '{' || l_header || ', ' || l_meta || ', ' || l_data || '}';
+        jsonPut(l_header, 'msg_type', 'SERVER_RESPONSE');
+        jsonPut(l_header, 'msg_name', 'PING_ECHO');
+        jsonPut(l_meta, 'server_version', LILAM_VERSION);
+        jsonPut(l_payload, 'server_message', TXT_PING_ECHO);
+        jsonPut(l_payload, 'server_code', get_serverCode(TXT_PING_ECHO));
+        
+        l_msg := jsonObject(l_header, 'header');
+        jsonPut(l_msg, 'meta', l_meta);
+        jsonPut(l_msg, 'payload', l_payload);
 
-        -- no payload, client waits only for unfreezing
-        DBMS_PIPE.RESET_BUFFER; -- Koffer leeren
+        DBMS_PIPE.RESET_BUFFER;
         DBMS_PIPE.PACK_MESSAGE(l_msg);        
         l_status := DBMS_PIPE.SEND_MESSAGE(p_clientChannel, timeout => 0);
 
@@ -3556,15 +3556,16 @@ raise;
 
     procedure doRemote_getMonitorLastEntry(p_clientChannel varchar2, l_message varchar2)
     as 
+        l_payload JSON_OBJ_LILAM;
+        l_header JSON_OBJ_LILAM;
+        l_meta   JSON_OBJ_LILAM;
+        l_msg    JSON_OBJ_LILAM;
         l_processId number;
-        l_payload JSON_OBJ_LILam;
         v_rec t_monitor_buffer_rec;
         l_status PLS_INTEGER;
         l_actionName varchar2(50);
         l_contextName varchar2(50);
-        l_header varchar2(200);
-        l_meta   varchar2(200);
-        l_msg    varchar2(2000);
+
     begin
         l_processId := jsonNumber(l_message, 'payload.process_id');
         l_actionName := jsonString(l_message, 'payload.action_name');
@@ -3579,11 +3580,17 @@ raise;
         jsonPut(l_payload, 'start_time', v_rec.start_time);
         jsonPut(l_payload, 'stop_time', v_rec.stop_time);
         jsonPut(l_payload, 'avg_action_time', v_rec.avg_action_time); 
+        
+        jsonPut(l_header, 'msg_type', 'SERVER_RESPONSE');
+        jsonPut(l_header, 'msg_name', 'LAST_MONITOR_ENTRY');
+        
+        jsonPut(l_meta, 'server_version', LILAM_VERSION);
+        jsonPut(l_meta, 'server_message', TXT_DATA_ANSWER);
+        jsonPut(l_meta, 'server_code', get_serverCode(TXT_DATA_ANSWER));
 
-        l_header := '"header":{"msg_type":"SERVER_RESPONSE", "msg_name":"LAST_MONITOR_ENTRY"}';
-        l_meta   := '"meta":{"server_version":"' || LILAM_VERSION || '", "server_message":"' || TXT_DATA_ANSWER || '","server_code":' || get_serverCode(TXT_DATA_ANSWER) || '}';
-        l_payload := '"payload":' || l_payload;
-        l_msg := '{' || l_header || ', ' || l_meta || ', ' || l_payload || '}';
+        l_msg := jsonObject(l_header, 'header');
+        jsonPut(l_msg, 'meta', l_meta);
+        jsonPut(l_msg, 'payload', l_payload);
 
         -- no payload, client waits only for unfreezing
         DBMS_PIPE.RESET_BUFFER; -- Koffer leeren
@@ -3593,8 +3600,6 @@ raise;
     exception
         when others then
             null;
---                dbms_output.enable();
---                dbms_output.put_line('Fehler in doRemote_getMonitorLastEntry: ' || sqlErrM);
     end;    
 
     -------------------------------------------------------------------------- 
@@ -3641,29 +3646,31 @@ raise;
     exception
         when others then
             null;
---                dbms_output.enable();
---                dbms_output.put_line('Fehler in doRemote_getProcessData: ' || sqlErrM);
     end;    
 
     -------------------------------------------------------------------------- 
 
     procedure doRemote_unfreezeClient(p_clientChannel varchar2, p_message VARCHAR2, p_shutdown BOOLEAN DEFAULT FALSE)
     as
-        l_payload varchar2(1600);
-        l_status PLS_INTEGER;
-        l_header varchar2(100);
-        l_meta   varchar2(100);
-        l_data   varchar2(100);
-        l_msg    varchar2(500);
+        l_payload JSON_OBJ_LILAM;
+        l_status  PLS_INTEGER;
+        l_header  JSON_OBJ_LILAM;
+        l_meta    JSON_OBJ_LILAM;
+        l_msg     JSON_OBJ_LILAM;
     begin
-        l_header := '"header":{"msg_type":"SERVER_RESPONSE", "msg_name":"UNFREEZE_CLIENT"}';
-        l_meta   := '"meta":{"server_version":"' || LILAM_VERSION || '"}';
+        jsonPut(l_header, 'msg_type', 'SERVER_RESPONSE');
+        jsonPut(l_header, 'msg_name', 'UNFREEZE_CLIENT');
+        jsonPut(l_meta, 'server_version', LILAM_VERSION);
         if p_shutdown then
-            l_data   := '"payload":{"server_message":"' || TXT_ACK_SHUTDOWN || '","server_code":' || get_serverCode(TXT_ACK_SHUTDOWN);
+            jsonPut(l_payload, 'server_message', TXT_ACK_SHUTDOWN);
+            jsonPut(l_payload, 'server_code', get_serverCode(TXT_ACK_SHUTDOWN));
         else
-            l_data   := '"payload":{"server_message":"' || TXT_ACK_OK || '","server_code":' || get_serverCode(TXT_ACK_OK);
+            jsonPut(l_payload, 'server_message', TXT_ACK_OK);
+            jsonPut(l_payload, 'server_code', get_serverCode(TXT_ACK_OK));
         end if;
-        l_msg := '{' || l_header || ', ' || l_meta || ', ' || l_data || '}';
+        l_msg := jsonObject(l_header, 'header');
+        jsonPut(l_msg, 'meta', l_meta);
+        jsonPut(l_msg, 'payload', l_payload);
 
         -- no payload, client waits only for unfreezing
         DBMS_PIPE.RESET_BUFFER; -- Koffer leeren
@@ -3673,8 +3680,6 @@ raise;
     exception
         when others then
             null;
---                dbms_output.enable();
---                dbms_output.put_line('Fehler in doRemote_unfreezeClient: ' || sqlErrM);
     end;    
 
     -------------------------------------------------------------------------- 
@@ -3682,44 +3687,24 @@ raise;
     procedure doRemote_newSession(p_clientChannel varchar2, p_message VARCHAR2)
     as
         l_processId number;
-        l_payload varchar2(1600);
+        l_payload JSON_OBJ_LILAM;
         l_session_init t_session_init;
         l_status PLS_INTEGER;
     begin
         l_payload := JSON_QUERY(p_message, '$.payload');
-        l_processId := jsonNumber(l_payload, 'process_id');
+--        l_processId := jsonNumber(l_payload, 'process_id');
+
         l_session_init.processName := jsonString(l_payload, 'process_name');
         l_session_init.logLevel    := jsonNumber(l_payload, 'log_level');
         l_session_init.stepsToDo   := jsonNumber(l_payload, 'steps_todo');
         l_session_init.daysToKeep  := jsonNumber(l_payload, 'days_to_keep');
         l_session_init.tabNameMaster := jsonString(l_payload, 'tabname_master');
-
+        
         l_processId := NEW_SESSION(l_session_init);
-        DBMS_PIPE.RESET_BUFFER; -- Koffer leeren
+        DBMS_PIPE.RESET_BUFFER;
         DBMS_PIPE.PACK_MESSAGE('{"process_id":' || l_processId || '}');        
         l_status := DBMS_PIPE.SEND_MESSAGE(p_clientChannel, timeout => 1);
-
---            evaluateRules(g_process_cache(l_processId), C_PROCESS_START);
     end;    
-
-    -------------------------------------------------------------------------- 
-
-    procedure SHUTDOWN_ALL_SERVERS
-    as
-        l_pipeName varchar2(100);
-        l_response  varchar2(500);
-        l_header varchar2(100);
-        l_meta   varchar2(50);
-        l_data   varchar2(50);
-        l_msg    varchar2(250);
-    begin
-        l_header := '"header":{"msg_type":"CLIENT_REQUEST", "request":"SERVER_SHUTDOWN"}';
-        l_meta   := '"meta":{}';
-        l_data   := '"payload":{}';
-
-        l_msg := '{' || l_header || ', ' || l_meta || ', ' || l_data || '}';
-
-    end;
 
     -------------------------------------------------------------------------- 
 
@@ -3739,12 +3724,13 @@ raise;
     procedure SERVER_SHUTDOWN(p_processId number, p_pipeName varchar2, p_password varchar2)
     as
         l_response JSON_OBJ_LILAM;
-        l_message  varchar2(200);
+        l_message  JSON_OBJ_LILAM;
         l_payload  JSON_OBJ_LILAM;
         l_serverCode PLS_INTEGER;
         l_slotIdx    PLS_INTEGER;
     begin
-        l_message := '{"pipe_name":"' || p_pipeName || '", "shutdown_password":"' || p_password || '"}';
+        jsonPut(l_message, 'pipe_name', p_pipeName);
+        jsonPut(l_message, 'shutdown_password', p_password);
         l_response := waitForResponse(
             p_processId     => p_processId,
             p_request       => 'SERVER_SHUTDOWN',
@@ -3757,12 +3743,16 @@ raise;
         if l_serverCode = NUM_ACK_SHUTDOWN then
             null;
         end if ;
+
+    EXCEPTION
+        WHEN OTHERS THEN
+            dbms_output.put_line(sqlErrM);
     end;
 
 
     procedure SERVER_SEND_ANY_MSG(p_processId number, p_message varchar2)
     as
-        l_response varchar2(1000);
+        l_response JSON_OBJ_LILAM;
     begin
         l_response := waitForResponse(
             p_processId     => p_processId,
@@ -3784,10 +3774,14 @@ raise;
 
     FUNCTION SERVER_NEW_SESSION(p_processName varchar2, p_logLevel PLS_INTEGER, p_procStepsToDo PLS_INTEGER, p_daysToKeep PLS_INTEGER, p_tabNameMaster varchar2) RETURN VARCHAR2
     as
-        l_payload    varchar2(1000);
+        l_payload JSON_OBJ_LILAM;
     begin
-        l_payload := '{"process_name":"' || p_processName  || '", "log_level":' || p_logLevel || ', "steps_todo":' || 
-                        p_procStepsToDo || ', "days_to_keep":' || p_daysToKeep || ', "tabname_master":"' || p_tabNameMaster || '"}';                            
+        jsonPut(l_payload, 'process_name', p_processName);
+        jsonPut(l_payload, 'log_level', p_logLevel);
+        jsonPut(l_payload, 'steps_todo', p_procStepsToDo);
+        jsonPut(l_payload, 'days_to_keep', p_daysToKeep);
+        jsonPut(l_payload, 'tabname_master', p_tabNameMaster);
+                         
         return server_new_session(l_payload);
     end;
 
@@ -3795,10 +3789,15 @@ raise;
 
     FUNCTION SERVER_NEW_SESSION(p_processName varchar2, p_groupName VARCHAR2, p_logLevel PLS_INTEGER, p_procStepsToDo PLS_INTEGER, p_daysToKeep PLS_INTEGER, p_tabNameMaster varchar2) RETURN VARCHAR2
     as
-        l_payload    varchar2(1000);
+        l_payload JSON_OBJ_LILAM;
     begin
-        l_payload := '{"process_name":"' || p_processName  || '", "group_name":"' || p_groupName || '", "log_level":' || p_logLevel || ', "steps_todo":' || 
-                        p_procStepsToDo || ', "days_to_keep":' || p_daysToKeep || ', "tabname_master":"' || p_tabNameMaster || '"}';                            
+        jsonPut(l_payload, 'process_name', p_processName);
+        jsonPut(l_payload, 'group_name', p_groupName);
+        jsonPut(l_payload, 'log_level', p_logLevel);
+        jsonPut(l_payload, 'steps_todo', p_procStepsToDo);
+        jsonPut(l_payload, 'days_to_keep', p_daysToKeep);
+        jsonPut(l_payload, 'tabname_master', p_tabNameMaster);
+
         return server_new_session(l_payload);
     end;
 
@@ -3807,7 +3806,7 @@ raise;
     FUNCTION SERVER_NEW_SESSION(p_jasonString varchar2) RETURN NUMBER
     as
         l_ProcessId number(19,0) := -500;   
-        l_payload   varchar2(1000);
+        l_payload   JSON_OBJ_LILAM;
         l_response  varchar2(100);        
     begin                        
         -- zunächst mal schauen, welche Server bereitstehen
@@ -3835,8 +3834,11 @@ raise;
 
     EXCEPTION
         WHEN OTHERS THEN
-        raise;
-        return -200;
+        if SQLCODE != NUM_ERR_NO_SERVER then 
+            raise; 
+        else
+            return NUM_ERR_NO_SERVER;
+        end if;
     end;
     --------------------------------------------------------------------------
 
@@ -3917,7 +3919,7 @@ raise;
         l_sqlStmt := '
         SELECT COUNT(*)
         FROM ' || C_LILAM_SERVER_REGISTRY || '
-        WHERE pipe_name = ''' || p_pipeName || '''
+        WHERE upper(pipe_name) = ''' || upper(p_pipeName) || '''
         AND rownum = 1'; -- Bricht nach dem ersten Treffer ab
         execute immediate l_sqlStmt into l_exists;
 
@@ -3943,8 +3945,8 @@ raise;
                 is_active = 1,
                 group_name = :1,
                 current_load = 0
-            where pipe_name = :2';            
-            execute immediate l_sqlStmt using g_serverGroupName, g_serverPipeName;
+            where upper(pipe_name) = :2';            
+            execute immediate l_sqlStmt using g_serverGroupName, upper(g_serverPipeName);
         else
                 -- new entry, server was not registered yet
             l_sqlStmt := '
@@ -3977,8 +3979,8 @@ raise;
     AS
         pragma autonomous_transaction; 
     BEGIN
-        execute immediate 'update ' || C_LILAM_SERVER_REGISTRY || ' set rule_set_name = :1, set_in_use = :2 where pipe_name = :3'
-        using p_ruleSetName, p_ruleSetVersion, g_serverPipeName;
+        execute immediate 'update ' || C_LILAM_SERVER_REGISTRY || ' set rule_set_name = :1, set_in_use = :2 where upper(pipe_name) = :3'
+        using p_ruleSetName, p_ruleSetVersion, upper(g_serverPipeName);
         commit;
 
     EXCEPTION
@@ -4078,8 +4080,8 @@ raise;
         l_newestVersion PLS_INTEGER;
         l_sqlStmt varchar2(200);
     begin
-        l_sqlStmt := 'SELECT rule_version FROM ' || C_LILAM_SERVER_REGISTRY || ' WHERE pipe_name = :1';
-        execute immediate l_sqlStmt into l_newestVersion using p_pipeName;
+        l_sqlStmt := 'SELECT rule_version FROM ' || C_LILAM_SERVER_REGISTRY || ' WHERE upper(pipe_name) = :1';
+        execute immediate l_sqlStmt into l_newestVersion USING upper(p_pipeName);
         if coalesce(l_newestVersion, 0) > g_current_rule_set_version then 
             return TRUE;
         else
@@ -4117,7 +4119,7 @@ raise;
         l_ruleSetName varchar2(30);
         l_ruleSetVersion PLS_INTEGER;
     begin
-        l_sqlStmt := 'SELECT rule_set_name, set_in_use FROM ' || C_LILAM_SERVER_REGISTRY || ' WHERE pipe_name = ''' || g_serverPipeName || '''';
+        l_sqlStmt := 'SELECT rule_set_name, set_in_use FROM ' || C_LILAM_SERVER_REGISTRY || ' WHERE upper(pipe_name) = ''' || upper(g_serverPipeName) || '''';
         execute immediate l_sqlStmt into l_ruleSetName,  l_ruleSetVersion;
         if l_ruleSetName is not null then
             readServerRules(l_ruleSetName, l_ruleSetVersion);
@@ -4199,11 +4201,11 @@ raise;
         UPDATE ' || C_LILAM_SERVER_REGISTRY || '
         SET last_activity = SYSTIMESTAMP, 
             is_active = :1,
-            current_load = (SELECT pipe_size FROM v$db_pipes WHERE name = :2),
+            current_load = (SELECT pipe_size FROM v$db_pipes WHERE upper(name) = :2),
             status = :3,
             processing = :4
-        WHERE pipe_name = :5';
-        execute immediate l_sqlStmt using l_booleanAsInt, g_serverPipeName, l_status, l_booleanAsInt, g_serverPipeName;
+        WHERE upper(pipe_name) = :5';
+        execute immediate l_sqlStmt USING l_booleanAsInt, upper(g_serverPipeName), l_status, l_booleanAsInt, upper(g_serverPipeName);
         COMMIT; -- Muss autonom sein!
 
     exception
@@ -4255,9 +4257,9 @@ raise;
     begin
         DBMS_PIPE.RESET_BUFFER;
         DBMS_PIPE.PURGE(p_pipeName);
-        l_dummyRes := DBMS_PIPE.REMOVE_PIPE(p_pipeName);
-        l_dummyRes := DBMS_PIPE.REMOVE_PIPE(p_pipeName || C_INTERLEAVE_PIPE_SUFFIX);
-        l_dummyRes := DBMS_PIPE.CREATE_PIPE(pipename => p_pipeName, maxpipesize => C_MAX_SERVER_PIPE_SIZE, private => false);
+        l_dummyRes := DBMS_PIPE.REMOVE_PIPE(upper(p_pipeName));
+        l_dummyRes := DBMS_PIPE.REMOVE_PIPE(upper(p_pipeName) || C_INTERLEAVE_PIPE_SUFFIX);
+        l_dummyRes := DBMS_PIPE.CREATE_PIPE(pipename => upper(p_pipeName), maxpipesize => C_MAX_SERVER_PIPE_SIZE, private => false);
     end;
 
     --------------------------------------------------------------------------
@@ -4360,7 +4362,7 @@ raise;
 
         LOOP
             -- Warten auf die nächste Nachricht (Timeout in Sekunden)
-            l_message := receiveMessage(g_serverPipeName, l_serverTimeout);    
+            l_message := receiveMessage(g_serverPipeName, l_serverTimeout); 
             if l_message is not null THEN
                 l_msgCnt := l_msgCnt + 1;
             BEGIN 
@@ -4630,7 +4632,7 @@ raise;
                     '  ); ' ||
                     'END;';
                     
-        l_action := 'select * from dual';
+--        l_action := 'select * from dual';
 
         -- 3. Den Hintergrund-Prozess "zünden"
         DBMS_SCHEDULER.CREATE_JOB (
