@@ -2818,7 +2818,7 @@ raise;
     begin
         log_any(
             p_processId, 
-            logLevelDebug,
+            logLevelError,
             p_logText,
             DBMS_UTILITY.FORMAT_ERROR_STACK,
             DBMS_UTILITY.FORMAT_ERROR_BACKTRACE,
@@ -2836,7 +2836,7 @@ raise;
     begin
         log_any(
             p_processId, 
-            logLevelInfo,
+            logLevelWarn,
             p_logText,
             null,
             null,
@@ -3301,13 +3301,10 @@ raise;
     as
         p_session_init t_session_init;
     begin
-        if p_logLevel is null then
-            p_session_init.logLevel := logLevelMonitor;
-        else
-            p_session_init.logLevel := p_logLevel;
-        end if;
+
 
         p_session_init.processName := p_processName;
+        p_session_init.logLevel := p_logLevel;
         p_session_init.daysToKeep := p_daysToKeep;
         p_session_init.stepsToDo := p_procStepsToDo;
         p_session_init.tabNameMaster := p_tabNameMaster;
@@ -3321,12 +3318,6 @@ raise;
     as
         p_session_init t_session_init;
     begin
-        if p_logLevel is null then
-            p_session_init.logLevel := logLevelMonitor;
-        else
-            p_session_init.logLevel := p_logLevel;
-        end if;
-
         p_session_init.processName := p_processName;
         p_session_init.logLevel := p_logLevel;
         p_session_init.daysToKeep := null;
@@ -3693,7 +3684,6 @@ raise;
     begin
         l_payload := JSON_QUERY(p_message, '$.payload');
 --        l_processId := jsonNumber(l_payload, 'process_id');
-
         l_session_init.processName := jsonString(l_payload, 'process_name');
         l_session_init.logLevel    := jsonNumber(l_payload, 'log_level');
         l_session_init.stepsToDo   := jsonNumber(l_payload, 'steps_todo');
