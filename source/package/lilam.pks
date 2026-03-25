@@ -6,7 +6,7 @@ create or replace PACKAGE LILAM AS
     -- JSON as VARCHAR2 for max. performance
     -- =====================================
     SUBTYPE JSON_OBJ_LILAM IS VARCHAR2(8000);
-    
+
     -- =========
     -- Log Level
     -- =========
@@ -16,7 +16,7 @@ create or replace PACKAGE LILAM AS
     logLevelMonitor     CONSTANT PLS_INTEGER := 3;
     logLevelInfo        CONSTANT PLS_INTEGER := 4;
     logLevelDebug       CONSTANT PLS_INTEGER := 8;
-    
+
     -- ==================
     -- Codes and Messages
     -- ==================
@@ -38,14 +38,14 @@ create or replace PACKAGE LILAM AS
     NUM_SERVER_INFO     CONSTANT PLS_INTEGER  := 101;
     TXT_DATA_ANSWER     CONSTANT VARCHAR2(30) := 'SERVER_DATA_ANSWER';
     NUM_DATA_ANSWER     CONSTANT VARCHAR2(30) := 102;
-    
+
     -- SUFFIXES of the three main tables
     C_SUFFIX_PROC_TABLE CONSTANT varchar2(6) := '_PROC'; -- Process
     C_SUFFIX_LOG_TABLE  CONSTANT varchar2(6) := '_LOG';  -- Logging
     C_SUFFIX_MON_TABLE  CONSTANT varchar2(6) := '_MON';  -- Monitoring
     C_LILAM_RULES       CONSTANT VARCHAR2(16) := 'LILAM_RULES';
     C_LILAM_ALERTS      CONSTANT VARCHAR2(16) := 'LILAM_ALERTS';
-    
+
     -- ================================
     -- Record representing process data
     -- ================================
@@ -75,7 +75,7 @@ create or replace PACKAGE LILAM AS
         procImmortal    PLS_INTEGER := 0,
         tabNameMaster VARCHAR2(100) DEFAULT 'LILAM_LOG'
     );
-    
+
     -- ==============================
     -- Sructure of table LILAM_ALERTS
     -- ==============================
@@ -92,13 +92,13 @@ create or replace PACKAGE LILAM AS
         rule_set_version    PLS_INTEGER,
         alert_severity      VARCHAR2(50)
     );
-    
+
     -- ==============================
     -- Alerts for activating consumer
     -- ==============================
     C_ALERT_MAIL_LOG CONSTANT VARCHAR2(30) := 'LILAM_ALERT_MAIL_LOG';
 
-    
+
 
 
     ------------------------------
@@ -147,7 +147,7 @@ create or replace PACKAGE LILAM AS
     PROCEDURE DEBUG(p_processId NUMBER, p_logText VARCHAR2);
     PROCEDURE WARN(p_processId NUMBER, p_logText VARCHAR2);
     PROCEDURE ERROR(p_processId NUMBER, p_logText VARCHAR2);
-    
+
     -------------
     -- Monitoring
     -------------
@@ -167,7 +167,6 @@ create or replace PACKAGE LILAM AS
     PROCEDURE SERVER_UPDATE_RULES(p_processId NUMBER, p_ruleSetName VARCHAR2, p_ruleSetVersion PLS_INTEGER);
 
     PROCEDURE SERVER_SEND_ANY_MSG(p_processId number, p_message varchar2);
-    PROCEDURE SHUTDOWN_ALL_SERVERS;
 
     PROCEDURE CALL_BY_JSON(p_callObject  IN  JSON_OBJECT_T, p_respObject  OUT JSON_OBJECT_T);
     PROCEDURE CALL_BY_JSON(p_callObject  IN  JSON_OBJ_LILAM, p_respObject  OUT JSON_OBJ_LILAM);
@@ -177,5 +176,5 @@ create or replace PACKAGE LILAM AS
     ----------
     -- Check if LILAM works
     PROCEDURE IS_ALIVE;
-        
+
 END LILAM;
