@@ -11,18 +11,18 @@ AS
     ---------------------------------------------------------------
 
     -- Dedicated to SERVER_LOOP
-    C_SERVER_SYNC_INTERVAL          CONSTANT PLS_INTEGER := 500; -- 500
+    C_SERVER_SYNC_INTERVAL          CONSTANT PLS_INTEGER := 500;
     C_SERVER_HEARTBEAT_INTERVAL     CONSTANT PLS_INTEGER := 60000;
-    C_SERVER_MAX_LOOPS_IN_TIME      CONSTANT PLS_INTEGER := 1000; -- 1000
+    C_SERVER_MAX_LOOPS_IN_TIME      CONSTANT PLS_INTEGER := 10000; -- 1000
     C_SERVER_TIMEOUT_WAIT_FOR_MSG   CONSTANT NUMBER      := 0.2; -- Timeout nach Sekunden Warten auf Nachricht
     C_SERVER_TIMEOUT_MAX_WAIT       CONSTANT NUMBER      := C_SERVER_SYNC_INTERVAL; -- Max. Timeout in IDLE State
     C_MAX_SERVER_PIPE_SIZE          CONSTANT PLS_INTEGER := 16777216; --  16777216, 67108864 
 
     -- Dedicated to Client
-    C_THROTTLE_LIMIT                CONSTANT PLS_INTEGER := 1000; -- 1000 Max logs until unfreeze handshake (depends to C_THROTTLE_INTERVAL)
-    C_THROTTLE_INTERVAL             CONSTANT PLS_INTEGER := 1000; -- 1000 Max logs within this interval
+    C_THROTTLE_LIMIT                CONSTANT PLS_INTEGER := 1000; -- Max logs until unfreeze handshake (depends to C_THROTTLE_INTERVAL)
+    C_THROTTLE_INTERVAL             CONSTANT PLS_INTEGER := 1000; -- Max logs within this interval
 
-    -- general Flush Time-Duration
+    -- Max Dirty Buffers and 
     C_FLUSH_MILLIS_THRESHOLD        PLS_INTEGER          := 1500;  -- 1500 Max. Millis until flush
     C_FLUSH_LOG_THRESHOLD           PLS_INTEGER          := 50000; -- 50000 Max. number of dirty buffered logs until flush
     C_FLUSH_MONITOR_THRESHOLD       PLS_INTEGER          := 50000; -- 20000 Max. number of dirty buffered metrics until flush
@@ -989,7 +989,7 @@ raise;
         end if;
 
         l_sqlStmt := l_sqlStmt || '
-        ORDER BY current_load ASC, last_activity DESC 
+        ORDER BY processing ASC, current_load ASC, last_activity DESC 
         FETCH FIRST 1 ROW ONLY';
 
         execute immediate l_sqlStmt into l_serverPipeName;
@@ -4179,6 +4179,7 @@ raise;
                 else
                     l_status := 'STOPPED';
                     DBMS_APPLICATION_INFO.SET_MODULE(NULL, NULL);
+                    DBMS_APPLICATION_INFO.SET_CLIENT_INFO(NULL);
                 end if;
 
             when p_eventCounter < 0 then
@@ -4373,7 +4374,7 @@ raise;
 
                     WHEN OTHERS THEN
                         -- WICHTIG: Fehler loggen, aber die Schleife NICHT verlassen!
-                        raise;
+                        -- raise;
                         ERROR(g_serverProcessId, g_serverPipeName || '=>Internal START_SERVER; Critical Error while processing command: ' || SQLERRM);
                 END; 
             end if;
@@ -4398,7 +4399,6 @@ raise;
             EXIT when l_shutdownSignal;
             l_loopCounter := l_loopCounter + 1;
         END LOOP;
-debug(g_serverProcessId, 'Nach dem Loop');
         -- Ab jetzt ist der Server nicht mehr erreichbar
         updateServerRegistry(FALSE, l_msgCnt);
 
