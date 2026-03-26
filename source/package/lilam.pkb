@@ -11,11 +11,11 @@ AS
     ---------------------------------------------------------------
 
     -- Dedicated to SERVER_LOOP
-    C_SEVER_SYNC_INTERVAL           CONSTANT PLS_INTEGER := 500; -- 500
+    C_SERVER_SYNC_INTERVAL          CONSTANT PLS_INTEGER := 500; -- 500
     C_SERVER_HEARTBEAT_INTERVAL     CONSTANT PLS_INTEGER := 60000;
     C_SERVER_MAX_LOOPS_IN_TIME      CONSTANT PLS_INTEGER := 1000; -- 1000
     C_SERVER_TIMEOUT_WAIT_FOR_MSG   CONSTANT NUMBER      := 0.2; -- Timeout nach Sekunden Warten auf Nachricht
-    C_SERVER_TIMEOUT_MAX_WAIT       CONSTANT NUMBER      := C_SEVER_SYNC_INTERVAL; -- Max. Timeout in IDLE State
+    C_SERVER_TIMEOUT_MAX_WAIT       CONSTANT NUMBER      := C_SERVER_SYNC_INTERVAL; -- Max. Timeout in IDLE State
     C_MAX_SERVER_PIPE_SIZE          CONSTANT PLS_INTEGER := 16777216; --  16777216, 67108864 
 
     -- Dedicated to Client
@@ -231,7 +231,6 @@ AS
     g_shutdownPassword                  varchar2(50);
 
     g_is_high_perf                      BOOLEAN                 := FALSE;
-    g_msg_counter                       PLS_INTEGER             := 0;
     g_last_check_time                   TIMESTAMP               := SYSTIMESTAMP;
 
 
@@ -983,7 +982,7 @@ raise;
         SELECT pipe_name 
         FROM ' || C_LILAM_SERVER_REGISTRY || ' 
         WHERE is_active = 1 
-          AND last_activity > SYSTIMESTAMP - INTERVAL ''5'' SECOND ';
+          AND last_activity > SYSTIMESTAMP - INTERVAL ''15'' SECOND ';
 
         if p_groupName is not null then
             l_sqlStmt := l_sqlStmt || ' AND upper(group_name) = ''' || upper(p_groupName) || '''';
@@ -1494,16 +1493,21 @@ raise;
     )    
     as
         pragma autonomous_transaction;
+        v_safe_table varchar2(150);
     begin
-        -- Bulk-Insert über alle gesammelten Log-Einträge
-        forall i in 1 .. p_levels.count
-            execute immediate 
-                'insert into ' || p_target_table || ' 
-                (PROCESS_ID, LOG_LEVEL, INFO, SESSION_TIME, NO, ERR_STACK, ERR_BACKTRACE, ERR_CALLSTACK, SESSION_USER, HOST_NAME)
-                values (:1, :2, :3, :4, :5, :6, :7, :8, :9, :10)'
-            USING p_processId, p_levels(i), p_texts(i), p_times(i), p_seqs(i), p_stacks(i), p_backtraces(i), p_callstacks(i),
-            SYS_CONTEXT('USERENV','SESSION_USER'), SYS_CONTEXT('USERENV','HOST');
-        commit;
+        if p_levels.count > 0 then            
+            -- Sicherheit: Tabellenname validieren
+            v_safe_table := DBMS_ASSERT.SQL_OBJECT_NAME(p_target_table);
+            -- Bulk-Insert über alle gesammelten Log-Einträge
+            forall i in 1 .. p_levels.count SAVE EXCEPTIONS
+                execute immediate 
+                    'insert into ' || p_target_table || ' 
+                    (PROCESS_ID, LOG_LEVEL, INFO, SESSION_TIME, NO, ERR_STACK, ERR_BACKTRACE, ERR_CALLSTACK, SESSION_USER, HOST_NAME)
+                    values (:1, :2, :3, :4, :5, :6, :7, :8, :9, :10)'
+                USING p_processId, p_levels(i), p_texts(i), p_times(i), p_seqs(i), p_stacks(i), p_backtraces(i), p_callstacks(i),
+                SYS_CONTEXT('USERENV','SESSION_USER'), SYS_CONTEXT('USERENV','HOST');
+            commit;
+        end if;
 
     exception
         when others then
@@ -1649,7 +1653,6 @@ raise;
         if p_actions.count > 0 then
             -- Sicherheit: Tabellenname validieren
             v_safe_table := DBMS_ASSERT.SQL_OBJECT_NAME(p_target_table);
-
             forall i in 1 .. p_actions.count SAVE EXCEPTIONS
                 execute immediate
                 'insert into ' || v_safe_table || ' 
@@ -1657,7 +1660,6 @@ raise;
                 values (:1, :2, :3, :4, :5, :6, :7, :8, :9, :10, :11)'
                 using p_processId, p_actions(i), p_contexts(i), p_mon_types(i), p_action_count(i), p_used(i), p_avgs(i), p_timesStart(i),
                       p_timesStop(i), v_user, v_host;
-
             commit;
         end if ;
     exception
@@ -4145,13 +4147,13 @@ raise;
 
     --------------------------------------------------------------------------
 
-    procedure updateServerRegistry(p_ready BOOLEAN, p_eventCounter PLS_INTEGER)
-    as
+    procedure updateServerRegistry(p_ready BOOLEAN, p_eventCounter PLS_INTEGER) as
         pragma autonomous_transaction; 
         l_sqlStmt varchar2(500);
-        l_booleanAsInt NUMBER(1);
+        l_booleanAsInt NUMBER(1) := 1;
         l_status    varchar2(20);
     begin
+
         case p_ready
             when true then l_booleanAsInt := 1;
             when false then l_booleanAsInt := 0;
@@ -4179,7 +4181,7 @@ raise;
                     DBMS_APPLICATION_INFO.SET_MODULE(NULL, NULL);
                 end if;
 
-            when p_eventCounter = -1 then
+            when p_eventCounter < 0 then
                 if p_ready then
                     l_status := 'UNKNOWN';
                     DBMS_APPLICATION_INFO.SET_ACTION('UNKNOWN');
@@ -4199,7 +4201,7 @@ raise;
             status = :3,
             processing = :4
         WHERE upper(pipe_name) = :5';
-        execute immediate l_sqlStmt USING l_booleanAsInt, upper(g_serverPipeName), l_status, l_booleanAsInt, upper(g_serverPipeName);
+        execute immediate l_sqlStmt USING l_booleanAsInt, upper(g_serverPipeName), l_status, p_eventCounter, upper(g_serverPipeName);
         COMMIT; -- Muss autonom sein!
 
     exception
@@ -4377,10 +4379,10 @@ raise;
             end if;
 
             if l_message is null or l_loopCounter > C_SERVER_MAX_LOOPS_IN_TIME then
-                if get_ms_diff(l_lastSync, sysTimestamp) >= C_SEVER_SYNC_INTERVAL  THEN
+                if get_ms_diff(l_lastSync, sysTimestamp) >= C_SERVER_SYNC_INTERVAL  THEN
                     -- Housekeeping
-                    SYNC_ALL_DIRTY;
                     updateServerRegistry(TRUE, l_msgCnt);
+                    SYNC_ALL_DIRTY;
                     l_lastSync := sysTimestamp;
                     l_loopCounter := 0;
                     l_msgCnt := 0;
@@ -4396,6 +4398,7 @@ raise;
             EXIT when l_shutdownSignal;
             l_loopCounter := l_loopCounter + 1;
         END LOOP;
+debug(g_serverProcessId, 'Nach dem Loop');
         -- Ab jetzt ist der Server nicht mehr erreichbar
         updateServerRegistry(FALSE, l_msgCnt);
 
