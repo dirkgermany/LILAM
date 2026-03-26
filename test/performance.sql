@@ -3,8 +3,17 @@
 SELECT 
     COUNT(*) as Anzahl_Jobs,
     SUM(50000) as Gesamt_Events,
-    ROUND(AVG(EXTRACT(SECOND FROM run_duration) + EXTRACT(MINUTE FROM run_duration) * 60), 2) as Avg_Dauer_Sek,
-    ROUND(SUM(50000) / NULLIF(MAX(EXTRACT(SECOND FROM run_duration) + EXTRACT(MINUTE FROM run_duration) * 60), 0), 2) as Kumulierte_EPS
+    -- Zeitspanne vom allerersten Start bis zum allerletzten Ende in Sekunden
+    ROUND(
+        (CAST(MAX(actual_start_date + run_duration) AS DATE) - 
+         CAST(MIN(actual_start_date) AS DATE)) * 86400, 2
+    ) as Gesamt_Zeit_Sek,
+    -- Echte kumulierte EPS
+    ROUND(
+        SUM(50000) / 
+        NULLIF((CAST(MAX(actual_start_date + run_duration) AS DATE) - 
+                CAST(MIN(actual_start_date) AS DATE)) * 86400, 0), 2
+    ) as Kumulierte_EPS
 FROM all_scheduler_job_run_details
 WHERE job_name LIKE '%LILAM_STRESS_%'
   AND actual_start_date > TRUNC(SYSDATE);
