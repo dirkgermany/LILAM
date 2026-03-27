@@ -232,8 +232,19 @@ AS
 
     g_is_high_perf                      BOOLEAN                 := FALSE;
     g_last_check_time                   TIMESTAMP               := SYSTIMESTAMP;
-
-
+    
+    -- Latencies between event generation and persistance in DB
+    g_firstLogTimeStamp                 TIMESTAMP               := NULL;
+    g_oldestLogTimeStamp                TIMESTAMP               := NULL;
+    g_avgLatencyLogs                    NUMBER                  := 0;
+    g_maxLatencyLogs                    NUMBER                  := 0;
+    g_logLatencyCounter                 NUMBER                  := 0;
+    
+    g_firstMonTimeStamp                 TIMESTAMP               := NULL;
+    g_oldestMonTimeStamp                TIMESTAMP               := NULL;
+    g_avgLatencyMon                     NUMBER                  := 0;
+    g_maxLatencyMon                     NUMBER                  := 0;
+    g_monLatencyCounter                 NUMBER                  := 0;
     ---------------------------------------------------------------
     -- Functions and Procedures
     ---------------------------------------------------------------
@@ -1254,7 +1265,11 @@ raise;
                 status         VARCHAR2(20),
                 processing     NUMBER,
                 rule_set_name  VARCHAR2(30),
-                set_in_use     NUMBER DEFAULT 0
+                set_in_use     NUMBER DEFAULT 0,
+                avg_log_lat    NUMBER DEFAULT 0,
+                max_log_lat    NUMBER DEFAULT 0,
+                avg_mon_lat    NUMBER DEFAULT 0,
+                max_mon_lat    NUMBER DEFAULT 0
             )';
             run_sql(sqlStmt);
         end if;
@@ -1536,11 +1551,19 @@ raise;
         v_stacks       sys.odcivarchar2list := sys.odcivarchar2list();
         v_backtraces   sys.odcivarchar2list := sys.odcivarchar2list();
         v_callstacks   sys.odcivarchar2list := sys.odcivarchar2list();
+        
+        v_latency      number;
     begin
         -- 1. Prüfen, ob Daten für diesen Prozess im Cache sind
         if not g_log_groups.EXISTS(v_key) or g_log_groups(v_key).COUNT = 0 then
             return;
         end if ;
+        
+        -- calc latency
+        v_latency  := get_ms_diff(g_firstLogTimeStamp, systimestamp);
+        g_avgLatencyLogs := round((g_avgLatencyLogs + v_latency) / g_logLatencyCounter, 2);
+        if v_latency > g_maxLatencyLogs then g_maxLatencyLogs := v_latency; end if;
+            
         -- 2. Ziel-Tabelle aus der Session-Liste ermitteln
         v_idx_session := v_indexSession(p_processId);
         v_targetTable := g_sessionList(v_idx_session).tabName_master || C_SUFFIX_LOG_TABLE;
@@ -1588,6 +1611,7 @@ raise;
         p_processId number, 
         p_level number,
         p_text varchar2,
+        p_logTime timestamp,
         p_errStack varchar2,
         p_errBacktrace varchar2,
         p_errCallstack varchar2
@@ -1597,6 +1621,12 @@ raise;
         v_key varchar2(100) := to_char(p_processId);
         v_new_log t_log_buffer_rec;
     begin
+        -- if there is no old value, this one will be the oldest when flush will be done
+        if g_firstLogTimeStamp is null then 
+            g_logLatencyCounter := g_logLatencyCounter + 1;
+            g_firstLogTimeStamp := p_logTime;
+        end if;
+        
         v_idx := v_indexSession(p_processId);
         g_sessionList(v_idx).serial_no := coalesce(g_sessionList(v_idx).serial_no, 0) + 1;
         v_new_log.serial_no := g_sessionList(v_idx).serial_no;
@@ -1610,7 +1640,7 @@ raise;
         v_new_log.process_id    := p_processId; -- Jetzt vorhanden
         v_new_log.log_level     := p_level;
         v_new_log.log_text      := p_text;
-        v_new_log.log_time      := systimestamp;
+        v_new_log.log_time      := p_logTime;
         v_new_log.serial_no     := g_sessionList(v_indexSession(p_processId)).serial_no;
         v_new_log.err_stack     := p_errStack;
         v_new_log.err_backtrace := p_errBacktrace;
@@ -1759,11 +1789,21 @@ raise;
         v_avgs        sys.odcinumberlist   := sys.odcinumberlist();
         v_timesStart  t_timestamp_list_t   := t_timestamp_list_t();
         v_timesStop   t_timestamp_list_t   := t_timestamp_list_t();
+        
+        v_latency     number := 0;
     begin
         v_idx_session := v_indexSession(p_processId);
         v_targetTable := g_sessionList(v_idx_session).tabName_master || C_SUFFIX_MON_TABLE;
 
         v_group_key := g_monitor_groups.FIRST;
+        
+        if v_group_key is not null then
+            -- calculate latency of oldest monitor entry until persistance
+            v_latency  := get_ms_diff(g_firstMonTimeStamp, systimestamp);
+            g_avgLatencyMon := round((g_avgLatencyMon + v_latency) / g_monLatencyCounter, 2);
+            if v_latency > g_maxLatencyMon then g_maxLatencyMon := v_latency; end if;        
+        end if;
+        
         while v_group_key is not null loop     
             -- Filter: Gehört dieser "Eimer" zum aktuellen Prozess?
            if v_group_key like v_id_prefix || '%' then  
@@ -1834,8 +1874,9 @@ raise;
         if p_force 
            or g_sessionList(v_idx).monitor_dirty_count >= C_FLUSH_MONITOR_THRESHOLD 
            or v_ms_since_flush >= C_FLUSH_MILLIS_THRESHOLD
-        then
+        then        
             flushMonitor(p_processId);
+            g_firstMonTimeStamp := null;
 
             -- Reset der prozessspezifischen Steuerungsdaten
             g_sessionList(v_idx).monitor_dirty_count := 0;
@@ -2006,6 +2047,12 @@ raise;
             insertEventMonitorRemote(p_processId, p_actionName, p_contextName, p_timestamp);
             return;
         end if ;
+        
+        -- this event will be the oldest when flush happens
+        if g_firstMonTimeStamp is null then 
+            g_monLatencyCounter := g_monLatencyCounter + 1;
+            g_firstMonTimeStamp := p_timestamp; 
+        end if;
 
         -- 0. Monitoring-Check (Log-Level Prüfung)
         if v_indexSession.EXISTS(p_processId) and 
@@ -2104,6 +2151,9 @@ raise;
             insertTraceMonitorRemote(p_processId, p_actionName, p_contextName, p_timestamp);
             return;
         end if ;
+        
+        -- this will be the oldest entry when flush happens
+        if g_firstMonTimeStamp is null then g_firstMonTimeStamp := p_timestamp; end if;
 
         if v_indexSession.EXISTS(p_processId) and 
            logLevelMonitor > g_sessionList(v_indexSession(p_processId)).log_level then
@@ -2630,9 +2680,10 @@ raise;
         if p_force 
            or g_sessionList(v_idx).log_dirty_count >= C_FLUSH_LOG_THRESHOLD 
            or v_ms_since_flush >= C_FLUSH_MILLIS_THRESHOLD
-        then
+        then            
             -- Alle gepufferten Logs dieses Prozesses in die DB schreiben
-           flushLogs(p_processId);
+            flushLogs(p_processId);
+            g_firstLogTimeStamp := null;
 
             -- Steuerungsdaten für diesen Prozess zurücksetzen
             g_sessionList(v_idx).log_dirty_count := 0;
@@ -2757,6 +2808,7 @@ raise;
                 p_processId, 
                 p_level,
                 p_logText,
+                p_timestamp,
                 null,
                 null,
                 DBMS_UTILITY.FORMAT_CALL_STACK
@@ -3158,6 +3210,7 @@ raise;
                     p_processId, 
                     logLevelWarn,
                     v_msg,
+                    systimestamp,
                     null,
                     null,
                     null
@@ -3951,12 +4004,20 @@ raise;
                 group_name,
                 last_activity,
                 is_active,
-                current_load
+                current_load,
+                avg_log_lat,
+                max_log_lat,
+                avg_mon_lat,
+                max_mon_lat
             ) values (
                 :1,
                 :2,
                 SYSTIMESTAMP,
                 1,
+                0,
+                0,
+                0,
+                0,
                 0
             )';
             execute immediate l_sqlStmt using g_serverPipeName, g_serverGroupName;
@@ -4200,9 +4261,14 @@ raise;
             is_active = :1,
             current_load = nvl((SELECT pipe_size FROM v$db_pipes WHERE upper(name) = :2), 0),
             status = :3,
-            processing = :4
-        WHERE upper(pipe_name) = :5';
-        execute immediate l_sqlStmt USING l_booleanAsInt, upper(g_serverPipeName), l_status, p_eventCounter, upper(g_serverPipeName);
+            processing = :4,
+            avg_log_lat = :5,
+            max_log_lat = :6,
+            avg_mon_lat = :7,
+            max_mon_lat = :8
+        WHERE upper(pipe_name) = :9';
+        execute immediate l_sqlStmt USING l_booleanAsInt, upper(g_serverPipeName), l_status, p_eventCounter, 
+            g_avgLatencyLogs, g_maxLatencyLogs, g_avgLatencyMon, g_maxLatencyMon, upper(g_serverPipeName);
         COMMIT; -- Muss autonom sein!
 
     exception
