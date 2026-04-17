@@ -12,6 +12,7 @@
     - [Procedure SET_STEPS_TODO](#procedure-set_steps_todo)
     - [Procedure SET_STEPS_DONE](#procedure-set_steps_done)
     - [Procedure STEP_DONE](#procedure-step_done)
+    - [Procedure FINAL_RESCUE](#procedure-final_rescue)
   - [Process control](#process-control)
     - [SET_PROCESS_STATUS](#procedure-set_process_status)
     - [SET_STEPS_TODO](#procedure-set_steps_todo)
