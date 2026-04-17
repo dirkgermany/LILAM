@@ -99,8 +99,6 @@ create or replace PACKAGE LILAM AS
     C_ALERT_MAIL_LOG CONSTANT VARCHAR2(30) := 'LILAM_ALERT_MAIL_LOG';
 
 
-
-
     ------------------------------
     -- Life cycle of a log session
     ------------------------------
@@ -169,6 +167,11 @@ create or replace PACKAGE LILAM AS
 
     PROCEDURE CALL_BY_JSON(p_callObject  IN  JSON_OBJECT_T, p_respObject  OUT JSON_OBJECT_T);
     PROCEDURE CALL_BY_JSON(p_callObject  IN  JSON_OBJ_LILAM, p_respObject  OUT JSON_OBJ_LILAM);
+    
+    ---------------
+    -- Final Rescue
+    ---------------
+    PROCEDURE FINAL_RESCUE;
 
     ----------
     -- Testing
