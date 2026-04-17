@@ -360,6 +360,25 @@ EXCEPTION WHEN OTHERS THEN
     );
     RAISE;
 ```
+
+#### Procedure FINAL_RESCUE
+For performance reasons, LILAM caches entries for logs, monitoring, and processes. This is possible because LILAM manages its memory and transactions independently of the calling package. To ensure that entries are written securely, a final [`CLOSE_SESSION`](#procedure-close_session) is required at the end of the process. Therefore, CLOSE_SESSION should also be called within the final exception handling of procedures or functions before the calling process terminates unexpectedly due to a fatal error.
+
+Should one or even multiple abnormal process terminations occur, LILAM's non-persisted data can be written by calling the 'FINAL_RESCUE' procedure.
+```sql
+exec lilam.final_rescue;
+```
+Alternatively
+```sql
+BEGIN
+  lilam.final_rescue;
+END;
+/
+```
+This call triggers the persistence of all currently cached data.
+> [!IMPORTANT]
+> Successful execution depends on calling the procedure from the specific session in which the crashed processes originated.
+
 [↑ Back to Top](#lilam-api-reference)
 
 ---
