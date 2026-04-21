@@ -2803,23 +2803,22 @@ raise;
         end if ;
 
         -- Hier nur weiter, wenn nicht remote
-        if v_indexSession.EXISTS(p_processId) then
-            if p_level <= g_sessionList(v_indexSession(p_processId)).log_level then
-                write_to_log_buffer(
-                    p_processId, 
-                    p_level,
-                    p_logText,
-                    p_timestamp,
-                    null,
-                    null,
-                    DBMS_UTILITY.FORMAT_CALL_STACK
-                );
-            end if;
-            -- Wenn harte Fehler, muss das Logfile geschrieben werden
-            if p_level = logLevelError then
-                SYNC_ALL_DIRTY(true);
-            end if;
+        if v_indexSession.EXISTS(p_processId) and p_level <= g_sessionList(v_indexSession(p_processId)).log_level then
+            write_to_log_buffer(
+                p_processId, 
+                p_level,
+                p_logText,
+                p_timestamp,
+                null,
+                null,
+                DBMS_UTILITY.FORMAT_CALL_STACK
+            );
         end if ;
+        
+        -- Wenn harte Fehler, muss das Logfile geschrieben werden
+        if p_level = logLevelError then
+            SYNC_ALL_DIRTY(true);
+        end if;
 
     exception
         when others then
@@ -3379,7 +3378,7 @@ raise;
 
     --------------------------------------------------------------------------
 
-    function NEW_SESSION(p_processName varchar2, p_logLevel PLS_INTEGER, p_tabNameMaster varchar2 default 'LILAM') return number
+    function NEW_SESSION(p_processName varchar2, p_logLevel PLS_INTEGER default logLevelMonitor, p_tabNameMaster varchar2 default 'LILAM') return number
     as
         p_session_init t_session_init;
     begin
