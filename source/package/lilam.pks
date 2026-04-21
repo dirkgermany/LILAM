@@ -1,6 +1,6 @@
 create or replace PACKAGE LILAM AS
     /* Complete Doc and last version see https://github.com/dirkgermany/LILA/docs */
-    LILAM_VERSION constant varchar2(20) := 'v1.4.2';
+    LILAM_VERSION constant varchar2(20) := 'v1.4.2.0';
 
     -- =====================================
     -- JSON as VARCHAR2 for max. performance
@@ -103,7 +103,7 @@ create or replace PACKAGE LILAM AS
     -- Life cycle of a log session
     ------------------------------
     FUNCTION NEW_SESSION(p_session_init t_session_init) RETURN NUMBER;
-    FUNCTION NEW_SESSION(p_processName VARCHAR2, p_logLevel PLS_INTEGER, p_tabNameMaster VARCHAR2 default 'LILAM') RETURN NUMBER;
+    FUNCTION NEW_SESSION(p_processName VARCHAR2, p_logLevel PLS_INTEGER default logLevelMonitor, p_tabNameMaster VARCHAR2 default 'LILAM') RETURN NUMBER;
     FUNCTION NEW_SESSION(p_processName VARCHAR2, p_logLevel PLS_INTEGER, p_daysToKeep NUMBER, p_tabNameMaster VARCHAR2 default 'LILAM') RETURN NUMBER;
     FUNCTION NEW_SESSION(p_processName VARCHAR2, p_logLevel PLS_INTEGER, p_procStepsToDo NUMBER, p_daysToKeep NUMBER, p_tabNameMaster VARCHAR2 DEFAULT 'LILAM') RETURN NUMBER;
 
@@ -168,9 +168,9 @@ create or replace PACKAGE LILAM AS
     PROCEDURE CALL_BY_JSON(p_callObject  IN  JSON_OBJECT_T, p_respObject  OUT JSON_OBJECT_T);
     PROCEDURE CALL_BY_JSON(p_callObject  IN  JSON_OBJ_LILAM, p_respObject  OUT JSON_OBJ_LILAM);
     
-    ---------------
+    ---------
     -- Final Rescue
-    ---------------
+    ---------
     PROCEDURE FINAL_RESCUE;
 
     ----------
