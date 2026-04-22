@@ -2818,6 +2818,8 @@ raise;
         -- Wenn harte Fehler, muss das Logfile geschrieben werden
         if p_level = logLevelError then
             SYNC_ALL_DIRTY(true);
+        else
+            SYNC_ALL_DIRTY();
         end if;
 
     exception
