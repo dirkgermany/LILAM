@@ -4745,6 +4745,6 @@ raise;
 
     BEGIN
         g_avg_params('DEFAULT').alpha := 0.1;
-        g_avg_params('DEFAULT').warmup := 100; 
+        g_avg_params('DEFAULT').warmup := 3; 
 
     END LILAM;
