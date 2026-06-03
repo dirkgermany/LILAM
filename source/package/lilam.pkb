@@ -48,12 +48,6 @@ AS
     C_INTERLEAVE_PIPE_SUFFIX        CONSTANT VARCHAR2(20)   := '_INTERLEAVE';
 
     ---------------------------------------------------------------
-    -- Kind of Monitor Entries
-    ---------------------------------------------------------------
-    C_MON_TYPE_EVENT                CONSTANT PLS_INTEGER := 0; -- Simple event, no stop-time
-    C_MON_TYPE_TRACE                CONSTANT PLS_INTEGER := 1; -- Transaction with start and stop
-
-    ---------------------------------------------------------------
     -- Sessions
     ---------------------------------------------------------------
     -- Record representing the internal session
@@ -1204,8 +1198,8 @@ raise;
                 process_start    TIMESTAMP(6) DEFAULT SYSTIMESTAMP,
                 process_end      TIMESTAMP(6),
                 last_update      TIMESTAMP(6),
-                steps_todo  NUMBER,
-                steps_done  NUMBER,
+                steps_todo       NUMBER DEFAULT 0,
+                steps_done       NUMBER DEFAULT 0,
                 status           NUMBER(2,0),
                 info             VARCHAR2(2000),
                 process_immortal NUMBER(1,0) DEFAULT 0,
