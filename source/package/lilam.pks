@@ -46,6 +46,12 @@ create or replace PACKAGE LILAM AS
     C_LILAM_RULES       CONSTANT VARCHAR2(16) := 'LILAM_RULES';
     C_LILAM_ALERTS      CONSTANT VARCHAR2(16) := 'LILAM_ALERTS';
 
+    -- =======================
+    -- Kind of Monitor Entries
+    -- =======================
+    C_MON_TYPE_EVENT                CONSTANT PLS_INTEGER := 0; -- Simple event, no stop-time
+    C_MON_TYPE_TRACE                CONSTANT PLS_INTEGER := 1; -- Transaction with start and stop
+
     -- ================================
     -- Record representing process data
     -- ================================
