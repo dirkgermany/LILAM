@@ -11,7 +11,7 @@ AS
     ---------------------------------------------------------------
 
     -- Dedicated to SERVER_LOOP
-    C_SERVER_SYNC_INTERVAL          CONSTANT PLS_INTEGER := 500;
+    C_SERVER_SYNC_INTERVAL          CONSTANT PLS_INTEGER := 100;
     C_SERVER_HEARTBEAT_INTERVAL     CONSTANT PLS_INTEGER := 60000;
     C_SERVER_MAX_LOOPS_IN_TIME      CONSTANT PLS_INTEGER := 10000; -- 1000
     C_SERVER_TIMEOUT_WAIT_FOR_MSG   CONSTANT NUMBER      := 0.2; -- Timeout nach Sekunden Warten auf Nachricht
