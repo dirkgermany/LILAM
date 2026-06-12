@@ -108,14 +108,18 @@ create or replace PACKAGE LILAM AS
     ------------------------------
     -- Life cycle of a log session
     ------------------------------
+    -- Standalone sessions without the need for a server process
     FUNCTION NEW_SESSION(p_session_init t_session_init) RETURN NUMBER;
     FUNCTION NEW_SESSION(p_processName VARCHAR2, p_logLevel PLS_INTEGER default logLevelMonitor, p_tabNameMaster VARCHAR2 default 'LILAM') RETURN NUMBER;
     FUNCTION NEW_SESSION(p_processName VARCHAR2, p_logLevel PLS_INTEGER, p_daysToKeep NUMBER, p_tabNameMaster VARCHAR2 default 'LILAM') RETURN NUMBER;
     FUNCTION NEW_SESSION(p_processName VARCHAR2, p_logLevel PLS_INTEGER, p_procStepsToDo NUMBER, p_daysToKeep NUMBER, p_tabNameMaster VARCHAR2 DEFAULT 'LILAM') RETURN NUMBER;
 
+    -- Server sessions for high load environments
     FUNCTION SERVER_NEW_SESSION(p_processName varchar2, p_logLevel PLS_INTEGER, p_procStepsToDo PLS_INTEGER, p_daysToKeep PLS_INTEGER, p_tabNameMaster varchar2) RETURN VARCHAR2;
     FUNCTION SERVER_NEW_SESSION(p_processName varchar2, p_groupName VARCHAR2, p_logLevel PLS_INTEGER, p_procStepsToDo PLS_INTEGER, p_daysToKeep PLS_INTEGER, p_tabNameMaster varchar2) RETURN VARCHAR2;
     FUNCTION SERVER_NEW_SESSION(p_jasonString varchar2) RETURN NUMBER;
+
+    -- Finalizing sessions
     PROCEDURE CLOSE_SESSION(p_processId NUMBER);
     PROCEDURE CLOSE_SESSION(p_processId NUMBER, p_processInfo VARCHAR2, p_status PLS_INTEGER);
     PROCEDURE CLOSE_SESSION(p_processId NUMBER, p_procStepsDone NUMBER, p_processInfo VARCHAR2, p_status PLS_INTEGER);
