@@ -90,23 +90,6 @@ Have also a look to [Rule Set Sample](./metro_rule_set_v1.json).
 ² The context field allows you to apply rules more selectively. Use it to differentiate between various instances of the same action. This is particularly useful when different thresholds or SLAs apply to specific locations or segments (e.g., a "Speed Limit" rule that only applies to a specific track section).
 For example rule SEQ-003 only monitors travel times for the specific track segment SECTION_400_001, rather than every segment on the line.
 
-### Deep Dive: Anomaly Detection with EWMA
-
-The `AVG_DEVIATION_PCT` operator utilizes an **Exponentially Weighted Moving Average (EWMA)**. Unlike a simple arithmetic mean, the EWMA gives more weight to recent data points, allowing the system to adapt to shifting performance trends in real-time.
-
-#### What is EWMA?
-It is a statistical measure used to model time-series data. In LILAM, it creates a "moving baseline" for your business transactions. If a new event deviates significantly from this baseline, an alert is triggered.
-
-#### Technical Example: `20|100|0.1`
-When using `AVG_DEVIATION_PCT` with the value `20|100|0.1`, the parameters are defined as follows:
-
-
-| Parameter | Value | Description |
-| :--- | :--- | :--- |
-| **Tolerance** | `20` | Trigger an alert if the deviation is > 20% from the average. |
-| **Warm-up** | `100` | Minimum number of initial events needed to build a stable baseline before alerting starts. |
-| **Smoothing (Alpha)** | `0.1` | The weight of the latest event (10%). A lower value makes the average more stable; a higher value makes it more reactive to sudden changes. |
-
 ```json
     {
       "id": "SEQ-003",
@@ -145,4 +128,22 @@ LILAM servers support dynamic rule set updates at runtime. Active configurations
 ```sql
 exec LILAM.SERVER_UPDATE_RULES(p_processId => 1202, p_ruleSetName => 'METRO Rules', p_ruleSetVersion => 2);
 ```
+---
+
+### Deep Dive: Anomaly Detection with EWMA
+
+The `AVG_DEVIATION_PCT` operator utilizes an **Exponentially Weighted Moving Average (EWMA)**. Unlike a simple arithmetic mean, the EWMA gives more weight to recent data points, allowing the system to adapt to shifting performance trends in real-time.
+
+#### What is EWMA?
+It is a statistical measure used to model time-series data. In LILAM, it creates a "moving baseline" for your business transactions. If a new event deviates significantly from this baseline, an alert is triggered.
+
+#### Technical Example: `20|100|0.1`
+When using `AVG_DEVIATION_PCT` with the value `20|100|0.1`, the parameters are defined as follows:
+
+
+| Parameter | Value | Description |
+| :--- | :--- | :--- |
+| **Tolerance** | `20` | Trigger an alert if the deviation is > 20% from the average. |
+| **Warm-up** | `100` | Minimum number of initial events needed to build a stable baseline before alerting starts. |
+| **Smoothing (Alpha)** | `0.1` | The weight of the latest event (10%). A lower value makes the average more stable; a higher value makes it more reactive to sudden changes. |
 
