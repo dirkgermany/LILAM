@@ -793,9 +793,6 @@ AS
                         WHEN p_list(i).condition_operator IN ('ON_START', 'ON_STOP', 'ON_UPDATE', 'ON_EVENT', C_PROCESS_STOP, C_PROCESS_START) THEN
                             fire := TRUE;
 
-                        WHEN p_list(i).condition_operator IN ('ON_STOP', C_PROCESS_STOP) THEN
-                            fire := TRUE;
-
                         WHEN p_list(i).condition_operator = 'RUNTIME_EXCEEDED' THEN
                             if p_processRec.processEnd is null and 
                                 get_ms_diff(coalesce(p_processRec.lastUpdate, systimestamp), systimestamp) >  to_number(p_list(i).condition_value)
