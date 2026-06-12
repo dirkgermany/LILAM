@@ -837,7 +837,7 @@ AS
 
                         WHEN p_list(i).condition_operator = 'PRECEDED_BY' THEN
                             declare
-                                l_history_key  PLS_INTEGER := g_last_action_per_process(p_processRec.id).full_key;
+                                l_history_key VARCHAR2(500) := g_last_action_per_process(p_processRec.id).full_key;
                             begin                                
                                 -- Wenn im JSON nur "ACTION" steht, schneiden wir den Context beim Vergleich ab
                                 IF l_history_key = p_list(i).condition_value 
