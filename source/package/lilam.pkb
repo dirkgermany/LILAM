@@ -4048,7 +4048,7 @@ AS
     --------------------------------------------------------------------------
 
     PROCEDURE load_rules_from_json(p_ruleSet CLOB) IS
-        l_ruleSet VARCHAR2(32000);
+        l_ruleSet CLOB;
     BEGIN
         -- Zuerst die alten Regeln löschen (Reset)
         g_rules_by_context.DELETE;
