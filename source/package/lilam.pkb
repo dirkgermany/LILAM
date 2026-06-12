@@ -1066,7 +1066,7 @@ raise;
     )
     as        
         l_pipeName      VARCHAR2(100);
-        l_msg           JSON_OBJ_LILAM;
+--        l_msg           JSON_OBJ_LILAM;
         l_status        PLS_INTEGER;
         l_now           TIMESTAMP := SYSTIMESTAMP;
         l_retryInterval INTERVAL DAY TO SECOND := INTERVAL '30' SECOND;
@@ -1094,7 +1094,7 @@ raise;
             end if ;
             if l_status = 2 then
                 DBMS_PIPE.RESET_BUFFER;
-                DBMS_PIPE.PACK_MESSAGE(l_msg);
+                DBMS_PIPE.PACK_MESSAGE(l_jsonMain);
             end if;
             dbms_session.sleep(0.3);
         end loop;
