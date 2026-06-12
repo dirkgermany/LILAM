@@ -4281,7 +4281,6 @@ AS
     as
         l_status    PLS_INTEGER;
         l_message   VARCHAR2(32767);
-        l_stop_server_exception EXCEPTION;
         c_max_timeout CONSTANT NUMBER := C_SERVER_TIMEOUT_MAX_WAIT; -- Maximum für den Eco-Mode
         c_min_timeout CONSTANT NUMBER := C_SERVER_TIMEOUT_WAIT_FOR_MSG;
     begin
@@ -4295,10 +4294,6 @@ AS
                 return l_message;
 
                 EXCEPTION
-                    WHEN l_stop_server_exception THEN
-                        -- Diese Exception wird NICHT hier abgefangen, 
-                        -- sondern nach außen an den Loop gereicht.
-                        RAISE;
                     WHEN OTHERS THEN
                         -- WICHTIG: Fehler loggen, aber die Schleife NICHT verlassen!
                         ERROR(g_serverProcessId, g_serverPipeName || '=>Internal START_SERVER; Critical Error while processing command: ' || SQLERRM);
@@ -4401,7 +4396,6 @@ AS
         l_request        VARCHAR2(500);
         l_dummyRes       PLS_INTEGER;
         l_shutdownSignal BOOLEAN := FALSE;
-        l_stop_server_exception EXCEPTION;            
         l_lastHeartbeat  TIMESTAMP := sysTimestamp;
         l_lastSync       TIMESTAMP := sysTimestamp;  
         l_loopCounter    PLS_INTEGER := 0;
@@ -4431,11 +4425,6 @@ AS
                 l_request := extractClientRequest(l_message);
                 l_shutdownSignal := processRequest(l_request, l_message, l_clientChannel);
                 EXCEPTION
-                    WHEN l_stop_server_exception THEN
-                        -- Diese Exception wird NICHT hier abgefangen, 
-                        -- sondern nach außen an den Loop gereicht.
-                        RAISE;
-
                     WHEN OTHERS THEN
                         -- WICHTIG: Fehler loggen, aber die Schleife NICHT verlassen!
                         -- raise;
@@ -4505,13 +4494,6 @@ AS
         updateServerRegistry(FALSE, 0);
 
     EXCEPTION
-    WHEN l_stop_server_exception THEN
-        -- Hier landen wir nur, wenn der Server gezielt beendet werden soll
-        DBMS_OUTPUT.PUT_LINE('Err: ' || sqlerrm);
-        ERROR(g_serverProcessId, g_serverPipeName || '=>Internal START_SERVER; Critical Error while processing command: ' || SQLERRM);
-
-        CLOSE_SESSION(g_serverProcessId);
-
     WHEN OTHERS THEN
         DBMS_PIPE.PURGE(g_serverPipeName); 
         l_dummyRes := DBMS_PIPE.REMOVE_PIPE(g_serverPipeName);
