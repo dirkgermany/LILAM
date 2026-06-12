@@ -952,7 +952,7 @@ AS
 
     exception
         when others then
-raise;
+        --raise;
             l_status := DBMS_PIPE.REMOVE_PIPE(l_clientChannel);
     end;
 
@@ -4024,8 +4024,8 @@ raise;
 
     exception
         when others then
-            raise;
             rollback;
+            raise;
     end;
 
     --------------------------------------------------------------------------
@@ -4040,9 +4040,9 @@ raise;
 
     EXCEPTION
         WHEN OTHERS THEN
-        raise;
             lilam.error(g_serverProcessId, g_serverPipeName || '=>Failed to parse JSON rules: ' || SQLERRM);
             rollback;
+            raise;
     END;
 
     --------------------------------------------------------------------------
@@ -4124,8 +4124,8 @@ raise;
 
     EXCEPTION
         WHEN OTHERS THEN
-        raise;
             lilam.error(g_serverProcessId, g_serverPipeName || '=>Failed to parse JSON rules: ' || SQLERRM);
+            raise;
     END;
 
     --------------------------------------------------------------------------
@@ -4301,8 +4301,8 @@ raise;
                         RAISE;
                     WHEN OTHERS THEN
                         -- WICHTIG: Fehler loggen, aber die Schleife NICHT verlassen!
-                        raise;
                         ERROR(g_serverProcessId, g_serverPipeName || '=>Internal START_SERVER; Critical Error while processing command: ' || SQLERRM);
+                        raise;
                 END; 
         else
              p_cur_timeout := LEAST(p_cur_timeout + C_SERVER_TIMEOUT_WAIT_FOR_MSG, c_max_timeout);
