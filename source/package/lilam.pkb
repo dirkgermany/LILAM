@@ -87,6 +87,28 @@ AS
     );
     TYPE t_throttle_tab IS TABLE OF t_throttle_stat INDEX BY BINARY_INTEGER;
     g_local_throttle_cache t_throttle_tab;
+    
+    ---------------------------------------------------------------
+    -- Gemeinsamer Typ für Monitoring und Process
+    ---------------------------------------------------------------
+    TYPE t_eval_context_rec IS RECORD (
+        -- gemeinsame Daten
+        process_id    NUMBER(19,0),
+        action_name   VARCHAR2(100),
+        context_name  VARCHAR2(100),
+        start_time    TIMESTAMP(6),
+        stop_time     TIMESTAMP(6),
+        -- Monitoring Felder
+        used_time     NUMBER,
+        action_count  PLS_INTEGER,
+        -- Prozess-spezifische Felder
+        process_end   TIMESTAMP,
+        last_update   TIMESTAMP,
+        steps_todo    PLS_INTEGER,
+        steps_done    PLS_INTEGER,
+        status        PLS_INTEGER,
+        info          VARCHAR2(4000)
+    );
 
     ---------------------------------------------------------------
     -- Processes
@@ -629,7 +651,237 @@ AS
             rollback;
             error(g_serverProcessId, g_serverPipeName || '=>Alert konnte nicht ausgelöst werden: ' || sqlErrM);
     END;
+    
 
+    ------------------------------------------------------------
+    -- Identifizieren von Regeln gegen eintreffendes Event/Trace
+    -- Zusammengefasste Version für Monitoring und Prozess
+    ------------------------------------------------------------  
+    PROCEDURE evaluateRules_internal(p_ctx t_eval_context_rec, p_trigger VARCHAR2, p_check_context BOOLEAN)
+    AS
+        v_key       VARCHAR2(200);
+        fire        BOOLEAN := FALSE;
+        l_diff_ms   PLS_INTEGER := 0;
+        l_condVal   NUMBER := 0;
+        p_monRec    t_monitor_buffer_rec; -- Hilfsvariable für fire_alert
+    
+        PROCEDURE apply_rule_list(p_list t_rule_list) IS
+        BEGIN
+            IF p_list IS NULL OR p_list.COUNT = 0 THEN RETURN; END IF;
+            FOR i IN 1 .. p_list.COUNT LOOP
+                fire := FALSE;
+                
+                IF p_list(i).trigger_type = p_trigger THEN
+                    CASE
+                        -- =====================================================
+                        -- GEMEINSAME OPERATOREN
+                        -- =====================================================
+                        WHEN p_list(i).condition_operator IN ('ON_START', 'ON_STOP', 'ON_UPDATE', 'ON_EVENT', C_PROCESS_STOP, C_PROCESS_START) THEN
+                            fire := TRUE;
+    
+                        WHEN p_list(i).condition_operator = 'MAX_OCCURRENCE' THEN
+                            -- Konsolidierte Logik: Prozess nutzt stepsTodo/stepsDone, Monitor nutzt action_count
+                            IF p_ctx.steps_todo IS NOT NULL THEN
+                                IF p_ctx.steps_todo - p_ctx.steps_done > p_list(i).condition_value THEN 
+                                    fire := TRUE; 
+                                END IF;
+                            ELSE
+                                IF p_ctx.action_count > p_list(i).condition_value THEN 
+                                    fire := TRUE; 
+                                END IF;
+                            END IF;
+    
+                        WHEN p_list(i).condition_operator = 'PRECEDED_BY' THEN
+                            IF g_last_action_per_process.EXISTS(p_ctx.process_id) THEN
+                                DECLARE
+                                    l_actual_history_key VARCHAR2(500) := g_last_action_per_process(p_ctx.process_id).full_key;
+                                BEGIN
+                                    IF l_actual_history_key = p_list(i).condition_value 
+                                       OR l_actual_history_key LIKE p_list(i).condition_value || '|%' 
+                                    THEN 
+                                        NULL; 
+                                    ELSE 
+                                        fire := TRUE; 
+                                    END IF;
+                                END;
+                            ELSE 
+                                fire := TRUE; 
+                            END IF;
+    
+                        WHEN p_list(i).condition_operator = 'PRECEDED_BY_WITHIN_SECS' THEN
+                            IF g_last_action_per_process.EXISTS(p_ctx.process_id) THEN
+                                DECLARE
+                                    l_history     t_action_history_rec := g_last_action_per_process(p_ctx.process_id);
+                                    l_pos         PLS_INTEGER; 
+                                    l_expected    VARCHAR2(100);
+                                    l_max_seconds NUMBER;
+                                    l_gap_ms      NUMBER;
+                                BEGIN
+                                    l_pos := instr(p_list(i).condition_value, '|', -1);
+                                    IF l_pos > 0 THEN
+                                        l_expected    := substr(p_list(i).condition_value, 1, l_pos - 1);
+                                        l_max_seconds := to_number(substr(p_list(i).condition_value, l_pos + 1));                            
+                                        IF l_history.full_key != l_expected THEN
+                                            fire := TRUE; 
+                                        ELSE
+                                            l_gap_ms := get_ms_diff(l_history.stop_time, p_ctx.start_time);
+                                            IF (l_gap_ms / 1000) > l_max_seconds THEN 
+                                                fire := TRUE; 
+                                            END IF;
+                                        END IF;
+                                    END IF;
+                                END;
+                            ELSE 
+                                fire := TRUE; 
+                            END IF;
+    
+                        -- =====================================================
+                        -- REINE MONITOR-OPERATOREN
+                        -- =====================================================
+                        WHEN p_list(i).condition_operator = 'AVG_DEVIATION_PCT' THEN
+                            p_monRec.start_time := p_ctx.start_time; 
+                            p_monRec.stop_time  := p_ctx.stop_time;
+                            IF NOT validateDurationInAverage(p_monRec, extractRuleValue(p_list(i).condition_value, 1)) THEN
+                                fire := TRUE;
+                            END IF;
+    
+                        WHEN p_list(i).condition_operator = 'MAX_DURATION_MS' THEN
+                            IF p_ctx.used_time > p_list(i).condition_value THEN 
+                                fire := TRUE; 
+                            END IF;
+    
+                        WHEN p_list(i).condition_operator = 'MAX_GAP_SECONDS' THEN
+                            v_key := buildMonitorKey(p_ctx.process_id, p_ctx.action_name, p_ctx.context_name);
+                            IF g_monitor_shadows.EXISTS(v_key) THEN
+                                DECLARE
+                                    l_vorganger_zeit TIMESTAMP := coalesce(g_monitor_shadows(v_key).stop_time, g_monitor_shadows(v_key).start_time);
+                                BEGIN
+                                    l_diff_ms := get_ms_diff(l_vorganger_zeit, p_ctx.start_time);
+                                    IF (l_diff_ms / 1000) > TO_NUMBER(p_list(i).condition_value) THEN 
+                                        fire := TRUE; 
+                                    END IF;
+                                END;
+                            END IF;
+    
+                        -- =====================================================
+                        -- REINE PROZESS-OPERATOREN
+                        -- =====================================================
+                        WHEN p_list(i).condition_operator = 'RUNTIME_EXCEEDED' THEN
+                            IF p_ctx.process_end IS NULL AND get_ms_diff(coalesce(p_ctx.last_update, systimestamp), systimestamp) > to_number(p_list(i).condition_value) THEN
+                                fire := TRUE;
+                            END IF;
+    
+                        WHEN p_list(i).condition_operator = 'MAX_RUNTIME_EXCEEDED' THEN
+                            IF p_ctx.process_end IS NOT NULL AND get_ms_diff(p_ctx.start_time, p_ctx.process_end) > to_number(p_list(i).condition_value) THEN
+                                fire := TRUE;
+                            END IF;
+    
+                        WHEN p_list(i).condition_operator = 'STEPS_LEFT_HIGH' THEN
+                            IF p_ctx.steps_todo - p_ctx.steps_done > p_list(i).condition_value THEN 
+                                fire := TRUE; 
+                            END IF;
+    
+                        WHEN p_list(i).condition_operator = 'SUCCESS_RATE_LOW' THEN
+                            IF coalesce(p_ctx.steps_todo, 0) > 0 AND (p_ctx.steps_done / p_ctx.steps_todo * 100 < to_number(p_list(i).condition_value)) THEN
+                                fire := TRUE;
+                            END IF;
+    
+                        WHEN p_list(i).condition_operator = 'STATUS_EQUALS' THEN
+                            IF coalesce(p_ctx.status, -1) = to_number(p_list(i).condition_value) THEN 
+                                fire := TRUE; 
+                            END IF;
+    
+                        WHEN p_list(i).condition_operator = 'INFO_CONTAINS' THEN
+                            IF p_ctx.info IS NOT NULL AND UPPER(p_ctx.info) LIKE '%' || UPPER(p_list(i).condition_value) || '%' THEN
+                                fire := TRUE;
+                            END IF;
+                    END CASE;
+                END IF;
+    
+                -- Wenn die Regel anschlägt, mappen wir die Daten für das Alarmsystem zurück
+                IF fire THEN
+                    p_monRec.process_id   := p_ctx.process_id;
+                    p_monRec.action_name  := p_ctx.action_name;
+                    p_monRec.context_name := p_ctx.context_name;
+                    p_monRec.action_count := coalesce(p_ctx.steps_done, p_ctx.action_count);
+                    p_monRec.start_time   := p_ctx.start_time;
+                    p_monRec.stop_time    := p_ctx.stop_time;
+                    p_monRec.used_time    := p_ctx.used_time;
+                    fire_alert(p_list(i), p_monRec);
+                END IF;
+            END LOOP;
+        END;
+    
+    BEGIN
+        -- 1. Kontext-Regeln (nur für Monitore relevant)
+        IF p_check_context AND g_rules_by_context.EXISTS(p_ctx.action_name || '|' || p_ctx.context_name) THEN          
+            apply_rule_list(g_rules_by_context(p_ctx.action_name || '|' || p_ctx.context_name));
+        END IF;
+    
+        -- 2. Allgemeine Action/Prozess-Regeln
+        IF g_rules_by_action.EXISTS(p_ctx.action_name) THEN
+            apply_rule_list(g_rules_by_action(p_ctx.action_name));
+        END IF;
+    EXCEPTION
+        WHEN OTHERS THEN
+            RAISE;
+    END evaluateRules_internal;
+    
+    -- Hilfsfunktion zum Mappen von Monitor-Daten
+    FUNCTION mapMonitorRecToContextRec(p_monitorRec t_monitor_buffer_rec) return t_eval_context_rec
+    AS
+        l_ctx t_eval_context_rec;
+    BEGIN
+        l_ctx.process_id   := p_monitorRec.process_id;
+        l_ctx.action_name  := p_monitorRec.action_name;
+        l_ctx.context_name := p_monitorRec.context_name;
+        l_ctx.start_time   := p_monitorRec.start_time;
+        l_ctx.stop_time    := p_monitorRec.stop_time;
+        l_ctx.used_time    := p_monitorRec.used_time;
+        l_ctx.action_count := p_monitorRec.action_count;
+        
+        return l_ctx;
+    END;
+
+    -- Hilfsfunktion zum Mappen von Process-Daten
+    FUNCTION mapProcessRecToContextRec(p_processRec t_process_rec) return t_eval_context_rec
+    AS
+        l_ctx t_eval_context_rec;
+    BEGIN
+        l_ctx.process_id   := p_processRec.id;
+        l_ctx.action_name  := p_processRec.processName;
+        l_ctx.context_name := NULL;
+        l_ctx.start_time   := p_processRec.processStart;
+        l_ctx.process_end  := p_processRec.processEnd;
+        l_ctx.last_update  := p_processRec.lastUpdate;
+        l_ctx.steps_todo   := p_processRec.stepsTodo;
+        l_ctx.steps_done   := p_processRec.stepsDone;
+        l_ctx.status       := p_processRec.status;
+        l_ctx.info         := p_processRec.info;
+        
+        return l_ctx;
+    END;
+
+    -- Methode dient dem Mapping für die zentrale evaluate Methode
+    PROCEDURE evaluateRules(p_monitorRec t_monitor_buffer_rec, p_trigger VARCHAR2)
+    AS
+    BEGIN
+        evaluateRules_internal(mapMonitorRecToContextRec(p_monitorRec), p_trigger, p_check_context => TRUE);
+
+        -- Historien-Zustand für den Monitor wegschreiben
+        g_last_action_per_process(p_monitorRec.process_id).full_key  := p_monitorRec.action_name || p_monitorRec.context_name;
+        g_last_action_per_process(p_monitorRec.process_id).stop_time := coalesce(p_monitorRec.stop_time, p_monitorRec.start_time);
+        
+    END evaluateRules;
+    
+    -- Methode dient dem Mapping für die zentrale evaluate Methode
+    PROCEDURE evaluateRules(p_processRec t_process_rec, p_trigger VARCHAR2)
+    AS
+    BEGIN
+        evaluateRules_internal(mapProcessRecToContextRec(p_processRec), p_trigger, p_check_context => FALSE);
+    END evaluateRules;
+
+/*
     ------------------------------------------------------------
     -- Identifizieren von Regeln gegen eintreffendes Event/Trace        
     ------------------------------------------------------------      
@@ -899,6 +1151,7 @@ AS
             apply_rule_list(g_rules_by_action(p_processRec.processName));
         END IF;
     END;
+*/
 
     --------------------------------------------------------------------------
     -- Avoid throttling 
@@ -4720,4 +4973,4 @@ AS
         g_avg_params('DEFAULT').alpha := 0.1;
         g_avg_params('DEFAULT').warmup := 3; 
 
-    END LILAM;
+END LILAM;
