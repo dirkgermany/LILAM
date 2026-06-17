@@ -2042,6 +2042,8 @@ AS
         v_group_key := g_monitor_groups.FIRST;
         
         if v_group_key is not null then
+            g_monLatencyCounter := g_monLatencyCounter +1;
+
             -- calculate latency of oldest monitor entry until persistance
             v_latency  := get_ms_diff(g_firstMonTimeStamp, systimestamp);
             g_avgLatencyMon := round((g_avgLatencyMon + v_latency) / g_monLatencyCounter, 2);
