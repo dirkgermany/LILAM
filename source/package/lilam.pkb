@@ -2823,7 +2823,7 @@ raise;
             -- Loops starts with 3 due to performance
             FOR i IN 3 .. l_maxDepth LOOP
                 v_stack_unit := UTL_CALL_STACK.subprogram(i);
-                IF v_stack_unit(1) != l_packageName and upper(v_stack_unit(1)) != '__ANONYMOUS_BLOCK' THEN
+                IF upper(v_stack_unit(1)) != upper(l_packageName) and upper(v_stack_unit(1)) != '__ANONYMOUS_BLOCK' THEN
                     l_aimDepth := i;
                     EXIT;
                 END IF;
