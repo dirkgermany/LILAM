@@ -1227,7 +1227,7 @@ raise;
                 "SESSION_TIME"      timestamp(6) DEFAULT SYSTIMESTAMP,
                 "SESSION_USER"      varchar2(50),
                 "HOST_NAME"         varchar2(50),
-                "CALLER"            varchar2(200),
+                "CALLER"            varchar2(255),
                 "ERR_STACK"         varchar2(4000),
                 "ERR_BACKTRACE"     varchar2(4000),
                 "ERR_CALLSTACK"     varchar2(4000)
@@ -2770,17 +2770,18 @@ raise;
 
     --------------------------------------------------------------------------
 
-    procedure log_anyRemote(p_processId number, p_level number, p_logText varchar2, p_errStack varchar2, p_errBacktrace varchar2, p_errCallstack varchar2, p_timestamp TIMESTAMP)
+    procedure log_anyRemote(p_processId number, p_level number, p_logText varchar2, p_caller varchar2, p_errStack varchar2, p_errBacktrace varchar2, p_errCallstack varchar2, p_timestamp TIMESTAMP)
     as
         l_payload JSON_OBJ_LILAM; -- Puffer für den JSON-String
     begin
-        jsonPut(l_payload,'process_id', p_processId);
-        jsonPut(l_payload,'level', p_level);
-        jsonPut(l_payload,'log_text', p_logText);
-        jsonPut(l_payload,'err_stack', p_errStack);
-        jsonPut(l_payload,'err_backtr', p_errBacktrace);
-        jsonPut(l_payload,'err_callstack', p_errCallstack);
-        jsonPut(l_payload,'timestamp', p_timestamp);
+        jsonPut(l_payload, 'process_id', p_processId);
+        jsonPut(l_payload, 'level', p_level);
+        jsonPut(l_payload, 'log_text', p_logText);
+        jsonPut(l_payload, 'caller', p_caller);
+        jsonPut(l_payload, 'err_stack', p_errStack);
+        jsonPut(l_payload, 'err_backtr', p_errBacktrace);
+        jsonPut(l_payload, 'err_callstack', p_errCallstack);
+        jsonPut(l_payload, 'timestamp', p_timestamp);
 
         sendNoWait(p_processId, 'LOG_ANY', l_payload, 0.5);
 
@@ -2798,6 +2799,7 @@ raise;
         p_processId number, 
         p_level number,
         p_logText varchar2,
+        p_caller varchar2,
         p_errStack varchar2,
         p_errBacktrace varchar2,
         p_errCallstack varchar2,
@@ -2807,34 +2809,27 @@ raise;
        l_packageName VARCHAR2(128);
        l_aimDepth    PLS_INTEGER := NULL;
        l_maxDepth    PLS_INTEGER;
-       l_module      VARCHAR2(255);
+       l_module      VARCHAR2(255) := p_caller;
        v_stack_unit  UTL_CALL_STACK.unit_qualified_name; 
     begin
-        if is_remote(p_processId) then
-            log_anyRemote(p_processId, p_level, p_logText, p_errStack, p_errBacktrace, p_errCallstack, p_timestamp);
-            return;
-        end if ;
-
-        -- Hier nur weiter, wenn nicht remote
-        if v_indexSession.EXISTS(p_processId) and p_level <= g_sessionList(v_indexSession(p_processId)).log_level then
-        
-           -- Name von LILAM könnte sich theoretisch ändern
-           l_packageName := $$PLSQL_UNIT; 
-           
-           -- Maximale Tiefe des aktuellen Aufrufs ermitteln
-           l_maxDepth := UTL_CALL_STACK.dynamic_depth;
-    
-           -- looks for first unit with other name
-           -- Loops starts with 3 due to performance
-           FOR i IN 3 .. l_maxDepth LOOP
+        -- lookup in stack - who called me?
+        if l_module is null then
+            -- Name von LILAM könnte sich theoretisch ändern
+            l_packageName := $$PLSQL_UNIT; 
+            
+            -- Maximale Tiefe des aktuellen Aufrufs ermitteln
+            l_maxDepth := UTL_CALL_STACK.dynamic_depth;
+            -- looks for first unit with other name
+            -- Loops starts with 3 due to performance
+            FOR i IN 3 .. l_maxDepth LOOP
                 v_stack_unit := UTL_CALL_STACK.subprogram(i);
-                if v_stack_unit(1) != l_packageName and upper(v_stack_unit(1)) != '__ANONYMOUS_BLOCK' THEN
-                   l_aimDepth := i;
-                   EXIT;
-               END IF;
-           END LOOP;
-           
-           if l_aimDepth IS NOT NULL then    
+                IF v_stack_unit(1) != l_packageName and upper(v_stack_unit(1)) != '__ANONYMOUS_BLOCK' THEN
+                    l_aimDepth := i;
+                    EXIT;
+                END IF;
+            END LOOP;
+            
+            if l_aimDepth IS NOT NULL then    
                -- Auslesen des vollqualifizierten Namens des echten Aufrufers
                l_module := UTL_CALL_STACK.concatenate_subprogram (
                               UTL_CALL_STACK.subprogram(l_aimDepth)
@@ -2842,7 +2837,16 @@ raise;
             else
                 l_module := 'EXTERNAL_CLIENT (' || SYS_CONTEXT('USERENV', 'CLIENT_PROGRAM_NAME') || ')';
             end if;
-       
+        
+        end if;
+            
+        if is_remote(p_processId) then
+            log_anyRemote(p_processId, p_level, p_logText, l_module, p_errStack, p_errBacktrace, p_errCallstack, p_timestamp);
+            return;
+        end if ;
+
+        -- Hier nur weiter, wenn nicht remote
+        if v_indexSession.EXISTS(p_processId) and p_level <= g_sessionList(v_indexSession(p_processId)).log_level then
             write_to_log_buffer(
                 p_processId, 
                 p_level,
@@ -2887,6 +2891,7 @@ raise;
                 p_logText,
                 null,
                 null,
+                null,
                 DBMS_UTILITY.FORMAT_CALL_STACK,
                 systimestamp
             );
@@ -2906,6 +2911,7 @@ raise;
             null,
             null,
             null,
+            null,
             systimestamp
         );
     end;
@@ -2921,6 +2927,7 @@ raise;
             p_processId, 
             logLevelError,
             p_logText,
+            null,
             DBMS_UTILITY.FORMAT_ERROR_STACK,
             DBMS_UTILITY.FORMAT_ERROR_BACKTRACE,
             DBMS_UTILITY.FORMAT_CALL_STACK,
@@ -2939,6 +2946,7 @@ raise;
             p_processId, 
             logLevelWarn,
             p_logText,
+            null,
             null,
             null,
             null,
@@ -3575,22 +3583,24 @@ raise;
         l_processId number;
         l_level number;
         l_logText varchar2(1000);
+        l_caller varchar2(255);
         l_errStack varchar2(1000);
         l_errBacktrace varchar2(1000);
         l_errCallstack varchar2(1000);
         l_payload varchar2(1600);
         l_timestamp TIMESTAMP(6);
     begin
-        l_payload := JSON_QUERY(p_message, '$.payload');
-        l_processId := jsonNumber(l_payload, 'process_id');
-        l_level := jsonNumber(l_payload, 'level');
-        l_logText := jsonString(l_payload, 'log_text');
-        l_errStack := jsonString(l_payload, 'err_stack');
-        l_errBacktrace := jsonString(l_payload, 'err_backtr');
-        l_errCallstack := jsonString(l_payload, 'err_callstack');
-        l_timestamp := jsonTime(l_payload, 'timestamp');
+        l_payload       := JSON_QUERY(p_message, '$.payload');
+        l_processId     := jsonNumber(l_payload, 'process_id');
+        l_level         := jsonNumber(l_payload, 'level');
+        l_logText       := jsonString(l_payload, 'log_text');
+        l_caller        := jsonString(l_payload, 'caller');
+        l_errStack      := jsonString(l_payload, 'err_stack');
+        l_errBacktrace  := jsonString(l_payload, 'err_backtr');
+        l_errCallstack  := jsonString(l_payload, 'err_callstack');
+        l_timestamp     := jsonTime(l_payload, 'timestamp');
 
-        log_any(l_processId, l_level, l_logText, l_errStack, l_errBacktrace, l_errCallstack, l_timestamp);
+        log_any(l_processId, l_level, l_logText, l_caller, l_errStack, l_errBacktrace, l_errCallstack, l_timestamp);
     end;
 
     -------------------------------------------------------------------------- 
