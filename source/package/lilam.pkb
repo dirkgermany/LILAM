@@ -2808,7 +2808,7 @@ raise;
        l_aimDepth    PLS_INTEGER := NULL;
        l_maxDepth    PLS_INTEGER;
        l_module      VARCHAR2(255);
-    v_stack_einheit        UTL_CALL_STACK.unit_qualified_name; 
+       v_stack_unit  UTL_CALL_STACK.unit_qualified_name; 
     begin
         if is_remote(p_processId) then
             log_anyRemote(p_processId, p_level, p_logText, p_errStack, p_errBacktrace, p_errCallstack, p_timestamp);
@@ -2827,8 +2827,8 @@ raise;
            -- looks for first unit with other name
            -- Loops starts with 3 due to performance
            FOR i IN 3 .. l_maxDepth LOOP
-                v_stack_einheit := UTL_CALL_STACK.subprogram(i);
-                IF v_stack_einheit(1) != l_packageName THEN
+                v_stack_unit := UTL_CALL_STACK.subprogram(i);
+                if v_stack_unit(1) != l_packageName and upper(v_stack_unit(1)) != '__ANONYMOUS_BLOCK' THEN
                    l_aimDepth := i;
                    EXIT;
                END IF;
