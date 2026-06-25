@@ -1,6 +1,6 @@
 create or replace PACKAGE LILAM AS
     /* Complete Doc and last version see https://github.com/dirkgermany/LILA/docs */
-    LILAM_VERSION constant varchar2(20) := 'v1.4.4.1';
+    LILAM_VERSION constant varchar2(20) := 'v1.5.0';
 
     -- =====================================
     -- JSON as VARCHAR2 for max. performance
@@ -46,12 +46,6 @@ create or replace PACKAGE LILAM AS
     C_LILAM_RULES       CONSTANT VARCHAR2(16) := 'LILAM_RULES';
     C_LILAM_ALERTS      CONSTANT VARCHAR2(16) := 'LILAM_ALERTS';
 
-    -- =======================
-    -- Kind of Monitor Entries
-    -- =======================
-    C_MON_TYPE_EVENT                CONSTANT PLS_INTEGER := 0; -- Simple event, no stop-time
-    C_MON_TYPE_TRACE                CONSTANT PLS_INTEGER := 1; -- Transaction with start and stop
-
     -- ================================
     -- Record representing process data
     -- ================================
@@ -62,12 +56,12 @@ create or replace PACKAGE LILAM AS
         processStart   TIMESTAMP,
         processEnd     TIMESTAMP,
         lastUpdate     TIMESTAMP,
-        stepsTodo      PLS_INTEGER,
-        stepsDone      PLS_INTEGER,
-        status         PLS_INTEGER,
-        info           VARCHAR2(4000),
+        stepsTodo PLS_INTEGER,
+        stepsDone PLS_INTEGER,
+        status          PLS_INTEGER,
+        info            VARCHAR2(4000),
         procImmortal   PLS_INTEGER := 0,
-        tabNameMaster  VARCHAR2(100)
+        tabNameMaster VARCHAR2(100)
     );
 
     -- ================================
@@ -108,18 +102,14 @@ create or replace PACKAGE LILAM AS
     ------------------------------
     -- Life cycle of a log session
     ------------------------------
-    -- Standalone sessions without the need for a server process
     FUNCTION NEW_SESSION(p_session_init t_session_init) RETURN NUMBER;
     FUNCTION NEW_SESSION(p_processName VARCHAR2, p_logLevel PLS_INTEGER default logLevelMonitor, p_tabNameMaster VARCHAR2 default 'LILAM') RETURN NUMBER;
     FUNCTION NEW_SESSION(p_processName VARCHAR2, p_logLevel PLS_INTEGER, p_daysToKeep NUMBER, p_tabNameMaster VARCHAR2 default 'LILAM') RETURN NUMBER;
     FUNCTION NEW_SESSION(p_processName VARCHAR2, p_logLevel PLS_INTEGER, p_procStepsToDo NUMBER, p_daysToKeep NUMBER, p_tabNameMaster VARCHAR2 DEFAULT 'LILAM') RETURN NUMBER;
 
-    -- Server sessions for high load environments
     FUNCTION SERVER_NEW_SESSION(p_processName varchar2, p_logLevel PLS_INTEGER, p_procStepsToDo PLS_INTEGER, p_daysToKeep PLS_INTEGER, p_tabNameMaster varchar2) RETURN VARCHAR2;
     FUNCTION SERVER_NEW_SESSION(p_processName varchar2, p_groupName VARCHAR2, p_logLevel PLS_INTEGER, p_procStepsToDo PLS_INTEGER, p_daysToKeep PLS_INTEGER, p_tabNameMaster varchar2) RETURN VARCHAR2;
     FUNCTION SERVER_NEW_SESSION(p_jasonString varchar2) RETURN NUMBER;
-
-    -- Finalizing sessions
     PROCEDURE CLOSE_SESSION(p_processId NUMBER);
     PROCEDURE CLOSE_SESSION(p_processId NUMBER, p_processInfo VARCHAR2, p_status PLS_INTEGER);
     PROCEDURE CLOSE_SESSION(p_processId NUMBER, p_procStepsDone NUMBER, p_processInfo VARCHAR2, p_status PLS_INTEGER);
@@ -177,7 +167,7 @@ create or replace PACKAGE LILAM AS
 
     PROCEDURE CALL_BY_JSON(p_callObject  IN  JSON_OBJECT_T, p_respObject  OUT JSON_OBJECT_T);
     PROCEDURE CALL_BY_JSON(p_callObject  IN  JSON_OBJ_LILAM, p_respObject  OUT JSON_OBJ_LILAM);
-    
+
     ---------
     -- Final Rescue
     ---------
