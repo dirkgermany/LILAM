@@ -32,6 +32,7 @@
     - [GET_METRIC_STEPS](#function-get_metric_steps)
   - [Server control](#server-control)
     - [START_SERVER](#procedure-start_server)
+    - [CREATE_SERVER](#function-create_server)
     - [SERVER_SHUTDOWN](#procedure-server_shutdown)
     - [GET_SERVER_PIPE](#function-get_server_pipe)
     - [SERVER_UPDATE_RULES](#procedure-server_update_rules)
@@ -193,7 +194,7 @@ To accommodate different logging requirements, the following variants are availa
     p_groupName     VARCHAR2,
     p_logLevel      PLS_INTEGER, 
     p_TabNameMaster VARCHAR2 DEFAULT 'LILAM_LOG'
-  )
+  ) RETURN NUMBER
  ```
 </details>
 
@@ -207,7 +208,7 @@ FUNCTION NEW_SESSION(
   p_logLevel      PLS_INTEGER, 
   p_daysToKeep    PLS_INTEGER, 
   p_TabNameMaster VARCHAR2 DEFAULT 'LILAM_LOG'
-)
+) RETURN NUMBER
  ```
 </details>
 
@@ -222,7 +223,7 @@ FUNCTION NEW_SESSION(
   p_stepsToDo     PLS_INTEGER, 
   p_daysToKeep    PLS_INTEGER, 
   p_TabNameMaster VARCHAR2 DEFAULT 'LILAM_LOG'
-)
+) RETURN NUMBER
  ```
 </details>
 
@@ -238,7 +239,7 @@ FUNCTION SERVER_NEW_SESSION(
   p_daysToKeep    PLS_INTEGER, 
   p_serverName    VARCHAR2,
   p_TabNameMaster VARCHAR2 DEFAULT 'LILAM_LOG'
-)
+) RETURN NUMBER
  ```
 </details>
 
@@ -250,7 +251,7 @@ FUNCTION SERVER_NEW_SESSION(
  ```sql
   FUNCTION NEW_SESSION(
     p_session_init t_session_init
-  )
+  ) RETURN NUMBER
  ```
 </details>
 
@@ -460,7 +461,7 @@ Retrieves the number of processed steps.
  ```sql
   FUNCTION GET_PROC_STEPS_DONE(
     p_processId     NUMBER
-  )
+  ) RETURN PLS_INTEGER
  ```
 
 **Returns**
@@ -473,7 +474,7 @@ Retrieves the number of planned process steps. This value has nothing to do with
  ```sql
   FUNCTION GET_PROC_STEPS_TODO(
     p_processId     NUMBER
-  )
+  ) RETURN PLS_INTEGER
  ```
 
 **Returns**
@@ -486,7 +487,7 @@ Retrieves the time when the process was started with `NEW_SESSION`.
  ```sql
   FUNCTION GET_PROCESS_START(
     p_processId     NUMBER
-  )
+  ) RETURN TIMESTAMP
  ```
 
 **Returns**
@@ -500,7 +501,7 @@ Retrieves the time when the process was finalized by `CLOSE_SESSION`.
  ```sql
   FUNCTION GET_PROCESS_END(
     p_processId     NUMBER
-  )
+  ) RETURN TIMESTAMP
  ```
 
 **Returns**
@@ -513,7 +514,7 @@ Reads the numerical status of a process. The status values are not part of the L
  ```sql
   FUNCTION GET_PROCESS_STATUS(
     p_processId     NUMBER
-  )
+  ) RETURN T_PROCESS_REC
  ```
 
 **Returns**
@@ -527,7 +528,7 @@ Reads the INFO-Text which is part of the process record. Likewise flexible and c
  ```sql
   FUNCTION GET_PROCESS_INFO(
     p_processId     NUMBER
-  )
+  ) RETURN VARCHAR2
  ```
 
 **Returns**
@@ -543,7 +544,7 @@ Reads the INFO-Text which is part of the process record. Likewise flexible and c
  ```sql
   FUNCTION GET_PROCESS_DATA(
     p_processId     NUMBER
-  )
+  ) RETURN T_PROCESS_REC
  ```
 
 **Returns**
@@ -698,8 +699,11 @@ Returns the average duration of markers, aggregated by their respective action n
   FUNCTION GET_METRIC_AVG_DURATION(
     p_processId     NUMBER,
     p_actionName    VARCHAR2
-  )
+  ) RETURN NUMBER
  ```
+
+**Returns**
+* Type: NUMBER
 
 #### Function GET_METRIC_STEPS
 Returns the number of markers, grouped by their respective action names.
@@ -708,8 +712,11 @@ Returns the number of markers, grouped by their respective action names.
   FUNCTION GET_METRIC_STEPS(
     p_processId     NUMBER,
     p_actionName    VARCHAR2
-  )
+  ) RETURN NUMBER
  ```
+
+**Returns**
+* Type: NUMBER
 
 **Parameters**
 
@@ -737,10 +744,11 @@ In server mode, LILAM acts as a central service provider to deliver several key 
 | Name               | Type      | Description                         | Scope
 | ------------------ | --------- | ----------------------------------- | -------
 | [`START_SERVER`](#procedure-start_server) | Procedure | Starts a LILAM-Server | Server control
+| [`CREATE_SERVER`](#function-create_server) | Function | Starts a LILAM-Server as background job | Server control
 | [`SERVER_SHUTDOWN`](#procedure-server_shutdown) | Procedure | Stops a LILAM-Server | Server control
 | [`GET_SERVER_PIPE`](#function-get_server_pipe) | Function | Returns the servers communication pipe (`DBMS_PIPE`) | Server control
 
-#### Function START_SERVER
+#### Procedure START_SERVER
 Starts the LILAM server using a specific server (pipe) name. A password is required, which must be provided again when calling SERVER_SHUTDOWN. This security measure ensures that the shutdown cannot be triggered by unauthorized clients.
 
  ```sql
@@ -751,16 +759,27 @@ Starts the LILAM server using a specific server (pipe) name. A password is requi
   )
  ```
 
+#### Function CREATE_SERVER
+Starts the LILAM server like procedure START_SERVER **AND** offloads the application workflow to a background thread via DBMS_SCHEDULER. Returns the names of pipe and group (if applicable).
+
+ ```sql
+  FUNCTION CREATE_SERVER(
+    p_pipeName      VARCHAR2,
+    p_groupName     VARCHAR2,
+    p_password      VARCHAR2
+  ) RETURN VARCHAR2
+ ```
+
 #### Procedure SERVER_SHUTDOWN
 Shutting down a server requires that the executing client has previously logged into the server and knows the password provided during `SERVER_START`. The `p_processId` received by the client upon login must be used in this call.
 The parameter p_pipeName is used by the server to secure that really he is addressed.
 
  ```sql
-  FUNCTION SERVER_SHUTDOWN(
+  PROCEDURE SERVER_SHUTDOWN(
     p_processId     NUMBER,
     p_pipeName      VARCHAR2,
     p_password      VARCHAR2
-  )
+  ) 
  ```
 
 #### Function GET_SERVER_PIPE
@@ -780,7 +799,7 @@ The rule set can be updated dynamically using the `SERVER_UPDATE_RULES` procedur
 Note that an active server connection (`NEW_SESSION`) is required. Upon execution, the server implements the new rule set and logs the rule set name and version to the `LILAM_SERVER__REGISTRY`.
 
  ```sql
-  FUNCTION SERVER_UPDATE_RULES(
+  PROCEDURE SERVER_UPDATE_RULES(
     p_processId      NUMBER,
     p_ruleSetName    VARCHAR2,
     p_ruleSetVersion PLS_INTEGER
@@ -845,17 +864,18 @@ Useful for getting a complete set of all process data. Using this record avoids 
 
 ```sql
 TYPE t_process_rec IS RECORD (
-    id                  NUMBER(19,0),
-    process_name        VARCHAR2(100),
-    log_level           PLS_INTEGER,
-    process_start       TIMESTAMP,
-    process_end         TIMESTAMP,
-    process_last_update TIMESTAMP,
-    proc_steps_todo     PLS_INTEGER,
-    proc_steps_done     PLS_INTEGER,
-    status              PLS_INTEGER,
-    info                VARCHAR2(4000),
-    tab_name_master     VARCHAR2(100)
+    id             NUMBER(19,0),
+    processName    VARCHAR2(100),
+    logLevel       PLS_INTEGER,
+    processStart   TIMESTAMP,
+    processEnd     TIMESTAMP,
+    lastUpdate     TIMESTAMP,
+    stepsTodo      PLS_INTEGER,
+    stepsDone      PLS_INTEGER,
+    status         PLS_INTEGER,
+    info           VARCHAR2(4000),
+    procImmortal   PLS_INTEGER := 0,
+    tabNameMaster  VARCHAR2(100)
 );
 
 ```
