@@ -51,17 +51,17 @@ create or replace PACKAGE LILAM AS
     -- ================================
     TYPE t_process_rec IS RECORD (
         id             NUMBER(19,0),
-        processName    varchar2(100),
+        processName    VARCHAR2(100),
         logLevel       PLS_INTEGER,
         processStart   TIMESTAMP,
         processEnd     TIMESTAMP,
         lastUpdate     TIMESTAMP,
-        stepsTodo PLS_INTEGER,
-        stepsDone PLS_INTEGER,
-        status          PLS_INTEGER,
-        info            VARCHAR2(4000),
+        stepsTodo      PLS_INTEGER,
+        stepsDone      PLS_INTEGER,
+        status         PLS_INTEGER,
+        info           VARCHAR2(4000),
         procImmortal   PLS_INTEGER := 0,
-        tabNameMaster VARCHAR2(100)
+        tabNameMaster  VARCHAR2(100)
     );
 
     -- ================================
