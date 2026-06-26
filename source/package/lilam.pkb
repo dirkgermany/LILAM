@@ -4755,23 +4755,23 @@ raise;
 
 --        l_action := 'select * from dual';
 
-        -- 3. Den Hintergrund-Prozess "zünden"
+        -- 3. Den Hintergrund-Prozess starten
         DBMS_SCHEDULER.CREATE_JOB (
             job_name   => p_pipeName,
             job_type   => 'PLSQL_BLOCK',
             job_action => l_action,
             enabled    => TRUE,
             auto_drop  => TRUE,
-            comments   => 'LILAM Background Worker [' || p_groupName || '] auf Pipe ' || p_pipeName
+            comments   => 'LILAM Background Worker [' || p_groupName || '] with Pipe ' || p_pipeName
         );
 
-        RETURN 'LILAM-Server gestartet: Pipe=' || p_pipeName || ' (Gruppe=' || p_groupName || ')';
+        RETURN 'LILAM-Server(pipe->' || p_pipeName || ', group->' || p_groupName || ')';
 
     EXCEPTION
         WHEN OTHERS THEN
         DBMS_OUTPUT.PUT_LINE('Err: ' || sqlerrm);
         ERROR(g_serverProcessId, g_serverPipeName || '=>Internal CREATE_SERVER; Critical Error while processing command: ' || SQLERRM);
-        return 'Internal CREATE_SERVER; job_action = ' || l_action || '; Critical Error while processing command: ' || SQLERRM;
+        return 'CREATE_SERVER job_action = ' || l_action || '; Critical Error while processing command: ' || SQLERRM;
 
     END;
 
