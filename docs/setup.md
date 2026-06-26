@@ -39,7 +39,7 @@ GRANT EXECUTE ON UTL_HTTP TO USER_NAME;     -- Allows LILAM to stream metrics vi
 
 ## Installing the Package
 
-The package code is located within the `source` folder of each release. Alternatively, you can access it directly via [GitHub LILAM Source Package]([https://github.com/dirkgermany/LILAM/tree/main/source/package]).
+The package code is located within the `source` folder of each release. Alternatively, you can access it directly via [GitHub LILAM Source Package](https://github.com/dirkgermany/LILAM/tree/main/source/package).
 
 1. Copy the complete content of `lilam.pks` (Package Specification) and `lilam.pkb` (Package Body).
 2. Paste it into your preferred SQL tool (e.g., Oracle SQL Developer, PL/SQL Developer, or VS Code).
