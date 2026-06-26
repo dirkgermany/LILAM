@@ -39,7 +39,7 @@ GRANT EXECUTE ON UTL_HTTP TO USER_NAME;   -- To allow LILAM send metrics via ext
 ```
 
 ### Creating Package
-Find the package under https://github.com/dirkgermany/LILAM/tree/main/source/package.
+The package code is located within the `source` folder of each release. Alternatively, you can access it directly via https://github.com/dirkgermany/LILAM/tree/main/source/package.
 
 Copy the complete content of lilam.pks (specification) and lilam.pkb (body) into your preferred sql tool (e.g. sqlDeveloper) and execute the sql script.
 After that you can see the package in your object tree (perhaps after refreshing it).
