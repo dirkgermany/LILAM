@@ -75,7 +75,7 @@ Have also a look to [Rule Set Sample](./metro_rule_set_v1.json).
 | :-- | :--
 | PROCESS_START, PROCESS_STOP, PROCESS_UPDATE | Process
 | MARK_EVENT | Event
-| TRACE_START, TRACE_STOP
+| TRACE_START, TRACE_STOP | Transaction
 
 ### Operators
 | operator | value / unit | scope | description
