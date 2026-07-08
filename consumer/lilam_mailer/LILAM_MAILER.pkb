@@ -142,13 +142,13 @@ create or replace PACKAGE BODY LILAM_MAILER AS
         v_count     pls_integer;
 
     BEGIN
-        DBMS_ALERT.REMOVE(LILAM_CONSUMER.C_ALERT_MAIL_LOG);
-        DBMS_ALERT.REGISTER(LILAM_CONSUMER.C_ALERT_MAIL_LOG);
+        DBMS_ALERT.REMOVE(C_ALERT_MAIL_LOG);
+        DBMS_ALERT.REGISTER(C_ALERT_MAIL_LOG);
         DBMS_OUTPUT.PUT_LINE('LILAM Mail-Log Consumer gestartet...');
     
         LOOP
             COMMIT; -- Snapshot erneuern für den nächsten Durchgang
-            DBMS_ALERT.WAITONE(LILAM_CONSUMER.C_ALERT_MAIL_LOG, v_msg_payload, v_status, 60);
+            DBMS_ALERT.WAITONE(C_ALERT_MAIL_LOG, v_msg_payload, v_status, 60);
     
             IF v_status = 0 THEN
                 -- Kurzer Check auf PENDING Records
