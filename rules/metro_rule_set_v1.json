@@ -96,6 +96,17 @@
         "value": "20|100|0.1" 
       },
       "alert": { "handler": "MAIL_LOG", "severity": "WARN", "throttle_seconds": 60 }
+    },
+    {
+      "id": "SEQ-009",
+      "_comment": "ERROR was raised.",
+      "trigger_type": "LOGGING",
+      "action": "",
+      "condition": {
+        "operator": "SEVERITY",
+        "value": "ERROR" 
+      },
+      "alert": { "handler": "MAIL_LOG", "severity": "ERROR", "throttle_seconds": 60 }
     }
    ]
 }
