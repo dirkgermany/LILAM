@@ -76,6 +76,7 @@ Have also a look to [Rule Set Sample](./metro_rule_set_v1.json).
 | PROCESS_START, PROCESS_STOP, PROCESS_UPDATE | Process
 | MARK_EVENT | Event
 | TRACE_START, TRACE_STOP | Transaction
+| LOGGING | Logging
 
 ### Operators
 | operator | value / unit | scope | description
@@ -84,6 +85,7 @@ Have also a look to [Rule Set Sample](./metro_rule_set_v1.json).
 | ON_STOP | NULL | Process, Transaction | reacting without any condition
 | ON_EVENT | NULL | Event | reacting without any condition
 | ON_UPDATE | NULL | Process | reacting without any condition
+| SEVERITY | enum | Logging | reacting to a log message³
 | AVG_DEVIATION_PCT | percent | all | detects duration anomalies using **EWMA**
 | MAX_DURATION_MS | milliseconds | Event, Transaction | maximum allowed duration between signals
 | MAX_OCCURRENCE | count | Event, Transaction | max allowed number of consecutive signals per action/context
@@ -94,6 +96,7 @@ Have also a look to [Rule Set Sample](./metro_rule_set_v1.json).
 ¹ The trigger_type acts as a filter to determine when a rule is evaluated. It maps to core LILAM API calls, such as starting a transaction (TRACE_START), reaching a milestone (MARK_EVENT), or completing a process (PROCESS_STOP).
 ² The context field allows you to apply rules more selectively. Use it to differentiate between various instances of the same action. This is particularly useful when different thresholds or SLAs apply to specific locations or segments (e.g., a "Speed Limit" rule that only applies to a specific track section).
 For example rule SEQ-003 only monitors travel times for the specific track segment SECTION_400_001, rather than every segment on the line.
+³ Like ERROR, WARN, MONITOR, INFO, DEBUG. Refer to [Package Specifiation](/source/package/lilam.pks)
 
 ```json
     {
