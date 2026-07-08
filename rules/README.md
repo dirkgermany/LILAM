@@ -71,14 +71,19 @@ Have also a look to [Rule Set Sample](./metro_rule_set_v1.json).
 | rules.alert.throttle | number | minimum seconds to wait before re-triggering the same alert
 
 ### Hooks / Trigger Types
-| hook | event type | effect
-| :-- | :-- | :--
-| ON_EVENT, ON_START, ON_STOP | Event, Transaction, Process | generic triggers for reacting to incoming signals
-| ON_UPDATE, PROCESS_START, PROCESS_STOP | Process | specific triggers for process lifecycle changes
+| hook | scope
+| :-- | :--
+| PROCESS_START, PROCESS_STOP, PROCESS_UPDATE | Process
+| MARK_EVENT | Event
+| TRACE_START, TRACE_STOP
 
 ### Operators
 | operator | value / unit | scope | description
 | :-- | :-- | :-- | :--
+| ON_START | NULL | Process, Event, Transaction | reacting without any condition
+| ON_STOP | NULL | Process, Event, Transaction | reacting without any condition
+| ON_EVENT | NULL | Event, Transaction | reacting without any condition
+| ON_UPDATE | NULL | Event, Transaction | reacting without any condition
 | AVG_DEVIATION_PCT | percent | all | detects duration anomalies using **EWMA**
 | MAX_DURATION_MS | milliseconds | Event, Transaction | maximum allowed duration between signals
 | MAX_OCCURRENCE | count | Event, Transaction | max allowed number of consecutive signals per action/context
