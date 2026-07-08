@@ -10,12 +10,13 @@ create or replace PACKAGE LILAM AS
     -- =========
     -- Log Level
     -- =========
-    logLevelSilent      CONSTANT PLS_INTEGER := 0;
-    logLevelError       CONSTANT PLS_INTEGER := 1;
-    logLevelWarn        CONSTANT PLS_INTEGER := 2;
-    logLevelMonitor     CONSTANT PLS_INTEGER := 3;
-    logLevelInfo        CONSTANT PLS_INTEGER := 4;
-    logLevelDebug       CONSTANT PLS_INTEGER := 8;
+    -- Configure logging rules using the constants below
+    logLevelSilent      CONSTANT PLS_INTEGER := 0; -- SILENT
+    logLevelError       CONSTANT PLS_INTEGER := 1; -- ERROR
+    logLevelWarn        CONSTANT PLS_INTEGER := 2; -- WARN
+    logLevelMonitor     CONSTANT PLS_INTEGER := 3; -- MONITOR
+    logLevelInfo        CONSTANT PLS_INTEGER := 4; -- INFO
+    logLevelDebug       CONSTANT PLS_INTEGER := 8; -- DEBUG
 
     -- ==================
     -- Codes and Messages
