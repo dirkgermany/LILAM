@@ -106,7 +106,7 @@
         "operator": "SEVERITY",
         "value": "ERROR" 
       },
-      "alert": { "handler": "MAIL_LOG", "severity": "ERROR", "throttle_seconds": 60 }
+      "alert": { "handler": "MAIL_LOG", "severity": "ERROR", "throttle_seconds": 0 }
     }
    ]
 }
