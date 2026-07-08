@@ -83,7 +83,7 @@ Have also a look to [Rule Set Sample](./metro_rule_set_v1.json).
 | ON_START | NULL | Process, Transaction | reacting without any condition
 | ON_STOP | NULL | Process, Transaction | reacting without any condition
 | ON_EVENT | NULL | Event | reacting without any condition
-| ON_UPDATE | NULL | Process, Transaction | reacting without any condition
+| ON_UPDATE | NULL | Process | reacting without any condition
 | AVG_DEVIATION_PCT | percent | all | detects duration anomalies using **EWMA**
 | MAX_DURATION_MS | milliseconds | Event, Transaction | maximum allowed duration between signals
 | MAX_OCCURRENCE | count | Event, Transaction | max allowed number of consecutive signals per action/context
