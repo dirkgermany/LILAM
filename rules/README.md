@@ -70,7 +70,7 @@ Have also a look to [Rule Set Sample](./metro_rule_set_v1.json).
 | rules.alert.severity | enum | severity level passed to the alert handler
 | rules.alert.throttle | number | minimum seconds to wait before re-triggering the same alert
 
-### Hooks
+### Hooks / Trigger Types
 | hook | event type | effect
 | :-- | :-- | :--
 | ON_EVENT, ON_START, ON_STOP | Event, Transaction, Process | generic triggers for reacting to incoming signals
