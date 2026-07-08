@@ -112,7 +112,7 @@ For example rule SEQ-003 only monitors travel times for the specific track segme
         "operator": "MAX_DURATION_MS",
         "value": "25000"
       },
-      "alert": { "handler": "MAIL_LOG", "severity": "WARN", "throttle_seconds": 0 }
+      "alert": { "handler": "LILAM_ALERT_MAIL_LOG", "severity": "WARN", "throttle_seconds": 0 }
     }
 
 ```
