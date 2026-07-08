@@ -70,6 +70,12 @@ Have also a look to [Rule Set Sample](./metro_rule_set_v1.json).
 | rules.alert.severity | enum | severity level passed to the alert handler
 | rules.alert.throttle | number | minimum seconds to wait before re-triggering the same alert
 
+¹ The trigger_type acts as a filter to determine when a rule is evaluated. It maps to core LILAM API calls, such as starting a transaction (TRACE_START), reaching a milestone (MARK_EVENT), or completing a process (PROCESS_STOP).
+
+² The context field allows you to apply rules more selectively. Use it to differentiate between various instances of the same action. This is particularly useful when different thresholds or SLAs apply to specific locations or segments (e.g., a "Speed Limit" rule that only applies to a specific track section).
+For example rule SEQ-003 only monitors travel times for the specific track segment SECTION_400_001, rather than every segment on the line.
+
+
 ### Hooks / Trigger Types
 | hook | scope
 | :-- | :--
@@ -92,11 +98,6 @@ Have also a look to [Rule Set Sample](./metro_rule_set_v1.json).
 | MAX_GAP_SECONDS | seconds | Event, Transaction | max time elapsed between the previous and current signal
 | PRECEDED_BY | name and context | all | validates if the direct predecessor matches the condition
 | PRECEDED_BY_WITHIN_MS | name and context and milliseconds | all | extends PRECEDED_BY with a maximum time constraint
-
-¹ The trigger_type acts as a filter to determine when a rule is evaluated. It maps to core LILAM API calls, such as starting a transaction (TRACE_START), reaching a milestone (MARK_EVENT), or completing a process (PROCESS_STOP).
-
-² The context field allows you to apply rules more selectively. Use it to differentiate between various instances of the same action. This is particularly useful when different thresholds or SLAs apply to specific locations or segments (e.g., a "Speed Limit" rule that only applies to a specific track section).
-For example rule SEQ-003 only monitors travel times for the specific track segment SECTION_400_001, rather than every segment on the line.
 
 ³ Like ERROR, WARN, MONITOR, INFO, DEBUG. Refer to [Package Specifiation](/source/package/lilam.pks)
 
