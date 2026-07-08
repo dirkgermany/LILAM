@@ -1,7 +1,5 @@
 CREATE OR REPLACE PACKAGE LILAM_CONSUMER AS 
 
-    C_ALERT_MAIL_LOG CONSTANT VARCHAR2(30) := 'LILAM_ALERT_MAIL_LOG';
-
     -- JSON for ALERT data
     TYPE t_json_rec IS RECORD (
         id                  VARCHAR2(30),
