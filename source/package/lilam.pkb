@@ -224,12 +224,15 @@ AS
     -- Process
     C_PROCESS_START    CONSTANT VARCHAR2(20) := 'PROCESS_START';
     C_PROCESS_UPDATE   CONSTANT VARCHAR2(20) := 'PROCESS_UPDATE';
-    C_PROCESS_STOP      CONSTANT VARCHAR2(20) := 'PROCESS_STOP';
+    C_PROCESS_STOP     CONSTANT VARCHAR2(20) := 'PROCESS_STOP';
 
     -- ACTIONS and TRANSACTIONS
     C_MARK_EVENT       CONSTANT VARCHAR2(20) := 'MARK_EVENT';
     C_TRACE_START      CONSTANT VARCHAR2(20) := 'TRACE_START';
     C_TRACE_STOP       CONSTANT VARCHAR2(20) := 'TRACE_STOP';
+    
+    -- Logging
+    C_LOGGING          CONSTANT VARCHAR2(20) := 'LOGGING';
 
     ---------------------------------------------------------------
     -- Automatisierte Lastverteilung
@@ -272,7 +275,6 @@ AS
     -- Functions and Procedures
     ---------------------------------------------------------------
     function getSessionRecord(p_processId number) return t_session_rec;
-    function getProcessRecord(p_processId number) return t_process_rec;
     procedure sync_log(p_processId number, p_force boolean default false);
     procedure sync_monitor(p_processId number, p_force boolean default false);
     procedure sync_process(p_processId number, p_force boolean default false);
@@ -595,14 +597,14 @@ AS
     ------------------------------------------------------------
     PROCEDURE fire_alert(p_rule t_rule_rec, p_rec t_monitor_buffer_rec) IS
         pragma autonomous_transaction;
-        v_history_key varchar2(200) := p_rec.process_id || '|' || p_rule.rule_id || '|' || p_rec.action_name;
+        v_history_key   VARCHAR2(200) := p_rec.process_id || '|' || p_rule.rule_id || '|' || p_rec.action_name;
         v_idx_session   PLS_INTEGER;
         v_last_fire     TIMESTAMP(6);
         v_throttle_sec  NUMBER := coalesce(p_rule.throttle_seconds, 0); -- Aus dem JSON
         v_channel_name  VARCHAR2(30); -- max. length of Alert-Name
         v_payload       VARCHAR2(1000);
         v_sqlStmt       VARCHAR2(2000);
-        v_alert_id  NUMBER;
+        v_alert_id      NUMBER;
     BEGIN
         -- 1. Prüfen, ob wir dieses spezifische Problem schon mal gemeldet haben
         IF g_alert_history.EXISTS(v_history_key) THEN
@@ -615,17 +617,18 @@ AS
 
         v_sqlStmt := '
         INSERT INTO ' || C_LILAM_ALERTS || '(
-            process_id, process_name, action_name, master_table_name, monitor_table_name, context_name, action_count, 
+            process_id, process_name, action_name, master_table_name, monitor_table_name, logging_table_name, context_name, action_count, 
             rule_set_name, rule_id, rule_set_version, alert_severity, handler_type
         ) VALUES (
-            :1, :2, :3, :4, :5, :6, :7, :8, :9, :10, :11, :12
-        ) RETURNING alert_id into :13';
+            :1, :2, :3, :4, :5, :6, :7, :8, :9, :10, :11, :12, :13
+        ) RETURNING alert_id into :14';
 
         v_idx_session := v_indexSession(p_rec.process_id);
 
         EXECUTE IMMEDIATE v_sqlStmt
         USING p_rec.process_id, g_process_cache(p_rec.process_id).processName, p_rec.action_Name, 
-        g_sessionList(v_idx_session).tabName_master, g_sessionList(v_idx_session).tabName_master || C_SUFFIX_MON_TABLE, 
+        g_sessionList(v_idx_session).tabName_master || C_SUFFIX_PROC_TABLE, g_sessionList(v_idx_session).tabName_master || C_SUFFIX_MON_TABLE,
+        g_sessionList(v_idx_session).tabName_master || C_SUFFIX_LOG_TABLE, 
         p_rec.context_name, p_rec.action_count, g_current_rule_set_name, p_rule.rule_id, g_current_rule_set_version, 
         p_rule.alert_severity, p_rule.alert_handler
         RETURNING INTO v_alert_id;
@@ -635,6 +638,7 @@ AS
             'process_id'       VALUE p_rec.process_id,
             'tab_name_process' VALUE g_sessionList(v_idx_session).tabName_master || C_SUFFIX_PROC_TABLE,
             'tab_name_monitor' VALUE g_sessionList(v_idx_session).tabName_master || C_SUFFIX_MON_TABLE,
+            'tab_name_logging' VALUE g_sessionList(v_idx_session).tabName_master || C_SUFFIX_LOG_TABLE,
             'action_name'      VALUE p_rec.action_name,
             'context_name'     VALUE p_rec.context_name,
             'action_count'     VALUE p_rec.action_count,
@@ -646,7 +650,7 @@ AS
         );
 
         -- p_rule.alert_handler wäre hier z.B. 'MAIL', 'REST', 'PROCESS'
-        v_channel_name := 'LILAM_ALERT_' || p_rule.alert_handler;
+        v_channel_name := p_rule.alert_handler;
         dbms_alert.signal(v_channel_name, v_payload);
         COMMIT; -- !!!
 
@@ -678,12 +682,19 @@ AS
             FOR i IN 1 .. p_list.COUNT LOOP
                 fire := FALSE;
                 
-                IF p_list(i).trigger_type = p_trigger THEN
+                IF upper(p_list(i).trigger_type) = upper(p_trigger) THEN
                     CASE
+                        -- =====================================================
+                        -- LOGGING OPERATOREN
+                        -- =====================================================
+                        -- ohne SEVERITY gibt's kein fire
+                        WHEN upper(p_list(i).condition_operator) = 'SEVERITY' AND upper(p_list(i).condition_value) = upper(p_ctx.context_name) THEN
+                            fire := TRUE;
+                        
                         -- =====================================================
                         -- GEMEINSAME OPERATOREN
                         -- =====================================================
-                        WHEN p_list(i).condition_operator IN ('ON_START', 'ON_STOP', 'ON_UPDATE', 'ON_EVENT', C_PROCESS_STOP, C_PROCESS_START) THEN
+                        WHEN p_list(i).condition_operator IN ('ON_START', 'ON_STOP', 'ON_UPDATE', 'ON_EVENT') THEN
                             fire := TRUE;
 
                         WHEN p_list(i).condition_operator = 'MAX_OCCURRENCE' THEN
@@ -873,6 +884,8 @@ AS
         l_ctx.steps_done   := p_processRec.stepsDone;
         l_ctx.status       := p_processRec.status;
         l_ctx.info         := p_processRec.info;
+        l_ctx.action_count := NULL;
+
         return l_ctx;
     END;
     
@@ -894,280 +907,6 @@ AS
         evaluateRules_internal(mapProcessRecToContextRec(p_processRec), p_trigger, p_check_context => FALSE);
     END evaluateRules;
 
-/*
-    ------------------------------------------------------------
-    -- Identifizieren von Regeln gegen eintreffendes Event/Trace        
-    ------------------------------------------------------------      
-    PROCEDURE evaluateRules(p_monitorRec t_monitor_buffer_rec, p_trigger VARCHAR2)
-    as
-        v_key       varchar2(200);
-        fire        BOOLEAN := FALSE;
-        l_diff_ms   PLS_INTEGER := 0;
-        l_condVal   NUMBER := 0;
-
-        -- Interne Hilfsprozedur, um Redundanz zu vermeiden
-        PROCEDURE apply_rule_list(p_list t_rule_list) IS
-        BEGIN
-            IF p_list IS NULL OR p_list.COUNT = 0 THEN RETURN; END IF;
-            FOR i IN 1 .. p_list.COUNT LOOP
-                fire := FALSE;
-                -- Nur Regeln für das aktuelle Ereignis prüfen (z.B. TRACE_STOP)
-                IF p_list(i).trigger_type = p_trigger THEN
-                    CASE
-                        WHEN p_list(i).condition_operator IN ('ON_START', 'ON_STOP', 'ON_EVENT') THEN
-                            fire := TRUE;
-
-                        WHEN p_list(i).condition_operator = 'AVG_DEVIATION_PCT' THEN
-                            l_condVal := extractRuleValue(p_list(i).condition_value, 1);
-                            if not validateDurationInAverage(p_monitorRec, l_condVal) then
-                                fire := TRUE;
-                            END IF;
-
-                        WHEN p_list(i).condition_operator = 'MAX_DURATION_MS' THEN
-                            -- Absoluter Schwellwert
-                            IF p_monitorRec.used_time > p_list(i).condition_value THEN
-                                fire := TRUE;
-                            END IF;
-
-                        WHEN p_list(i).condition_operator = 'MAX_OCCURRENCE' THEN
-                            -- Feuert, wenn die Anzahl der Aufrufe überschritten wird
-                            IF p_monitorRec.action_count > p_list(i).condition_value THEN
-                                fire := TRUE;
-                            END IF;
-
-                        WHEN p_list(i).condition_operator = 'MAX_GAP_SECONDS' THEN
-                            v_key := buildMonitorKey(p_monitorRec.process_id, p_monitorRec.action_name, p_monitorRec.context_name);
-                            IF g_monitor_shadows.EXISTS(v_key) THEN
-                                DECLARE
-                                    -- Wir holen den Referenzzeitpunkt des Vorgängers
-                                    -- Falls stop_time NULL ist (wie bei deinen Events), nutzen wir die start_time
-                                    l_vorganger_zeit TIMESTAMP := coalesce(g_monitor_shadows(v_key).stop_time, g_monitor_shadows(v_key).start_time);
-                                BEGIN
-                                    -- Lücke = Vom (Ende-)Zeitpunkt des Vorgängers bis zum Start von JETZT
-                                    l_diff_ms := get_ms_diff(l_vorganger_zeit, p_monitorRec.start_time);
-
-                                    IF (l_diff_ms / 1000) > TO_NUMBER(p_list(i).condition_value) THEN
-                                        fire := TRUE;
-                                    END IF;
-                                END;
-                            END IF;
-
-                        WHEN p_list(i).condition_operator = 'PRECEDED_BY' THEN
-                            DECLARE
-                                -- Wir brauchen einen String (VARCHAR2), keine Zahl (PLS_INTEGER)
-                                l_actual_history_key VARCHAR2(500); 
-                            BEGIN
-                                -- 1. Sicherstellen, dass überhaupt etwas im Gedächtnis ist
-                                IF g_last_action_per_process.EXISTS(p_monitorRec.process_id) THEN
-                                    l_actual_history_key := g_last_action_per_process(p_monitorRec.process_id).full_key;
-
-                                    -- 2. Vergleich: Entspricht die Historie der Erwartung aus dem JSON?
-                                    -- Wir nutzen LIKE, falls im JSON nur die Action ohne |Context steht
-                                    IF l_actual_history_key = p_list(i).condition_value 
-                                       OR l_actual_history_key LIKE p_list(i).condition_value || '|%' 
-                                    THEN
-                                        -- Alles okay, Bedingung erfüllt -> kein Alarm
-                                        NULL;
-                                    ELSE
-                                        -- Historie passt nicht zur Erwartung -> FEUER!
-                                        fire := TRUE;
-                                    END IF;
-                                ELSE
-                                    -- Gar kein Vorgänger bekannt -> Auch das ist ein Regelverstoß
-                                    fire := TRUE;
-                                END IF;
-                            END;
-
-                        WHEN p_list(i).condition_operator = 'PRECEDED_BY_WITHIN_SECS' THEN
-                            IF g_last_action_per_process.EXISTS(p_monitorRec.process_id) THEN
-                                DECLARE
-                                    l_history     t_action_history_rec := g_last_action_per_process(p_monitorRec.process_id);
-                                    l_pos         PLS_INTEGER; 
-                                    l_expected    VARCHAR2(100);
-                                    l_max_seconds NUMBER;
-                                    l_gap_ms      NUMBER;
-                                BEGIN
-                                    -- Validierung: Wenn keine Pipe da ist, ist die Regel ungültig konfiguriert
-                                    l_pos := instr(p_list(i).condition_value, '|', -1);
-                                    IF l_pos > 0 THEN
-                                        l_expected    := substr(p_list(i).condition_value, 1, l_pos - 1);
-                                        l_max_seconds := to_number(substr(p_list(i).condition_value, l_pos + 1));                            
-                                        -- 1. Identität prüfen
-                                        IF l_history.full_key != l_expected THEN
-                                            fire := TRUE; 
-                                        ELSE
-                                            -- 2. Zeitfenster prüfen
-                                            l_gap_ms := get_ms_diff(l_history.stop_time, p_monitorRec.start_time);
-                                            IF (l_gap_ms / 1000) > l_max_seconds THEN
-                                                fire := TRUE; 
-                                            END IF;
-                                        END IF;
-                                    END IF;
-                                END;
-                            ELSE
-                                fire := TRUE; -- Gar kein Vorgänger vorhanden!
-                            END IF;
-
-                    END CASE;
-                END IF;
-
-                if fire then
-                    fire_alert(p_list(i), p_monitorRec);
-                end if;
-            END LOOP;
-        END;
-
-    BEGIN
-        -- 1. Spezifische Kontext-Regeln prüfen (Key: Action|Context)
-        IF g_rules_by_context.EXISTS(p_monitorRec.action_name || '|' || p_monitorRec.context_name) THEN          
-            apply_rule_list(g_rules_by_context(p_monitorRec.action_name || '|' || p_monitorRec.context_name));
-        END IF;
-
-        -- 2. Allgemeine Action-Regeln prüfen (Key: Action)
-        IF g_rules_by_action.EXISTS(p_monitorRec.action_name) THEN
-            apply_rule_list(g_rules_by_action(p_monitorRec.action_name));
-        END IF;
-
-        --  die aktuell geprüfte Aktion wird nun zum Vorgänger der nächsten
-        g_last_action_per_process(p_monitorRec.process_id).full_key := p_monitorRec.action_name || p_monitorRec.context_name;
-        g_last_action_per_process(p_monitorRec.process_id).stop_time   := coalesce(p_monitorRec.stop_time, p_monitorRec.start_time);
-
-    exception
-        when others then
-        raise;
-    END;
-
-    ---------------------------------------------------------------
-    -- Identifizieren von Regeln gegen eintreffendes Prozess-Update
-    -- Trigger z.B. PROCESS_START
-    ---------------------------------------------------------------
-    PROCEDURE evaluateRules(p_processRec t_process_rec, p_trigger VARCHAR2)
-    as
-        fire BOOLEAN := FALSE;
-        p_monRec t_monitor_buffer_rec; -- helper to avoid double fire_alert code
-
-        -- Interne Hilfsprozedur, um Redundanz zu vermeiden
-        PROCEDURE apply_rule_list(p_list t_rule_list) IS
-        BEGIN
-            IF p_list IS NULL OR p_list.COUNT = 0 THEN dbms_output.put_line('-------- leere Liste '); RETURN; END IF;       
-            FOR i IN 1 .. p_list.COUNT LOOP
-                fire := FALSE;
-                -- Nur Regeln für das aktuelle Ereignis prüfen (z.B. TRACE_STOP)
-                IF p_list(i).trigger_type = p_trigger THEN                    
-                    CASE
-                        WHEN p_list(i).condition_operator IN ('ON_START', 'ON_STOP', 'ON_UPDATE', 'ON_EVENT', C_PROCESS_STOP, C_PROCESS_START) THEN
-                            fire := TRUE;
-
-                        WHEN p_list(i).condition_operator IN ('ON_STOP', C_PROCESS_STOP) THEN
-                            fire := TRUE;
-
-                        WHEN p_list(i).condition_operator = 'RUNTIME_EXCEEDED' THEN
-                            if p_processRec.processEnd is null and 
-                                get_ms_diff(coalesce(p_processRec.lastUpdate, systimestamp), systimestamp) >  to_number(p_list(i).condition_value)
-                            then
-                                fire := TRUE;
-                            end if;
-
-                        WHEN p_list(i).condition_operator = 'MAX_RUNTIME_EXCEEDED' THEN
-                            if p_processRec.processEnd is not null and
-                                get_ms_diff(p_processRec.processStart, p_processRec.processEnd) >  to_number(p_list(i).condition_value)
-                            then
-                                fire := TRUE;
-                            end if;
-
-                        WHEN p_list(i).condition_operator = 'STEPS_LEFT_HIGH' THEN
-                            if p_processRec.stepsTodo - p_processRec.stepsDone > (p_list(i).condition_value) then
-                                fire := TRUE;
-                            end if;                                
-
-                        WHEN p_list(i).condition_operator = 'SUCCESS_RATE_LOW' THEN
-                            if coalesce(p_processRec.stepsTodo, 0) > 0 and (
-                                p_processRec.stepsDone / p_processRec.stepsTodo * 100 < to_number(p_list(i).condition_value)
-                            ) then
-                                fire := TRUE;
-                            end if; 
-
-                        WHEN p_list(i).condition_operator = 'MAX_OCCURRENCE' THEN
-                            if p_processRec.stepsTodo - p_processRec.stepsDone > (p_list(i).condition_value) then
-                                fire := TRUE;
-                            end if;                                
-
-                        WHEN p_list(i).condition_operator = 'STATUS_EQUALS' THEN
-                            if coalesce(p_processRec.status, -1) = to_number(p_list(i).condition_value) then
-                                fire := TRUE;
-                            end if; 
-
-                        WHEN p_list(i).condition_operator = 'INFO_CONTAINS' THEN
-                            if p_processRec.info is not null and
-                                UPPER(p_processRec.info) LIKE '%' || UPPER(p_list(i).condition_value) || '%' then
-                                fire := TRUE;
-                            end if;
-
-                        WHEN p_list(i).condition_operator = 'PRECEDED_BY' THEN
-                            declare
-                                l_history_key  PLS_INTEGER := g_last_action_per_process(p_processRec.id).full_key;
-                            begin                                
-                                -- Wenn im JSON nur "ACTION" steht, schneiden wir den Context beim Vergleich ab
-                                IF l_history_key = p_list(i).condition_value 
-                                   OR l_history_key LIKE p_list(i).condition_value || '|%' THEN
-                                    -- Treffer!
-                                    null;
-                                ELSE
-                                    fire := TRUE;
-                                END IF;
-                            end;
-
-                        WHEN p_list(i).condition_operator = 'PRECEDED_BY_WITHIN_SECS' THEN
-                            IF g_last_action_per_process.EXISTS(p_processRec.id) THEN
-                                DECLARE
-                                    l_history     t_action_history_rec := g_last_action_per_process(p_processRec.id);
-                                    l_pos         PLS_INTEGER; 
-                                    l_expected    VARCHAR2(100);
-                                    l_max_seconds NUMBER;
-                                    l_gap_ms      NUMBER;
-                                BEGIN
-                                    -- Validierung: Wenn keine Pipe da ist, ist die Regel ungültig konfiguriert
-                                    l_pos := instr(p_list(i).condition_value, '|', -1);
-                                    IF l_pos > 0 THEN
-                                        l_expected    := substr(p_list(i).condition_value, 1, l_pos - 1);
-                                        l_max_seconds := to_number(substr(p_list(i).condition_value, l_pos + 1)); -- Rule in seconds                            
-                                        -- 1. Identität prüfen
-                                        IF l_history.full_key != l_expected THEN
-                                            fire := TRUE; 
-                                        ELSE
-                                            -- 2. Zeitfenster prüfen
-                                            l_gap_ms := get_ms_diff(l_history.stop_time, p_processRec.processStart);
-                                            IF (l_gap_ms / 1000) > l_max_seconds THEN
-                                                fire := TRUE; 
-                                            END IF;
-                                        END IF;
-                                    END IF;
-                                END;
-                            ELSE
-                                fire := TRUE; -- Gar kein Vorgänger vorhanden!
-                            END IF;
-
-                    END CASE;
-                END IF;
-
-                if fire then
-                    p_monRec.process_id := p_processRec.id;
-                    p_monRec.action_name := p_processRec.processName;
-                    p_monRec.context_name := null;
-                    p_monRec.action_count := p_processRec.stepsDone;
-                    fire_alert(p_list(i), p_monRec);
-                end if;
-
-            END LOOP;
-        END;
-
-    BEGIN
-        -- Prozesse kennen keinen Kontext (Key: Action)
-        IF g_rules_by_action.EXISTS(p_processRec.processName) THEN
-            apply_rule_list(g_rules_by_action(p_processRec.processName));
-        END IF;
-    END;
-*/
     --------------------------------------------------------------------------
     -- Avoid throttling 
     --------------------------------------------------------------------------
@@ -1555,6 +1294,7 @@ raise;
                 process_name       VARCHAR2(50),
                 master_table_name  VARCHAR2(50), 
                 monitor_table_name VARCHAR2(50), 
+                logging_table_name VARCHAR2(50), 
                 action_name        VARCHAR2(100) NOT NULL,
                 context_name       VARCHAR2(100),
                 group_name         VARCHAR2(100),
@@ -1697,18 +1437,6 @@ raise;
             if should_raise_error(p_processId) then
                 RAISE;
             end if ;
-    end;
-
-    --------------------------------------------------------------------------
-
-    function getProcessRecord(p_processId number) return t_process_rec
-    as
-    begin
-        if g_process_cache(p_processId).id is not null then
-            return g_process_cache(p_processId);
-        else
-            return null;
-        end if ;
     end;
 
     --------------------------------------------------------------------------
@@ -3025,6 +2753,20 @@ raise;
         sendNoWait(p_processId, 'SET_ANY_STATUS', l_payload, 0.5);
     end;
 
+    --------------------------------------------------------------------------
+    
+    function logLevelToEnum(p_level number) return varchar2
+    as
+    begin
+        case p_level
+            when logLevelSilent     then return 'SILENT';
+            when logLevelError       then return 'ERROR';
+            when logLevelWarn        then return 'WARN';
+            when logLevelMonitor     then return 'MONITOR';
+            when logLevelInfo        then return 'INFO';
+            when logLevelDebug       then return 'DEBUG';
+        end case;
+    end;
 
     --------------------------------------------------------------------------
 
@@ -3064,11 +2806,12 @@ raise;
         p_timestamp TIMESTAMP
     )
     as
-       l_packageName VARCHAR2(128);
-       l_aimDepth    PLS_INTEGER := NULL;
-       l_maxDepth    PLS_INTEGER;
-       l_module      VARCHAR2(255) := p_caller;
-       v_stack_unit  UTL_CALL_STACK.unit_qualified_name; 
+        l_packageName VARCHAR2(128);
+        l_aimDepth    PLS_INTEGER := NULL;
+        l_maxDepth    PLS_INTEGER;
+        l_module      VARCHAR2(255) := p_caller;
+        v_dummyMonRec   t_monitor_buffer_rec;
+        v_stack_unit  UTL_CALL_STACK.unit_qualified_name; 
     begin
         -- lookup in stack - who called me?
         if l_module is null then
@@ -3116,6 +2859,15 @@ raise;
                 DBMS_UTILITY.FORMAT_CALL_STACK
             );
         end if ;
+        
+        -- raise alert
+        v_dummyMonRec.process_id := p_processId;
+        v_dummyMonRec.start_time := coalesce(p_timestamp, systimestamp);
+        v_dummyMonRec.stop_time := null;
+        v_dummyMonRec.monitor_type := C_LOGGING;
+        v_dummyMonRec.action_name := 'LOGGING';
+        v_dummyMonRec.context_name := logLevelToEnum(p_level);
+        evaluateRules(v_dummyMonRec, C_LOGGING);
 
         -- Wenn harte Fehler, muss das Logfile geschrieben werden
         if p_level = logLevelError then
@@ -3641,10 +3393,11 @@ raise;
         createLogTables(p_session_init.tabNameMaster);
 --            end if ;
 
+        -- New Process ID by Sequence
         execute immediate 'select seq_lilam_log.nextVal from dual' into p_processId;
+        
         -- persist to session internal table
         if l_session_init.logLevel is null then l_session_init.logLevel := logLevelMonitor; end if;
-
         insertSession (p_session_init.tabNameMaster, p_processId, l_session_init.logLevel);
         deleteOldLogs(p_processId, upper(trim(l_session_init.processName)), l_session_init.daysToKeep);
 
