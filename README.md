@@ -55,7 +55,7 @@ LILAM is developed by a developer who hates over-engineered tools. Focus: 5 minu
 
 ## Quick start
 1. Execute grants
-    refer [documentation file "setup.md"](docs/setup.md#privileges-of-your-schema-user)
+    refer [grants](docs/setup.md#privileges-of-your-schema-user)
 2. Compile Package
     package [spec](source/package/lilam.pks)
     package [body](source/package/lilam.pkb)
