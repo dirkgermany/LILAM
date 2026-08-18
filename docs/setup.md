@@ -56,7 +56,7 @@ After completing the setup steps, you can verify that LILAM is working correctly
 EXECUTE lilam.is_alive;
 
 -- Query the LILAM log data to verify automatic table creation
+SELECT * FROM lilam_proc;
 SELECT * FROM lilam_log;
-SELECT * FROM lilam_log_detail;
 ```
 
