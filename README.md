@@ -31,9 +31,9 @@ LILAM is developed by a developer who hates over-engineered tools. Focus: 5 minu
   END;
   /
 
-  select   log.no, log.info, log.session_time, log.caller
-  from     lilam_log log
-  order by log.process_id desc, log.no;
+  select   no, info, session_time, caller
+  from     lilam_log
+  order by process_id desc, no;
 ```
 
 ## Content
@@ -54,11 +54,8 @@ LILAM is developed by a developer who hates over-engineered tools. Focus: 5 minu
 - [Roadmap](#roadmap)
 
 ## Quick start
-1. Execute grants
-    refer [grants](docs/setup.md#privileges-of-your-schema-user)
-2. Compile Package
-    package [spec](source/package/lilam.pks)
-    package [body](source/package/lilam.pkb)
+1. Execute [grants](docs/setup.md#privileges-of-your-schema-user)
+3. Copy & compile [spec](source/package/lilam.pks) and [body](source/package/lilam.pkb)
 4. Execute
     ```sql
      l_pid := lilam.new_session('MY_PROCESS');
