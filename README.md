@@ -21,6 +21,7 @@ LILAM utilizes **autonomous transactions** to ensure that process states, log en
 LILAM is developed by a developer who hates over-engineered tools. Focus: 5 minutes to integrate, 100% visibility.
 
 ## Content
+- [Quick start] (#quick-start)
 - [Key features](#key-features)
 - [Fast integration](#fast-integration)
 - [Advantages](#advantages)
@@ -36,6 +37,23 @@ LILAM is developed by a developer who hates over-engineered tools. Focus: 5 minu
 - [License](#license)
 - [Roadmap](#roadmap)
 
+## Quick start 
+```sql
+  DECLARE
+    l_pid NUMBER;
+  BEGIN
+    l_pid := lilam.new_session('IMPORT_CUSTOMERS', lilam.logLevelInfo);
+    lilam.info(l_pid, 'Import started');
+    -- your business logic
+    lilam.info(l_pid, 'Import finished');
+    lilam.close_session(l_pid);
+  END;
+  /
+
+  select   log.no, log.info, log.session_time, log.caller
+  from     lilam_log log
+  order by log.process_id desc, log.no;
+```
 
 ## Key features
 1. **Lightweight:** One Package, a handful of Tables, one Sequence. That's it!
