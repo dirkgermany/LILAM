@@ -19,6 +19,22 @@ Its simple API allows for seamless integration into existing applications with m
 LILAM utilizes **autonomous transactions** to ensure that process states, log entries, and performance metrics are persisted independently of the main execution flow. This decoupled approach guarantees a complete audit trail and reliable monitoring data, even if the primary business process undergoes a rollback.
 
 LILAM is developed by a developer who hates over-engineered tools. Focus: 5 minutes to integrate, 100% visibility.
+```sql
+  DECLARE
+    l_pid NUMBER;
+  BEGIN
+    l_pid := lilam.new_session('IMPORT_CUSTOMERS', lilam.logLevelInfo);
+    lilam.info(l_pid, 'Import started');
+    -- your business logic
+    lilam.info(l_pid, 'Import finished');
+    lilam.close_session(l_pid);
+  END;
+  /
+
+  select   log.no, log.info, log.session_time, log.caller
+  from     lilam_log log
+  order by log.process_id desc, log.no;
+```
 
 ## Content
 - [Quick start](#quick-start)
@@ -37,23 +53,23 @@ LILAM is developed by a developer who hates over-engineered tools. Focus: 5 minu
 - [License](#license)
 - [Roadmap](#roadmap)
 
-## Quick start 
-```sql
-  DECLARE
-    l_pid NUMBER;
-  BEGIN
-    l_pid := lilam.new_session('IMPORT_CUSTOMERS', lilam.logLevelInfo);
-    lilam.info(l_pid, 'Import started');
-    -- your business logic
-    lilam.info(l_pid, 'Import finished');
-    lilam.close_session(l_pid);
-  END;
-  /
-
-  select   log.no, log.info, log.session_time, log.caller
-  from     lilam_log log
-  order by log.process_id desc, log.no;
-```
+## Quick start
+1. Execute grants
+    refer [documentation file "setup.md"](docs/setup.md#privileges-of-your-schema-user)
+2. Compile Package
+    package [spec](source/package/lilam.pks)
+    package [body](source/package/lilam.pkb)
+4. Execute
+    ```sql
+     l_pid := lilam.new_session('MY_PROCESS');
+     lilam.warn(l_pid, 'Hello LILAM');
+     lilam.close_session(l_pid);
+    ```
+5. Query
+    ```sql
+     select * from lilam.proc; -- process status
+     select * from lilam.log;  -- log details
+    ```
 
 ## Key features
 1. **Lightweight:** One Package, a handful of Tables, one Sequence. That's it!
