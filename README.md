@@ -21,7 +21,7 @@ LILAM utilizes **autonomous transactions** to ensure that process states, log en
 LILAM is developed by a developer who hates over-engineered tools. Focus: 5 minutes to integrate, 100% visibility.
 
 ## Content
-- [Quick start] (#quick-start)
+- [Quick start](#quick-start)
 - [Key features](#key-features)
 - [Fast integration](#fast-integration)
 - [Advantages](#advantages)
