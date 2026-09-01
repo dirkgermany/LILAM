@@ -1,6 +1,6 @@
 create or replace PACKAGE LILAM AS
     /* Complete Doc and last version see https://github.com/dirkgermany/LILA/docs */
-    LILAM_VERSION constant varchar2(20) := 'v1.5.0';
+    LILAM_VERSION constant varchar2(20) := 'v1.6.0';
 
     -- =====================================
     -- JSON as VARCHAR2 for max. performance
