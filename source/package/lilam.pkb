@@ -4482,7 +4482,7 @@ raise;
         g_shutdownPassword := p_password;
         g_serverPipeName := p_pipeName; --l_pipe;
         g_serverGroupName := p_groupName;
-        g_serverProcessId := new_session('LILAM_REMOTE_SERVER', logLevelMonitor);
+        g_serverProcessId := new_session('LILAM_SERVER', logLevelMonitor, 'LILAM_SERVER');
         registerServerPipe;
         preparePipe(g_serverPipeName);
         loadServerRules;
