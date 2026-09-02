@@ -514,7 +514,7 @@ Reads the numerical status of a process. The status values are not part of the L
  ```sql
   FUNCTION GET_PROCESS_STATUS(
     p_processId     NUMBER
-  ) RETURN T_PROCESS_REC
+  ) RETURN PLS_INTEGER
  ```
 
 **Returns**
@@ -682,7 +682,7 @@ Stops a transaction trace. The `p_action_name` and `p_context_name` must match t
 > This guarantees that even in the event of a failure, "dangling" traces are identified and recorded in the Log Table.
 
  ```sql
-  PROCEDURE TRACE_START
+  PROCEDURE TRACE_STOP
     p_processId     NUMBER,
     p_actionName    VARCHAR2,
     p_contextName  VARCHAR2,
@@ -855,7 +855,7 @@ TYPE t_session_init IS RECORD (
     stepsToDo PLS_INTEGER,
     daysToKeep PLS_INTEGER,
     procImmortal PLS_INTEGER,
-    tabNameMaster VARCHAR2(100) DEFAULT 'LILAM_LOG'
+    tabNameMaster VARCHAR2(100) DEFAULT 'LILAM'
 );
 ```
 
