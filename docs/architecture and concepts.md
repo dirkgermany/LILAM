@@ -305,6 +305,7 @@ The LILAM API consists of approximately 35 procedures and functions, some of whi
 
 ### Server Control
 * **START_SERVER:** Starts a LILAM server.
+* **CREATE_SERVER:** Starts a LILAM server as a background process (Job).
 * **SERVER_SHUTDOWN:** Shuts down a LILAM server.
 * **GET_SERVER_PIPE:** Returns the name of the pipe used to communicate with the server.
 * **SERVER_UPDATE_RULES:** Implements or changes the used rule set
