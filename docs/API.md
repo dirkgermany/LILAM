@@ -537,7 +537,7 @@ Reads the INFO-Text which is part of the process record. Likewise flexible and c
 
 #### Function GET_PROCESS_DATA
 > [!NOTE]
-> Every query for process data has an impact—albeit minor—on the overall system performance.
+> Every query for process data has a small impact on overall system performance. While this overhead is generally negligible, applications that frequently request multiple process attributes may benefit from retrieving all process data in a single call.
 > If such queries occur only sporadically or if only a few attributes are needed (e.g., the number of completed process steps), this impact is negligible. However, if queries are called frequently and several of the functions mentioned above are used (e.g., `GET_PROCESS_INFO`, `GET_PROCESS_STATUS`, `GET_PROC_STEPS_DONE`, ...), it is recommended to request this information collectively.
 > For this purpose, the function `GET_PROCESS_DATA` provides a record containing all relevant process data 'in one go': [#t_process_rec](#record-type-t_process_rec). This record serves as the exclusive way to retrieve the process name and the tabnameMaster attribute. Following LILAMs naming convention, the process table's name is deterministic: it always uses the master table's name as a prefix, followed by the suffix `_PROC`.
 
