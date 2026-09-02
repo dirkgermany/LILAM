@@ -24,7 +24,7 @@
   - [Logging](#logging)
     - [ERROR](#procedure-error)
     - [WARN](#procedure-warn)
-    - [INFO](#procedure-error)
+    - [INFO](#procedure-info)
     - [DEBUG](#procedure-debug)
   - [Metrics](#metrics)
     - [MARK_EVENT](#procedure-mark_event)
@@ -135,7 +135,7 @@ BEGIN
   lilam.trace_start(p_processId => l_processId, p_actionName => 'NEXT_STATION'); -- begins a transaction
   dbms_session.sleep(1);
   lilam.mark_event(p_processId => l_processId, p_actionName => 'DATA_LOAD');
-  lilam.trace_stop(p_processId => l_processId, p_actionName => 'TRACK_SECTION'); -- ends the transaction
+  lilam.trace_stop(p_processId => l_processId, p_actionName => 'NEXT_STATION'); -- ends the transaction
 
   -- 5. Update Process Status
   lilam.step_done(p_processId => l_processId); -- increments process step counter
