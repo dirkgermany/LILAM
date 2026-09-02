@@ -27,7 +27,7 @@
     - [INFO](#procedure-error)
     - [DEBUG](#procedure-debug)
   - [Metrics](#metrics)
-    - [MARK_STEP](#procedure-mark_step)
+    - [MARK_EVENT](#procedure-mark_event)
     - [GET_METRIC_AVG_DURATION](#function-get_metric_avg_duration)
     - [GET_METRIC_STEPS](#function-get_metric_steps)
   - [Server control](#server-control)
@@ -644,7 +644,7 @@ To ensure data integrity, LILAM monitors the state of all traces. Any trace that
 
 #### Procedure MARK_EVENT
 Reports a completed work step, which typically represents an intermediate stage in the process lifecycle. For this reason, markers must not be confused with the actual process steps.
-The MARK_STEP procedure reports a completed work step. Markers are distinguished by the `p_actionName` parameter. A process can contain any number of action names, enabling highly granular monitoring.
+The MARK_EVENT procedure reports a completed work step. Markers are distinguished by the `p_actionName` parameter. A process can contain any number of action names, enabling highly granular monitoring.
 With every marker report, LILAM calculates:
 * the time elapsed for this marker since the last report (except, of course, for the very first report of this action name),
 * the total number of reports for this marker to date (simple increment),
