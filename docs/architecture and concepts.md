@@ -105,7 +105,7 @@ LILAM captures detailed process steps by measuring their **frequency** and **dur
 **TRACE:** Measures the specific duration of a work step from start to finish.
 
 ### Analysis & Outliers
-For every action, LILAM maintains a **moving average**. This average is recorded with each new entry, allowing for real-time performance tracking. If a trace significantly deviates from this baseline, LILAM generates a **warning** in the Log Table.
+For every action, LILAM maintains a **moving average**. This average is recorded with each new entry, allowing for real-time performance tracking. If a trace significantly deviates from this baseline, LILAM evaluates your custom JSON rule-sets to automatically trigger specific **warnings** or **alerts** in the Log Table.
 
 **Example:**
 A process monitors actions **'A'** and **'B'**:
