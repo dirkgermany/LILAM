@@ -23,7 +23,7 @@
   - [In-Session](#in-session)
   - [Decoupled](#decoupled)
 - [Tables](#tables)
-  - [Master or Process Table](#master-or-process-table)
+  - [Process Table](#process-table)
   - [Log Table](#log-table)
   - [Monitor Table](#monitor-table)
   - [Registry Table](#registry-table)
@@ -232,8 +232,8 @@ With the possibility of using several LILAM Servers in parallel and simultaneous
 ## Tables
 A total of four tables are required for operation and user data, one of which serves solely for the internal synchronization of multiple LILAM servers (more on this later). The detailed structure of these tables is described in the README file of the LILAM project on GitHub.
 
-### Master or Process Table
-The process table, also known as the master table, represents the processes. For each process, exactly one entry exists in this master table. During the lifecycle of a process, this data may change—especially the counter for completed process steps (i.e., the work progress). Additional information includes the currently used log level for this process, the name of the process, the timestamps for process start, last reported update, and completion. Another important piece of data is the Session ID, which is used for management.
+### Process Table
+The process table represents the processes. For each process, exactly one entry exists in this master table. During the lifecycle of a process, this data may change—especially the counter for completed process steps (i.e., the work progress). Additional information includes the currently used log level for this process, the name of the process, the timestamps for process start, last reported update, and completion. Another important piece of data is the Session ID, which is used for management.
 
 The number of planned steps as well as the steps already completed are controlled by the application, either by explicitly setting these values or via an API trigger.
 
