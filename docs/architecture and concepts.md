@@ -146,15 +146,17 @@ The following metrics and operators can be defined within the JSON rule sets to 
 **Trigger:** PROCESS_START, PROCESS_UPDATE, PROCESS_STOP
 These rules evaluate the global state of a process stored in the Master Table.
 
-| Metric        | Operator Name (JSON)  | Technical Condition                             | Use Case                                      |
-| :------------ | :-------------------- | :---------------------------------------------- | :-------------------------------------------- |
-| **Runtime**   | `RUNTIME_EXCEEDED`    | `(SYSTIMESTAMP - PROCESS_START) > value`        | Detect hanging or "zombie" processes.         |
-| **Runtime**   | `MAX_RUNTIME_EXCEEDED` | `(PROCESS_END - PROCESS_START) > value`        | Process took too much time                    |
-| **Progress**  | `STEPS_LEFT_HIGH`     | `(STEPS_TODO - STEPS_DONE) > value`             | Check for unfinished work at process end.     |
-| **Efficiency**| `SUCCESS_RATE_LOW`    | `(STEPS_DONE / STEPS_TODO) * 100 < value`       | Monitor batch processing quality.             |
-| **Frequency** | `MAX_OCCURRENCE`      | `STEPS_DONE > value`                            | Flood protection / infinite loop detection.   |
-| **Status**    | `STATUS_EQUALS`       | `STATUS = value`                                | React to specific error status codes.         |
-| **Info Text** | `INFO_CONTAINS`       | `UPPER(INFO) LIKE '%' \|\| UPPER(value) \|\| '%'` | Search for keywords like "FATAL" or "ERROR".  |
+| Metric         | Operator Name (JSON)   | Technical Condition                               | Use Case                                       |
+| :------------- | :--------------------- | :------------------------------------------------ | :--------------------------------------------- |
+| **Runtime**    | `RUNTIME_EXCEEDED`     | `(SYSTIMESTAMP - PROCESS_START) > value`          | Detect hanging or "zombie" processes.          |
+| **Runtime**    | `MAX_RUNTIME_EXCEEDED` | `(PROCESS_END - PROCESS_START) > value`           | Process took too much time                     |
+| **Progress**   | `STEPS_LEFT_HIGH`      | `(STEPS_TODO - STEPS_DONE) > value`               | Check for unfinished work at process end.      |
+| **Efficiency** | `SUCCESS_RATE_LOW`     | `(STEPS_DONE / STEPS_TODO) * 100 < value`         | Monitor batch processing quality.              |
+| **Frequency**  | `MAX_OCCURRENCE`       | `STEPS_DONE > value`                              | Flood protection / infinite loop detection.    |
+| **Status**     | `STATUS_EQUALS`        | `STATUS = value`                                  | React to specific error status codes.          |
+| **Info Text**  | `INFO_CONTAINS`        | `UPPER(INFO) LIKE '%' \|\| UPPER(value) \|\| '%'` | Search for keywords like "FATAL" or "ERROR".   |
+| **Dependency** | `PRECEDED_BY`          | `value = <Event name>`                            | Validates predecessor.                         |
+| **Dependency** | `PRECEDED_BY_WITHIN_SECS` | `value = <Event name>`                         | Validates predecessor and max. delay. |
 
 #### Action & Context Metrics
 **Trigger:** TRACE_START, TRACE_STOP, MARK_EVENT
@@ -169,7 +171,8 @@ These rules evaluate granular performance data from the Monitor Table.
 | **Variance**    | `AVG_DEVIATION_PCT`   | `used_time > (avg_time * (1 + value/100))`      | Relative deviation from moving average.       |
 | **Frequency**   | `MAX_OCCURRENCE`      | `action_count > value`                          | Flood protection / infinite loop detection.   |
 | **Interval**    | `MAX_GAP_SECONDS`     | `(TIMESTAMP - LAST_TIMESTAMP) > value`          | Detect stall between two consecutive events.  |
-
+| **Dependency**  | `PRECEDED_BY`          | `value = <Event name>`                         | Validates predecessor.                         |
+| **Dependency**  | `PRECEDED_BY_WITHIN_SECS` | `value = <Event name>`                      | Validates predecessor and max. delay. |
 
 ### JSON Structure
 The JSON object is divided into a header for metadata and an array of individual rules. Alert throttling is managed in seconds:
