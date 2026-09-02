@@ -74,7 +74,7 @@ create or replace PACKAGE LILAM AS
         stepsToDo       PLS_INTEGER,
         daysToKeep      PLS_INTEGER := 100,
         procImmortal    PLS_INTEGER := 0,
-        tabNameMaster VARCHAR2(100) DEFAULT 'LILAM_LOG'
+        tabNameMaster VARCHAR2(100) DEFAULT 'LILAM'
     );
 
     -- ==============================
