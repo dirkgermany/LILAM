@@ -1799,7 +1799,7 @@ raise;
         if v_group_key is not null then
             -- calculate latency of oldest monitor entry until persistance
             v_latency  := get_ms_diff(g_firstMonTimeStamp, systimestamp);
-            g_avgLatencyMon := round((g_avgLatencyMon + v_latency) / nvl(g_monLatencyCounter, 1), 2);
+            g_avgLatencyMon := round((g_avgLatencyMon + v_latency) / nvl(nullif(g_monLatencyCounter, 0), 1), 2);
             if v_latency > g_maxLatencyMon then g_maxLatencyMon := v_latency; end if;        
         end if;
 
