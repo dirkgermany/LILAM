@@ -2952,7 +2952,7 @@ raise;
 
     --------------------------------------------------------------------------
 
-    FUNCTION GET_WARNING_COUNT(p_processId NUMBER) return PLS_INTEGER
+    FUNCTION GET_COUNTER_WARN(p_processId NUMBER) return PLS_INTEGER
     as
     begin
         return g_counterWarning;
@@ -2960,7 +2960,7 @@ raise;
     
     --------------------------------------------------------------------------
     
-    FUNCTION GET_ERROR_COUNT(p_processId NUMBER) return PLS_INTEGER
+    FUNCTION GET_COUNTER_ERROR(p_processId NUMBER) return PLS_INTEGER
     as
     begin
         return g_counterError;
