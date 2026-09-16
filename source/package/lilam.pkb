@@ -244,7 +244,11 @@ AS
 
     ---------------------------------------------------------------
     -- General Variables
-    ---------------------------------------------------------------    
+    ---------------------------------------------------------------   
+    -- Counter for ERROR and WARN Calls
+    g_counterError                      NUMBER := 0;
+    g_counterWarning                    NUMBER := 0;
+
     -- ALERT Registration
     g_isAlertRegistered                 BOOLEAN                 := false;
 
@@ -2933,6 +2937,7 @@ raise;
     procedure ERROR(p_processId number, p_logText varchar2)
     as
     begin
+        g_counterError := g_counterError + 1;
         log_any(
             p_processId, 
             logLevelError,
@@ -2947,11 +2952,28 @@ raise;
 
     --------------------------------------------------------------------------
 
+    FUNCTION GET_WARNING_COUNT(p_processId NUMBER) return PLS_INTEGER
+    as
+    begin
+        return g_counterWarning;
+    end;
+    
+    --------------------------------------------------------------------------
+    
+    FUNCTION GET_ERROR_COUNT(p_processId NUMBER) return PLS_INTEGER
+    as
+    begin
+        return g_counterError;
+    end;
+    
+    --------------------------------------------------------------------------
+
     -- Used by external Procedure to write a new log entry with log level WARN
     -- Details are adjusted to the warn level
     procedure WARN(p_processId number, p_logText varchar2)
     as
     begin
+        g_counterWarning := g_counterWarning + 1;
         log_any(
             p_processId, 
             logLevelWarn,
