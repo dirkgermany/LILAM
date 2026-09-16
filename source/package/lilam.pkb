@@ -52,6 +52,7 @@ AS
     ---------------------------------------------------------------
     C_MON_TYPE_EVENT                CONSTANT PLS_INTEGER := 0; -- Simple event, no stop-time
     C_MON_TYPE_TRACE                CONSTANT PLS_INTEGER := 1; -- Transaction with start and stop
+    C_MON_TYPE_LOG                  CONSTANT PLS_INTEGER := 2; -- Placeholder without sense
 
     ---------------------------------------------------------------
     -- Sessions
@@ -2868,7 +2869,7 @@ raise;
         v_dummyMonRec.process_id := p_processId;
         v_dummyMonRec.start_time := coalesce(p_timestamp, systimestamp);
         v_dummyMonRec.stop_time := null;
-        v_dummyMonRec.monitor_type := C_LOGGING;
+        v_dummyMonRec.monitor_type := C_MON_TYPE_LOG;
         v_dummyMonRec.action_name := 'LOGGING';
         v_dummyMonRec.context_name := logLevelToEnum(p_level);
         evaluateRules(v_dummyMonRec, C_LOGGING);
