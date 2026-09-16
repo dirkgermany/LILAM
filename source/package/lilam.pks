@@ -1,6 +1,6 @@
 create or replace PACKAGE LILAM AS
     /* Complete Doc and last version see https://github.com/dirkgermany/LILA/docs */
-    LILAM_VERSION constant varchar2(20) := 'v1.6.0';
+    LILAM_VERSION constant varchar2(20) := 'v1.6.1';
 
     -- =====================================
     -- JSON as VARCHAR2 for max. performance
@@ -137,6 +137,8 @@ create or replace PACKAGE LILAM AS
     FUNCTION GET_PROCESS_INFO(p_processId NUMBER) RETURN VARCHAR2;
     FUNCTION GET_PROCESS_DATA(p_processId NUMBER) RETURN t_process_rec;
     FUNCTION GET_PROCESS_DATA_JSON(p_processId NUMBER) return varchar2;
+    FUNCTION GET_WARNING_COUNT(p_processId NUMBER) return PLS_INTEGER;
+    FUNCTION GET_ERROR_COUNT(p_processId NUMBER) return PLS_INTEGER;
 
     ------------------
     -- Logging details
