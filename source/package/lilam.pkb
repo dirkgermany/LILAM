@@ -3913,7 +3913,7 @@ raise;
 
     --------------------------------------------------------------------------
 
-    FUNCTION SERVER_NEW_SESSION(p_processName varchar2, p_logLevel PLS_INTEGER, p_procStepsToDo PLS_INTEGER, p_daysToKeep PLS_INTEGER, p_tabNameMaster varchar2) RETURN VARCHAR2
+    FUNCTION SERVER_NEW_SESSION(p_processName varchar2, p_logLevel PLS_INTEGER, p_procStepsToDo PLS_INTEGER, p_daysToKeep PLS_INTEGER, p_tabNameMaster varchar2) RETURN NUMBER
     as
         l_payload JSON_OBJ_LILAM;
     begin
@@ -3928,7 +3928,7 @@ raise;
 
     --------------------------------------------------------------------------
 
-    FUNCTION SERVER_NEW_SESSION(p_processName varchar2, p_groupName VARCHAR2, p_logLevel PLS_INTEGER, p_procStepsToDo PLS_INTEGER, p_daysToKeep PLS_INTEGER, p_tabNameMaster varchar2) RETURN VARCHAR2
+    FUNCTION SERVER_NEW_SESSION(p_processName varchar2, p_groupName VARCHAR2, p_logLevel PLS_INTEGER, p_procStepsToDo PLS_INTEGER, p_daysToKeep PLS_INTEGER, p_tabNameMaster varchar2) RETURN NUMBER
     as
         l_payload JSON_OBJ_LILAM;
     begin
@@ -3944,10 +3944,9 @@ raise;
 
     --------------------------------------------------------------------------
 
-    FUNCTION SERVER_NEW_SESSION(p_jasonString varchar2) RETURN NUMBER
+    FUNCTION SERVER_NEW_SESSION(p_jsonObject JSON_OBJ_LILAM) RETURN NUMBER
     as
         l_ProcessId number(19,0) := -500;   
-        l_payload   JSON_OBJ_LILAM;
         l_response  varchar2(100);        
     begin                        
         -- zunächst mal schauen, welche Server bereitstehen
