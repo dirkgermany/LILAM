@@ -1510,7 +1510,7 @@ raise;
             -- Bulk-Insert über alle gesammelten Log-Einträge
             forall i in 1 .. p_levels.count SAVE EXCEPTIONS
                 execute immediate 
-                    'insert into ' || p_target_table || ' 
+                    'insert into ' || v_safe_table || ' 
                     (PROCESS_ID, LOG_LEVEL, INFO, SESSION_TIME, NO, CALLER, ERR_STACK, ERR_BACKTRACE, ERR_CALLSTACK, SESSION_USER, HOST_NAME)
                     values (:1, :2, :3, :4, :5, :6, :7, :8, :9, :10, :11)'
                 USING p_processId, p_levels(i), p_texts(i), p_times(i), p_seqs(i), p_callers(i), p_stacks(i), p_backtraces(i), p_callstacks(i),
