@@ -3950,7 +3950,7 @@ raise;
         l_response  varchar2(100);        
     begin                        
         -- zunächst mal schauen, welche Server bereitstehen
-        l_response := waitForResponse(null, 'NEW_SESSION', p_jasonString, C_TIMEOUT_NEW_SESSION);
+        l_response := waitForResponse(null, 'NEW_SESSION', p_jsonObject, C_TIMEOUT_NEW_SESSION);
 
         CASE
             WHEN l_response = 'TIMEOUT' THEN
