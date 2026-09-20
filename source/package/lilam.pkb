@@ -4862,20 +4862,14 @@ AS
     ------------------------------------------------------------------------
 
     PROCEDURE logLilamErr AS
+        pragma autonomous_transaction;
     BEGIN
-        if g_lilamSessionId = -1 then
-            g_lilamSessionId := new_session('LILAM ERROR PROCESS');
-        end if;
-        
-        log_any(
-            g_lilamSessionId,
-            logLevelError,
-            sqlErrM,
-            null,
-            DBMS_UTILITY.FORMAT_ERROR_STACK,
-            DBMS_UTILITY.FORMAT_ERROR_BACKTRACE,
-            DBMS_UTILITY.FORMAT_CALL_STACK
-        );
+        BEGIN
+            dbms_output.put_line('LILAM ERR: ' || substr(sqlErrM,1,1000));
+            commit;
+        EXCEPTION
+            when others then null;
+        END;
     END;
 
     ------------------------------------------------------------------------
