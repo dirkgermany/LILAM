@@ -2859,9 +2859,9 @@ raise;
                 p_logText,
                 p_timestamp,
                 l_module,
-                null,
-                null,
-                DBMS_UTILITY.FORMAT_CALL_STACK
+                p_errStack,
+                p_errBacktrace,
+                p_errCallstack
             );
         end if ;
         
@@ -2980,9 +2980,9 @@ raise;
             logLevelWarn,
             p_logText,
             null,
-            null,
-            null,
-            null,
+            DBMS_UTILITY.FORMAT_ERROR_STACK,
+            DBMS_UTILITY.FORMAT_ERROR_BACKTRACE,
+            DBMS_UTILITY.FORMAT_CALL_STACK,
             SYSTIMESTAMP
         );
     end;
