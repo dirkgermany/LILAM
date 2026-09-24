@@ -31,7 +31,6 @@ AS
     -- Placeholders for tables
     ---------------------------------------------------------------
     C_PARAM_MASTER_TABLE            CONSTANT varchar2(50) := 'PH_MASTER_TABLE';
-    C_PARAM_PROC_TABLE              CONSTANT varchar2(50) := 'PH_PROC_TABLE';
     C_PARAM_LOG_TABLE               CONSTANT varchar2(50) := 'PH_LOG_TABLE';
     C_PARAM_MON_TABLE               CONSTANT varchar2(50) := 'PH_MON_TABLE';
     C_LILAM_SERVER_REGISTRY         CONSTANT VARCHAR2(50) := 'LILAM_SERVER_REGISTRY';
@@ -245,13 +244,16 @@ AS
 
     ---------------------------------------------------------------
     -- General Variables
-    ---------------------------------------------------------------   
+    ---------------------------------------------------------------
+    -- Exclusive SessionId for Logging internal Errors or Warnings
+    g_lilamSessionId                    NUMBER := -1; -- -1 as Flag for not initialized
+    
     -- Counter for ERROR and WARN Calls
     g_counterError                      NUMBER := 0;
     g_counterWarning                    NUMBER := 0;
 
     -- ALERT Registration
-    g_isAlertRegistered                 BOOLEAN                 := false;
+    g_isAlertRegistered                 BOOLEAN := false;
 
     TYPE code_map_t IS TABLE OF PLS_INTEGER INDEX BY VARCHAR2(30);
     g_response_codes code_map_t;
@@ -284,6 +286,7 @@ AS
     procedure sync_monitor(p_processId number, p_force boolean default false);
     procedure sync_process(p_processId number, p_force boolean default false);
     procedure flushMonitor(p_processId number);
+    procedure logLilamErr;
     function getServerPipeAvailable(p_groupName varchar2) return varchar2;
 
     ---------------------------------------------------------------
@@ -303,6 +306,23 @@ AS
             g_response_codes(TXT_ERR_UNKNOWN)     := NUM_ERR_UNKNOWN;
         end if ;
     END initialize_map;
+
+    --------------------------------------------------------------------------
+    
+    function logLevelToEnum(p_level number) return varchar2
+    as
+    begin
+        case p_level
+            when logLevelSilent     then return 'SILENT';
+            when logLevelError       then return 'ERROR';
+            when logLevelWarn        then return 'WARN';
+            when logLevelMonitor     then return 'MONITOR';
+            when logLevelInfo        then return 'INFO';
+            when logLevelDebug       then return 'DEBUG';
+        end case;
+    end;
+
+    --------------------------------------------------------------------------
 
     FUNCTION get_serverCode(p_txt VARCHAR2) RETURN PLS_INTEGER IS
     BEGIN
@@ -330,7 +350,7 @@ AS
     BEGIN
         RETURN g_remote_sessions.EXISTS(p_processId);
     END is_remote;
-
+    
     ------------------------------------------------------------------------
 
     function jsonObject(p_jsonString varchar2, p_path varchar2) return varchar2
@@ -354,7 +374,9 @@ AS
     begin
         return JSON_VALUE(p_json_doc, '$.' || jsonPath returning NUMBER);
     exception 
-        when others then return null; -- Oder Fehlerbehandlung
+        when others then
+        logLilamErr;
+        return null;
     end;
 
     --------------------------------------------------------------------------
@@ -364,7 +386,9 @@ AS
     BEGIN
         RETURN TO_TIMESTAMP(p_obj.get_string(p_key), 'YYYY-MM-DD"T"HH24:MI:SS.FF');
     EXCEPTION 
-        WHEN OTHERS THEN raise; --RETURN NULL; -- Oder Fehlerhandling
+        WHEN OTHERS THEN
+        logLilamErr;
+        return null;
     END;
 
     --------------------------------------------------------------------------
@@ -374,7 +398,9 @@ AS
     begin
         return JSON_VALUE(p_json_doc, '$.' || jsonPath returning TIMESTAMP);
     exception 
-        when others then raise; --return null; -- Oder Fehlerbehandlung
+        when others then
+        logLilamErr;
+        return null;
     end;
 
     ------------------------------------------------------------------------
@@ -664,8 +690,8 @@ AS
 
     exception
         when others then
-            rollback;
-            error(g_serverProcessId, g_serverPipeName || '=>Alert konnte nicht ausgelöst werden: ' || sqlErrM);
+            logLilamErr;
+            error(p_rec.process_id, 'Could not raise alert : ' || sqlErrM);
     END;
     
     ------------------------------------------------------------
@@ -855,7 +881,9 @@ AS
 
     EXCEPTION
         WHEN OTHERS THEN
-            RAISE;
+            logLilamErr;
+            error(p_ctx.process_id, 'Could not evaluate rule internal: ' || sqlErrM);
+        
     END evaluateRules_internal;
 
     -- Hilfsfunktion zum Mappen von Monitor-Daten
@@ -964,8 +992,9 @@ AS
 
     exception
         when others then
-raise;
+            logLilamErr;
             l_status := DBMS_PIPE.REMOVE_PIPE(l_clientChannel);
+            error(p_processId, 'Wait for response failed: ' || sqlErrM);
     end;
 
     ---------------------------------------------------------------
@@ -1013,9 +1042,10 @@ raise;
         when NO_DATA_FOUND then
             return null;
         when others then
-            raise;
+            logLilamErr;
+            
     end;
-
+    
     ---------------------------------------------------------------
 
     procedure send_sync_signal(p_processId number)
@@ -1026,7 +1056,8 @@ raise;
 
     exception
         when others then
-            raise;
+            logLilamErr;
+            error(p_processId, 'Could not send synchronization signal to server: ' || sqlErrM);
     end;
 
     --------------------------------------------------------------------------
@@ -1120,7 +1151,8 @@ raise;
 
     exception
         when others then
-            raise;
+            logLilamErr;
+            error(p_processId, 'Could not send message to server: ' || sqlErrM);
     end;
 
     --------------------------------------------------------------------------    
@@ -1136,7 +1168,9 @@ raise;
         end if ;
         return false;
     exception
-        when others then return false; -- Sicherheit geht vor
+        when others then
+            logLilamErr;
+            error(p_processId, 'Check "should raise error" failed: ' || sqlErrM);
     end;  
 
     --------------------------------------------------------------------------
@@ -1149,8 +1183,7 @@ raise;
 
     exception
         when OTHERS then
-    raise;
- --           null;
+        logLilamErr;
     end;
 
     --------------------------------------------------------------------------
@@ -1200,7 +1233,7 @@ raise;
         if not objectExists(p_TabNameMaster || C_SUFFIX_PROC_TABLE, 'TABLE') then
             -- Master table
             sqlStmt := '
-            create table PH_MASTER_TABLE ( 
+            create table ' || C_PARAM_MASTER_TABLE || ' ( 
                 id               NUMBER(19,0),
                 process_name     VARCHAR2(100),
                 log_level        NUMBER,
@@ -1221,11 +1254,12 @@ raise;
         if not objectExists(p_TabNameMaster || C_SUFFIX_LOG_TABLE, 'TABLE') then
             -- Details table
             sqlStmt := '
-            create table PH_LOG_TABLE (
+            create table ' || C_PARAM_LOG_TABLE || ' (
                 "PROCESS_ID"        number(19,0),
                 "NO"                number(19,0),
                 "INFO"              varchar2(2000),
-                "LOG_LEVEL"         varchar2(10),
+                "LOG_LEVEL"         number,
+                "LOG_LEVEL_C"       varchar2(10),
                 "SESSION_TIME"      timestamp(6) DEFAULT SYSTIMESTAMP,
                 "SESSION_USER"      varchar2(50),
                 "HOST_NAME"         varchar2(50),
@@ -1241,7 +1275,7 @@ raise;
         if not objectExists(p_TabNameMaster || C_SUFFIX_MON_TABLE, 'TABLE') then
             -- Details table
             sqlStmt := '
-            create table PH_MON_TABLE (
+            create table ' || C_PARAM_MON_TABLE || ' (
                 "PROCESS_ID"    number(19,0),
                 "MON_TYPE"      number DEFAULT 0,
                 "START_TIME"    timestamp(6)  DEFAULT SYSTIMESTAMP,
@@ -1322,7 +1356,7 @@ raise;
         if not objectExists('idx_lilam_main_id', 'INDEX') then
             sqlStmt := '
             CREATE INDEX idx_lilam_main_id
-            ON PH_MASTER_TABLE (id)';
+            ON ' || C_PARAM_MASTER_TABLE || ' (id)';
             sqlStmt := replaceNameTable(sqlStmt, C_PARAM_MASTER_TABLE, C_SUFFIX_PROC_TABLE, p_TabNameMaster);
             run_sql(sqlStmt);
         end if ;
@@ -1330,7 +1364,7 @@ raise;
         if not objectExists('idx_lilam_LOG_master', 'INDEX') then
             sqlStmt := '
             CREATE INDEX idx_lilam_LOG_master
-            ON PH_LOG_TABLE (process_id)';
+            ON ' || C_PARAM_LOG_TABLE || ' (process_id)';
             sqlStmt := replaceNameTable(sqlStmt, C_PARAM_LOG_TABLE, C_SUFFIX_LOG_TABLE, p_TabNameMaster);
             run_sql(sqlStmt);
         end if ;
@@ -1338,7 +1372,7 @@ raise;
         if not objectExists('idx_lilam_mon_master', 'INDEX') then
             sqlStmt := '
             CREATE INDEX idx_lilam_mon_master
-            ON PH_MON_TABLE (process_id)';
+            ON ' || C_PARAM_MON_TABLE || ' (process_id)';
             sqlStmt := replaceNameTable(sqlStmt, C_PARAM_MON_TABLE, C_SUFFIX_MON_TABLE, p_TabNameMaster);
             run_sql(sqlStmt);
         end if ;
@@ -1346,7 +1380,7 @@ raise;
         if not objectExists('idx_lilam_LOG_info', 'INDEX') then
             sqlStmt := '
             CREATE INDEX idx_lilam_LOG_info
-            ON PH_LOG_TABLE (info)';
+            ON ' || C_PARAM_LOG_TABLE || ' (info)';
             sqlStmt := replaceNameTable(sqlStmt, C_PARAM_LOG_TABLE, C_SUFFIX_LOG_TABLE, p_TabNameMaster);
             run_sql(sqlStmt);
         end if ;
@@ -1354,7 +1388,7 @@ raise;
        if not objectExists('idx_lilam_cleanup', 'INDEX') then
             sqlStmt := '
             CREATE INDEX idx_lilam_cleanup 
-            ON PH_MASTER_TABLE (process_name, process_end)';
+            ON ' || C_PARAM_MASTER_TABLE || ' (process_name, process_end)';
             sqlStmt := replaceNameTable(sqlStmt, C_PARAM_MASTER_TABLE, C_SUFFIX_PROC_TABLE, p_TabNameMaster);
             run_sql(sqlStmt);
         end if ;
@@ -1377,13 +1411,13 @@ raise;
 
     exception      
         when others then
-            -- creating log files mustn't fail
-            RAISE;
+        logLilamErr;
      end;
 
     --------------------------------------------------------------------------
-    -- Kills log entries depending to their age in days and process name.
-    -- Matching of process name is not case sensitive
+    -- Deletes log entries based on their age (in days) and the process name.
+    -- Matching of process name is not case sensitive.
+    -- Doesn't work if the Master-Tablename of the process changed in the meantime.
     procedure deleteOldLogs(p_processId number, p_processName varchar2, p_daysToKeep number)
     as
         pragma autonomous_transaction;
@@ -1392,24 +1426,34 @@ raise;
         sessionRec t_session_rec;
         processIdToDelete number(19,0);
     begin
+        
         if p_daysToKeep is null then
             return;
         end if ;
+        
+        -- 1. eine aktive Session über die ID suchen; darin steckt der Name
+        --    der Master-Tabelle
+        -- 2. im vorgefertigten SQL den Namen der Master-Tabelle ersetzen
+        -- 3. alle veralteten IDs aus der Master-Tabelle suchen
+        -- 4. im Loop die Daten aus den Log-, Monitor- und Mastertabellen löschen
 
-        -- find out process IDs
-        sqlStatement := '
-        select id from PH_MASTER_TABLE
-        where process_end <= sysdate - :PH_DAYS_TO_KEEP
-        and upper(process_name) = upper(:PH_PROCESS_NAME)
-        and process_immortal = 0';
-
+        -- 1.
         sessionRec := getSessionRecord(p_processId);
         if sessionRec.process_id is null then
             return; 
         end if ;
 
+        -- basic sql for iteration through (old) sessions
+        sqlStatement := '
+        select id from ' || C_PARAM_MASTER_TABLE || '
+        where process_end <= sysdate - :PH_DAYS_TO_KEEP
+        and upper(process_name) = upper(:PH_PROCESS_NAME)
+        and process_immortal = 0';
+        
+        -- 2.
         sqlStatement := replaceNameTable(sqlStatement, C_PARAM_MASTER_TABLE, C_SUFFIX_PROC_TABLE, sessionRec.tabName_master);
 
+        -- 3., 4.
         -- for all process IDs
         open t_rc for sqlStatement using p_daysToKeep, p_processName;
         loop
@@ -1417,16 +1461,16 @@ raise;
             EXIT WHEN t_rc%NOTFOUND;
 
             -- delete Logs and Monitor-entries first (integrity)
-            sqlStatement := 'delete from PH_LOG_TABLE where process_id = :1';
+            sqlStatement := 'delete from ' || C_PARAM_LOG_TABLE || ' where process_id = :1';
             sqlStatement := replaceNameTable(sqlStatement, C_PARAM_LOG_TABLE, C_SUFFIX_LOG_TABLE, sessionRec.tabName_master);
             execute immediate sqlStatement USING processIdToDelete;
 
-            sqlStatement := 'delete from PH_MON_TABLE where process_id = :1';
+            sqlStatement := 'delete from ' || C_PARAM_MON_TABLE || ' where process_id = :1';
             sqlStatement := replaceNameTable(sqlStatement, C_PARAM_MON_TABLE, C_SUFFIX_MON_TABLE, sessionRec.tabName_master);
             execute immediate sqlStatement USING processIdToDelete;
 
             -- delete master
-            sqlStatement := 'delete from PH_MASTER_TABLE where id = :1';
+            sqlStatement := 'delete from ' || C_PARAM_MASTER_TABLE || ' where id = :1';
             sqlStatement := replaceNameTable(sqlStatement, C_PARAM_MASTER_TABLE, C_SUFFIX_PROC_TABLE, sessionRec.tabName_master);
             execute immediate sqlStatement USING processIdToDelete;
         end loop;
@@ -1439,8 +1483,9 @@ raise;
                 close t_rc;
             end if ;
             rollback; -- Auch im Fehlerfall die Transaktion beenden
+            logLilamErr;
             if should_raise_error(p_processId) then
-                RAISE;
+                error(p_processId, 'Deletion of old logs failed: ' || sqlErrM);
             end if ;
     end;
 
@@ -1466,7 +1511,7 @@ raise;
             info,
             process_immortal,
             tab_name_master
-        from PH_MASTER_TABLE
+        from ' || C_PARAM_MASTER_TABLE || '
         where id = :PH_PROCESS_ID';
 
         sessionRec := getSessionRecord(p_processId);
@@ -1478,11 +1523,11 @@ raise;
 
     exception
         when others then
+            logLilamErr;
             if should_raise_error(p_processId) then
-                RAISE;
-            else
-                return null;
+                error(p_processId, 'Reading process record failed: ' || sqlErrM);
             end if ;
+            return null;
     end;
 
     --------------------------------------------------------------------------
@@ -1493,6 +1538,7 @@ raise;
         p_target_table varchar2,
         p_seqs         sys.odcinumberlist,
         p_levels       sys.odcinumberlist,
+        p_levelsC      sys.odcivarchar2list,
         p_texts        sys.odcivarchar2list,
         p_times        t_timestamp_list_t,
         p_callers      sys.odcivarchar2list,
@@ -1512,8 +1558,8 @@ raise;
                 execute immediate 
                     'insert into ' || v_safe_table || ' 
                     (PROCESS_ID, LOG_LEVEL, INFO, SESSION_TIME, NO, CALLER, ERR_STACK, ERR_BACKTRACE, ERR_CALLSTACK, SESSION_USER, HOST_NAME)
-                    values (:1, :2, :3, :4, :5, :6, :7, :8, :9, :10, :11)'
-                USING p_processId, p_levels(i), p_texts(i), p_times(i), p_seqs(i), p_callers(i), p_stacks(i), p_backtraces(i), p_callstacks(i),
+                    values (:1, :2, :3, :4, :5, :6, :7, :8, :9, :10, :11, :12)'
+                USING p_processId, p_levels(i), p_levelsC(i), p_texts(i), p_times(i), p_seqs(i), p_callers(i), p_stacks(i), p_backtraces(i), p_callstacks(i),
                 SYS_CONTEXT('USERENV','SESSION_USER'), SYS_CONTEXT('USERENV','HOST');
             commit;
         end if;
@@ -1521,10 +1567,11 @@ raise;
     exception
         when others then
             rollback;
+            logLilamErr;
             if should_raise_error(p_processId) then
-                raise;
+                error(p_processId, 'Could not persist log data: ' || sqlErrM);
             end if ;
-
+            
     end;
 
     --------------------------------------------------------------------------
@@ -1539,6 +1586,7 @@ raise;
 
         -- Bulk-Listen für den Datentransfer (Schema-Level Typen)
         v_levels       sys.odcinumberlist   := sys.odcinumberlist();
+        v_levelsC      sys.odcivarchar2list := sys.odcivarchar2List();
         v_texts        sys.odcivarchar2list := sys.odcivarchar2list();
         v_times        t_timestamp_list_t   := t_timestamp_list_t(); 
         v_seqs         sys.odcinumberlist   := sys.odcinumberlist();
@@ -1566,6 +1614,7 @@ raise;
         -- 3. Daten aus der hierarchischen Map in flache Listen sammeln
         for i in 1 .. g_log_groups(v_key).COUNT loop
             v_levels.EXTEND;     v_levels(v_levels.LAST)     := g_log_groups(v_key)(i).log_level;
+            v_levelsC.EXTEND;    v_levelsC(v_levelsC.LAST)   := logLevelToEnum(g_log_groups(v_key)(i).log_level);
             v_texts.EXTEND;      v_texts(v_texts.LAST)       := substrb(g_log_groups(v_key)(i).log_text, 1, 4000);
             v_times.EXTEND;      v_times(v_times.LAST)       := g_log_groups(v_key)(i).log_time;
             v_seqs.EXTEND;       v_seqs(v_seqs.LAST)         := g_log_groups(v_key)(i).serial_no;
@@ -1582,6 +1631,7 @@ raise;
             p_processId    => p_processId,
             p_target_table => v_targetTable,
             p_levels       => v_levels,
+            p_levelsC      => v_levelsC,
             p_texts        => v_texts,
             p_times        => v_times,
             p_callers      => v_callers,
@@ -1596,9 +1646,9 @@ raise;
 
     exception
         when others then
-            -- Zentrale Fehlerbehandlung nutzen
+            logLilamErr;
             if should_raise_error(p_processId) then
-                raise;
+                error(p_processId, 'Flushing logs failed: ' || sqlErrM);
             end if ;
     end;
 
@@ -1694,10 +1744,10 @@ raise;
     exception
         when others then
             rollback;
-            -- Fehler-Logging hier sinnvoll, da autonome Transaktion den Fehler sonst "verschluckt"
---                if should_raise_error(p_processId) then
-                raise;
---                end if ;
+            logLilamErr;
+            if should_raise_error(p_processId) then
+                error(p_processId, 'Could not persist monitor data: ' || sqlErrM);
+            end if ;
     end;
 
     --------------------------------------------------------------------
@@ -1845,7 +1895,10 @@ raise;
 
     exception
         when others then
-            if should_raise_error(p_processId) then RAISE; end if ;
+            logLilamErr;
+            if should_raise_error(p_processId) then
+                error(p_processId, 'Could not flush monitor data: ' || sqlErrM);
+            end if ;
     end flushMonitor;
 
     --------------------------------------------------------------------------
@@ -1884,9 +1937,9 @@ raise;
 
     exception
         when others then
-            -- Sicherheit für das Framework: Fehler im Flush dürfen Applikation nicht stoppen
+            logLilamErr;
             if should_raise_error(p_processId) then
-                raise;
+                error(p_processId, 'Could not synchronize monitor data: ' || sqlErrM);
             end if ;
     end;
 
@@ -1958,8 +2011,9 @@ raise;
 
     EXCEPTION
         WHEN OTHERS THEN
+            logLilamErr;
             if should_raise_error(p_processId) then
-                raise;
+                error(p_processId, 'Could not send remote trace to server: ' || sqlErrM);
             end if ;
     end;
 
@@ -1983,9 +2037,10 @@ raise;
 
     EXCEPTION
         WHEN OTHERS THEN
+            logLilamErr;
             if should_raise_error(p_processId) then
-                raise;
-            end if ;    
+                error(p_processId, 'Could not send trace data to server: ' || sqlErrM);
+            end if ;
     end;
 
     --------------------------------------------------------------------------
@@ -2012,9 +2067,10 @@ raise;
 
     EXCEPTION
         WHEN OTHERS THEN
+            logLilamErr;
             if should_raise_error(p_processId) then
-                raise;
-            end if ;    
+                error(p_processId, 'Could not send event data to server: ' || sqlErrM);
+            end if ;  
     end;
 
     --------------------------------------------------------------------------
@@ -2103,8 +2159,9 @@ raise;
 
     exception
         when others then
+            logLilamErr;
             if should_raise_error(p_processId) then
-                RAISE;
+                error(p_processId, 'Could not buffer event data: ' || sqlErrM);
             end if ;
     end;
 
@@ -2208,8 +2265,9 @@ raise;
 
     exception
         when others then
+            logLilamErr;
             if should_raise_error(p_processId) then
-                RAISE;
+                error(p_processId, 'Could not buffer trace data: ' || sqlErrM);
             end if ;
     end;
 
@@ -2249,8 +2307,9 @@ raise;
     exception
         when others then
             -- Hier nutzen wir deine neue zentrale Fehler-Logik
+            logLilamErr;
             if should_raise_error(p_processId) then
-                raise;
+                error(p_processId, 'Could not search last monitor entry: ' || sqlErrM);
             end if ;
             return v_empty;
     end;
@@ -2268,8 +2327,9 @@ raise;
 
     exception
         when others then
+            logLilamErr;
             if should_raise_error(p_processId) then
-                raise;
+                error(p_processId, 'Check if monitor entry exists failed: ' || sqlErrM);
             end if ;
             return false;
     end;
@@ -2448,7 +2508,7 @@ raise;
         sqlStatement varchar2(1000);
     begin
         sqlStatement := '
-        update PH_MASTER_TABLE
+        update ' || C_PARAM_MASTER_TABLE || '
         set status           = :PH_STATUS,
             last_update      = current_timestamp,
             process_end      = :PH_PROCESS_END,
@@ -2473,8 +2533,9 @@ raise;
     exception
         when others then
             rollback; -- Auch im Fehlerfall die Transaktion beenden
+            logLilamErr;
             if should_raise_error(p_process_rec.id) then
-                RAISE;
+                error(p_process_rec.id, 'Could not persist process record: ' || sqlErrM);
             end if ;
     end;
 
@@ -2489,7 +2550,7 @@ raise;
         updateCount number;
     begin
         sqlStatement := '
-        update PH_MASTER_TABLE
+        update ' || C_PARAM_MASTER_TABLE || '
         set process_end = systimestamp,
             last_update = systimestamp';
 
@@ -2539,8 +2600,9 @@ raise;
             end if ;
             sqlCursor := null;
             rollback;
+            logLilamErr;
             if should_raise_error(p_processId) then
-                RAISE;
+                error(p_processId, 'Could not persist process data while closing session: ' || sqlErrM);
             end if ;
     end;
 
@@ -2552,7 +2614,7 @@ raise;
         sqlStatement varchar2(2000);
     begin
         sqlStatement := '
-        insert into PH_MASTER_TABLE (
+        insert into ' || C_PARAM_MASTER_TABLE || ' (
             id,
             process_name,
             process_start,
@@ -2586,8 +2648,9 @@ raise;
     exception
         when others then
             rollback; -- Auch im Fehlerfall die Transaktion beenden
+            logLilamErr;
             if should_raise_error(p_processId) then
-                RAISE;
+                error(p_processId, 'Could not persist new session data: ' || sqlErrM);
             end if ;
     end;
 
@@ -2632,8 +2695,9 @@ raise;
 
     exception
         when others then
+            logLilamErr;
             if should_raise_error(p_processId) then
-                raise;
+                error(p_processId, 'Could not synchronize process: ' || sqlErrM);
             end if ;
     end;    
 
@@ -2691,9 +2755,9 @@ raise;
 
     exception
         when others then
-            -- Sicherheit für das Framework: Fehler im Flush dürfen Applikation nicht stoppen
+            logLilamErr;
             if should_raise_error(p_processId) then
-                raise;
+                error(p_processId, 'Could not synchronize log data: ' || sqlErrM);
             end if ;
     end;
 
@@ -2723,8 +2787,9 @@ raise;
 
     EXCEPTION
         WHEN OTHERS THEN
+            logLilamErr;
             if should_raise_error(p_processId) then
-                raise;
+                error(p_processId, 'Could not send "CLOSE SESSION" to server: ' || sqlErrM);
             end if ;
     end;
 
@@ -2759,21 +2824,6 @@ raise;
     end;
 
     --------------------------------------------------------------------------
-    
-    function logLevelToEnum(p_level number) return varchar2
-    as
-    begin
-        case p_level
-            when logLevelSilent     then return 'SILENT';
-            when logLevelError       then return 'ERROR';
-            when logLevelWarn        then return 'WARN';
-            when logLevelMonitor     then return 'MONITOR';
-            when logLevelInfo        then return 'INFO';
-            when logLevelDebug       then return 'DEBUG';
-        end case;
-    end;
-
-    --------------------------------------------------------------------------
 
     procedure log_anyRemote(p_processId number, p_level number, p_logText varchar2, p_caller varchar2, p_errStack varchar2, p_errBacktrace varchar2, p_errCallstack varchar2, p_timestamp TIMESTAMP)
     as
@@ -2792,8 +2842,9 @@ raise;
 
     EXCEPTION
         WHEN OTHERS THEN
+            logLilamErr;
             if should_raise_error(p_processId) then
-                raise;
+                error(p_processId, 'Could not send log data to server: ' || sqlErrM);
             end if ;
     end;
 
@@ -2808,7 +2859,7 @@ raise;
         p_errStack varchar2,
         p_errBacktrace varchar2,
         p_errCallstack varchar2,
-        p_timestamp TIMESTAMP
+        p_timestamp TIMESTAMP DEFAULT sysdate
     )
     as
         l_packageName VARCHAR2(128);
@@ -2816,7 +2867,7 @@ raise;
         l_maxDepth    PLS_INTEGER;
         l_module      VARCHAR2(255) := p_caller;
         v_dummyMonRec   t_monitor_buffer_rec;
-        v_stack_unit  UTL_CALL_STACK.unit_qualified_name; 
+        v_stack_unit  UTL_CALL_STACK.unit_qualified_name;        
     begin
         -- lookup in stack - who called me?
         if l_module is null then
@@ -2883,9 +2934,9 @@ raise;
 
     exception
         when others then
-            -- Sicherheit für das Framework: Fehler im Flush dürfen Applikation nicht stoppen
+            logLilamErr;
             if should_raise_error(p_processId) then
-                raise;
+                error(p_processId, 'Could not log data: ' || sqlErrM);
             end if ;
     end;
 
@@ -3013,9 +3064,9 @@ raise;
 
     exception
         when others then
-            -- Sicherheit für das Framework: Fehler im Flush dürfen Applikation nicht stoppen
+            logLilamErr;
             if should_raise_error(p_processId) then
-                raise;
+                error(p_processId, 'Could not set process status: ' || sqlErrM);
             end if ;
     end;
 
@@ -3323,8 +3374,10 @@ raise;
 
     EXCEPTION
         WHEN OTHERS THEN
-            -- Hier optional Loggen, falls beim Cleanup was schief geht
-            RAISE;
+            logLilamErr;
+            if should_raise_error(p_processId) then
+                error(p_processId, 'Clearing buffered session data failed: ' || sqlErrM);
+            end if ;
     END;
 
     --------------------------------------------------------------------------
@@ -3691,7 +3744,7 @@ raise;
 
     exception
         when others then
-            null;
+            logLilamErr;
     end; 
 
     -------------------------------------------------------------------------- 
@@ -3741,7 +3794,8 @@ raise;
 
     exception
         when others then
-            null;
+            logLilamErr;
+    
     end;    
 
     -------------------------------------------------------------------------- 
@@ -3787,7 +3841,8 @@ raise;
 
     exception
         when others then
-            null;
+            logLilamErr;
+            error(l_processId, 'Could not send process data to client: ' || sqlErrM);
     end;    
 
     -------------------------------------------------------------------------- 
@@ -3821,6 +3876,8 @@ raise;
 
     exception
         when others then
+            logLilamErr;
+            error(p_clientChannel, 'Could not send unlock signal to client: ' || sqlErrM);
             null;
     end;    
 
@@ -3887,9 +3944,13 @@ raise;
 
     EXCEPTION
         WHEN OTHERS THEN
-            dbms_output.put_line(sqlErrM);
+            logLilamErr;
+            if should_raise_error(p_processId) then
+                error(p_processId, 'Could not send shutdown command to server: ' || sqlErrM);
+            end if ;
     end;
 
+    -------------------------------------------------------------------------- 
 
     procedure SERVER_SEND_ANY_MSG(p_processId number, p_message varchar2)
     as
@@ -3974,8 +4035,11 @@ raise;
 
     EXCEPTION
         WHEN OTHERS THEN
-        if SQLCODE != NUM_ERR_NO_SERVER then 
-            raise; 
+        if SQLCODE != NUM_ERR_NO_SERVER then
+            logLilamErr;
+            if should_raise_error(l_processId) then
+                error(l_processId, 'Could not send "new session command" to server: ' || sqlErrM);
+            end if ; 
         else
             return NUM_ERR_NO_SERVER;
         end if;
@@ -4117,8 +4181,8 @@ raise;
 
     exception
         when others then
-            raise;
             rollback;
+            logLilamErr;
     end;
 
     --------------------------------------------------------------------------
@@ -4133,8 +4197,10 @@ raise;
 
     EXCEPTION
         WHEN OTHERS THEN
-        raise;
-            lilam.error(g_serverProcessId, g_serverPipeName || '=>Failed to parse JSON rules: ' || SQLERRM);
+            logLilamErr;
+            if should_raise_error(g_serverProcessId) then
+                error(g_serverProcessId, 'Failed to parse JSON rules: ' || sqlErrM);
+            end if ; 
             rollback;
     END;
 
@@ -4217,8 +4283,11 @@ raise;
 
     EXCEPTION
         WHEN OTHERS THEN
-        raise;
-            lilam.error(g_serverProcessId, g_serverPipeName || '=>Failed to parse JSON rules: ' || SQLERRM);
+            logLilamErr;
+            if should_raise_error(g_serverProcessId) then
+                error(g_serverProcessId, g_serverPipeName || '=>Failed to parse JSON rules: ' || sqlErrM);
+            end if ; 
+            
     END;
 
     --------------------------------------------------------------------------
@@ -4256,7 +4325,10 @@ raise;
         when NO_DATA_FOUND then
             error(g_serverProcessId, g_serverPipeName || '=>Could not find server rule: ' || p_ruleSetName || '; version: ' || p_ruleSetVersion);
         when others then
-            raise;
+            logLilamErr;
+            if should_raise_error(g_serverProcessId) then
+                error(g_serverProcessId, g_serverPipeName || '=>Could not read server rule: ' || p_ruleSetName || '; version: ' || p_ruleSetVersion || '; ' || sqlErrM);
+            end if ;
     end;
 
     --------------------------------------------------------------------------
@@ -4278,8 +4350,8 @@ raise;
         when NO_DATA_FOUND then
             null; -- in der Registry smüssen für den Server keine Rules hinterlegt sein
         when others then
-            raise;
-    end;
+            logLilamErr;
+        end;
 
     --------------------------------------------------------------------------
 
@@ -4365,7 +4437,7 @@ raise;
     exception
         when others then
             rollback;
-            raise;
+            logLilamErr;
     end;
 
     --------------------------------------------------------------------------
@@ -4374,7 +4446,6 @@ raise;
     as
         l_status    PLS_INTEGER;
         l_message   VARCHAR2(32767);
-        l_stop_server_exception EXCEPTION;
         c_max_timeout CONSTANT NUMBER := C_SERVER_TIMEOUT_MAX_WAIT; -- Maximum für den Eco-Mode
         c_min_timeout CONSTANT NUMBER := C_SERVER_TIMEOUT_WAIT_FOR_MSG;
     begin
@@ -4388,14 +4459,10 @@ raise;
                 return l_message;
 
                 EXCEPTION
-                    WHEN l_stop_server_exception THEN
-                        -- Diese Exception wird NICHT hier abgefangen, 
-                        -- sondern nach außen an den Loop gereicht.
-                        RAISE;
                     WHEN OTHERS THEN
+                        logLilamErr;
                         -- WICHTIG: Fehler loggen, aber die Schleife NICHT verlassen!
-                        raise;
-                        ERROR(g_serverProcessId, g_serverPipeName || '=>Internal START_SERVER; Critical Error while processing command: ' || SQLERRM);
+                        ERROR(g_serverProcessId, g_serverPipeName || '=>Receiving message per pipe; ' || SQLERRM);
                 END; 
         else
              p_cur_timeout := LEAST(p_cur_timeout + C_SERVER_TIMEOUT_WAIT_FOR_MSG, c_max_timeout);
@@ -4494,7 +4561,6 @@ raise;
         l_request        VARCHAR2(500);
         l_dummyRes       PLS_INTEGER;
         l_shutdownSignal BOOLEAN := FALSE;
-        l_stop_server_exception EXCEPTION;            
         l_lastHeartbeat  TIMESTAMP := sysTimestamp;
         l_lastSync       TIMESTAMP := sysTimestamp;  
         l_loopCounter    PLS_INTEGER := 0;
@@ -4524,14 +4590,9 @@ raise;
                 l_request := extractClientRequest(l_message);
                 l_shutdownSignal := processRequest(l_request, l_message, l_clientChannel);
                 EXCEPTION
-                    WHEN l_stop_server_exception THEN
-                        -- Diese Exception wird NICHT hier abgefangen, 
-                        -- sondern nach außen an den Loop gereicht.
-                        RAISE;
-
                     WHEN OTHERS THEN
+                        logLilamErr;
                         -- WICHTIG: Fehler loggen, aber die Schleife NICHT verlassen!
-                        -- raise;
                         ERROR(g_serverProcessId, g_serverPipeName || '=>Internal START_SERVER; Critical Error while processing command: ' || SQLERRM);
                 END; 
             end if;
@@ -4598,14 +4659,9 @@ raise;
         updateServerRegistry(FALSE, 0);
 
     EXCEPTION
-    WHEN l_stop_server_exception THEN
-        -- Hier landen wir nur, wenn der Server gezielt beendet werden soll
-        DBMS_OUTPUT.PUT_LINE('Err: ' || sqlerrm);
-        ERROR(g_serverProcessId, g_serverPipeName || '=>Internal START_SERVER; Critical Error while processing command: ' || SQLERRM);
-
-        CLOSE_SESSION(g_serverProcessId);
 
     WHEN OTHERS THEN
+        logLilamErr;
         DBMS_PIPE.PURGE(g_serverPipeName); 
         l_dummyRes := DBMS_PIPE.REMOVE_PIPE(g_serverPipeName);
         DBMS_PIPE.PURGE(g_serverPipeName || C_INTERLEAVE_PIPE_SUFFIX);
@@ -4613,7 +4669,6 @@ raise;
         clearServerData;
         clearAllSessionData(g_serverProcessId);
         updateServerRegistry(FALSE, -1);
-        raise;
     end;
 
     --------------------------------------------------------------------------
@@ -4726,6 +4781,8 @@ raise;
 
     EXCEPTION
         WHEN OTHERS THEN
+            logLilamErr;
+
             jsonPut(l_jsonHeader, 'status', 'ERROR');
             jsonPut(l_jsonPayload, 'returns', 'ERROR_MSG');
             jsonPut(l_jsonPayload, 'value', SQLERRM);
@@ -4802,10 +4859,24 @@ raise;
 
     EXCEPTION
         WHEN OTHERS THEN
+        logLilamErr;
         DBMS_OUTPUT.PUT_LINE('Err: ' || sqlerrm);
         ERROR(g_serverProcessId, g_serverPipeName || '=>Internal CREATE_SERVER; Critical Error while processing command: ' || SQLERRM);
         return 'Internal CREATE_SERVER; job_action = ' || l_action || '; Critical Error while processing command: ' || SQLERRM;
 
+    END;
+    
+    ------------------------------------------------------------------------
+
+    PROCEDURE logLilamErr AS
+        pragma autonomous_transaction;
+    BEGIN
+        BEGIN
+            dbms_output.put_line('LILAM ERR: ' || substr(sqlErrM,1,1000));
+            commit;
+        EXCEPTION
+            when others then null;
+        END;
     END;
 
     ------------------------------------------------------------------------
