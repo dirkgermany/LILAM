@@ -307,6 +307,23 @@ AS
         end if ;
     END initialize_map;
 
+    --------------------------------------------------------------------------
+    
+    function logLevelToEnum(p_level number) return varchar2
+    as
+    begin
+        case p_level
+            when logLevelSilent     then return 'SILENT';
+            when logLevelError       then return 'ERROR';
+            when logLevelWarn        then return 'WARN';
+            when logLevelMonitor     then return 'MONITOR';
+            when logLevelInfo        then return 'INFO';
+            when logLevelDebug       then return 'DEBUG';
+        end case;
+    end;
+
+    --------------------------------------------------------------------------
+
     FUNCTION get_serverCode(p_txt VARCHAR2) RETURN PLS_INTEGER IS
     BEGIN
         initialize_map; -- Stellt sicher, dass die Map befüllt ist
@@ -1241,7 +1258,8 @@ AS
                 "PROCESS_ID"        number(19,0),
                 "NO"                number(19,0),
                 "INFO"              varchar2(2000),
-                "LOG_LEVEL"         varchar2(10),
+                "LOG_LEVEL"         number,
+                "LOG_LEVEL_C"       varchar2(10),
                 "SESSION_TIME"      timestamp(6) DEFAULT SYSTIMESTAMP,
                 "SESSION_USER"      varchar2(50),
                 "HOST_NAME"         varchar2(50),
@@ -1520,6 +1538,7 @@ AS
         p_target_table varchar2,
         p_seqs         sys.odcinumberlist,
         p_levels       sys.odcinumberlist,
+        p_levelsC      sys.odcivarchar2list,
         p_texts        sys.odcivarchar2list,
         p_times        t_timestamp_list_t,
         p_callers      sys.odcivarchar2list,
@@ -1539,8 +1558,8 @@ AS
                 execute immediate 
                     'insert into ' || v_safe_table || ' 
                     (PROCESS_ID, LOG_LEVEL, INFO, SESSION_TIME, NO, CALLER, ERR_STACK, ERR_BACKTRACE, ERR_CALLSTACK, SESSION_USER, HOST_NAME)
-                    values (:1, :2, :3, :4, :5, :6, :7, :8, :9, :10, :11)'
-                USING p_processId, p_levels(i), p_texts(i), p_times(i), p_seqs(i), p_callers(i), p_stacks(i), p_backtraces(i), p_callstacks(i),
+                    values (:1, :2, :3, :4, :5, :6, :7, :8, :9, :10, :11, :12)'
+                USING p_processId, p_levels(i), p_levelsC(i), p_texts(i), p_times(i), p_seqs(i), p_callers(i), p_stacks(i), p_backtraces(i), p_callstacks(i),
                 SYS_CONTEXT('USERENV','SESSION_USER'), SYS_CONTEXT('USERENV','HOST');
             commit;
         end if;
@@ -1567,6 +1586,7 @@ AS
 
         -- Bulk-Listen für den Datentransfer (Schema-Level Typen)
         v_levels       sys.odcinumberlist   := sys.odcinumberlist();
+        v_levelsC      sys.odcivarchar2list := sys.odcivarchar2List();
         v_texts        sys.odcivarchar2list := sys.odcivarchar2list();
         v_times        t_timestamp_list_t   := t_timestamp_list_t(); 
         v_seqs         sys.odcinumberlist   := sys.odcinumberlist();
@@ -1594,6 +1614,7 @@ AS
         -- 3. Daten aus der hierarchischen Map in flache Listen sammeln
         for i in 1 .. g_log_groups(v_key).COUNT loop
             v_levels.EXTEND;     v_levels(v_levels.LAST)     := g_log_groups(v_key)(i).log_level;
+            v_levelsC.EXTEND;    v_levelsC(v_levelsC.LAST)   := logLevelToEnum(g_log_groups(v_key)(i).log_level);
             v_texts.EXTEND;      v_texts(v_texts.LAST)       := substrb(g_log_groups(v_key)(i).log_text, 1, 4000);
             v_times.EXTEND;      v_times(v_times.LAST)       := g_log_groups(v_key)(i).log_time;
             v_seqs.EXTEND;       v_seqs(v_seqs.LAST)         := g_log_groups(v_key)(i).serial_no;
@@ -1610,6 +1631,7 @@ AS
             p_processId    => p_processId,
             p_target_table => v_targetTable,
             p_levels       => v_levels,
+            p_levelsC      => v_levelsC,
             p_texts        => v_texts,
             p_times        => v_times,
             p_callers      => v_callers,
@@ -2799,21 +2821,6 @@ AS
         jsonPut(l_payload,'timestamp', p_timestamp);
 
         sendNoWait(p_processId, 'SET_ANY_STATUS', l_payload, 0.5);
-    end;
-
-    --------------------------------------------------------------------------
-    
-    function logLevelToEnum(p_level number) return varchar2
-    as
-    begin
-        case p_level
-            when logLevelSilent     then return 'SILENT';
-            when logLevelError       then return 'ERROR';
-            when logLevelWarn        then return 'WARN';
-            when logLevelMonitor     then return 'MONITOR';
-            when logLevelInfo        then return 'INFO';
-            when logLevelDebug       then return 'DEBUG';
-        end case;
     end;
 
     --------------------------------------------------------------------------
