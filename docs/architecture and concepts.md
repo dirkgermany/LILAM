@@ -323,7 +323,28 @@ In the interest of flexibility, it is possible to use dedicated LILAM logging ta
 But beware! The choice of tables and their names should be well-planned to avoid chaos caused by an excessive number of different LILAM logging tables.
 
 ### Registry Table
-The `LILAM_SERVER_REGISTRY` is used for the coordination and assignment of LILAM servers. Its name is fixed.
+
+The `LILAM_SERVER_REGISTRY` table maintains the runtime state of registered LILAM servers. Unlike the process, log, and monitor tables, its name is fixed and is not derived from `tabNameMaster`.
+
+Each active LILAM server registers itself in this table and periodically updates its activity information. Clients use the registry to discover suitable servers and to select a server based on its current load.
+
+If `SERVER_NEW_SESSION` is called with a `p_groupName`, only servers registered for the requested group are considered.
+
+#### Table Structure
+> [!NOTE]
+> `LAST_ACTIVITY` acts as the server heartbeat. During server discovery, entries older than 15 seconds are not considered available.
+
+| Column | Data Type | Description |
+| --- | --- | --- |
+| `PIPE_NAME` | `VARCHAR2(50)` | Unique pipe name used to identify and communicate with the LILAM server. |
+| `GROUP_NAME` | `VARCHAR2(50)` | Optional group to which the server is assigned. Used to restrict server selection when `p_groupName` is specified. |
+| `LAST_ACTIVITY` | `TIMESTAMP(3)` | Timestamp of the server's most recent heartbeat/activity. Used to determine whether the server is still available. |
+| `CURRENT_LOAD` | `NUMBER` | Current server load used by clients when selecting an available server. |
+| `IS_ACTIVE` | `NUMBER(1)` | Indicates whether the server is marked as active. |
+| `STATUS` | `VARCHAR2(20)` | Current status of the server. |
+| `PROCESSING` | `NUMBER` | Indicates what the server is currently processing. |
+| `RULE_SET_NAME` | `VARCHAR2(30)` | Name of the rule set currently associated with the server. |
+| `SET_IN_USE` | `NUMBER` | Version of the rule set currently imported by the server. |
 
 ### Rules Table
 **Rules** define how LILAM reacts to incoming **signals**. They are organized into **Rule Sets**, which are structured as JSON objects for maximum flexibility. 
