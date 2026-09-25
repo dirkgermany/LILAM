@@ -233,7 +233,7 @@ With the possibility of using several LILAM Servers in parallel and simultaneous
 ## Tables
 LILAM uses two categories of tables: **process-specific tables** for application data and **fixed internal tables** for framework-wide functionality.
 
-### Process-Specific Tables
+#### Process-Specific Tables
 Process-specific tables store process state, logging data, and monitoring data. Their names are derived from a common, freely configurable master name (`tabNameMaster`) by appending a fixed suffix.
 
 | Purpose | Fixed Suffix | Default Table Name |
@@ -254,7 +254,7 @@ For example, if `tabNameMaster` is set to `MY_APPLICATION`, LILAM uses:
 This allows different applications, processes, or environments to use separate sets of LILAM tables without requiring additional configuration tables.
 A total of four tables are required for operation and user data, one of which serves solely for the internal synchronization of multiple LILAM servers (more on this later). The detailed structure of these tables is described in the README file of the LILAM project on GitHub.
 
-### Fixed Internal Tables
+#### Fixed Internal Tables
 In addition to the process-specific tables, LILAM uses internal tables whose names are fixed and must not be changed.
 
 | Table | Purpose |
@@ -270,7 +270,6 @@ In addition to the process-specific tables, LILAM uses internal tables whose nam
 The process table represents the processes. For each process, exactly one entry exists in this master table. During the lifecycle of a process, this data may change—especially the counter for completed process steps (i.e., the work progress). Additional information includes the currently used log level for this process, the name of the process, the timestamps for process start, last reported update, and completion. Another important piece of data is the Session ID, which is used for management.
 
 #### Table Structure
-
 All Process Tables use the following structure, regardless of the configured table name:
 
 | Column | Data Type | Description |
@@ -294,7 +293,6 @@ The number of planned steps as well as the steps already completed are controlle
 Stores chronological log entries including timestamps, severity levels, and detailed diagnostic information. Each entry is linked to its process through the `PROCESS_ID`.
 
 #### Table Structure
-
 All Log Tables use the following structure, regardless of the configured table name:
 
 | Column | Data Type | Description |
