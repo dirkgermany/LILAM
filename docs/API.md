@@ -192,7 +192,7 @@ The functions and procedures are organized into the following five groups:
 
 > [!NOTE]
 > All API calls are the same, independent of whether LILAM is used 'locally' or in a 'decoupled' manner. One exception is the function `SERVER_NEW_SESSION`, which initializes the LILAM package to function as a dedicated client, managing the communication with the LILAM server seamlessly.
-> **The parameters and return value of `SERVER_NEW_SESSION` are nearly identical to those of `NEW_SESSION`.** However, `SERVER_NEW_SESSION` includes an additional parameter to specify a target server. This ensures that the client connects to a specific server instance (e.g., for department-specific or multi-tenant tasks) rather than simply choosing the one with the lowest load.
+> **The parameters and return value of `SERVER_NEW_SESSION` are nearly identical to those of `NEW_SESSION`.** However, `SERVER_NEW_SESSION` includes an additional parameter to specify a server of a specific group. This ensures that the client connects to a specific server instance (e.g., for department-specific or multi-tenant tasks) rather than simply choosing the one with the lowest load.
 
 #### Function NEW_SESSION / SERVER_NEW_SESSION
 The `NEW_SESSION` resp. `SERVER_NEW_SESSION` function starts the logging session for a process. This procedure must be called first. Calls to the API without a prior `NEW_SESSION` do not make sense or can (theoretically) lead to undefined states.
@@ -242,7 +242,7 @@ FUNCTION NEW_SESSION(
 </details>
 
 <details>
-  <summary><b>5. using a data-structure (record)</b> (Standard initialization)</summary>
+  <summary><b>4. using a data-structure (record)</b> (Standard initialization)</summary>
   
   This variant uses the dedicated [`t_session_init` record](#record-type-t_session_init) for initializing the new session.
   
@@ -254,7 +254,21 @@ FUNCTION NEW_SESSION(
 </details>
 
 <details>
-  <summary><b>4. Connecting to selected server</b> (With progress tracking)</summary>
+  <summary><b>5. Connecting to any available server</b></summary>
+
+```sql
+FUNCTION SERVER_NEW_SESSION(
+  p_processName   VARCHAR2, 
+  p_logLevel      PLS_INTEGER, 
+  p_procStepsToDo PLS_INTEGER, 
+  p_daysToKeep    PLS_INTEGER, 
+  p_TabNameMaster VARCHAR2
+) RETURN NUMBER
+ ```
+</details>
+
+<details>
+  <summary><b>6. Connecting to an available server of a specific group</b></summary>
 
 ```sql
 FUNCTION SERVER_NEW_SESSION(
@@ -576,7 +590,7 @@ For convenience, the configurable log levels are also declared as constants with
 | ------------------ | --------- | ----------------------------------- | -------
 | [`ERROR`](#procedure-error) | Procedure | Writes ERROR log entry | Logging
 | [`WARN`](#procedure-warn) | Procedure | Writes WARN log entry  | Logging
-| [`INFO`](#procedure-error) | Procedure | Writes INFO log entry  | Logging
+| [`INFO`](#procedure-info) | Procedure | Writes INFO log entry  | Logging
 | [`DEBUG`](#procedure-debug) | Procedure | Writes DEBUG log entry  | Logging
 
 #### Procedure ERROR
