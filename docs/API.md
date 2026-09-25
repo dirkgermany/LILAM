@@ -121,7 +121,7 @@ DECLARE
 BEGIN
   -- 1. Setup minimal configuration
   l_sessionInit.processName := 'DECOUPLED_SYNC';
-  l_sessionInit.logLevel    := logLevelInfo;     -- default is logLevelMonitorr
+  l_sessionInit.logLevel    := logLevelInfo;     -- default is logLevelMonitor
   
   -- 2. Initialize the session
   -- Use SERVER_NEW_SESSION to connect to a central LILAM management server.
@@ -234,7 +234,7 @@ FUNCTION NEW_SESSION(
 FUNCTION NEW_SESSION(
   p_processName   VARCHAR2, 
   p_logLevel      PLS_INTEGER, 
-  p_stepsToDo     PLS_INTEGER, 
+  p_procStepsToDo     PLS_INTEGER, 
   p_daysToKeep    PLS_INTEGER, 
   p_TabNameMaster VARCHAR2 DEFAULT 'LILAM'
 ) RETURN NUMBER
@@ -261,7 +261,7 @@ FUNCTION SERVER_NEW_SESSION(
   p_processName   VARCHAR2, 
   p_groupName     VARCHAR2,
   p_logLevel      PLS_INTEGER, 
-  p_stepsToDo     PLS_INTEGER, 
+  p_procStepsToDo PLS_INTEGER, 
   p_daysToKeep    PLS_INTEGER, 
   p_TabNameMaster VARCHAR2
 ) RETURN NUMBER
@@ -275,7 +275,7 @@ FUNCTION SERVER_NEW_SESSION(
 | p_processName | VARCHAR2| process_name | freely selectable name for identifying the process; is written to *master table* | [`M`](#m)
 | p_groupName | VARCHAR2| group_name | used to get a dedicated server for the group | [`N`](#n)
 | p_logLevel | PLS_INTEGER | log_level | determines the level of detail in *detail table* (see above) | [`M`](#m)
-| p_stepsToDo | PLS_INTEGER | steps_todo | defines how many steps must be done during the process | [`O`](#o)
+| p_procStepsToDo | PLS_INTEGER | steps_todo | defines how many steps must be done during the process | [`O`](#o)
 | p_daysToKeep | PLS_INTEGER | days_to_keep | max. age of entries in days; if not NULL, all entries older than p_daysToKeep and whose process name = p_processName (not case sensitive) are deleted | [`O`](#o)
 | p_TabNameMaster | VARCHAR2 | tab_name_master | optional prefix of the PROC, LOG AND MON table names (see above) | [`D`](#d)
 
@@ -326,7 +326,7 @@ Ends a logging session with optional final informations. Four function signature
  ```sql
   PROCEDURE CLOSE_SESSION(
     p_processId     NUMBER,
-    p_stepsDone     PLS_INTEGER,
+    p_procStepsDone     PLS_INTEGER,
     p_processInfo   VARCHAR2,
     p_processStatus PLS_INTEGER
   )
@@ -402,7 +402,7 @@ Documents the lifecycle of a process.
 | [`PROC_STEP_DONE`](#procedure-proc_step_done) | Procedure | Increments the counter of completed steps | Process
 | [`SET_PROC_STEPS_DONE`](#procedure-set_proc_steps_done) | Procedure | Sets the number of completed actions | Process
 | [`GET_PROC_STEPS_DONE`](#function-get_proc_steps_done) | FUNCTION | Returns number of already finished steps | Process
-| [`GET_PROC_STEPS_TODO`](#function-get_proc_steps_done) | FUNCTION | Returns number of steps to do | Process
+| [`GET_PROC_STEPS_TODO`](#function-get_proc_steps_todo) | FUNCTION | Returns number of steps to do | Process
 | [`GET_PROCESS_START`](#function-get_process_start) | FUNCTION | Returns time of process start | Process
 | [`GET_PROCESS_END`](#function-get_process_end) | FUNCTION | Returns time of process end (if finished) | Process
 | [`GET_PROCESS_STATUS`](#function-get_process_status) | FUNCTION | Returns the process state | Process
@@ -428,7 +428,7 @@ This value specifies the planned number of work steps for the entire process. Th
  ```sql
   PROCEDURE SET_PROC_STEPS_TODO(
     p_processId     NUMBER,
-    p_stepsToDo     PLS_INTEGER
+    p_procStepsToDo PLS_INTEGER
   )
 
  ```
@@ -448,7 +448,7 @@ Sets the total number of completed steps. Note: Calling this procedure overwrite
  ```sql
   PROCEDURE SET_PROC_STEPS_DONE(
     p_processId     NUMBER,
-    p_stepsDone     PLS_INTEGER
+    p_procStepsDone PLS_INTEGER
   )
  ```
 
