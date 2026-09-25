@@ -232,36 +232,50 @@ With the possibility of using several LILAM Servers in parallel and simultaneous
 ## Tables
 A total of four tables are required for operation and user data, one of which serves solely for the internal synchronization of multiple LILAM servers (more on this later). The detailed structure of these tables is described in the README file of the LILAM project on GitHub.
 
+LILAM uses three tables for storing process, log, and monitoring data. Their names are derived from a common, freely configurable master name (`tabNameMaster`) by appending a fixed suffix.
+ 
+| Purpose | Fixed Suffix | Default Table Name |
+| ------------ | ------- | ------------ |
+| Process data | `_PROC` | `LILAM_PROC`  |
+| Log data     | `_LOG`  | `LILAM_LOG`   |
+| Monitoring data | `_MON` | `LILAM_MON` |
+ 
+For example, if `tabNameMaster` is set to `MY_APPLICATION`, LILAM uses:
+ 
+- `MY_APPLICATION_PROC`
+- `MY_APPLICATION_LOG`
+- `MY_APPLICATION_MON`
+ 
+> [!IMPORTANT]
+> Only the master name is configurable. The suffixes `_PROC`, `_LOG`, and `_MON` are fixed and define the relationship between the three tables.
+
+
 ### Process Table
 The process table represents the processes. For each process, exactly one entry exists in this master table. During the lifecycle of a process, this data may change—especially the counter for completed process steps (i.e., the work progress). Additional information includes the currently used log level for this process, the name of the process, the timestamps for process start, last reported update, and completion. Another important piece of data is the Session ID, which is used for management.
 
+#### Table Structure
+
+All Process Tables use the following structure, regardless of the configured table name:
+
+| Column | Data Type | Description |
+| --- | --- | --- |
+| `ID` | `NUMBER(19)` | Unique Process ID assigned when the process is initialized. It is used to associate logs, metrics, and subsequent API calls with the process. |
+| `PROCESS_NAME` | `VARCHAR2(100)` | Application-defined name used to identify the process. |
+| `LOG_LEVEL` | `NUMBER` | Active log level for the process. |
+| `PROCESS_START` | `TIMESTAMP(6)` | Timestamp at which the process was initialized. |
+| `PROCESS_END` | `TIMESTAMP(6)` | Timestamp at which the process was finalized. |
+| `LAST_UPDATE` | `TIMESTAMP(6)` | Timestamp of the most recent update to the process record. |
+| `STEPS_TODO` | `NUMBER` | Planned number of work steps for the process. This value is managed by the calling application. |
+| `STEPS_DONE` | `NUMBER` | Number of completed work steps. This value is managed by the calling application through the Process Control API. |
+| `STATUS` | `NUMBER(2)` | Application-defined numerical process status. LILAM does not assign a specific meaning to this value. |
+| `INFO` | `VARCHAR2(2000)` | Application-defined information associated with the process. |
+| `PROCESS_IMMORTAL` | `NUMBER(1)` | Indicates whether the process is protected from automatic retention cleanup. |
+| `TAB_NAME_MASTER` | `VARCHAR2(100)` | Master table name associated with the process and used as the basis for deriving the related LILAM table names. |
+
 The number of planned steps as well as the steps already completed are controlled by the application, either by explicitly setting these values or via an API trigger.
-
-**The name of the Process Table is derived from the configured master table name by appending the fixed suffix `_PROC`.**
-
-For example:
-
-| Master Table Name | Process Table Name |
-| --- | --- |
-| `LILAM` | `LILAM_PROC` |
-| `MY_APPLICATION` | `MY_APPLICATION_PROC` |
-| `LILAM_LOGGING` | `LILAM_LOGGING_PROC` |
 
 ### Log Table
 Stores chronological log entries including timestamps, severity levels, and detailed diagnostic information. Each entry is linked to its process through the `PROCESS_ID`.
-
-The name of the Log Table is derived from the configured master table name by appending the fixed suffix `_LOG`.
-
-For example:
-
-| Master Table Name | Log Table Name |
-| --- | --- |
-| `LILAM` | `LILAM_LOG` |
-| `MY_APPLICATION` | `MY_APPLICATION_LOG` |
-| `LILAM_LOGGING` | `LILAM_LOGGING_LOG` |
-
-> [!IMPORTANT]
-> The suffix `_LOG` is fixed. The Log Table name must correspond to the master table name used when the LILAM session was initialized.
 
 #### Table Structure
 
