@@ -269,6 +269,8 @@ In addition to the process-specific tables, LILAM uses internal tables whose nam
 > Fixed internal tables are framework-wide and are independent of `tabNameMaster`.
 
 ### Process Table
+**Table Category:** Application-Specific Table
+
 The process table represents the processes. For each process, exactly one entry exists in this master table. During the lifecycle of a process, this data may change—especially the counter for completed process steps (i.e., the work progress). Additional information includes the currently used log level for this process, the name of the process, the timestamps for process start, last reported update, and completion. Another important piece of data is the Session ID, which is used for management.
 
 #### Table Structure
@@ -292,6 +294,8 @@ All Process Tables use the following structure, regardless of the configured tab
 The number of planned steps as well as the steps already completed are controlled by the application, either by explicitly setting these values or via an API trigger.
 
 ### Log Table
+**Table Category:** Application-Specific Table
+
 Stores chronological log entries including timestamps, severity levels, and detailed diagnostic information. Each entry is linked to its process through the `PROCESS_ID`.
 
 #### Table Structure
@@ -313,6 +317,8 @@ All Log Tables use the following structure, regardless of the configured table n
 | `ERR_CALLSTACK` | `VARCHAR2(4000)` | Call stack information, if available. |
 
 ### Monitor Table
+**Table Category:** Application-Specific Table
+
 Stores detailed monitoring data for events and traces. Each entry is linked to its process through `PROCESS_ID`.
 
 Events and traces share the same table structure. The `MON_TYPE` column identifies the type of monitoring entry, while `ACTION` and `CONTEXT` identify the monitored activity.
@@ -339,6 +345,7 @@ In the interest of flexibility, it is possible to use dedicated LILAM logging ta
 But beware! The choice of tables and their names should be well-planned to avoid chaos caused by an excessive number of different LILAM logging tables.
 
 ### Registry Table
+**Table Category:** Fixed Internal Table
 
 The `LILAM_SERVER_REGISTRY` table maintains the runtime state of registered LILAM servers. Unlike the process, log, and monitor tables, its name is fixed and is not derived from `tabNameMaster`.
 
@@ -363,7 +370,9 @@ If `SERVER_NEW_SESSION` is called with a `p_groupName`, only servers registered 
 | `SET_IN_USE` | `NUMBER` | Version of the rule set currently imported by the server. |
 
 ### Rules Table
-**Rules** define how LILAM reacts to incoming **signals**. They are organized into **Rule Sets**, which are structured as JSON objects for maximum flexibility.
+**Table Category:** Fixed Internal Table
+
+Rules define how LILAM reacts to incoming signals. They are organized into Rule Sets, which are structured as JSON objects for maximum flexibility.
 
 The central table `LILAM_RULES` acts as the repository for these configurations. Its name is fixed and is not derived from `tabNameMaster`.
 
@@ -380,6 +389,7 @@ Rule Sets are stored as JSON documents and identified by their name and version.
 | `AUTHOR` | `VARCHAR2(50)` | Author associated with the Rule Set. |
 
 ### Internal Log Table
+**Table Category:** Fixed Internal Table
 
 The `LILAM_LOG_INTERNAL` table provides a dedicated fallback logging mechanism for errors occurring within the LILAM framework itself.
 
