@@ -760,6 +760,8 @@ Returns the number of markers, grouped by their respective action names.
 
 ---
 ### Server Control
+A LILAM server is a long-running process that receives requests from decoupled clients. Servers are identified by their pipe name and may optionally belong to a group. Clients can either connect to any available server or restrict server selection to a specific group.
+
 In server mode, LILAM acts as a central service provider to deliver several key advantages:
 * Centralized Logging & Monitoring: Consolidates all log data and metrics into a single, unified oversight layer.
 * Targeted Orchestration: Manages jobs and data specifically tailored to horizontal or vertical organizational units (e.g., department-specific or multi-tenant environments).
