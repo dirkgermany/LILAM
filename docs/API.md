@@ -461,8 +461,8 @@ Sets the total number of completed steps. Note: Calling this procedure overwrite
 | --------- | ---- | --- | ----------- | -------
 | p_processId | NUMBER | process_id | ID of the process to which the session applies | [`M`](#m)
 | p_processStatus | PLS_INTEGER | process_status | information about the overall state of the process | [`O`](#o)
-| p_stepsToDo | PLS_INTEGER | steps_todo | Number of work steps that would have been necessary for complete processing. This value must be managed by the calling package | [`N`](#n)
-| p_stepsDone | PLS_INTEGER | steps_done | Number of work steps that were actually processed. This value must be managed by the calling package | [`N`](#n)
+| p_procStepsToDo | PLS_INTEGER | steps_todo | Number of work steps that would have been necessary for complete processing. This value must be managed by the calling package | [`N`](#n)
+| p_procStepsDone | PLS_INTEGER | steps_done | Number of work steps that were actually processed. This value must be managed by the calling package | [`N`](#n)
 | p_processInfo | VARCHAR2 | process_info | Final information about the process (e.g., a readable status) | [`N`](#n)
 | p_status | PLS_INTEGER | status | Final status of the process (freely selected by the calling package) | [`N`](#n)
 
