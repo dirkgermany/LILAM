@@ -256,7 +256,6 @@ For example:
 > The suffix `_LOG` is fixed. The Log Table name must correspond to the master table name used when the LILAM session was initialized.
 
 #### Table Structure
-#### Table Structure
 
 All Log Tables use the following structure, regardless of the configured table name:
 
@@ -265,7 +264,8 @@ All Log Tables use the following structure, regardless of the configured table n
 | `PROCESS_ID` | `NUMBER(19)` | Identifies the process to which the log entry belongs. |
 | `NO` | `NUMBER(19)` | Sequential counter per process. It reflects the order in which the logging procedures were called. |
 | `INFO` | `VARCHAR2(2000)` | Contains the actual log message. |
-| `LOG_LEVEL` | `VARCHAR2(10)` | Severity level of the log entry, such as `ERROR`, `WARN`, `INFO`, or `DEBUG`. |
+| `LOG_LEVEL` | `VARCHAR2(10)` | Numeric representation of the log severity level. |
+| `LOG_LEVEL_C` | `VARCHAR2(10)` | Text representation of the log severity level, such as `ERROR`, `WARN`, `INFO`, or `DEBUG`. |
 | `SESSION_TIME` | `TIMESTAMP(6)` | Timestamp at which the log entry was recorded. |
 | `SESSION_USER` | `VARCHAR2(50)` | Database session user, determined by `SYS_CONTEXT('USERENV','SESSION_USER')`. |
 | `HOST_NAME` | `VARCHAR2(50)` | Client host, determined by `SYS_CONTEXT('USERENV','HOST')`. |
