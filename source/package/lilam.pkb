@@ -35,6 +35,7 @@ AS
     C_PARAM_MON_TABLE               CONSTANT varchar2(50) := 'PH_MON_TABLE';
     C_LILAM_SERVER_REGISTRY         CONSTANT VARCHAR2(50) := 'LILAM_SERVER_REGISTRY';
     C_LILAM_RULES_TABLE             CONSTANT VARCHAR2(50) := 'LILAM_RULES';
+    C_LILAM_LOG_TABLE               CONSTANT VARCHAR2(20) := 'LILAM_LOG_INTERNAL';
 
     ---------------------------------------------------------------
     -- Other general Parameters
@@ -2832,7 +2833,7 @@ AS
         jsonPut(l_payload, 'steps_todo', p_procStepsToDo);
         jsonPut(l_payload, 'steps_done', p_procStepsDone);
         jsonPut(l_payload, 'process_info', p_processInfo);
-        jsonPut(l_payload, 'process_status', p_status);
+        jsonPut(l_payload, 'process_status', p_processStatus);
 
         l_response := waitForResponse(p_processId, 'CLOSE_SESSION', l_payload, 1);
 
@@ -3428,50 +3429,6 @@ AS
 
     --------------------------------------------------------------------------
 
-    PROCEDURE CLOSE_SESSION(p_processId NUMBER, p_processInfo VARCHAR2, p_pocessStatus PLS_INTEGER)
-    as
-    begin
-        close_session(
-            p_processId   => p_processId, 
-            p_procStepsToDo   => null, 
-            p_procStepsDone   => null, 
-            p_processInfo => p_processInfo, 
-            p_status      => p_processStatus
-        );
-    end;
-
-    --------------------------------------------------------------------------
-
-    PROCEDURE CLOSE_SESSION(p_processId NUMBER, p_procStepsDone PLS_INTEGER, p_processInfo VARCHAR2, p_processStatus PLS_INTEGER)
-    as
-    begin
-        close_session(
-            p_processId   => p_processId, 
-            p_procStepsToDo   => null, 
-            p_procStepsDone   => p_procStepsDone, 
-            p_processInfo => p_processInfo, 
-            p_status      => p_processStatus
-        );
-    end;
-
-    --------------------------------------------------------------------------
-
-    -- Ends an earlier started logging session by the process ID.
-    -- Important! Ignores if the process doesn't exist! No exception is thrown!
-    procedure CLOSE_SESSION(p_processId number)
-    as
-    begin
-        close_session(
-            p_processId   => p_processId, 
-            p_procStepsToDo   => null, 
-            p_procStepsDone   => null, 
-            p_processInfo => null, 
-            p_status      => null
-        );
-    end;
-
-    --------------------------------------------------------------------------
-
     procedure CLOSE_SESSION(p_processId number, p_procStepsToDo PLS_INTEGER, p_procStepsDone PLS_INTEGER, p_processInfo varchar2, p_processStatus PLS_INTEGER)
     as
         v_idx PLS_INTEGER;
@@ -3498,6 +3455,50 @@ AS
             checkLogsBuffer(p_processId, 'nach clearAllSessionData');
 
         end if ;
+    end;
+    
+    --------------------------------------------------------------------------
+
+    PROCEDURE CLOSE_SESSION(p_processId NUMBER, p_processInfo VARCHAR2, p_processStatus PLS_INTEGER)
+    as
+    begin
+        close_session(
+            p_processId      => p_processId, 
+            p_procStepsToDo  => null, 
+            p_procStepsDone  => null, 
+            p_processInfo    => p_processInfo, 
+            p_processStatus   => p_processStatus
+        );
+    end;
+
+    --------------------------------------------------------------------------
+
+    PROCEDURE CLOSE_SESSION(p_processId NUMBER, p_procStepsDone PLS_INTEGER, p_processInfo VARCHAR2, p_processStatus PLS_INTEGER)
+    as
+    begin
+        close_session(
+            p_processId      => p_processId, 
+            p_procStepsToDo  => null, 
+            p_procStepsDone  => p_procStepsDone, 
+            p_processInfo    => p_processInfo, 
+            p_processStatus   => p_processStatus
+        );
+    end;
+
+    --------------------------------------------------------------------------
+
+    -- Ends an earlier started logging session by the process ID.
+    -- Important! Ignores if the process doesn't exist! No exception is thrown!
+    procedure CLOSE_SESSION(p_processId number)
+    as
+    begin
+        close_session(
+            p_processId      => p_processId, 
+            p_procStepsToDo  => null, 
+            p_procStepsDone  => null, 
+            p_processInfo    => null, 
+            p_processStatus   => null
+        );
     end;
 
     --------------------------------------------------------------------------
