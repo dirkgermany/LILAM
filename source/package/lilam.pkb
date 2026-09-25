@@ -2821,7 +2821,7 @@ AS
 
     --------------------------------------------------------------------------
 
-    procedure close_sessionRemote(p_processId number, p_procStepsToDo number, p_procStepsDone number, p_processInfo varchar2, p_status PLS_INTEGER)
+    procedure close_sessionRemote(p_processId number, p_procStepsToDo number, p_procStepsDone number, p_processInfo varchar2, p_processStatus PLS_INTEGER)
     as
         l_payload JSON_OBJ_LILAM; -- Puffer für den JSON-String
         l_serverMsg varchar2(100);
@@ -3428,7 +3428,7 @@ AS
 
     --------------------------------------------------------------------------
 
-    PROCEDURE CLOSE_SESSION(p_processId NUMBER, p_processInfo VARCHAR2, p_status PLS_INTEGER)
+    PROCEDURE CLOSE_SESSION(p_processId NUMBER, p_processInfo VARCHAR2, p_pocessStatus PLS_INTEGER)
     as
     begin
         close_session(
@@ -3436,13 +3436,13 @@ AS
             p_procStepsToDo   => null, 
             p_procStepsDone   => null, 
             p_processInfo => p_processInfo, 
-            p_status      => p_status
+            p_status      => p_processStatus
         );
     end;
 
     --------------------------------------------------------------------------
 
-    PROCEDURE CLOSE_SESSION(p_processId NUMBER, p_procStepsDone NUMBER, p_processInfo VARCHAR2, p_status PLS_INTEGER)
+    PROCEDURE CLOSE_SESSION(p_processId NUMBER, p_procStepsDone NUMBER, p_processInfo VARCHAR2, p_processStatus PLS_INTEGER)
     as
     begin
         close_session(
@@ -3450,7 +3450,7 @@ AS
             p_procStepsToDo   => null, 
             p_procStepsDone   => p_procStepsDone, 
             p_processInfo => p_processInfo, 
-            p_status      => p_status
+            p_status      => p_processStatus
         );
     end;
 
@@ -3472,12 +3472,12 @@ AS
 
     --------------------------------------------------------------------------
 
-    procedure CLOSE_SESSION(p_processId number, p_procStepsToDo number, p_procStepsDone number, p_processInfo varchar2, p_status PLS_INTEGER)
+    procedure CLOSE_SESSION(p_processId number, p_procStepsToDo number, p_procStepsDone number, p_processInfo varchar2, p_processStatus PLS_INTEGER)
     as
         v_idx PLS_INTEGER;
     begin
         if is_remote(p_processId) then
-            close_sessionRemote(p_processId, p_procStepsToDo, p_procStepsDone, p_processInfo, p_status);
+            close_sessionRemote(p_processId, p_procStepsToDo, p_procStepsDone, p_processInfo, p_processStatus);
             g_remote_sessions.delete(p_processId);
             return;
         end if ;
@@ -3492,7 +3492,7 @@ AS
             evaluateRules(g_process_cache(p_processId), C_PROCESS_STOP);
 
             v_idx := v_indexSession(p_processId);
-            persist_close_session(p_processId,  g_sessionList(v_idx).tabName_master, p_procStepsToDo, p_procStepsDone, p_processInfo, p_status);
+            persist_close_session(p_processId,  g_sessionList(v_idx).tabName_master, p_procStepsToDo, p_procStepsDone, p_processInfo, p_processStatus);
             checkLogsBuffer(p_processId, 'vor clearAllSessionData');
             clearAllSessionData(p_processId);
             checkLogsBuffer(p_processId, 'nach clearAllSessionData');
