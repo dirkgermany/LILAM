@@ -668,7 +668,7 @@ With every marker report, LILAM calculates:
   PROCEDURE MARK_EVENT(
     p_processId     NUMBER,
     p_actionName    VARCHAR2,
-    p_contextName  VARCHAR2,
+    p_contextName   VARCHAR2 DEFAULT NULL,
     p_timestamp     TIMESTAMP DEFAULT NULL
   )
  ```
@@ -682,7 +682,7 @@ LILAM measures the duration of each trace, maintains a moving average, and repor
   PROCEDURE TRACE_START
     p_processId     NUMBER,
     p_actionName    VARCHAR2,
-    p_contextName  VARCHAR2,
+    p_contextName   VARCHAR2 DEFAULT NULL,
     p_timestamp     TIMESTAMP DEFAULT NULL
   )
  ```
@@ -698,7 +698,7 @@ Stops a transaction trace. The `p_action_name` and `p_context_name` must match t
   PROCEDURE TRACE_STOP
     p_processId     NUMBER,
     p_actionName    VARCHAR2,
-    p_contextName  VARCHAR2,
+    p_contextName   VARCHAR2 DEFAULT NULL,
     p_timestamp     TIMESTAMP DEFAULT NULL
   )
  ```
