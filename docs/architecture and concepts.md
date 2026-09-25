@@ -28,6 +28,7 @@
   - [Monitor Table](#monitor-table)
   - [Registry Table](#registry-table)
   - [Rules Table](#rules-table)
+  - [Internal Log Table](#internal-log-table)
 - [API](#api)
   - [Session Handling](#session-handling)
   - [Process Control](#process-control)
@@ -362,6 +363,31 @@ Rule Sets are stored as JSON documents and identified by their name and version.
 | `VERSION` | `NUMBER` | Version of the Rule Set. |
 | `CREATED` | `TIMESTAMP(6)` | Timestamp at which the Rule Set was created. |
 | `AUTHOR` | `VARCHAR2(50)` | Author associated with the Rule Set. |
+
+### Internal Log Table
+
+The `LILAM_LOG_INTERNAL` table provides a dedicated fallback logging mechanism for errors occurring within the LILAM framework itself.
+
+Unlike the process, log, and monitor tables, its name is fixed and must not be changed.
+
+Internal framework errors must not be processed through LILAM's regular logging mechanisms, as this could cause recursive failures or conceal the original error. Therefore, highly specialized internal routines can create this table when required and write diagnostic information directly to it.
+
+> [!IMPORTANT]
+> `LILAM_LOG_INTERNAL` is intended exclusively for internal framework errors. Application logging belongs in the regular Log Table associated with the corresponding process.
+
+#### Table Structure
+
+| Column | Data Type | Description |
+| --- | --- | --- |
+| `ID` | `NUMBER` | Identity-generated unique identifier of the internal log entry. |
+| `LOG_TIMESTAMP` | `TIMESTAMP(6)` | Timestamp of the internal error. Defaults to `SYSTIMESTAMP`. |
+| `ERROR_CODE` | `NUMBER` | Oracle error code, if available. |
+| `ERROR_MESSAGE` | `VARCHAR2(4000)` | Error message associated with the internal failure. |
+| `ERROR_STACK` | `VARCHAR2(4000)` | Error stack associated with the failure. |
+| `ERROR_BACKTRACE` | `VARCHAR2(4000)` | Error backtrace associated with the failure. |
+| `CALL_STACK` | `VARCHAR2(4000)` | Call stack at the point at which the error was recorded. |
+| `MODULE_NAME` | `VARCHAR2(200)` | LILAM module in which the error occurred. |
+| `LOG_OPERATION` | `VARCHAR2(200)` | Internal operation being performed when the error was recorded. |
 
 ---
 ## API
