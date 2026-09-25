@@ -2821,7 +2821,7 @@ AS
 
     --------------------------------------------------------------------------
 
-    procedure close_sessionRemote(p_processId number, p_procStepsToDo number, p_procStepsDone number, p_processInfo varchar2, p_processStatus PLS_INTEGER)
+    procedure close_sessionRemote(p_processId number, p_procStepsToDo PLS_INTEGER, p_procStepsDone PLS_INTEGER, p_processInfo varchar2, p_processStatus PLS_INTEGER)
     as
         l_payload JSON_OBJ_LILAM; -- Puffer für den JSON-String
         l_serverMsg varchar2(100);
@@ -3442,7 +3442,7 @@ AS
 
     --------------------------------------------------------------------------
 
-    PROCEDURE CLOSE_SESSION(p_processId NUMBER, p_procStepsDone NUMBER, p_processInfo VARCHAR2, p_processStatus PLS_INTEGER)
+    PROCEDURE CLOSE_SESSION(p_processId NUMBER, p_procStepsDone PLS_INTEGER, p_processInfo VARCHAR2, p_processStatus PLS_INTEGER)
     as
     begin
         close_session(
@@ -3472,7 +3472,7 @@ AS
 
     --------------------------------------------------------------------------
 
-    procedure CLOSE_SESSION(p_processId number, p_procStepsToDo number, p_procStepsDone number, p_processInfo varchar2, p_processStatus PLS_INTEGER)
+    procedure CLOSE_SESSION(p_processId number, p_procStepsToDo PLS_INTEGER, p_procStepsDone PLS_INTEGER, p_processInfo varchar2, p_processStatus PLS_INTEGER)
     as
         v_idx PLS_INTEGER;
     begin
