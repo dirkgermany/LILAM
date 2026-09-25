@@ -240,10 +240,39 @@ The number of planned steps as well as the steps already completed are controlle
 **The name of the master table can be chosen freely—within the scope of Oracle naming rules.** By default, the master table is named 'LILAM_LOG'.
 
 ### Log Table
-Stores chronological entries including timestamps, severity levels, and detailed metadata (user, host, call/error stacks), all linked via the Master Table's Process ID.
+Stores chronological log entries including timestamps, severity levels, and detailed diagnostic information. Each entry is linked to its process through the `PROCESS_ID`.
 
-The name of the log table is always based on the name of the master table. It consists of the name of the master table plus an attached '_LOG' suffix.
-Meaning: If the master table is named 'LILAM_LOGGING', the detail table is named 'LILAM_LOGGING_LOG'. This dependency cannot and must not be broken.
+The name of the Log Table is derived from the configured master table name by appending the fixed suffix `_LOG`.
+
+For example:
+
+| Master Table Name | Log Table Name |
+| --- | --- |
+| `LILAM` | `LILAM_LOG` |
+| `MY_APPLICATION` | `MY_APPLICATION_LOG` |
+| `LILAM_LOGGING` | `LILAM_LOGGING_LOG` |
+
+> [!IMPORTANT]
+> The suffix `_LOG` is fixed. The Log Table name must correspond to the master table name used when the LILAM session was initialized.
+
+#### Table Structure
+#### Table Structure
+
+All Log Tables use the following structure, regardless of the configured table name:
+
+| Column | Data Type | Description |
+| --- | --- | --- |
+| `PROCESS_ID` | `NUMBER(19)` | Identifies the process to which the log entry belongs. |
+| `NO` | `NUMBER(19)` | Sequential counter per process. It reflects the order in which the logging procedures were called. |
+| `INFO` | `VARCHAR2(2000)` | Contains the actual log message. |
+| `LOG_LEVEL` | `VARCHAR2(10)` | Severity level of the log entry, such as `ERROR`, `WARN`, `INFO`, or `DEBUG`. |
+| `SESSION_TIME` | `TIMESTAMP(6)` | Timestamp at which the log entry was recorded. |
+| `SESSION_USER` | `VARCHAR2(50)` | Database session user, determined by `SYS_CONTEXT('USERENV','SESSION_USER')`. |
+| `HOST_NAME` | `VARCHAR2(50)` | Client host, determined by `SYS_CONTEXT('USERENV','HOST')`. |
+| `CALLER` | `VARCHAR2(255)` | Name of the calling procedure. |
+| `ERR_STACK` | `VARCHAR2(4000)` | Error stack information, if available. |
+| `ERR_BACKTRACE` | `VARCHAR2(4000)` | Error backtrace information, if available. |
+| `ERR_CALLSTACK` | `VARCHAR2(4000)` | Call stack information, if available. |
 
 ### Monitor Table
 Stores detailed metrics for events and traces, including duration, moving averages, and action counts, all linked via the Master Table's Process ID. 
