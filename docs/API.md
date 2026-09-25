@@ -208,7 +208,7 @@ To accommodate different logging requirements, the following variants are availa
  ```sql
   FUNCTION NEW_SESSION(
     p_processName   VARCHAR2,
-    p_logLevel      PLS_INTEGER, 
+    p_logLevel      PLS_INTEGER DEFAULT logLevelMonitor, 
     p_TabNameMaster VARCHAR2 DEFAULT 'LILAM'
   ) RETURN NUMBER
  ```
@@ -263,7 +263,7 @@ FUNCTION SERVER_NEW_SESSION(
   p_logLevel      PLS_INTEGER, 
   p_stepsToDo     PLS_INTEGER, 
   p_daysToKeep    PLS_INTEGER, 
-  p_TabNameMaster VARCHAR2 DEFAULT 'LILAM'
+  p_TabNameMaster VARCHAR2
 ) RETURN NUMBER
  ```
 </details>
@@ -401,8 +401,8 @@ Documents the lifecycle of a process.
 | [`SET_PROC_STEPS_TODO`](#procedure-set_proc_steps_todo) | Procedure | Sets the required number of actions | Process
 | [`PROC_STEP_DONE`](#procedure-proc_step_done) | Procedure | Increments the counter of completed steps | Process
 | [`SET_PROC_STEPS_DONE`](#procedure-set_proc_steps_done) | Procedure | Sets the number of completed actions | Process
-| [`GET_PROC_STEPS_DONE`](fFunction-get_proc_steps_done) | FUNCTION | Returns number of already finished steps | Process
-| [`GET_PROC_STEPS_TODO`](fFunction-get_proc_steps_done) | FUNCTION | Returns number of steps to do | Process
+| [`GET_PROC_STEPS_DONE`](#function-get_proc_steps_done) | FUNCTION | Returns number of already finished steps | Process
+| [`GET_PROC_STEPS_TODO`](#function-get_proc_steps_done) | FUNCTION | Returns number of steps to do | Process
 | [`GET_PROCESS_START`](#function-get_process_start) | FUNCTION | Returns time of process start | Process
 | [`GET_PROCESS_END`](#function-get_process_end) | FUNCTION | Returns time of process end (if finished) | Process
 | [`GET_PROCESS_STATUS`](#function-get_process_status) | FUNCTION | Returns the process state | Process
@@ -443,7 +443,7 @@ Increments the number of completed steps (progress). This simplifies the managem
  ```
 
 #### Procedure SET_PROC_STEPS_DONE
-Sets the total number of completed steps. Note: Calling this procedure overwrites any progress previously calculated via `STEP_DONE`.
+Sets the total number of completed steps. Note: Calling this procedure overwrites any progress previously calculated via `PROC_STEP_DONE`.
 
  ```sql
   PROCEDURE SET_PROC_STEPS_DONE(
