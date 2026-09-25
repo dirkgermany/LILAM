@@ -286,8 +286,61 @@ AS
     procedure sync_monitor(p_processId number, p_force boolean default false);
     procedure sync_process(p_processId number, p_force boolean default false);
     procedure flushMonitor(p_processId number);
-    procedure logLilamErr;
     function getServerPipeAvailable(p_groupName varchar2) return varchar2;
+    procedure createInternalLogTable;
+
+    ------------------------------------------------------------------------
+    
+    ---------------------------------------------------------------
+    -- Fallback Logging
+    ---------------------------------------------------------------
+    PROCEDURE logLilamErr(p_errCode varchar2, p_errMessage varchar2, p_moduleName varchar2 default 'UNKNOWN', p_logOperation varchar2 default 'UNKNONW')
+    AS
+        pragma autonomous_transaction;
+        l_stmt varchar2(4000);
+    BEGIN
+        createInternalLogTable;
+        l_stmt := '
+            insert into C_LILAM_LOG_TABLE
+            (
+                error_code,
+                error_message,
+                error_stack,
+                error_backtrace,
+                call_stack,
+                module_name,
+                log_operation
+            )
+            values
+            (
+                :1, :2, :3, :4, :5, :6, :7
+                substr(dbms_utility.format_error_stack,     1, 4000),
+                substr(dbms_utility.format_error_backtrace, 1, 4000),
+                substr(dbms_utility.format_call_stack,      1, 4000),
+                substr(p_module_name,   1, 200),
+                substr(p_log_operation, 1, 200)
+            )';
+    
+        execute immediate l_stmt using
+                coalesce(p_errCode, sqlcode),
+                substr(coalesce(p_errMessage, sqlerrm), 1, 4000),
+                substr(dbms_utility.format_error_stack,     1, 4000),
+                substr(dbms_utility.format_error_backtrace, 1, 4000),
+                substr(dbms_utility.format_call_stack,      1, 4000),
+                substr(p_moduleName,   1, 200),
+                substr(p_logOperation, 1, 200);                
+                
+        commit;            
+            
+    EXCEPTION
+        when others then
+        begin
+            dbms_output.put_line('LILAM ERR: ' || substr(sqlErrM,1,1000));
+        end;
+    END;
+
+    ------------------------------------------------------------------------
+
 
     ---------------------------------------------------------------
     -- Antwort Codes stabil vereinheitlichen
@@ -375,7 +428,7 @@ AS
         return JSON_VALUE(p_json_doc, '$.' || jsonPath returning NUMBER);
     exception 
         when others then
-        logLilamErr;
+        logLilamErr(sqlCode, sqlErrM, 'jsonNumber', 'JSON_VALUE');
         return null;
     end;
 
@@ -387,7 +440,7 @@ AS
         RETURN TO_TIMESTAMP(p_obj.get_string(p_key), 'YYYY-MM-DD"T"HH24:MI:SS.FF');
     EXCEPTION 
         WHEN OTHERS THEN
-        logLilamErr;
+        logLilamErr(sqlCode, sqlErrM, 'extractFromJsonObjTime', 'RETURN TO_TIMESTAMP');
         return null;
     END;
 
@@ -399,7 +452,7 @@ AS
         return JSON_VALUE(p_json_doc, '$.' || jsonPath returning TIMESTAMP);
     exception 
         when others then
-        logLilamErr;
+        logLilamErr(sqlCode, sqlErrM, 'jsonTime', 'JSON_VALUE');
         return null;
     end;
 
@@ -690,8 +743,7 @@ AS
 
     exception
         when others then
-            logLilamErr;
-            error(p_rec.process_id, 'Could not raise alert : ' || sqlErrM);
+        logLilamErr(sqlCode, sqlErrM, 'fire_alert');
     END;
     
     ------------------------------------------------------------
@@ -881,8 +933,7 @@ AS
 
     EXCEPTION
         WHEN OTHERS THEN
-            logLilamErr;
-            error(p_ctx.process_id, 'Could not evaluate rule internal: ' || sqlErrM);
+        logLilamErr(sqlCode, sqlErrM, 'evaluateRules_internal');
         
     END evaluateRules_internal;
 
@@ -992,9 +1043,14 @@ AS
 
     exception
         when others then
-            logLilamErr;
+        logLilamErr(sqlCode, sqlErrM, 'waitForResponse');
+        begin
             l_status := DBMS_PIPE.REMOVE_PIPE(l_clientChannel);
+        exception
+            when others then
+            logLilamErr(sqlCode, sqlErrM, 'waitForResponse', 'DBMS_PIPE.REMOVE_PIPE');
             error(p_processId, 'Wait for response failed: ' || sqlErrM);
+        end;
     end;
 
     ---------------------------------------------------------------
@@ -1042,7 +1098,7 @@ AS
         when NO_DATA_FOUND then
             return null;
         when others then
-            logLilamErr;
+            logLilamErr(sqlCode, sqlErrM, 'getServerPipeAvailable', 'EXECUTE IMMEDIATE');
             
     end;
     
@@ -1056,8 +1112,7 @@ AS
 
     exception
         when others then
-            logLilamErr;
-            error(p_processId, 'Could not send synchronization signal to server: ' || sqlErrM);
+            logLilamErr(sqlCode, sqlErrM, 'send_sync_signal', 'waitForResponse');
     end;
 
     --------------------------------------------------------------------------
@@ -1151,8 +1206,7 @@ AS
 
     exception
         when others then
-            logLilamErr;
-            error(p_processId, 'Could not send message to server: ' || sqlErrM);
+            logLilamErr(sqlCode, sqlErrM, 'sendNoWait');
     end;
 
     --------------------------------------------------------------------------    
@@ -1169,7 +1223,7 @@ AS
         return false;
     exception
         when others then
-            logLilamErr;
+            logLilamErr(sqlCode, sqlErrM, 'should_raise_error');
             error(p_processId, 'Check "should raise error" failed: ' || sqlErrM);
     end;  
 
@@ -1183,7 +1237,7 @@ AS
 
     exception
         when OTHERS then
-        logLilamErr;
+            logLilamErr(sqlCode, sqlErrM, 'run_sql', 'EXECUTE IMMEDIATE');
     end;
 
     --------------------------------------------------------------------------
@@ -1218,6 +1272,26 @@ AS
     end;
 
     --------------------------------------------------------------------------
+    procedure createInternalLogTable
+    as
+        l_sql varchar2(1000);
+    begin
+        if not objectExists(C_LILAM_LOG_TABLE, 'TABLE') then
+            l_sql := '
+                create table ' || C_LILAM_LOG_TABLE || '
+                (
+                    id              number generated always as identity,
+                    log_timestamp   timestamp(6) default systimestamp not null,            
+                    error_code      number,
+                    error_message   varchar2(4000),
+                    error_stack     varchar2(4000),
+                    error_backtrace varchar2(4000),
+                    call_stack      varchar2(4000),
+                    module_name     varchar2(200),
+                    log_operation   varchar2(200)
+                )';
+        end if;
+    end;
 
     -- Creates LOG tables and the sequence for the process IDs if tables or sequence don't exist
     -- For naming rules of the tables see package description
@@ -1411,7 +1485,7 @@ AS
 
     exception      
         when others then
-        logLilamErr;
+            logLilamErr(sqlCode, sqlErrM, 'createLogTables');
      end;
 
     --------------------------------------------------------------------------
@@ -1479,14 +1553,17 @@ AS
 
     exception
         when others then
+        begin
             if t_rc%isopen then 
                 close t_rc;
             end if ;
             rollback; -- Auch im Fehlerfall die Transaktion beenden
-            logLilamErr;
-            if should_raise_error(p_processId) then
-                error(p_processId, 'Deletion of old logs failed: ' || sqlErrM);
-            end if ;
+        exception
+            when others then
+            logLilamErr(sqlCode, sqlErrM, 'deleteOldLogs', 'close t_rc');
+        end;            
+        logLilamErr(sqlCode, sqlErrM, 'deleteOldLogs');
+
     end;
 
     --------------------------------------------------------------------------
@@ -1523,7 +1600,7 @@ AS
 
     exception
         when others then
-            logLilamErr;
+            logLilamErr(sqlCode, sqlErrM, 'readProcessRecord');
             if should_raise_error(p_processId) then
                 error(p_processId, 'Reading process record failed: ' || sqlErrM);
             end if ;
@@ -1567,11 +1644,8 @@ AS
     exception
         when others then
             rollback;
-            logLilamErr;
-            if should_raise_error(p_processId) then
-                error(p_processId, 'Could not persist log data: ' || sqlErrM);
-            end if ;
-            
+            logLilamErr(sqlCode, sqlErrM, 'persist_log_data');
+
     end;
 
     --------------------------------------------------------------------------
@@ -1646,10 +1720,8 @@ AS
 
     exception
         when others then
-            logLilamErr;
-            if should_raise_error(p_processId) then
-                error(p_processId, 'Flushing logs failed: ' || sqlErrM);
-            end if ;
+            logLilamErr(sqlCode, sqlErrM, 'flushLogs');
+
     end;
 
     --------------------------------------------------------------------------
@@ -1744,10 +1816,8 @@ AS
     exception
         when others then
             rollback;
-            logLilamErr;
-            if should_raise_error(p_processId) then
-                error(p_processId, 'Could not persist monitor data: ' || sqlErrM);
-            end if ;
+            logLilamErr(sqlCode, sqlErrM, 'persist_monitor_data');
+
     end;
 
     --------------------------------------------------------------------
@@ -1895,7 +1965,7 @@ AS
 
     exception
         when others then
-            logLilamErr;
+            logLilamErr(sqlCode, sqlErrM, 'flushMonitor'); 
             if should_raise_error(p_processId) then
                 error(p_processId, 'Could not flush monitor data: ' || sqlErrM);
             end if ;
@@ -1937,7 +2007,7 @@ AS
 
     exception
         when others then
-            logLilamErr;
+            logLilamErr(sqlCode, sqlErrM, 'sync_monitor'); 
             if should_raise_error(p_processId) then
                 error(p_processId, 'Could not synchronize monitor data: ' || sqlErrM);
             end if ;
@@ -2011,10 +2081,7 @@ AS
 
     EXCEPTION
         WHEN OTHERS THEN
-            logLilamErr;
-            if should_raise_error(p_processId) then
-                error(p_processId, 'Could not send remote trace to server: ' || sqlErrM);
-            end if ;
+            logLilamErr(sqlCode, sqlErrM, 'startTraceRemote'); 
     end;
 
     --------------------------------------------------------------------------
@@ -2037,10 +2104,7 @@ AS
 
     EXCEPTION
         WHEN OTHERS THEN
-            logLilamErr;
-            if should_raise_error(p_processId) then
-                error(p_processId, 'Could not send trace data to server: ' || sqlErrM);
-            end if ;
+            logLilamErr(sqlCode, sqlErrM, 'insertTraceMonitorRemote'); 
     end;
 
     --------------------------------------------------------------------------
@@ -2067,10 +2131,8 @@ AS
 
     EXCEPTION
         WHEN OTHERS THEN
-            logLilamErr;
-            if should_raise_error(p_processId) then
-                error(p_processId, 'Could not send event data to server: ' || sqlErrM);
-            end if ;  
+            logLilamErr(sqlCode, sqlErrM, 'insertEventMonitorRemote'); 
+ 
     end;
 
     --------------------------------------------------------------------------
@@ -2159,7 +2221,7 @@ AS
 
     exception
         when others then
-            logLilamErr;
+            logLilamErr(sqlCode, sqlErrM, 'writeEventToMonitorBuffer'); 
             if should_raise_error(p_processId) then
                 error(p_processId, 'Could not buffer event data: ' || sqlErrM);
             end if ;
@@ -2265,7 +2327,7 @@ AS
 
     exception
         when others then
-            logLilamErr;
+            logLilamErr(sqlCode, sqlErrM, 'writeTraceToMonitorBuffer'); 
             if should_raise_error(p_processId) then
                 error(p_processId, 'Could not buffer trace data: ' || sqlErrM);
             end if ;
@@ -2306,10 +2368,9 @@ AS
 
     exception
         when others then
-            -- Hier nutzen wir deine neue zentrale Fehler-Logik
-            logLilamErr;
+            logLilamErr(sqlCode, sqlErrM, 'getLastMonitorEntry'); 
             if should_raise_error(p_processId) then
-                error(p_processId, 'Could not search last monitor entry: ' || sqlErrM);
+                error(p_processId, 'Could not search or read last monitor entry: ' || sqlErrM);
             end if ;
             return v_empty;
     end;
@@ -2327,9 +2388,9 @@ AS
 
     exception
         when others then
-            logLilamErr;
+            logLilamErr(sqlCode, sqlErrM, 'hasMonitorEntry'); 
             if should_raise_error(p_processId) then
-                error(p_processId, 'Check if monitor entry exists failed: ' || sqlErrM);
+                error(p_processId, 'Checking "monitor entry exists" failed: ' || sqlErrM);
             end if ;
             return false;
     end;
@@ -2532,11 +2593,9 @@ AS
 
     exception
         when others then
-            rollback; -- Auch im Fehlerfall die Transaktion beenden
-            logLilamErr;
-            if should_raise_error(p_process_rec.id) then
-                error(p_process_rec.id, 'Could not persist process record: ' || sqlErrM);
-            end if ;
+            rollback; -- im Fehlerfall die Transaktion beenden
+            logLilamErr(sqlCode, sqlErrM, 'persist_process_record', 'EXECUTE IMMEDIATE');
+            
     end;
 
     -------------------------------------------------------------------
@@ -2595,16 +2654,20 @@ AS
 
     EXCEPTION
         WHEN OTHERS THEN
-            if DBMS_SQL.IS_OPEN(sqlCursor) THEN
-                DBMS_SQL.CLOSE_CURSOR(sqlCursor);
-            end if ;
-            sqlCursor := null;
+            logLilamErr(sqlCode, sqlErrM, 'persist_close_session');
+            begin
+                if DBMS_SQL.IS_OPEN(sqlCursor) THEN
+                    DBMS_SQL.CLOSE_CURSOR(sqlCursor);
+                end if ;
+            exception
+                when others then
+                sqlCursor := null;
+            end;
             rollback;
-            logLilamErr;
             if should_raise_error(p_processId) then
                 error(p_processId, 'Could not persist process data while closing session: ' || sqlErrM);
             end if ;
-    end;
+    END;
 
     --------------------------------------------------------------------------
 
@@ -2648,10 +2711,8 @@ AS
     exception
         when others then
             rollback; -- Auch im Fehlerfall die Transaktion beenden
-            logLilamErr;
-            if should_raise_error(p_processId) then
-                error(p_processId, 'Could not persist new session data: ' || sqlErrM);
-            end if ;
+            logLilamErr(sqlCode, sqlErrM, 'persist_new_session'); 
+            
     end;
 
     --------------------------------------------------------------------------
@@ -2695,9 +2756,9 @@ AS
 
     exception
         when others then
-            logLilamErr;
+            logLilamErr(sqlCode, sqlErrM, 'sync_process'); 
             if should_raise_error(p_processId) then
-                error(p_processId, 'Could not synchronize process: ' || sqlErrM);
+                error(p_processId, 'Could not synchronize process data: ' || sqlErrM);
             end if ;
     end;    
 
@@ -2755,10 +2816,8 @@ AS
 
     exception
         when others then
-            logLilamErr;
-            if should_raise_error(p_processId) then
-                error(p_processId, 'Could not synchronize log data: ' || sqlErrM);
-            end if ;
+            logLilamErr(sqlCode, sqlErrM, 'sync_log'); 
+
     end;
 
     --------------------------------------------------------------------------
@@ -2787,10 +2846,8 @@ AS
 
     EXCEPTION
         WHEN OTHERS THEN
-            logLilamErr;
-            if should_raise_error(p_processId) then
-                error(p_processId, 'Could not send "CLOSE SESSION" to server: ' || sqlErrM);
-            end if ;
+            logLilamErr(sqlCode, sqlErrM, 'close_sessionRemote'); 
+
     end;
 
     --------------------------------------------------------------------------
@@ -2842,10 +2899,8 @@ AS
 
     EXCEPTION
         WHEN OTHERS THEN
-            logLilamErr;
-            if should_raise_error(p_processId) then
-                error(p_processId, 'Could not send log data to server: ' || sqlErrM);
-            end if ;
+            logLilamErr(sqlCode, sqlErrM, 'log_anyRemote'); 
+
     end;
 
     --------------------------------------------------------------------------
@@ -2934,10 +2989,7 @@ AS
 
     exception
         when others then
-            logLilamErr;
-            if should_raise_error(p_processId) then
-                error(p_processId, 'Could not log data: ' || sqlErrM);
-            end if ;
+        logLilamErr(sqlCode, sqlErrM, 'log_any'); 
     end;
 
     --------------------------------------------------------------------------
@@ -3064,7 +3116,7 @@ AS
 
     exception
         when others then
-            logLilamErr;
+            logLilamErr(sqlCode, sqlErrM, 'setAnyStatus'); 
             if should_raise_error(p_processId) then
                 error(p_processId, 'Could not set process status: ' || sqlErrM);
             end if ;
@@ -3261,6 +3313,11 @@ AS
         g_alert_history.DELETE;
         g_rules_by_context.DELETE;
         g_rules_by_action.DELETE;
+        
+    exception
+        when others then
+        logLilamErr(sqlCode, sqlErrM, 'clearServerData', 'deletion of memory data'); 
+        
     end;
 
     --------------------------------------------------------------------------
@@ -3374,10 +3431,8 @@ AS
 
     EXCEPTION
         WHEN OTHERS THEN
-            logLilamErr;
-            if should_raise_error(p_processId) then
-                error(p_processId, 'Clearing buffered session data failed: ' || sqlErrM);
-            end if ;
+        logLilamErr(sqlCode, sqlErrM, 'clearAllSessionData'); 
+
     END;
 
     --------------------------------------------------------------------------
@@ -3744,7 +3799,7 @@ AS
 
     exception
         when others then
-            logLilamErr;
+        logLilamErr(sqlCode, sqlErrM, 'doRemote_pingEcho'); 
     end; 
 
     -------------------------------------------------------------------------- 
@@ -3794,7 +3849,7 @@ AS
 
     exception
         when others then
-            logLilamErr;
+        logLilamErr(sqlCode, sqlErrM, 'doRemote_getMonitorLastEntry'); 
     
     end;    
 
@@ -3841,7 +3896,7 @@ AS
 
     exception
         when others then
-            logLilamErr;
+            logLilamErr(sqlCode, sqlErrM, 'doRemote_getProcessData'); 
             error(l_processId, 'Could not send process data to client: ' || sqlErrM);
     end;    
 
@@ -3876,9 +3931,8 @@ AS
 
     exception
         when others then
-            logLilamErr;
+            logLilamErr(sqlCode, sqlErrM, 'doRemote_unfreezeClient'); 
             error(p_clientChannel, 'Could not send unlock signal to client: ' || sqlErrM);
-            null;
     end;    
 
     -------------------------------------------------------------------------- 
@@ -3944,10 +3998,8 @@ AS
 
     EXCEPTION
         WHEN OTHERS THEN
-            logLilamErr;
-            if should_raise_error(p_processId) then
-                error(p_processId, 'Could not send shutdown command to server: ' || sqlErrM);
-            end if ;
+        logLilamErr(sqlCode, sqlErrM, 'SERVER_SHUTDOWN'); 
+
     end;
 
     -------------------------------------------------------------------------- 
@@ -4036,10 +4088,7 @@ AS
     EXCEPTION
         WHEN OTHERS THEN
         if SQLCODE != NUM_ERR_NO_SERVER then
-            logLilamErr;
-            if should_raise_error(l_processId) then
-                error(l_processId, 'Could not send "new session command" to server: ' || sqlErrM);
-            end if ; 
+            logLilamErr(sqlCode, sqlErrM, 'SERVER_NEW_SESSION'); 
         else
             return NUM_ERR_NO_SERVER;
         end if;
@@ -4182,7 +4231,7 @@ AS
     exception
         when others then
             rollback;
-            logLilamErr;
+            logLilamErr(sqlCode, sqlErrM, 'registerServerPipe', 'EXECUTE IMMEDIATE'); 
     end;
 
     --------------------------------------------------------------------------
@@ -4197,7 +4246,7 @@ AS
 
     EXCEPTION
         WHEN OTHERS THEN
-            logLilamErr;
+            logLilamErr(sqlCode, sqlErrM, 'updateRulesInRegistry', 'EXECUTE IMMEDIATE'); 
             if should_raise_error(g_serverProcessId) then
                 error(g_serverProcessId, 'Failed to parse JSON rules: ' || sqlErrM);
             end if ; 
@@ -4283,7 +4332,7 @@ AS
 
     EXCEPTION
         WHEN OTHERS THEN
-            logLilamErr;
+            logLilamErr(sqlCode, sqlErrM, 'load_rules_from_json'); 
             if should_raise_error(g_serverProcessId) then
                 error(g_serverProcessId, g_serverPipeName || '=>Failed to parse JSON rules: ' || sqlErrM);
             end if ; 
@@ -4325,7 +4374,7 @@ AS
         when NO_DATA_FOUND then
             error(g_serverProcessId, g_serverPipeName || '=>Could not find server rule: ' || p_ruleSetName || '; version: ' || p_ruleSetVersion);
         when others then
-            logLilamErr;
+            logLilamErr(sqlCode, sqlErrM, 'readServerRules'); 
             if should_raise_error(g_serverProcessId) then
                 error(g_serverProcessId, g_serverPipeName || '=>Could not read server rule: ' || p_ruleSetName || '; version: ' || p_ruleSetVersion || '; ' || sqlErrM);
             end if ;
@@ -4350,8 +4399,11 @@ AS
         when NO_DATA_FOUND then
             null; -- in der Registry smüssen für den Server keine Rules hinterlegt sein
         when others then
-            logLilamErr;
-        end;
+            logLilamErr(sqlCode, sqlErrM, 'loadServerRules'); 
+            if should_raise_error(g_serverProcessId) then
+                error(g_serverProcessId, 'Could not load server ruleset: ' || sqlErrM);
+            end if ;
+    END;
 
     --------------------------------------------------------------------------
 
@@ -4437,8 +4489,11 @@ AS
     exception
         when others then
             rollback;
-            logLilamErr;
-    end;
+            logLilamErr(sqlCode, sqlErrM, 'updateServerRegistry'); 
+            if should_raise_error(g_serverProcessId) then
+                error(g_serverProcessId, 'Could not update server registry: ' || sqlErrM);
+            end if ;
+    END;
 
     --------------------------------------------------------------------------
 
@@ -4460,14 +4515,19 @@ AS
 
                 EXCEPTION
                     WHEN OTHERS THEN
-                        logLilamErr;
-                        -- WICHTIG: Fehler loggen, aber die Schleife NICHT verlassen!
-                        ERROR(g_serverProcessId, g_serverPipeName || '=>Receiving message per pipe; ' || SQLERRM);
+                        if should_raise_error(g_serverProcessId) then
+                            ERROR(g_serverProcessId, g_serverPipeName || '=>Receiving message per pipe; ' || SQLERRM);
+                        end if;
                 END; 
         else
              p_cur_timeout := LEAST(p_cur_timeout + C_SERVER_TIMEOUT_WAIT_FOR_MSG, c_max_timeout);
             return null;
         end if;
+        
+        EXCEPTION
+            WHEN OTHERS THEN
+            logLilamErr(sqlCode, sqlErrM, 'receiveMessage'); 
+            return null;
     end;
 
     --------------------------------------------------------------------------
@@ -4591,9 +4651,10 @@ AS
                 l_shutdownSignal := processRequest(l_request, l_message, l_clientChannel);
                 EXCEPTION
                     WHEN OTHERS THEN
-                        logLilamErr;
                         -- WICHTIG: Fehler loggen, aber die Schleife NICHT verlassen!
-                        ERROR(g_serverProcessId, g_serverPipeName || '=>Internal START_SERVER; Critical Error while processing command: ' || SQLERRM);
+                        if should_raise_error(g_serverProcessId) then
+                            ERROR(g_serverProcessId, g_serverPipeName || '=>Internal START_SERVER; Critical Error while processing command: ' || SQLERRM);
+                        end if;
                 END; 
             end if;
 
@@ -4661,14 +4722,33 @@ AS
     EXCEPTION
 
     WHEN OTHERS THEN
-        logLilamErr;
-        DBMS_PIPE.PURGE(g_serverPipeName); 
-        l_dummyRes := DBMS_PIPE.REMOVE_PIPE(g_serverPipeName);
-        DBMS_PIPE.PURGE(g_serverPipeName || C_INTERLEAVE_PIPE_SUFFIX);
-        l_dummyRes := DBMS_PIPE.REMOVE_PIPE(g_serverPipeName || C_INTERLEAVE_PIPE_SUFFIX);
+        logLilamErr(sqlCode, sqlErrM, 'START_SERVER', 'MAIN CODE');
+        if should_raise_error(g_serverProcessId) then
+            ERROR(g_serverProcessId, g_serverPipeName || '=>Internal START_SERVER; Critical Error: ' || SQLERRM);
+        end if;
+        
+        -- error handling step by step ensuring to close max. number of pipes
+        begin
+            DBMS_PIPE.PURGE(g_serverPipeName); 
+            l_dummyRes := DBMS_PIPE.REMOVE_PIPE(g_serverPipeName);
+        exception
+            when others then
+                logLilamErr(sqlCode, sqlErrM, 'START_SERVER', 'DBMS_PIPE.PURGE');
+        end;
+        
+        begin
+            DBMS_PIPE.PURGE(g_serverPipeName || C_INTERLEAVE_PIPE_SUFFIX);
+            l_dummyRes := DBMS_PIPE.REMOVE_PIPE(g_serverPipeName || C_INTERLEAVE_PIPE_SUFFIX);
+        exception
+            when others then
+                logLilamErr(sqlCode, sqlErrM, 'START_SERVER', 'DBMS_PIPE.PURGE');
+        end;
+        
+        -- the next procedures use their own error handling
         clearServerData;
         clearAllSessionData(g_serverProcessId);
         updateServerRegistry(FALSE, -1);
+
     end;
 
     --------------------------------------------------------------------------
@@ -4781,13 +4861,8 @@ AS
 
     EXCEPTION
         WHEN OTHERS THEN
-            logLilamErr;
+        logLilamErr(sqlCode, sqlErrM, 'CALL_BY_JSON'); 
 
-            jsonPut(l_jsonHeader, 'status', 'ERROR');
-            jsonPut(l_jsonPayload, 'returns', 'ERROR_MSG');
-            jsonPut(l_jsonPayload, 'value', SQLERRM);
-            jsonPut(p_respObject, 'header', l_jsonHeader);
-            jsonPut(p_respObject, 'payload', l_jsonPayload);
     END;
 
     PROCEDURE CALL_BY_JSON (
@@ -4859,26 +4934,11 @@ AS
 
     EXCEPTION
         WHEN OTHERS THEN
-        logLilamErr;
-        DBMS_OUTPUT.PUT_LINE('Err: ' || sqlerrm);
-        ERROR(g_serverProcessId, g_serverPipeName || '=>Internal CREATE_SERVER; Critical Error while processing command: ' || SQLERRM);
+        logLilamErr(sqlCode, sqlErrM, 'createLogTables', 'bla'); 
         return 'Internal CREATE_SERVER; job_action = ' || l_action || '; Critical Error while processing command: ' || SQLERRM;
 
     END;
     
-    ------------------------------------------------------------------------
-
-    PROCEDURE logLilamErr AS
-        pragma autonomous_transaction;
-    BEGIN
-        BEGIN
-            dbms_output.put_line('LILAM ERR: ' || substr(sqlErrM,1,1000));
-            commit;
-        EXCEPTION
-            when others then null;
-        END;
-    END;
-
     ------------------------------------------------------------------------
 
     PROCEDURE FINAL_RESCUE
@@ -4902,4 +4962,4 @@ AS
         g_avg_params('DEFAULT').alpha := 0.1;
         g_avg_params('DEFAULT').warmup := 3; 
 
-    END LILAM;
+END LILAM;
