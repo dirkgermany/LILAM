@@ -237,6 +237,8 @@ LILAM uses two categories of tables: **application-specific tables** for applica
 
 #### Application-Specific Tables
 Application-specific tables store process state, logging data, and monitoring data. Their names are derived from a common, freely configurable master name (`tabNameMaster`) by appending a fixed suffix.
+But beware! The choice of tables and their names should be well-planned to avoid chaos caused by an excessive number of different LILAM logging tables.
+
 
 | Purpose | Fixed Suffix | Default Table Name |
 | --- | --- | --- |
@@ -255,6 +257,7 @@ For example, if `tabNameMaster` is set to `MY_APPLICATION`, LILAM uses:
 
 This allows different applications, processes, or environments to use separate sets of LILAM tables without requiring additional configuration tables.
 A total of four tables are required for operation and user data, one of which serves solely for the internal synchronization of multiple LILAM servers (more on this later). The detailed structure of these tables is described in the README file of the LILAM project on GitHub.
+
 
 #### Fixed Internal Tables
 In addition to the process-specific tables, LILAM uses internal tables whose names are fixed and must not be changed.
@@ -339,10 +342,6 @@ Events and traces share the same table structure. The `MON_TYPE` column identifi
 | `AVG_MILLIS` | `NUMBER(19)` | Moving average duration in milliseconds for the corresponding action and context. |
 | `ACTION_COUNT` | `NUMBER(19)` | Number of occurrences recorded for the corresponding action and context. |
 
-### Application-Specific Tables
-In the interest of flexibility, it is possible to use dedicated LILAM logging tables for different scenarios, applications, or processes. This also requires no configuration table or similar overhead. The names of the master and detail tables are optionally set during the API call to lilam.new_session or lilam.server_new_session.
-
-But beware! The choice of tables and their names should be well-planned to avoid chaos caused by an excessive number of different LILAM logging tables.
 
 ### Registry Table
 **Table Category:** Fixed Internal Table
