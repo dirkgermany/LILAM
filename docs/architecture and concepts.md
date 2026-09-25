@@ -297,8 +297,25 @@ All Log Tables use the following structure, regardless of the configured table n
 | `ERR_CALLSTACK` | `VARCHAR2(4000)` | Call stack information, if available. |
 
 ### Monitor Table
-Stores detailed metrics for events and traces, including duration, moving averages, and action counts, all linked via the Master Table's Process ID. 
-This table uses the `Context Name` to differentiate recurring actions and records the execution type (Event or Trace) to provide a granular performance history.
+Stores detailed monitoring data for events and traces. Each entry is linked to its process through `PROCESS_ID`.
+
+Events and traces share the same table structure. The `MON_TYPE` column identifies the type of monitoring entry, while `ACTION` and `CONTEXT` identify the monitored activity.
+
+#### Table Structure
+
+| Column | Data Type | Description |
+| --- | --- | --- |
+| `PROCESS_ID` | `NUMBER(19)` | Identifies the process to which the monitoring entry belongs. |
+| `MON_TYPE` | `NUMBER` | Identifies the monitoring type. `0` represents an Event. |
+| `START_TIME` | `TIMESTAMP(6)` | Timestamp at which the Event occurred or the Trace started. |
+| `STOP_TIME` | `TIMESTAMP(6)` | Timestamp at which the Trace ended. Remains `NULL` for Events. |
+| `SESSION_USER` | `VARCHAR2(50)` | Database session user, determined by `SYS_CONTEXT('USERENV','SESSION_USER')`. |
+| `HOST_NAME` | `VARCHAR2(50)` | Client host, determined by `SYS_CONTEXT('USERENV','HOST')`. |
+| `ACTION` | `VARCHAR2(100)` | Name of the monitored action. |
+| `CONTEXT` | `VARCHAR2(100)` | Optional context used to distinguish occurrences of the same action. |
+| `USED_MILLIS` | `NUMBER(19)` | Measured duration in milliseconds. |
+| `AVG_MILLIS` | `NUMBER(19)` | Moving average duration in milliseconds for the corresponding action and context. |
+| `ACTION_COUNT` | `NUMBER(19)` | Number of occurrences recorded for the corresponding action and context. |
 
 ### Application-Specific Tables
 In the interest of flexibility, it is possible to use dedicated LILAM logging tables for different scenarios, applications, or processes. This also requires no configuration table or similar overhead. The names of the master and detail tables are optionally set during the API call to lilam.new_session or lilam.server_new_session.
