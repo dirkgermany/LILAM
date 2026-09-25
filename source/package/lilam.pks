@@ -120,8 +120,7 @@ create or replace PACKAGE LILAM AS
     ---------------------------------
     -- Update the status of a process
     ---------------------------------
-    PROCEDURE SET_PROCESS_STATUS(p_processId NUMBER, p_status PLS_INTEGER);
-    PROCEDURE SET_PROCESS_STATUS(p_processId NUMBER, p_status PLS_INTEGER, p_processInfo VARCHAR2);
+    PROCEDURE SET_PROCESS_STATUS(p_processId NUMBER, p_status PLS_INTEGER, p_processInfo VARCHAR2 DEFAULT NULL);
     PROCEDURE SET_PROC_STEPS_TODO(p_processId NUMBER, p_procStepsToDo NUMBER);
     PROCEDURE SET_PROC_STEPS_DONE(p_processId NUMBER, p_procStepsDone NUMBER);
     PROCEDURE PROC_STEP_DONE(p_processId NUMBER);
