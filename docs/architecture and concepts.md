@@ -23,7 +23,7 @@
   - [In-Session](#in-session)
   - [Decoupled](#decoupled)
 - [Tables](#tables)
-  - [Process Table](#process-table)
+  - [Application Table](#application-table)
   - [Log Table](#log-table)
   - [Monitor Table](#monitor-table)
   - [Registry Table](#registry-table)
@@ -231,10 +231,10 @@ With the possibility of using several LILAM Servers in parallel and simultaneous
 
 ---
 ## Tables
-LILAM uses two categories of tables: **process-specific tables** for application data and **fixed internal tables** for framework-wide functionality.
+LILAM uses two categories of tables: **application-specific tables** for application data and **fixed internal tables** for framework-wide functionality.
 
-#### Process-Specific Tables
-Process-specific tables store process state, logging data, and monitoring data. Their names are derived from a common, freely configurable master name (`tabNameMaster`) by appending a fixed suffix.
+#### Application-Specific Tables
+Application-specific tables store process state, logging data, and monitoring data. Their names are derived from a common, freely configurable master name (`tabNameMaster`) by appending a fixed suffix.
 
 | Purpose | Fixed Suffix | Default Table Name |
 | --- | --- | --- |
