@@ -302,7 +302,7 @@ AS
     BEGIN
         createInternalLogTable;
         l_stmt := '
-            insert into C_LILAM_LOG_TABLE
+            insert into ' || C_LILAM_LOG_TABLE || '
             (
                 error_code,
                 error_message,
