@@ -1,4 +1,5 @@
 # LILAM API Reference
+### Version: 1.7
 
 <details>
 <summary>📖<b>Content</b></summary>
