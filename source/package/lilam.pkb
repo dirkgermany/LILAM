@@ -314,11 +314,6 @@ AS
             values
             (
                 :1, :2, :3, :4, :5, :6, :7
-                substr(dbms_utility.format_error_stack,     1, 4000),
-                substr(dbms_utility.format_error_backtrace, 1, 4000),
-                substr(dbms_utility.format_call_stack,      1, 4000),
-                substr(p_module_name,   1, 200),
-                substr(p_log_operation, 1, 200)
             )';
     
         execute immediate l_stmt using
@@ -335,7 +330,7 @@ AS
     EXCEPTION
         when others then
         begin
-            dbms_output.put_line('LILAM ERR: ' || substr(sqlErrM,1,1000));
+            dbms_output.put_line('LILAM ERR: ' || substr(sqlErrM, 1, 1000));
         end;
     END;
 
@@ -1261,6 +1256,10 @@ AS
         else
             return false;
         end if ;
+        
+    exception
+        when others then
+            dbms_output.put_line('Error in function objectExists. p_objectName: ' || p_objectName || '; p_objectType: ' || p_objectType);
     end;
 
     --------------------------------------------------------------------------
