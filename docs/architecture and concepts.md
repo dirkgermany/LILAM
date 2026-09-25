@@ -347,9 +347,21 @@ If `SERVER_NEW_SESSION` is called with a `p_groupName`, only servers registered 
 | `SET_IN_USE` | `NUMBER` | Version of the rule set currently imported by the server. |
 
 ### Rules Table
-**Rules** define how LILAM reacts to incoming **signals**. They are organized into **Rule Sets**, which are structured as JSON objects for maximum flexibility. 
+**Rules** define how LILAM reacts to incoming **signals**. They are organized into **Rule Sets**, which are structured as JSON objects for maximum flexibility.
 
-The central table `LILA_RULES` acts as the definitive repository for these configurations, storing each JSON-based rule set alongside a **version stamp**. This versioning ensures that every LILAM server can track, verify, and synchronize its active logic in real-time.
+The central table `LILAM_RULES` acts as the repository for these configurations. Its name is fixed and is not derived from `tabNameMaster`.
+
+Rule Sets are stored as JSON documents and identified by their name and version. This allows different versions of the same Rule Set to be maintained and enables LILAM servers to track which Rule Set and version is currently in use.
+
+#### Table Structure
+
+| Column | Data Type | Description |
+| --- | --- | --- |
+| `RULE_SET` | `CLOB` | Contains the Rule Set as a JSON document. |
+| `SET_NAME` | `VARCHAR2(30)` | Name identifying the Rule Set. |
+| `VERSION` | `NUMBER` | Version of the Rule Set. |
+| `CREATED` | `TIMESTAMP(6)` | Timestamp at which the Rule Set was created. |
+| `AUTHOR` | `VARCHAR2(50)` | Author associated with the Rule Set. |
 
 ---
 ## API
