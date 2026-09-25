@@ -1,6 +1,6 @@
 # LILAM API Reference
 ### Version: 1.7
-
+---
 <details>
 <summary>📖<b>Content</b></summary>
 
@@ -29,6 +29,8 @@
     - [DEBUG](#procedure-debug)
   - [Metrics](#metrics)
     - [MARK_EVENT](#procedure-mark_event)
+    - [TRACE_START](#procedure-trace_start)
+    - [TRACE_STOP](#procedure-trace_stop)
     - [GET_METRIC_AVG_DURATION](#function-get_metric_avg_duration)
     - [GET_METRIC_STEPS](#function-get_metric_steps)
   - [Server control](#server-control)
@@ -69,13 +71,13 @@ DECLARE
 BEGIN
   -- 1. Setup minimal configuration
   l_sessionInit.processName := 'MY_FIRST_SYNC';
-  l_sessionInit.logLevel    := logLevelInfo;     -- default is logLevelMonitorr
+  l_sessionInit.logLevel    := logLevelInfo;     -- default is logLevelMonitor
   
   -- 2. Initialize the session
   l_processId := lilam.new_session(p_sessionInit => l_sessionInit);
   
   -- 3. Start logging
-  lilam.info(p_processId => l_processId, p_info => 'LILAM is up and running!');
+  lilam.info(p_processId => l_processId, p_logText => 'LILAM is up and running!');
   
   -- 4. Mark a work step
   lilam.mark_event(p_processId => l_processId, p_actionName => 'DATA_LOAD');
@@ -103,7 +105,7 @@ Start the server with
 
 ```sql
 BEGIN
-  lilam.start_server('MY_FIRST_LILAM_SERVER', 'SECURE PASSWORD');
+  lilam.start_server('MY_FIRST_LILAM_SERVER', null, 'SECURE PASSWORD');
 END;
 /
 ```
@@ -126,10 +128,10 @@ BEGIN
   -- In this mode, LILAM acts as a transparent relay: the local framework 
   -- handles all communication with the central server in the background, 
   -- offloading the actual logging and monitoring
-  l_processId := lilam.server_new_session(p_sessionInit => l_sessionInit);
+  l_processId := lilam.server_new_session('DECOUPLED_SYNC', null, lilam.logLevelInfo, 0, 100);
   
   -- 3. Start logging
-  lilam.info(p_processId => l_processId, p_info => 'LILAM is up and running!');
+  lilam.info(p_processId => l_processId, p_info => 'LILAM initialized');
   
   -- 4. Mark a work step and trace a business transaction
   lilam.mark_event(p_processId => l_processId, p_actionName => 'DATA_LOAD'); -- simple event
@@ -139,13 +141,27 @@ BEGIN
   lilam.trace_stop(p_processId => l_processId, p_actionName => 'NEXT_STATION'); -- ends the transaction
 
   -- 5. Update Process Status
-  lilam.step_done(p_processId => l_processId); -- increments process step counter
+  lilam.proc_step_done(p_processId => l_processId); -- increments process step counter
 
-  -- 5. Shutdown the server
-  lilam.server_shutdown(p_processId => l_processId, p_password => 'SECURE PASSWORD');
+  -- 6. Finalize LILAM session to ensure all 'dirty data' will be flushed
+  lilam.close_session(l_processId);
 
 END;
 /
+```
+
+**Step 3: Shut down LILAM server**
+Later you can shut down the LILAM server by opening another client session and call
+```sql
+...
+-- 1. Temporarly connect with server
+l_processId := lilam.server_new_session('SHUT DOWN SERVER', null, lilam.logLevelInfo, 0, 100);
+-- 2. Get Server Pipe and shut down server
+l_serverPipe := lilam.get_server_pipe(l_processId);
+lilam.server_shutdown(l_processId, l_serverPipe, 'SECURE PASSWORD');
+-- 3. Close temporary session
+lilam.close_session(l_pocessId);
+...
 ```
 
 ---
@@ -192,9 +208,8 @@ To accommodate different logging requirements, the following variants are availa
  ```sql
   FUNCTION NEW_SESSION(
     p_processName   VARCHAR2,
-    p_groupName     VARCHAR2,
     p_logLevel      PLS_INTEGER, 
-    p_TabNameMaster VARCHAR2 DEFAULT 'LILAM_LOG'
+    p_TabNameMaster VARCHAR2 DEFAULT 'LILAM'
   ) RETURN NUMBER
  ```
 </details>
@@ -205,10 +220,9 @@ To accommodate different logging requirements, the following variants are availa
 ```sql
 FUNCTION NEW_SESSION(
   p_processName   VARCHAR2, 
-  p_groupName     VARCHAR2,
   p_logLevel      PLS_INTEGER, 
   p_daysToKeep    PLS_INTEGER, 
-  p_TabNameMaster VARCHAR2 DEFAULT 'LILAM_LOG'
+  p_TabNameMaster VARCHAR2 DEFAULT 'LILAM'
 ) RETURN NUMBER
  ```
 </details>
@@ -219,27 +233,10 @@ FUNCTION NEW_SESSION(
 ```sql
 FUNCTION NEW_SESSION(
   p_processName   VARCHAR2, 
-  p_groupName     VARCHAR2,
   p_logLevel      PLS_INTEGER, 
   p_stepsToDo     PLS_INTEGER, 
   p_daysToKeep    PLS_INTEGER, 
-  p_TabNameMaster VARCHAR2 DEFAULT 'LILAM_LOG'
-) RETURN NUMBER
- ```
-</details>
-
-<details>
-  <summary><b>4. Connecting to selected server</b> (With progress tracking)</summary>
-
-```sql
-FUNCTION SERVER_NEW_SESSION(
-  p_processName   VARCHAR2, 
-  p_groupName     VARCHAR2,
-  p_logLevel      PLS_INTEGER, 
-  p_stepsToDo     PLS_INTEGER, 
-  p_daysToKeep    PLS_INTEGER, 
-  p_serverName    VARCHAR2,
-  p_TabNameMaster VARCHAR2 DEFAULT 'LILAM_LOG'
+  p_TabNameMaster VARCHAR2 DEFAULT 'LILAM'
 ) RETURN NUMBER
  ```
 </details>
@@ -256,6 +253,21 @@ FUNCTION SERVER_NEW_SESSION(
  ```
 </details>
 
+<details>
+  <summary><b>4. Connecting to selected server</b> (With progress tracking)</summary>
+
+```sql
+FUNCTION SERVER_NEW_SESSION(
+  p_processName   VARCHAR2, 
+  p_groupName     VARCHAR2,
+  p_logLevel      PLS_INTEGER, 
+  p_stepsToDo     PLS_INTEGER, 
+  p_daysToKeep    PLS_INTEGER, 
+  p_TabNameMaster VARCHAR2 DEFAULT 'LILAM'
+) RETURN NUMBER
+ ```
+</details>
+
 **Parameters**
 
 | Parameter | Type | JSON | Description | Required
@@ -265,7 +277,6 @@ FUNCTION SERVER_NEW_SESSION(
 | p_logLevel | PLS_INTEGER | log_level | determines the level of detail in *detail table* (see above) | [`M`](#m)
 | p_stepsToDo | PLS_INTEGER | steps_todo | defines how many steps must be done during the process | [`O`](#o)
 | p_daysToKeep | PLS_INTEGER | days_to_keep | max. age of entries in days; if not NULL, all entries older than p_daysToKeep and whose process name = p_processName (not case sensitive) are deleted | [`O`](#o)
-| p_serverName | VARCHAR2 | server_name | Used for server affinity / multi-tenancy| [`O`](od)
 | p_TabNameMaster | VARCHAR2 | tab_name_master | optional prefix of the PROC, LOG AND MON table names (see above) | [`D`](#d)
 
 **Returns**
@@ -327,11 +338,11 @@ Ends a logging session with optional final informations. Four function signature
   
  ```sql
   PROCEDURE CLOSE_SESSION(
-    p_processId     NUMBER,
-    p_stepsToDo     PLS_INTEGER,
-    p_stepsDone     PLS_INTEGER,
-    p_processInfo   VARCHAR2,
-    p_processStatus PLS_INTEGER
+    p_processId      NUMBER,
+    p_procStepsToDo  PLS_INTEGER,
+    p_procStepsDone  PLS_INTEGER,
+    p_processInfo    VARCHAR2,
+    p_processStatus  PLS_INTEGER
   )
  ```
 </details>
@@ -340,11 +351,11 @@ Ends a logging session with optional final informations. Four function signature
 
 | Parameter | Type | JSON | Description | Required
 | --------- | ---- | --- | ----------- | -------
-| p_processId | NUMBER | process_id | ID of the process to which the session applies | [`M`](#m)
-| p_stepsToDo | PLS_INTEGER | steps_todo | Number of work steps that would have been necessary for complete processing. This value must be managed by the calling package | [`N`](#n)
-| p_stepsDone | PLS_INTEGER | steps_done | Number of work steps that were actually processed. This value must be managed by the calling package | [`N`](#n)
-| p_processInfo | VARCHAR2 | process_info | Final information about the process (e.g., a readable status) | [`N`](#n)
-| p_status | PLS_INTEGER | status | Final status of the process (freely selected by the calling package) | [`N`](#n)
+| p_processId     | NUMBER | process_id | ID of the process to which the session applies | [`M`](#m)
+| p_procStepsToDo | PLS_INTEGER | steps_todo | Number of work steps that would have been necessary for complete processing. This value must be managed by the calling package | [`N`](#n)
+| p_procStepsDone | PLS_INTEGER | steps_done | Number of work steps that were actually processed. This value must be managed by the calling package | [`N`](#n)
+| p_processInfo   | VARCHAR2 | process_info | Final information about the process (e.g., a readable status) | [`N`](#n)
+| p_status        | PLS_INTEGER | status | Final status of the process (freely selected by the calling package) | [`N`](#n)
 
 > [!IMPORTANT]
 > Since LILAM utilizes high-performance buffering, calling `CLOSE_SESSION` is essential to ensure that all remaining data is flushed and securely written to the database. To prevent data loss during an unexpected application crash, ensure that CLOSE_SESSION is part of your exception handling:
@@ -387,9 +398,9 @@ Documents the lifecycle of a process.
 | Name               | Type      | Description                         | Scope
 | ------------------ | --------- | ----------------------------------- | -------
 | [`SET_PROCESS_STATUS`](#procedure-set_process_status) | Procedure | Sets the state of the log status | Process
-| [`SET_PROC_STEPS_TODO`](#procedure-set_steps_todo) | Procedure | Sets the required number of actions | Process
-| [`STEP_DONE`](#procedure-step_done) | Procedure | Increments the counter of completed steps | Process
-| [`SET_PROC_STEPS_DONE`](#procedure-set_steps_todo) | Procedure | Sets the number of completed actions | Process
+| [`SET_PROC_STEPS_TODO`](#procedure-set_proc_steps_todo) | Procedure | Sets the required number of actions | Process
+| [`PROC_STEP_DONE`](#procedure-proc_step_done) | Procedure | Increments the counter of completed steps | Process
+| [`SET_PROC_STEPS_DONE`](#procedure-set_proc_steps_done) | Procedure | Sets the number of completed actions | Process
 | [`GET_PROC_STEPS_DONE`](fFunction-get_proc_steps_done) | FUNCTION | Returns number of already finished steps | Process
 | [`GET_PROC_STEPS_TODO`](fFunction-get_proc_steps_done) | FUNCTION | Returns number of steps to do | Process
 | [`GET_PROCESS_START`](#function-get_process_start) | FUNCTION | Returns time of process start | Process
@@ -406,26 +417,27 @@ The process status provides information about the overall state of the process. 
  ```sql
   PROCEDURE SET_PROCESS_STATUS(
     p_processId     NUMBER,
-    p_processStatus PLS_INTEGER
+    p_status        PLS_INTEGER,
+    p_processInfo   VARCHAR2 DEFAULT NULL
   )
  ```
 
-#### Procedure SET_STEPS_TODO
+#### Procedure SET_PROC_STEPS_TODO
 This value specifies the planned number of work steps for the entire process. There is no correlation between this value and the actual number of actions recorded within the metrics.
 
  ```sql
-  PROCEDURE SET_STEPS_TODO(
+  PROCEDURE SET_PROC_STEPS_TODO(
     p_processId     NUMBER,
     p_stepsToDo     PLS_INTEGER
   )
 
  ```
 
-#### Procedure STEP_DONE
+#### Procedure PROC_STEP_DONE
 Increments the number of completed steps (progress). This simplifies the management of this value within the application.
 
  ```sql
-  PROCEDURE STEP_DONE(
+  PROCEDURE PROC_STEP_DONE(
     p_processId     NUMBER
   )
  ```
@@ -519,8 +531,8 @@ Reads the numerical status of a process. The status values are not part of the L
  ```
 
 **Returns**
-* Type: Reord Type t_process_rec
-* Description: Stores all known data of a process
+* Type: PLS_INTEGER
+* Description: Aktual known status of process
 
 
 #### Function GET_PROCESS_INFO
@@ -699,7 +711,8 @@ Returns the average duration of markers, aggregated by their respective action n
  ```sql
   FUNCTION GET_METRIC_AVG_DURATION(
     p_processId     NUMBER,
-    p_actionName    VARCHAR2
+    p_actionName    VARCHAR2,
+    p_contextName   VARCHAR2 DEFAULT NULL
   ) RETURN NUMBER
  ```
 
@@ -712,7 +725,8 @@ Returns the number of markers, grouped by their respective action names.
  ```sql
   FUNCTION GET_METRIC_STEPS(
     p_processId     NUMBER,
-    p_actionName    VARCHAR2
+    p_actionName    VARCHAR2,
+    p_contextName   VARCHAR2 DEFAULT NULL
   ) RETURN NUMBER
  ```
 
@@ -725,7 +739,7 @@ Returns the number of markers, grouped by their respective action names.
 | --------- | ---- | --- | ----------- | -------
 | p_processId | NUMBER | process_id | ID of the process to which the session applies | [`M`](#m)
 | p_actionName | VARCHAR2 | action_name | identifier of the action | [`M`](#m)
-| p_contextName | VARCHAR2 | context_name | differentiates recurring actions within a session | [`M`](#m)
+| p_contextName | VARCHAR2 | context_name | differentiates recurring actions within a session | [`N`](#n)
 
 
 [↑ Back to Top](#lilam-api-reference)
@@ -788,8 +802,8 @@ Retrieves the server name (which also serves as the pipe name). Similar to SERVE
 
  ```sql
   FUNCTION GET_SERVER_PIPE(
-    p_processId     NUMBER,
-  )
+    p_processId     NUMBER
+  ) RETURN VARCHAR2
  ```
 
 #### PROCEDURE SERVER_UPDATE_RULES
@@ -854,8 +868,8 @@ TYPE t_session_init IS RECORD (
     processName VARCHAR2(100),
     logLevel PLS_INTEGER := logLevelMonitor,
     stepsToDo PLS_INTEGER,
-    daysToKeep PLS_INTEGER,
-    procImmortal PLS_INTEGER,
+    daysToKeep PLS_INTEGER := 100,
+    procImmortal PLS_INTEGER := 0,
     tabNameMaster VARCHAR2(100) DEFAULT 'LILAM'
 );
 ```
