@@ -237,7 +237,15 @@ The process table represents the processes. For each process, exactly one entry 
 
 The number of planned steps as well as the steps already completed are controlled by the application, either by explicitly setting these values or via an API trigger.
 
-**The name of the master table can be chosen freely—within the scope of Oracle naming rules.** By default, the master table is named 'LILAM_LOG'.
+**The name of the Process Table is derived from the configured master table name by appending the fixed suffix `_PROC`.**
+
+For example:
+
+| Master Table Name | Process Table Name |
+| --- | --- |
+| `LILAM` | `LILAM_PROC` |
+| `MY_APPLICATION` | `MY_APPLICATION_PROC` |
+| `LILAM_LOGGING` | `LILAM_LOGGING_PROC` |
 
 ### Log Table
 Stores chronological log entries including timestamps, severity levels, and detailed diagnostic information. Each entry is linked to its process through the `PROCESS_ID`.
