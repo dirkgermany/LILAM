@@ -1,921 +1,808 @@
 # LILAM API Reference
 ### Version: 1.7
+
 ---
+
 <details>
-<summary>📖<b>Content</b></summary>
+<summary>📖 <b>Content</b></summary>
 
 - [Quick Start](#quick-start)
+  - [In-Session Mode](#in-session-mode)
+  - [Decoupled Server Mode](#decoupled-server-mode)
+- [Core Concepts](#core-concepts)
+  - [Process Progress vs. Metrics](#process-progress-vs-metrics)
+  - [Events vs. Traces](#events-vs-traces)
 - [Functions and Procedures](#functions-and-procedures)
-  - [Session handling](#session-handling)
-    - [NEW_SESSION](#function-new_session--server_new_session)
-    - [CLOSE_SESSION](#procedure-close_session)
-    - [FINAL_RESCUE](#procedure-final_rescue)
-  - [Process control](#process-control)
-    - [SET_PROCESS_STATUS](#procedure-set_process_status)
-    - [SET_PROC_STEPS_TODO](#procedure-set_proc_steps_todo)
-    - [PROC_STEP_DONE](#procedure-proc_step_done)
-    - [SET_PROC_STEPS_DONE](#procedure-set_proc_steps_done)
-    - [GET_PROC_STEPS_DONE](#function-get_proc_steps_done)
-    - [GET_PROC_STEPS_TODO](#function-get_proc_steps_todo)
-    - [GET_PROCESS_START](#function-get_process_start)
-    - [GET_PROCESS_END](#function-get_process_end)
-    - [GET_PROCESS_STATUS](#function-get_process_status)
-    - [GET_PROCESS_INFO](#function-get_process_info)
-    - [GET_PROCESS_DATA](#function-get_process_data)
+  - [Session Handling](#session-handling)
+  - [Process Control](#process-control)
   - [Logging](#logging)
-    - [ERROR](#procedure-error)
-    - [WARN](#procedure-warn)
-    - [INFO](#procedure-info)
-    - [DEBUG](#procedure-debug)
   - [Metrics](#metrics)
-    - [MARK_EVENT](#procedure-mark_event)
-    - [TRACE_START](#procedure-trace_start)
-    - [TRACE_STOP](#procedure-trace_stop)
-    - [GET_METRIC_AVG_DURATION](#function-get_metric_avg_duration)
-    - [GET_METRIC_STEPS](#function-get_metric_steps)
-  - [Server control](#server-control)
-    - [START_SERVER](#procedure-start_server)
-    - [CREATE_SERVER](#function-create_server)
-    - [SERVER_SHUTDOWN](#procedure-server_shutdown)
-    - [GET_SERVER_PIPE](#function-get_server_pipe)
-    - [SERVER_UPDATE_RULES](#procedure-server_update_rules)
-  - [Appendix](#appendix)
-    - [Log Level](#log-level)
-        - [Declaration of Log Levels](#declaration-of-log-levels)
-    - [JSON API Interface](#json-api-interface)
-    - [Record Type t_session_init](#record-type-t_session_init)
-    - [Record Type t_process_rec](#record-type-t_process_rec)
+  - [Server Control](#server-control)
+- [Appendix](#appendix)
+  - [Parameter Requirements](#parameter-requirements)
+  - [Log Levels](#log-levels)
+  - [Record Type t_session_init](#record-type-t_session_init)
+  - [Record Type t_process_rec](#record-type-t_process_rec)
+  - [JSON API Interface](#json-api-interface)
 
 </details>
-
 
 > [!TIP]
-> This document serves as the LILAM API reference, providing a straightforward description of the programming interface.
-> For those new to LILAM, I recommend starting with the document [architecture and concepts.md](architecture%20and%20concepts.md), which (hopefully) provides a fundamental understanding of how LILAM works. Furthermore, the demos and examples in the #demo folder demonstrate how easily the LILAM API can be integrated.
+> This document is the LILAM API reference. If you are new to LILAM, start with [architecture and concepts.md](architecture%20and%20concepts.md) for the underlying concepts. The examples in the `demo` folder show how the API can be integrated into applications.
 
 ---
+
 ## Quick Start
+
 ### In-Session Mode
-The following example shows the simplest way to initialize a session and log a message. 
-LILAM uses reasonable defaults, so you only need to provide a process name and the logLevel setting.
-After your application ends there should be three tables:
-* LILAM_PROC (the process data table)
-* LILAM_LOG (table with logging data)
-* LILAM_MON (table with events and transaction metrics)
 
+Use in-session mode when logging and monitoring should be handled directly within the current database session.
+
+The following example initializes LILAM, writes a log entry, and records two occurrences of an event. With the default table prefix, LILAM uses these tables:
+
+- `LILAM_PROC` for process data
+- `LILAM_LOG` for log entries
+- `LILAM_MON` for events and transaction metrics
 
 ```sql
 DECLARE
-  l_processId    NUMBER;
-  l_sessionInit  t_session_init;
+  l_processId   NUMBER;
+  l_sessionInit t_session_init;
 BEGIN
-  -- 1. Setup minimal configuration
+  -- 1. Configure the session
   l_sessionInit.processName := 'MY_FIRST_SYNC';
-  l_sessionInit.logLevel    := logLevelInfo;     -- default is logLevelMonitor
-  
-  -- 2. Initialize the session
-  l_processId := lilam.new_session(p_sessionInit => l_sessionInit);
-  
-  -- 3. Start logging
-  lilam.info(p_processId => l_processId, p_logText => 'LILAM is up and running!');
-  
-  -- 4. Mark a work step
-  lilam.mark_event(p_processId => l_processId, p_actionName => 'DATA_LOAD');
+  l_sessionInit.logLevel    := logLevelInfo; -- default: logLevelMonitor
+
+  -- 2. Initialize LILAM
+  l_processId := lilam.new_session(
+    p_session_init => l_sessionInit
+  );
+
+  -- 3. Write a log entry
+  lilam.info(
+    p_processId => l_processId,
+    p_logText   => 'LILAM is up and running!'
+  );
+
+  -- 4. Record an event twice
+  lilam.mark_event(
+    p_processId  => l_processId,
+    p_actionName => 'DATA_LOAD'
+  );
+
   dbms_session.sleep(1);
-  lilam.mark_event(p_processId => l_processId, p_actionName => 'DATA_LOAD');
-  
-  -- Missing a COMMIT? 
-  -- Don't worry: LILAM uses AUTONOMOUS TRANSACTIONS.
-  -- This ensures that logs are stored immediately and independently 
-  -- from your main transaction (even if you ROLLBACK).
-END;
-/
-```
 
-### Decoupled (Server) Mode
+  lilam.mark_event(
+    p_processId  => l_processId,
+    p_actionName => 'DATA_LOAD'
+  );
 
-**Step 1: Start the server (Session A)**
-
-To use the decoupled mode, you first need to start a LILAM server. For this example, use a dedicated database session (e.g., a second instance of SQL Developer), as the server will block the session while it is running. In production environments, the server is typically started as a background process via `DBMS_JOB` or `DBMS_SCHEDULE` to avoid session blocking.
-
-By default, the client automatically identifies and connects to the server with the lowest current load. This means the client does not need to know specific server names in advance.
-Additionally, it is possible to explicitly connect a client to a server assigned to a specific group. In this case, the system also automatically selects the server with the lowest current workload within that group.
-
-Start the server with 
-
-```sql
-BEGIN
-  lilam.start_server('MY_FIRST_LILAM_SERVER', null, 'SECURE PASSWORD');
-END;
-/
-```
-
-**Step 2: Execute the client code (Session B)**
-
-In a separate session, execute the following block. Note that `SERVER_NEW_SESSION` automatically connects to your active server.
-
-```sql
-DECLARE
-  l_processId    NUMBER;
-  l_sessionInit  t_session_init;
-BEGIN
-  -- 1. Setup minimal configuration
-  l_sessionInit.processName := 'DECOUPLED_SYNC';
-  l_sessionInit.logLevel    := logLevelInfo;     -- default is logLevelMonitor
-  
-  -- 2. Initialize the session
-  -- Use SERVER_NEW_SESSION to connect to a central LILAM management server.
-  -- In this mode, LILAM acts as a transparent relay: the local framework 
-  -- handles all communication with the central server in the background, 
-  -- offloading the actual logging and monitoring
-  l_processId := lilam.server_new_session('DECOUPLED_SYNC', null, lilam.logLevelInfo, 0, 100);
-  
-  -- 3. Start logging
-  lilam.info(p_processId => l_processId, p_logText => 'LILAM initialized');
-  
-  -- 4. Mark a work step and trace a business transaction
-  lilam.mark_event(p_processId => l_processId, p_actionName => 'DATA_LOAD'); -- simple event
-  lilam.trace_start(p_processId => l_processId, p_actionName => 'NEXT_STATION'); -- begins a transaction
-  dbms_session.sleep(1);
-  lilam.mark_event(p_processId => l_processId, p_actionName => 'DATA_LOAD');
-  lilam.trace_stop(p_processId => l_processId, p_actionName => 'NEXT_STATION'); -- ends the transaction
-
-  -- 5. Update Process Status
-  lilam.proc_step_done(p_processId => l_processId); -- increments process step counter
-
-  -- 6. Finalize LILAM session to ensure all 'dirty data' will be flushed
+  -- 5. Finalize the session
   lilam.close_session(l_processId);
-
 END;
 /
 ```
-
-**Step 3: Shut down LILAM server**
-Later you can shut down the LILAM server by opening another client session and call
-```sql
-...
--- 1. Temporarly connect with server
-l_processId := lilam.server_new_session('SHUT DOWN SERVER', null, lilam.logLevelInfo, 0, 100);
--- 2. Get Server Pipe and shut down server
-l_serverPipe := lilam.get_server_pipe(l_processId);
-lilam.server_shutdown(l_processId, l_serverPipe, 'SECURE PASSWORD');
--- 3. Close temporary session
-lilam.close_session(l_processId);
-...
-```
-
----
-## Functions and Procedures
-Parameters for procedures and functions can be mandatory, nullable, or optional and some can have default values.In the overview tables, they are marked as follows:
-
-### Shortcuts for parameter requirement
-* <a id="M"> ***M***andatory</a>
-* <a id="O"> ***O***ptional</a>
-* <a id="N"> ***N***ullable</a>
-* <a id="D"> ***D***efault</a>
-
-The functions and procedures are organized into the following five groups:
-* Session Handling
-* Process Control
-* Logging
-* Metrics
-* Server Control
-
----
-### Session Handling
-
-| Name               | Type      | Description                         | Scope
-| ------------------ | --------- | ----------------------------------- | ---------
-| [NEW_SESSION](#function-new_session--server_new_session) | Function  | Opens a new log session | Session control
-| [SERVER_NEW_SESSION](#function-new_session--server_new_session) | Function  | Opens a new decoupled session | Session control
-| [CLOSE_SESSION](#procedure-close_session) | Procedure | Ends a log session | Session control
 
 > [!NOTE]
-> All API calls are the same, independent of whether LILAM is used 'locally' or in a 'decoupled' manner. One exception is the function `SERVER_NEW_SESSION`, which initializes the LILAM package to function as a dedicated client, managing the communication with the LILAM server seamlessly.
-> **The parameters and return value of `SERVER_NEW_SESSION` are nearly identical to those of `NEW_SESSION`.** However, `SERVER_NEW_SESSION` includes an additional parameter to specify a server of a specific group. This ensures that the client connects to a specific server instance (e.g., for department-specific or multi-tenant tasks) rather than simply choosing the one with the lowest load.
+> LILAM uses autonomous transactions. Logging and monitoring data is therefore persisted independently of the caller's main transaction, including when that transaction is rolled back.
 
-#### Function NEW_SESSION / SERVER_NEW_SESSION
-The `NEW_SESSION` resp. `SERVER_NEW_SESSION` function starts the logging session for a process. This procedure must be called first. Calls to the API without a prior `NEW_SESSION` do not make sense or can (theoretically) lead to undefined states.
-`NEW_SESSION` and `SERVER_NEW_SESSION` are overloaded so various signatures are available.
+### Decoupled Server Mode
 
-**Signatures**
+Use decoupled mode when clients should send logging and monitoring data to a LILAM server.
 
-To accommodate different logging requirements, the following variants are available:
+A server is identified by its pipe name and can optionally belong to a group. A client can connect either to an available server or restrict server selection to a specific group.
 
-<details>
-  <summary><b>1. Basic Mode</b> (Standard initialization)</summary>
-  
- ```sql
-  FUNCTION NEW_SESSION(
-    p_processName   VARCHAR2,
-    p_logLevel      PLS_INTEGER DEFAULT logLevelMonitor, 
-    p_TabNameMaster VARCHAR2 DEFAULT 'LILAM'
-  ) RETURN NUMBER
- ```
-</details>
+#### Step 1: Start the server
 
-<details>
-  <summary><b>2. Retention Mode</b> (With automated cleanup)</summary>
+Start the server in a dedicated database session. `START_SERVER` blocks that session while the server is running. In production, `CREATE_SERVER` can be used to start a server through `DBMS_SCHEDULER`.
 
 ```sql
-FUNCTION NEW_SESSION(
-  p_processName   VARCHAR2, 
-  p_logLevel      PLS_INTEGER, 
-  p_daysToKeep    PLS_INTEGER, 
-  p_TabNameMaster VARCHAR2 DEFAULT 'LILAM'
-) RETURN NUMBER
- ```
-</details>
-
-<details>
-  <summary><b>3. Full Progress Mode</b> (With progress tracking)</summary>
-
-```sql
-FUNCTION NEW_SESSION(
-  p_processName   VARCHAR2, 
-  p_logLevel      PLS_INTEGER, 
-  p_procStepsToDo     PLS_INTEGER, 
-  p_daysToKeep    PLS_INTEGER, 
-  p_TabNameMaster VARCHAR2 DEFAULT 'LILAM'
-) RETURN NUMBER
- ```
-</details>
-
-<details>
-  <summary><b>4. using a data-structure (record)</b> (Standard initialization)</summary>
-  
-  This variant uses the dedicated [`t_session_init` record](#record-type-t_session_init) for initializing the new session.
-  
- ```sql
-  FUNCTION NEW_SESSION(
-    p_session_init t_session_init
-  ) RETURN NUMBER
- ```
-</details>
-
-<details>
-  <summary><b>5. Connecting to any available server</b></summary>
-
-```sql
-FUNCTION SERVER_NEW_SESSION(
-  p_processName   VARCHAR2, 
-  p_logLevel      PLS_INTEGER, 
-  p_procStepsToDo PLS_INTEGER, 
-  p_daysToKeep    PLS_INTEGER, 
-  p_TabNameMaster VARCHAR2
-) RETURN NUMBER
- ```
-</details>
-
-<details>
-  <summary><b>6. Connecting to an available server of a specific group</b></summary>
-
-```sql
-FUNCTION SERVER_NEW_SESSION(
-  p_processName   VARCHAR2, 
-  p_groupName     VARCHAR2,
-  p_logLevel      PLS_INTEGER, 
-  p_procStepsToDo PLS_INTEGER, 
-  p_daysToKeep    PLS_INTEGER, 
-  p_TabNameMaster VARCHAR2
-) RETURN NUMBER
- ```
-</details>
-
-**Parameters**
-
-| Parameter | Type | JSON | Description | Required
-| --------- | ---- | --- | ----------- | -------
-| p_processName | VARCHAR2| process_name | freely selectable name for identifying the process; is written to *master table* | [`M`](#m)
-| p_groupName | VARCHAR2| group_name | used to get a dedicated server for the group | [`N`](#n)
-| p_logLevel | PLS_INTEGER | log_level | determines the level of detail in *detail table* (see above) | [`M`](#m)
-| p_procStepsToDo | PLS_INTEGER | steps_todo | defines how many steps must be done during the process | [`O`](#o)
-| p_daysToKeep | PLS_INTEGER | days_to_keep | max. age of entries in days; if not NULL, all entries older than p_daysToKeep and whose process name = p_processName (not case sensitive) are deleted | [`O`](#o)
-| p_TabNameMaster | VARCHAR2 | tab_name_master | optional prefix of the PROC, LOG AND MON table names (see above) | [`D`](#d)
-
-**Returns**
-* Type: NUMBER
-* Description: The new process ID; this ID is required for subsequent calls in order to be able to assign the LOG calls to the process
-
-**Example**
-```sql
-DECLARE
-  v_processId NUMBER;
 BEGIN
-  -- Using the "Retention" variant
-  v_processId := NEW_SESSION('DATA_IMPORT', 2, 30);
+  lilam.start_server(
+    'MY_FIRST_LILAM_SERVER',
+    NULL,
+    'SECURE PASSWORD'
+  );
 END;
+/
 ```
 
-#### Procedure CLOSE_SESSION
-Ends a logging session with optional final informations. Four function signatures are available for different scenarios.
+#### Step 2: Run a client
 
-**Signatures**
+```sql
+DECLARE
+  l_processId NUMBER;
+BEGIN
+  -- Connect to an available server
+  l_processId := lilam.server_new_session(
+    'DECOUPLED_SYNC',
+    lilam.logLevelInfo,
+    0,
+    100,
+    'LILAM'
+  );
 
-<details>
-  <summary><b>1. No information about process</b> (Standard)</summary>
-  
- ```sql
-  PROCEDURE CLOSE_SESSION(
-    p_processId     NUMBER
-  )
- ```
-</details>
+  lilam.info(
+    p_processId => l_processId,
+    p_logText   => 'LILAM initialized'
+  );
 
-<details>
-  <summary><b>2. Update process info and process status</b> (Standard)</summary>
-  
- ```sql
-  PROCEDURE CLOSE_SESSION(
-    p_processId     NUMBER,
-    p_processInfo   VARCHAR2,
-    p_processStatus PLS_INTEGER
-  )
- ```
-</details>
+  -- Discrete event
+  lilam.mark_event(
+    p_processId  => l_processId,
+    p_actionName => 'DATA_LOAD'
+  );
 
-<details>
-  <summary><b>3. Update process info and metric results</b> (Standard)</summary>
-  
- ```sql
-  PROCEDURE CLOSE_SESSION(
-    p_processId     NUMBER,
-    p_procStepsDone     PLS_INTEGER,
-    p_processInfo   VARCHAR2,
-    p_processStatus PLS_INTEGER
-  )
- ```
-</details>
+  -- Timed transaction
+  lilam.trace_start(
+    p_processId  => l_processId,
+    p_actionName => 'NEXT_STATION'
+  );
 
-<details>
-  <summary><b>4. Update complete process data and complete metric data</b> (Standard)</summary>
-  
- ```sql
-  PROCEDURE CLOSE_SESSION(
-    p_processId      NUMBER,
-    p_procStepsToDo  PLS_INTEGER,
-    p_procStepsDone  PLS_INTEGER,
-    p_processInfo    VARCHAR2,
-    p_processStatus  PLS_INTEGER
-  )
- ```
-</details>
+  dbms_session.sleep(1);
 
-**Parameters**
+  lilam.trace_stop(
+    p_processId  => l_processId,
+    p_actionName => 'NEXT_STATION'
+  );
 
-| Parameter | Type | JSON | Description | Required
-| --------- | ---- | --- | ----------- | -------
-| p_processId     | NUMBER | process_id | ID of the process to which the session applies | [`M`](#m)
-| p_procStepsToDo | PLS_INTEGER | steps_todo | Number of work steps that would have been necessary for complete processing. This value must be managed by the calling package | [`N`](#n)
-| p_procStepsDone | PLS_INTEGER | steps_done | Number of work steps that were actually processed. This value must be managed by the calling package | [`N`](#n)
-| p_processInfo   | VARCHAR2 | process_info | Final information about the process (e.g., a readable status) | [`N`](#n)
-| p_status        | PLS_INTEGER | status | Final status of the process (freely selected by the calling package) | [`N`](#n)
+  lilam.proc_step_done(p_processId => l_processId);
+
+  -- Flush remaining buffered data
+  lilam.close_session(l_processId);
+END;
+/
+```
+
+#### Step 3: Shut down the server
+
+A client must first establish a server session. The server pipe associated with that session can then be obtained with `GET_SERVER_PIPE` and passed to `SERVER_SHUTDOWN`.
+
+```sql
+DECLARE
+  l_processId NUMBER;
+  l_serverPipe VARCHAR2(100);
+BEGIN
+  l_processId := lilam.server_new_session(
+    'SHUT DOWN SERVER',
+    lilam.logLevelInfo,
+    0,
+    100,
+    'LILAM'
+  );
+
+  l_serverPipe := lilam.get_server_pipe(l_processId);
+
+  lilam.server_shutdown(
+    l_processId,
+    l_serverPipe,
+    'SECURE PASSWORD'
+  );
+
+  lilam.close_session(l_processId);
+END;
+/
+```
+
+---
+
+## Core Concepts
+
+### Process Progress vs. Metrics
 
 > [!IMPORTANT]
-> Since LILAM utilizes high-performance buffering, calling `CLOSE_SESSION` is essential to ensure that all remaining data is flushed and securely written to the database. To prevent data loss during an unexpected application crash, ensure that CLOSE_SESSION is part of your exception handling:
-  
+> Process progress and metrics are independent concepts.
+
+Use `SET_PROC_STEPS_TODO`, `PROC_STEP_DONE`, and `SET_PROC_STEPS_DONE` to describe the overall progress of a process.
+
+Use `MARK_EVENT`, `TRACE_START`, and `TRACE_STOP` to record measurable activities within that process. The number of process steps does not have to correspond to the number of metric events or traces.
+
+### Events vs. Traces
+
+A simple rule of thumb:
+
+- **Something happened:** use `MARK_EVENT`.
+- **Something started and later finished:** use `TRACE_START` and `TRACE_STOP`.
+
+A metric is identified by the combination of `p_actionName` and `p_contextName`. If a trace is started with a context, it must be stopped using the same action and context.
+
+---
+
+## Functions and Procedures
+
+### Parameter Requirements
+
+The following markers are used in parameter descriptions:
+
+- **M**: Mandatory
+- **O**: Optional
+- **N**: Nullable
+- **D**: Has a default value
+
+---
+
+## Session Handling
+
+Session handling controls the lifecycle of a LILAM process.
+
+| API | Purpose |
+| --- | --- |
+| `NEW_SESSION` | Starts an in-session LILAM process |
+| `SERVER_NEW_SESSION` | Starts a process connected to a LILAM server |
+| `CLOSE_SESSION` | Finalizes a process and flushes buffered data |
+| `FINAL_RESCUE` | Persists cached data after abnormal process termination |
+
+### Function NEW_SESSION / SERVER_NEW_SESSION
+
+Both functions start a LILAM process and return its process ID. That ID is required by subsequent API calls.
+
+#### Which variant should I use?
+
+- Use the `t_session_init` variant when you want initialization settings collected in a readable record.
+- Use a short `NEW_SESSION` overload when only a few settings are required.
+- Use `SERVER_NEW_SESSION` for decoupled operation.
+- Use the group overload of `SERVER_NEW_SESSION` when server selection should be restricted to a specific group.
+
+#### NEW_SESSION: Basic Mode
+
 ```sql
-EXCEPTION WHEN OTHERS THEN
-    -- Flushes buffered data and logs the error state before terminating
+FUNCTION NEW_SESSION(
+  p_processName   VARCHAR2,
+  p_logLevel      PLS_INTEGER DEFAULT logLevelMonitor,
+  p_tabNameMaster VARCHAR2 DEFAULT 'LILAM'
+) RETURN NUMBER
+```
+
+#### NEW_SESSION: Retention Mode
+
+```sql
+FUNCTION NEW_SESSION(
+  p_processName   VARCHAR2,
+  p_logLevel      PLS_INTEGER,
+  p_daysToKeep    PLS_INTEGER,
+  p_tabNameMaster VARCHAR2 DEFAULT 'LILAM'
+) RETURN NUMBER
+```
+
+#### NEW_SESSION: Full Progress Mode
+
+```sql
+FUNCTION NEW_SESSION(
+  p_processName   VARCHAR2,
+  p_logLevel      PLS_INTEGER,
+  p_procStepsToDo PLS_INTEGER,
+  p_daysToKeep    PLS_INTEGER,
+  p_tabNameMaster VARCHAR2 DEFAULT 'LILAM'
+) RETURN NUMBER
+```
+
+#### NEW_SESSION: Record-Based Initialization
+
+```sql
+FUNCTION NEW_SESSION(
+  p_session_init t_session_init
+) RETURN NUMBER
+```
+
+#### SERVER_NEW_SESSION: Any Available Server
+
+```sql
+FUNCTION SERVER_NEW_SESSION(
+  p_processName   VARCHAR2,
+  p_logLevel      PLS_INTEGER,
+  p_procStepsToDo PLS_INTEGER,
+  p_daysToKeep    PLS_INTEGER,
+  p_tabNameMaster VARCHAR2
+) RETURN NUMBER
+```
+
+#### SERVER_NEW_SESSION: Server from a Specific Group
+
+```sql
+FUNCTION SERVER_NEW_SESSION(
+  p_processName   VARCHAR2,
+  p_groupName     VARCHAR2,
+  p_logLevel      PLS_INTEGER,
+  p_procStepsToDo PLS_INTEGER,
+  p_daysToKeep    PLS_INTEGER,
+  p_tabNameMaster VARCHAR2
+) RETURN NUMBER
+```
+
+#### Parameters
+
+| Parameter | JSON | Description |
+| --- | --- | --- |
+| `p_processName` | `process_name` | Name used to identify the process |
+| `p_groupName` | `group_name` | Restricts server selection to the specified group |
+| `p_logLevel` | `log_level` | Controls logging detail |
+| `p_procStepsToDo` | `steps_todo` | Planned number of process steps |
+| `p_daysToKeep` | `days_to_keep` | Maximum age of matching process data before cleanup |
+| `p_tabNameMaster` | `tab_name_master` | Prefix used for the PROC, LOG, and MON table names |
+
+**Returns:** `NUMBER`, the process ID.
+
+### Procedure CLOSE_SESSION
+
+Finalizes a LILAM process. Depending on the overload, final process information, progress, and status can be supplied.
+
+> [!IMPORTANT]
+> Always call `CLOSE_SESSION` when processing ends. LILAM buffers data for performance, and `CLOSE_SESSION` ensures remaining buffered data is persisted. It should therefore also be called from final exception handling.
+
+```sql
+PROCEDURE CLOSE_SESSION(
+  p_processId NUMBER
+)
+```
+
+```sql
+PROCEDURE CLOSE_SESSION(
+  p_processId   NUMBER,
+  p_processInfo VARCHAR2,
+  p_status      PLS_INTEGER
+)
+```
+
+```sql
+PROCEDURE CLOSE_SESSION(
+  p_processId      NUMBER,
+  p_procStepsDone  NUMBER,
+  p_processInfo    VARCHAR2,
+  p_processStatus  PLS_INTEGER
+)
+```
+
+```sql
+PROCEDURE CLOSE_SESSION(
+  p_processId      NUMBER,
+  p_procStepsToDo  NUMBER,
+  p_procStepsDone  NUMBER,
+  p_processInfo    VARCHAR2,
+  p_processStatus  PLS_INTEGER
+)
+```
+
+Example exception handling:
+
+```sql
+EXCEPTION
+  WHEN OTHERS THEN
     lilam.close_session(
-        p_process_id  => l_proc_id, 
-        p_status      => -1,          -- Your custom error status code here
-        p_processInfo => SQLERRM      -- Captures the Oracle error message
+      p_processId   => l_proc_id,
+      p_processInfo => SQLERRM,
+      p_status      => -1
     );
     RAISE;
 ```
 
-#### Procedure FINAL_RESCUE
-For performance reasons, LILAM caches entries for logs, monitoring, and processes. This is possible because LILAM manages its memory and transactions independently of the calling package. To ensure that entries are written securely, a final [`CLOSE_SESSION`](#procedure-close_session) is required at the end of the process. Therefore, CLOSE_SESSION should also be called within the final exception handling of procedures or functions before the calling process terminates unexpectedly due to a fatal error.
+### Procedure FINAL_RESCUE
 
-Should one or even multiple abnormal process terminations occur, LILAM's non-persisted data can be written by calling the 'FINAL_RESCUE' procedure.
-```sql
-exec lilam.final_rescue;
-```
-Alternatively
+LILAM caches logging, monitoring, and process entries for performance. `FINAL_RESCUE` persists all currently cached data in the current database session.
+
 ```sql
 BEGIN
   lilam.final_rescue;
 END;
 /
 ```
-This call triggers the persistence of all currently cached data.
-> [!IMPORTANT]
-> Successful execution depends on calling the procedure from the specific session in which the crashed processes originated.
-
-[↑ Back to Top](#lilam-api-reference)
-
----
-### Process Control
-Documents the lifecycle of a process.
-
-| Name               | Type      | Description                         | Scope
-| ------------------ | --------- | ----------------------------------- | -------
-| [`SET_PROCESS_STATUS`](#procedure-set_process_status) | Procedure | Sets the state of the log status | Process
-| [`SET_PROC_STEPS_TODO`](#procedure-set_proc_steps_todo) | Procedure | Sets the required number of actions | Process
-| [`PROC_STEP_DONE`](#procedure-proc_step_done) | Procedure | Increments the counter of completed steps | Process
-| [`SET_PROC_STEPS_DONE`](#procedure-set_proc_steps_done) | Procedure | Sets the number of completed actions | Process
-| [`GET_PROC_STEPS_DONE`](#function-get_proc_steps_done) | FUNCTION | Returns number of already finished steps | Process
-| [`GET_PROC_STEPS_TODO`](#function-get_proc_steps_todo) | FUNCTION | Returns number of steps to do | Process
-| [`GET_PROCESS_START`](#function-get_process_start) | FUNCTION | Returns time of process start | Process
-| [`GET_PROCESS_END`](#function-get_process_end) | FUNCTION | Returns time of process end (if finished) | Process
-| [`GET_PROCESS_STATUS`](#function-get_process_status) | FUNCTION | Returns the process state | Process
-| [`GET_PROCESS_INFO`](#function-get_process_info) | FUNCTION | Returns info text about process | Process
-| [`GET_PROCESS_DATA`](#function-get_process_data) | FUNCTION | Returns all process data as a record (see below) | Process 
-
-**Procedures (Setter)**
-  
-#### Procedure SET_PROCESS_STATUS
-The process status provides information about the overall state of the process. This integer value is not evaluated by LILAM; its meaning depends entirely on the specific application scenario.
-
- ```sql
-  PROCEDURE SET_PROCESS_STATUS(
-    p_processId     NUMBER,
-    p_status        PLS_INTEGER,
-    p_processInfo   VARCHAR2 DEFAULT NULL
-  )
- ```
-
-#### Procedure SET_PROC_STEPS_TODO
-This value specifies the planned number of work steps for the entire process. There is no correlation between this value and the actual number of actions recorded within the metrics.
-
- ```sql
-  PROCEDURE SET_PROC_STEPS_TODO(
-    p_processId     NUMBER,
-    p_procStepsToDo PLS_INTEGER
-  )
-
- ```
-
-#### Procedure PROC_STEP_DONE
-Increments the number of completed steps (progress). This simplifies the management of this value within the application.
-
- ```sql
-  PROCEDURE PROC_STEP_DONE(
-    p_processId     NUMBER
-  )
- ```
-
-#### Procedure SET_PROC_STEPS_DONE
-Sets the total number of completed steps. Note: Calling this procedure overwrites any progress previously calculated via `PROC_STEP_DONE`.
-
- ```sql
-  PROCEDURE SET_PROC_STEPS_DONE(
-    p_processId     NUMBER,
-    p_procStepsDone PLS_INTEGER
-  )
- ```
-
-> [!NOTE]
-> Whenever a record in the master table is changed, the `last_update field` is updated implicitly. This mechanism is designed to support the monitoring features.
-
-**Parameters**
-
-| Parameter | Type | JSON | Description | Required
-| --------- | ---- | --- | ----------- | -------
-| p_processId | NUMBER | process_id | ID of the process to which the session applies | [`M`](#m)
-| p_processStatus | PLS_INTEGER | process_status | information about the overall state of the process | [`O`](#o)
-| p_procStepsToDo | PLS_INTEGER | steps_todo | Number of work steps that would have been necessary for complete processing. This value must be managed by the calling package | [`N`](#n)
-| p_procStepsDone | PLS_INTEGER | steps_done | Number of work steps that were actually processed. This value must be managed by the calling package | [`N`](#n)
-| p_processInfo | VARCHAR2 | process_info | Final information about the process (e.g., a readable status) | [`N`](#n)
-| p_status | PLS_INTEGER | status | Final status of the process (freely selected by the calling package) | [`N`](#n)
-
-**Functions (Getter)**
-
-#### Function GET_PROC_STEPS_DONE
-Retrieves the number of processed steps.
-
- ```sql
-  FUNCTION GET_PROC_STEPS_DONE(
-    p_processId     NUMBER
-  ) RETURN PLS_INTEGER
- ```
-
-**Returns**
-* Type: PLS_INTEGER
-* Description: Number of already processed steps (progress)
-
-#### Function GET_PROC_STEPS_TODO
-Retrieves the number of planned process steps. This value has nothing to do with metric actions.
-
- ```sql
-  FUNCTION GET_PROC_STEPS_TODO(
-    p_processId     NUMBER
-  ) RETURN PLS_INTEGER
- ```
-
-**Returns**
-* Type: PLS_INTEGER
-* Description: Number of planned steps
-
-#### Function GET_PROCESS_START
-Retrieves the time when the process was started with `NEW_SESSION`.
-
- ```sql
-  FUNCTION GET_PROCESS_START(
-    p_processId     NUMBER
-  ) RETURN TIMESTAMP
- ```
-
-**Returns**
-* Type: TIMESTAMP
-* Description: This value cannot be changed by the API
-
-
-#### Function GET_PROCESS_END
-Retrieves the time when the process was finalized by `CLOSE_SESSION`.
-
- ```sql
-  FUNCTION GET_PROCESS_END(
-    p_processId     NUMBER
-  ) RETURN TIMESTAMP
- ```
-
-**Returns**
-* Type: TIMESTAMP
-* Description: This value cannot be changed by the API
-
-#### Function GET_PROCESS_STATUS
-Reads the numerical status of a process. The status values are not part of the LILAM specification.
-
- ```sql
-  FUNCTION GET_PROCESS_STATUS(
-    p_processId     NUMBER
-  ) RETURN PLS_INTEGER
- ```
-
-**Returns**
-* Type: PLS_INTEGER
-* Description: Aktual known status of process
-
-
-#### Function GET_PROCESS_INFO
-Reads the INFO-Text which is part of the process record. Likewise flexible and contingent on the specific application requirements. 
-
- ```sql
-  FUNCTION GET_PROCESS_INFO(
-    p_processId     NUMBER
-  ) RETURN VARCHAR2
- ```
-
-**Returns**
-* Type: VARCHAR2
-* Description: Any info text. 
-
-#### Function GET_PROCESS_DATA
-> [!NOTE]
-> Every query for process data has a small impact on overall system performance. While this overhead is generally negligible, applications that frequently request multiple process attributes may benefit from retrieving all process data in a single call.
-> If such queries occur only sporadically or if only a few attributes are needed (e.g., the number of completed process steps), this impact is negligible. However, if queries are called frequently and several of the functions mentioned above are used (e.g., `GET_PROCESS_INFO`, `GET_PROCESS_STATUS`, `GET_PROC_STEPS_DONE`, ...), it is recommended to request this information collectively.
-> For this purpose, the function `GET_PROCESS_DATA` provides a record containing all relevant process data 'in one go': [#t_process_rec](#record-type-t_process_rec). This record serves as the exclusive way to retrieve the process name and the tabnameMaster attribute. Following LILAMs naming convention, the process table's name is deterministic: it always uses the master table's name as a prefix, followed by the suffix `_PROC`.
-
- ```sql
-  FUNCTION GET_PROCESS_DATA(
-    p_processId     NUMBER
-  ) RETURN T_PROCESS_REC
- ```
-
-**Returns**
-* Type: t_process_rec
-* Description: Returns a record of type [`t_process_rec`](#record-type-t-process-rec) containing a complete snapshot of all process data in a single call. 
-
-[↑ Back to Top](#lilam-api-reference)
-
----
-### Logging
-Likely the most intuitive methods for a developer...
-In this regard, please also refer to the table [# Log Level](#log-level) in the appendix. It provides details on which severity levels are considered—and thus logged—at each activated log level.
-For convenience, the configurable log levels are also declared as constants within the LILAM package. You can find them in the appendix under [# Declaration of Log Levels](#declaration-of-log-levels).
-
-| Name               | Type      | Description                         | Scope
-| ------------------ | --------- | ----------------------------------- | -------
-| [`ERROR`](#procedure-error) | Procedure | Writes ERROR log entry | Logging
-| [`WARN`](#procedure-warn) | Procedure | Writes WARN log entry  | Logging
-| [`INFO`](#procedure-info) | Procedure | Writes INFO log entry  | Logging
-| [`DEBUG`](#procedure-debug) | Procedure | Writes DEBUG log entry  | Logging
-
-#### Procedure ERROR
-Writes a log entry with severity ERROR. This is the lowest numerical value (highest priority). Independent of the activated log level, ERROR messages are always stored.
-
- ```sql
-  PROCEDURE ERROR(
-    p_processId     NUMBER,
-    p_logText       VARCHAR2
-  )
- ```
-
-#### Procedure WARN
-Writes Log with severity WARN.
-
- ```sql
-  PROCEDURE WARN(
-    p_processId     NUMBER,
-    p_logText       VARCHAR2
-  )
- ```
-
-#### Procedure INFO
-Writes Log with severity INFO.
-
- ```sql
-  PROCEDURE INFO(
-    p_processId     NUMBER,
-    p_logText       VARCHAR2
-  )
- ```
-#### Procedure DEBUG
-Writes a log entry with severity DEBUG. By default, LILAM operates 'silently,' meaning it does not raise exceptions to avoid disrupting the main process. However, when log level DEBUG is activated, caught exceptions will be re-thrown.
-
- ```sql
-  PROCEDURE DEBUG(
-    p_processId     NUMBER,
-    p_logText       VARCHAR2
-  )
- ```
-
-**Parameters**
-
-| Parameter | Type | API | Description | Required
-| --------- | ---- | --- | ----------- | -------
-| p_processId | NUMBER | process_id | ID of the process to which the session applies | [`M`](#m)
-| p_logText   | VARCHAR2 | log_text | the log text | [`M`](#m)
-
-[↑ Back to Top](#lilam-api-reference)
-
----
-### Metrics
-Metrics are quantifiable data points used to track the health and performance of a process. In LILAM, they document progress through two types of measurements:
-1. Events: Discrete occurrences at a specific point in time.
-2. Logical Transactions: Time-based segments (Traces) with a defined start and end.
-
-**Identification of Metrics:**
-The combination of p_actionName and p_contextName forms a unique identifier for a metric. Although p_contextName is optional, it must be provided consistently to match a specific trace.
-
-> [!Important]: 'TRACK_SEGMENT' is not the same as 'TRACK_SEGMENT' + 'Moulin Rouge'. If a trace is started with a context, it must be stopped with that same context.
-
-**Session Safety & Cleanup:**
-To ensure data integrity, LILAM monitors the state of all traces. Any trace that remains "open" (not closed via trace_stop) when the session ends will be automatically logged with a WARN status. This allows developers to easily identify incomplete business transactions or logic errors.
-
-    
-
-| Name               | Type      | Description                         | Scope
-| ------------------ | --------- | ----------------------------------- | -------
-| [`MARK_EVENT`](#procedure-mark_event) | Procedure | Sets a metric action | Metrics
-| [`TRACE_START`](#procedure-trace_start) | Procedure | Begins a business transaction | Metrics
-| [`TRACE_STOP`](#procedure-trace_stop) | Procedure | Ends a business transaction | Metrics
-| [`GET_METRIC_AVG_DURATION`](#function-get_metric_avg_duration) | Function | Returns average action time | Metrics
-| [`GET_METRIC_STEPS`](#function-get_metric_steps) | Function | Returns the counter of action steps | Metrics
-
-
-**Procedures (Setter)**
-
-
-#### Procedure MARK_EVENT
-Reports a completed work step, which typically represents an intermediate stage in the process lifecycle. For this reason, markers must not be confused with the actual process steps.
-The MARK_EVENT procedure reports a completed work step. Markers are distinguished by the `p_actionName` parameter. A process can contain any number of action names, enabling highly granular monitoring.
-With every marker report, LILAM calculates:
-* the time elapsed for this marker since the last report (except, of course, for the very first report of this action name),
-* the total number of reports for this marker to date (simple increment),
-* the average time consumed for all markers sharing the same `p_actionName`, and
-* whether the time span between markers deviates significantly from the average.
-
- ```sql
-  PROCEDURE MARK_EVENT(
-    p_processId     NUMBER,
-    p_actionName    VARCHAR2,
-    p_contextName   VARCHAR2 DEFAULT NULL,
-    p_timestamp     TIMESTAMP DEFAULT NULL
-  )
- ```
-
-
-#### Procedure TRACE_START
-Starts a transaction trace. Traces represent a work step with a defined start and end. All traces must be completed with an end timestamp before the session closes. If any traces remain open at the end of a session, LILAM will automatically generate a warning in the Log Table.
-LILAM measures the duration of each trace, maintains a moving average, and reports significant deviations as WARN entries in the Log Table.
-
- ```sql
-  PROCEDURE TRACE_START
-    p_processId     NUMBER,
-    p_actionName    VARCHAR2,
-    p_contextName   VARCHAR2 DEFAULT NULL,
-    p_timestamp     TIMESTAMP DEFAULT NULL
-  )
- ```
-
-#### Procedure TRACE_STOP
-Stops a transaction trace. The `p_action_name` and `p_context_name` must match the corresponding open trace. 
-
-> [!Important]
-> To ensure all open traces are validated and persisted, always call CLOSE_SESSION within your exception handler.
-> This guarantees that even in the event of a failure, "dangling" traces are identified and recorded in the Log Table.
-
- ```sql
-  PROCEDURE TRACE_STOP
-    p_processId     NUMBER,
-    p_actionName    VARCHAR2,
-    p_contextName   VARCHAR2 DEFAULT NULL,
-    p_timestamp     TIMESTAMP DEFAULT NULL
-  )
- ```
-
-**Functions (Getter)**
-
-#### Function GET_METRIC_AVG_DURATION
-Returns the average duration of markers, aggregated by their respective action names.
-
- ```sql
-  FUNCTION GET_METRIC_AVG_DURATION(
-    p_processId     NUMBER,
-    p_actionName    VARCHAR2,
-    p_contextName   VARCHAR2 DEFAULT NULL
-  ) RETURN NUMBER
- ```
-
-**Returns**
-* Type: NUMBER
-
-#### Function GET_METRIC_STEPS
-Returns the number of markers, grouped by their respective action names.
-
- ```sql
-  FUNCTION GET_METRIC_STEPS(
-    p_processId     NUMBER,
-    p_actionName    VARCHAR2,
-    p_contextName   VARCHAR2 DEFAULT NULL
-  ) RETURN NUMBER
- ```
-
-**Returns**
-* Type: NUMBER
-
-**Parameters**
-
-| Parameter | Type | JSON | Description | Required
-| --------- | ---- | --- | ----------- | -------
-| p_processId | NUMBER | process_id | ID of the process to which the session applies | [`M`](#m)
-| p_actionName | VARCHAR2 | action_name | identifier of the action | [`M`](#m)
-| p_contextName | VARCHAR2 | context_name | differentiates recurring actions within a session | [`N`](#n)
-
-
-[↑ Back to Top](#lilam-api-reference)
-
----
-### Server Control
-A LILAM server is a long-running process that receives requests from decoupled clients. Servers are identified by their pipe name and may optionally belong to a group. Clients can either connect to any available server or restrict server selection to a specific group.
-
-In server mode, LILAM acts as a central service provider to deliver several key advantages:
-* Centralized Logging & Monitoring: Consolidates all log data and metrics into a single, unified oversight layer.
-* Targeted Orchestration: Manages jobs and data specifically tailored to horizontal or vertical organizational units (e.g., department-specific or multi-tenant environments).
-* Asynchronous Decoupling: Decouples clients from synchronous database operations to improve application responsiveness and stability.
-* Efficient Load Balancing: Optimizes resource distribution across the infrastructure to ensure high performance.
-* Future-Proof Extensibility: Built-in foundation for upcoming features such as automated process chains, active messaging, and real-time alerting.
 
 > [!IMPORTANT]
-> A server is identified by its unique name, which also serves as the identifier for the underlying Oracle Pipe (`DBMS_PIPE`) used for communication. Therefore, server names must be unique within the database instance to prevent naming conflicts.
-
-| Name               | Type      | Description                         | Scope
-| ------------------ | --------- | ----------------------------------- | -------
-| [`START_SERVER`](#procedure-start_server) | Procedure | Starts a LILAM-Server | Server control
-| [`CREATE_SERVER`](#function-create_server) | Function | Starts a LILAM-Server as background job | Server control
-| [`SERVER_SHUTDOWN`](#procedure-server_shutdown) | Procedure | Stops a LILAM-Server | Server control
-| [`GET_SERVER_PIPE`](#function-get_server_pipe) | Function | Returns the servers communication pipe (`DBMS_PIPE`) | Server control
-
-#### Procedure START_SERVER
-Starts the LILAM server using a specific server (pipe) name. A password is required, which must be provided again when calling SERVER_SHUTDOWN. This security measure ensures that the shutdown cannot be triggered by unauthorized clients.
-
- ```sql
-  Procedure START_SERVER(
-    p_pipeName      VARCHAR2,
-    p_groupName     VARCHAR2,
-    p_password      VARCHAR2
-  )
- ```
-
-#### Function CREATE_SERVER
-Starts the LILAM server like procedure START_SERVER **AND** offloads the application workflow to a background thread via DBMS_SCHEDULER. Returns the names of pipe and group (if applicable).
-
- ```sql
-  FUNCTION CREATE_SERVER(
-    p_pipeName      VARCHAR2,
-    p_groupName     VARCHAR2,
-    p_password      VARCHAR2
-  ) RETURN VARCHAR2
- ```
-
-#### Procedure SERVER_SHUTDOWN
-Shutting down a server requires that the executing client has previously logged into the server and knows the password provided during `SERVER_START`. The `p_processId` received by the client upon login must be used in this call.
-The parameter p_pipeName is used by the server to secure that really he is addressed.
-
- ```sql
-  PROCEDURE SERVER_SHUTDOWN(
-    p_processId     NUMBER,
-    p_pipeName      VARCHAR2,
-    p_password      VARCHAR2
-  ) 
- ```
-
-#### Function GET_SERVER_PIPE
-Retrieves the server name (which also serves as the pipe name). Similar to SERVER_SHUTDOWN, the client must first connect to the server. The p_processId returned upon connection is then required for subsequent calls.
-
- ```sql
-  FUNCTION GET_SERVER_PIPE(
-    p_processId     NUMBER
-  ) RETURN VARCHAR2
- ```
-
-#### PROCEDURE SERVER_UPDATE_RULES
-The **LILAM Server** responds to signals based on predefined conditions. Supported events include process changes, marker events, and traced transactions. Rules are defined as JSON objects and persisted in the `LILAM_RULES` table.
-
-The rule set can be updated dynamically using the `SERVER_UPDATE_RULES` procedure. After storing a new or modified rule set in `LILAM_RULES`, call this procedure to apply the changes.
-
-Note that an active server connection (`NEW_SESSION`) is required. Upon execution, the server implements the new rule set and logs the rule set name and version to the `LILAM_SERVER__REGISTRY`.
-
- ```sql
-  PROCEDURE SERVER_UPDATE_RULES(
-    p_processId      NUMBER,
-    p_ruleSetName    VARCHAR2,
-    p_ruleSetVersion PLS_INTEGER
-  )
- ```
-
-**Parameters**
-
-| Parameter | Type | JSON | Description | Required
-| --------- | ---- | --- | ----------- | -------
-| p_processId | NUMBER | process_id | ID of the process to which the session applies | [`M`](#m)
-| p_pipeName | VARCHAR2 | pipe_name | pipe name supported by server; no spaces allowed | [`M`](#m)
-| p_password | VARCHAR2 | password | security for shutdown; | [`M`](#m)
-| p_serverName | VARCHAR2 | server_name | servers identity; no spaces allowed | [`M`](#m)
-| p_groupName | VARCHAR2 | group_name | group which server is dedicated to; no spaces allowed | [`N`](#n)
-| p_ruleSetName | VARCHAR2 | rule_set_name | rules are organized within sets (see [architecture and concepts.md](./architecture%20and%20concepts.md)) | [`M`](#m)
-| p_ruleSetVersion | PLS_INTEGER | rule_set_version | version of ruleset | [`M`](#m)
-
-[↑ Back to Top](#lilam-api-reference)
+> `FINAL_RESCUE` must be called from the database session in which the affected processes originated.
 
 ---
-## Appendix
-### Log Level
-Depending on the selected log level, additional information is written to the *detail table*.
-        
-To do this, the selected log level must be >= the level implied in the logging call.
-* logLevelSilent  -> No details are written to the *detail table*
-* logLevelError   -> Calls to the ERROR() procedure are taken into account
-* logLevelWarn    -> Calls to the WARN() and ERROR() procedures are taken into account
-* logLevelMonitor -> Must be set for using the monitoring features;
-* logLevelInfo    -> Calls to the INFO(), WARN(), and ERROR() procedures are taken into account
-* logLevelDebug   -> Calls to the DEBUG(), INFO(), WARN(), and ERROR() procedures are taken into account
 
-If you want to suppress any logging, set logLevelSilent as active log level.
+## Process Control
 
-#### Declaration of Log Levels
-To simplify usage and improve code readability, constants for the log levels are declared in the specification (lilam.pks).
+Process-control APIs manage overall process progress and status.
+
+| API | Purpose |
+| --- | --- |
+| `SET_PROCESS_STATUS` | Updates process status and optional information |
+| `SET_PROC_STEPS_TODO` | Sets the planned number of process steps |
+| `PROC_STEP_DONE` | Increments completed process steps |
+| `SET_PROC_STEPS_DONE` | Sets completed process steps explicitly |
+| `GET_PROC_STEPS_DONE` | Returns completed process steps |
+| `GET_PROC_STEPS_TODO` | Returns planned process steps |
+| `GET_PROCESS_START` | Returns process start time |
+| `GET_PROCESS_END` | Returns process end time |
+| `GET_PROCESS_STATUS` | Returns process status |
+| `GET_PROCESS_INFO` | Returns process information |
+| `GET_PROCESS_DATA` | Returns all process data as one record |
+
+> [!NOTE]
+> Whenever process data is changed, the process record's `lastUpdate` value is updated implicitly.
+
+### Procedure SET_PROCESS_STATUS
+
+Updates the application-defined numerical process status and, optionally, process information. LILAM does not assign application-specific meaning to the status value.
 
 ```sql
-logLevelSilent  constant PLS_INTEGER := 0;
-logLevelError   constant PLS_INTEGER := 1;
-logLevelWarn    constant PLS_INTEGER := 2;
-logLevelMonitor constant PLS_INTEGER := 3;
-logLevelInfo    constant PLS_INTEGER := 4;
-logLevelDebug   constant PLS_INTEGER := 8;
+PROCEDURE SET_PROCESS_STATUS(
+  p_processId   NUMBER,
+  p_status      PLS_INTEGER,
+  p_processInfo VARCHAR2 DEFAULT NULL
+)
+```
+
+### Procedure SET_PROC_STEPS_TODO
+
+Sets the planned number of steps for the overall process.
+
+```sql
+PROCEDURE SET_PROC_STEPS_TODO(
+  p_processId     NUMBER,
+  p_procStepsToDo NUMBER
+)
+```
+
+### Procedure PROC_STEP_DONE
+
+Increments the number of completed process steps.
+
+```sql
+PROCEDURE PROC_STEP_DONE(
+  p_processId NUMBER
+)
+```
+
+### Procedure SET_PROC_STEPS_DONE
+
+Explicitly sets the number of completed process steps. This overwrites progress previously accumulated through `PROC_STEP_DONE`.
+
+```sql
+PROCEDURE SET_PROC_STEPS_DONE(
+  p_processId     NUMBER,
+  p_procStepsDone NUMBER
+)
+```
+
+### Function GET_PROC_STEPS_DONE
+
+```sql
+FUNCTION GET_PROC_STEPS_DONE(
+  p_processId NUMBER
+) RETURN PLS_INTEGER
+```
+
+Returns the number of completed process steps.
+
+### Function GET_PROC_STEPS_TODO
+
+```sql
+FUNCTION GET_PROC_STEPS_TODO(
+  p_processId NUMBER
+) RETURN PLS_INTEGER
+```
+
+Returns the planned number of process steps.
+
+### Function GET_PROCESS_START
+
+```sql
+FUNCTION GET_PROCESS_START(
+  p_processId NUMBER
+) RETURN TIMESTAMP
+```
+
+Returns the timestamp at which the process was started by `NEW_SESSION` or `SERVER_NEW_SESSION`.
+
+### Function GET_PROCESS_END
+
+```sql
+FUNCTION GET_PROCESS_END(
+  p_processId NUMBER
+) RETURN TIMESTAMP
+```
+
+Returns the timestamp at which the process was finalized by `CLOSE_SESSION`.
+
+### Function GET_PROCESS_STATUS
+
+```sql
+FUNCTION GET_PROCESS_STATUS(
+  p_processId NUMBER
+) RETURN PLS_INTEGER
+```
+
+Returns the current application-defined numerical process status.
+
+### Function GET_PROCESS_INFO
+
+```sql
+FUNCTION GET_PROCESS_INFO(
+  p_processId NUMBER
+) RETURN VARCHAR2
+```
+
+Returns the information text stored with the process.
+
+### Function GET_PROCESS_DATA
+
+Use this function when several process properties are required at once. It avoids multiple individual getter calls and returns a complete `t_process_rec` record.
+
+```sql
+FUNCTION GET_PROCESS_DATA(
+  p_processId NUMBER
+) RETURN t_process_rec
+```
+
+> [!NOTE]
+> `GET_PROCESS_DATA` is also the documented way to retrieve the process name and `tabNameMaster` together with the other process attributes. The process table name is derived from the master table name by appending `_PROC`.
+
+---
+
+## Logging
+
+Logging APIs write messages to the LILAM log according to the active log level.
+
+| API | Severity |
+| --- | --- |
+| `ERROR` | ERROR |
+| `WARN` | WARN |
+| `INFO` | INFO |
+| `DEBUG` | DEBUG |
+
+All logging procedures use the same signature pattern:
+
+```sql
+PROCEDURE ERROR(
+  p_processId NUMBER,
+  p_logText   VARCHAR2
+)
+
+PROCEDURE WARN(
+  p_processId NUMBER,
+  p_logText   VARCHAR2
+)
+
+PROCEDURE INFO(
+  p_processId NUMBER,
+  p_logText   VARCHAR2
+)
+
+PROCEDURE DEBUG(
+  p_processId NUMBER,
+  p_logText   VARCHAR2
+)
+```
+
+- `p_processId` identifies the process.
+- `p_logText` contains the message.
+
+`ERROR` has the highest priority and is always stored unless logging is completely disabled with `logLevelSilent`.
+
+When `logLevelDebug` is active, caught LILAM exceptions are re-thrown rather than silently absorbed.
+
+See [Log Levels](#log-levels) for the complete mapping.
+
+---
+
+## Metrics
+
+Metrics record events and logical transactions within a process.
+
+> [!IMPORTANT]
+> `p_actionName` and `p_contextName` together identify a metric. A trace started with a context must be stopped with the same action and context.
+
+### Procedure MARK_EVENT
+
+Use `MARK_EVENT` for a discrete occurrence at a point in the process.
+
+For repeated markers sharing an action and context, LILAM tracks elapsed time, occurrence count, average duration, and significant timing deviations.
+
+```sql
+PROCEDURE MARK_EVENT(
+  p_processId   NUMBER,
+  p_actionName  VARCHAR2,
+  p_contextName VARCHAR2 DEFAULT NULL,
+  p_timestamp   TIMESTAMP DEFAULT NULL
+)
+```
+
+### Procedure TRACE_START
+
+Starts a timed logical transaction.
+
+```sql
+PROCEDURE TRACE_START(
+  p_processId   NUMBER,
+  p_actionName  VARCHAR2,
+  p_contextName VARCHAR2 DEFAULT NULL,
+  p_timestamp   TIMESTAMP DEFAULT NULL
+)
+```
+
+### Procedure TRACE_STOP
+
+Stops a matching logical transaction.
+
+```sql
+PROCEDURE TRACE_STOP(
+  p_processId   NUMBER,
+  p_actionName  VARCHAR2,
+  p_contextName VARCHAR2 DEFAULT NULL,
+  p_timestamp   TIMESTAMP DEFAULT NULL
+)
+```
+
+> [!IMPORTANT]
+> Open traces are checked when the session closes. A trace that remains open is recorded as a warning. Call `CLOSE_SESSION` from final exception handling so that this validation can take place.
+
+### Function GET_METRIC_AVG_DURATION
+
+Returns the average duration for the specified metric.
+
+```sql
+FUNCTION GET_METRIC_AVG_DURATION(
+  p_processId   NUMBER,
+  p_actionName  VARCHAR2,
+  p_contextName VARCHAR2 DEFAULT NULL
+) RETURN NUMBER
+```
+
+### Function GET_METRIC_STEPS
+
+Returns the occurrence count for the specified metric.
+
+```sql
+FUNCTION GET_METRIC_STEPS(
+  p_processId   NUMBER,
+  p_actionName  VARCHAR2,
+  p_contextName VARCHAR2 DEFAULT NULL
+) RETURN NUMBER
+```
+
+---
+
+## Server Control
+
+In decoupled mode, a LILAM server receives client requests and handles logging and monitoring centrally. Servers are identified by their pipe names and may optionally be assigned to groups.
+
+> [!IMPORTANT]
+> Server pipe names must be unique within the database instance.
+
+| API | Purpose |
+| --- | --- |
+| `START_SERVER` | Starts a LILAM server in the current session |
+| `CREATE_SERVER` | Starts a LILAM server through `DBMS_SCHEDULER` |
+| `SERVER_SHUTDOWN` | Stops a server |
+| `GET_SERVER_PIPE` | Returns the server pipe of a connected client |
+| `SERVER_UPDATE_RULES` | Applies an updated rule set |
+
+### Procedure START_SERVER
+
+Starts a LILAM server. The password is required again when the server is shut down.
+
+```sql
+PROCEDURE START_SERVER(
+  p_pipeName  VARCHAR2,
+  p_groupName VARCHAR2,
+  p_password  VARCHAR2
+)
+```
+
+### Function CREATE_SERVER
+
+Starts a LILAM server through `DBMS_SCHEDULER` and returns server information as `VARCHAR2`.
+
+```sql
+FUNCTION CREATE_SERVER(
+  p_pipeName  VARCHAR2,
+  p_groupName VARCHAR2,
+  p_password  VARCHAR2
+) RETURN VARCHAR2
+```
+
+### Procedure SERVER_SHUTDOWN
+
+The client must already be connected to the server. The process ID, server pipe, and shutdown password are required.
+
+```sql
+PROCEDURE SERVER_SHUTDOWN(
+  p_processId NUMBER,
+  p_pipeName  VARCHAR2,
+  p_password  VARCHAR2
+)
+```
+
+### Function GET_SERVER_PIPE
+
+Returns the server pipe associated with the connected client process.
+
+```sql
+FUNCTION GET_SERVER_PIPE(
+  p_processId NUMBER
+) RETURN VARCHAR2
+```
+
+### Procedure SERVER_UPDATE_RULES
+
+Rules are stored as JSON objects in `LILAM_RULES`. After a rule set has been inserted or modified, call `SERVER_UPDATE_RULES` through an active server connection to apply it.
+
+```sql
+PROCEDURE SERVER_UPDATE_RULES(
+  p_processId      NUMBER,
+  p_ruleSetName    VARCHAR2,
+  p_ruleSetVersion PLS_INTEGER
+)
+```
+
+---
+
+## Appendix
+
+### Parameter Requirements
+
+| Marker | Meaning |
+| --- | --- |
+| M | Mandatory |
+| O | Optional |
+| N | Nullable |
+| D | Default value |
+
+### Log Levels
+
+The active log level determines which log messages are written.
+
+| Level | Value | Behavior |
+| --- | ---: | --- |
+| `logLevelSilent` | 0 | No log details |
+| `logLevelError` | 1 | ERROR |
+| `logLevelWarn` | 2 | WARN and ERROR |
+| `logLevelMonitor` | 3 | Enables monitoring features |
+| `logLevelInfo` | 4 | INFO, WARN, and ERROR |
+| `logLevelDebug` | 8 | DEBUG, INFO, WARN, and ERROR |
+
+```sql
+logLevelSilent  CONSTANT PLS_INTEGER := 0;
+logLevelError   CONSTANT PLS_INTEGER := 1;
+logLevelWarn    CONSTANT PLS_INTEGER := 2;
+logLevelMonitor CONSTANT PLS_INTEGER := 3;
+logLevelInfo    CONSTANT PLS_INTEGER := 4;
+logLevelDebug   CONSTANT PLS_INTEGER := 8;
 ```
 
 ### Record Type t_session_init
+
+Use `t_session_init` to collect initialization settings before calling the record-based `NEW_SESSION` overload.
+
 ```sql
 TYPE t_session_init IS RECORD (
-    processName VARCHAR2(100),
-    logLevel PLS_INTEGER := logLevelMonitor,
-    stepsToDo PLS_INTEGER,
-    daysToKeep PLS_INTEGER := 100,
-    procImmortal PLS_INTEGER := 0,
-    tabNameMaster VARCHAR2(100) DEFAULT 'LILAM'
+  processName   VARCHAR2(100),
+  logLevel      PLS_INTEGER := logLevelMonitor,
+  stepsToDo     PLS_INTEGER,
+  daysToKeep    PLS_INTEGER := 100,
+  procImmortal  PLS_INTEGER := 0,
+  tabNameMaster VARCHAR2(100) DEFAULT 'LILAM'
 );
 ```
 
 ### Record Type t_process_rec
-Useful for getting a complete set of all process data. Using this record avoids multiple individual API calls.
+
+`t_process_rec` contains the process data returned by `GET_PROCESS_DATA`.
 
 ```sql
 TYPE t_process_rec IS RECORD (
-    id             NUMBER(19,0),
-    processName    VARCHAR2(100),
-    logLevel       PLS_INTEGER,
-    processStart   TIMESTAMP,
-    processEnd     TIMESTAMP,
-    lastUpdate     TIMESTAMP,
-    stepsTodo      PLS_INTEGER,
-    stepsDone      PLS_INTEGER,
-    status         PLS_INTEGER,
-    info           VARCHAR2(4000),
-    procImmortal   PLS_INTEGER := 0,
-    tabNameMaster  VARCHAR2(100)
+  id            NUMBER(19,0),
+  processName   VARCHAR2(100),
+  logLevel      PLS_INTEGER,
+  processStart  TIMESTAMP,
+  processEnd    TIMESTAMP,
+  lastUpdate    TIMESTAMP,
+  stepsTodo     PLS_INTEGER,
+  stepsDone     PLS_INTEGER,
+  status        PLS_INTEGER,
+  info          VARCHAR2(4000),
+  procImmortal  PLS_INTEGER := 0,
+  tabNameMaster VARCHAR2(100)
 );
-
 ```
 
 ### JSON API Interface
-The JSON objects follow a fundamental structure.
-> The header parameters version and client_id are currently not in use
 
-For example, the JSON for calling the SERVER_NEW_SESSION API looks like this:
+LILAM JSON requests use a header and a parameter object. The `version` and `client_id` header fields are currently not used.
+
+Example for `SERVER_NEW_SESSION`:
 
 ```json
 {
