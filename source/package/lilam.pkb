@@ -3123,18 +3123,10 @@ AS
 
     --------------------------------------------------------------------------
 
-    procedure SET_PROCESS_STATUS(p_processId number, p_status PLS_INTEGER, p_processInfo varchar2)
+    procedure SET_PROCESS_STATUS(p_processId number, p_status PLS_INTEGER, p_processInfo varchar2 DEFAULT NULL)
     as
     begin
         setAnyStatus(p_processId, p_status, p_processInfo, null, null, null, SYSTIMESTAMP);
-    end;
-
-    --------------------------------------------------------------------------
-
-    procedure SET_PROCESS_STATUS(p_processId number, p_status PLS_INTEGER)
-    as
-    begin
-        setAnyStatus(p_processId, p_status, null, null, null, null, SYSTIMESTAMP);
     end;
 
     --------------------------------------------------------------------------
