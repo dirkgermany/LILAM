@@ -239,7 +239,7 @@ LILAM uses three tables for storing process, log, and monitoring data. Their nam
 | Process data | `_PROC` | `LILAM_PROC`  |
 | Log data     | `_LOG`  | `LILAM_LOG`   |
 | Monitoring data | `_MON` | `LILAM_MON` |
- 
+
 For example, if `tabNameMaster` is set to `MY_APPLICATION`, LILAM uses:
  
 - `MY_APPLICATION_PROC`
