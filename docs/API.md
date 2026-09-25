@@ -12,11 +12,11 @@
     - [FINAL_RESCUE](#procedure-final_rescue)
   - [Process control](#process-control)
     - [SET_PROCESS_STATUS](#procedure-set_process_status)
-    - [SET_STEPS_TODO](#procedure-set_steps_todo)
-    - [STEP_DONE](#procedure-step_done)
-    - [SET_STEPS_DONE](#procedure-set_steps_todo)
+    - [SET_PROC_STEPS_TODO](#procedure-set_proc_steps_todo)
+    - [PROC_STEP_DONE](#procedure-proc_step_done)
+    - [SET_PROC_STEPS_DONE](#procedure-set_proc_steps_done)
     - [GET_PROC_STEPS_DONE](#function-get_proc_steps_done)
-    - [GET_PROC_STEPS_TODO](#function-get_proc_steps_done)
+    - [GET_PROC_STEPS_TODO](#function-get_proc_steps_todo)
     - [GET_PROCESS_START](#function-get_process_start)
     - [GET_PROCESS_END](#function-get_process_end)
     - [GET_PROCESS_STATUS](#function-get_process_status)
@@ -131,7 +131,7 @@ BEGIN
   l_processId := lilam.server_new_session('DECOUPLED_SYNC', null, lilam.logLevelInfo, 0, 100);
   
   -- 3. Start logging
-  lilam.info(p_processId => l_processId, p_info => 'LILAM initialized');
+  lilam.info(p_processId => l_processId, p_logText => 'LILAM initialized');
   
   -- 4. Mark a work step and trace a business transaction
   lilam.mark_event(p_processId => l_processId, p_actionName => 'DATA_LOAD'); -- simple event
@@ -160,7 +160,7 @@ l_processId := lilam.server_new_session('SHUT DOWN SERVER', null, lilam.logLevel
 l_serverPipe := lilam.get_server_pipe(l_processId);
 lilam.server_shutdown(l_processId, l_serverPipe, 'SECURE PASSWORD');
 -- 3. Close temporary session
-lilam.close_session(l_pocessId);
+lilam.close_session(l_processId);
 ...
 ```
 
