@@ -114,8 +114,8 @@ create or replace PACKAGE LILAM AS
 
     PROCEDURE CLOSE_SESSION(p_processId NUMBER);
     PROCEDURE CLOSE_SESSION(p_processId NUMBER, p_processInfo VARCHAR2, p_processStatus PLS_INTEGER);
-    PROCEDURE CLOSE_SESSION(p_processId NUMBER, p_procStepsDone NUMBER, p_processInfo VARCHAR2, p_processStatus PLS_INTEGER);
-    PROCEDURE CLOSE_SESSION(p_processId NUMBER, p_procStepsToDo NUMBER, p_procStepsDone NUMBER, p_processInfo VARCHAR2, p_processStatus PLS_INTEGER);
+    PROCEDURE CLOSE_SESSION(p_processId NUMBER, p_procStepsDone PLS_INTEGER, p_processInfo VARCHAR2, p_processStatus PLS_INTEGER);
+    PROCEDURE CLOSE_SESSION(p_processId NUMBER, p_procStepsToDo PLS_INTEGER, p_procStepsDone PLS_INTEGER, p_processInfo VARCHAR2, p_processStatus PLS_INTEGER);
 
     ---------------------------------
     -- Update the status of a process
