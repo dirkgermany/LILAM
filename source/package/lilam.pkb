@@ -2140,7 +2140,7 @@ AS
 
     function findAvgRule(p_action varchar2, p_context varchar2) return t_avg_params
     as
-        l_ruleKey varchar2(100) := p_action || p_context;
+        l_ruleKey varchar2(100) := p_action || '|' || p_context;
     begin
         IF g_avg_params.EXISTS(l_ruleKey) THEN
             return g_avg_params(l_ruleKey);
