@@ -83,9 +83,10 @@ LILAM is developed by a developer who hates over-engineered tools. Focus: 5 minu
 
 ---
 ## Comparison
-While traditional PL/SQL tools focus on logging or low-level tracing,
-LILAM introduces process-level observability directly inside the database:
+While traditional PL/SQL tools focus on logging or low-level tracing, LILAM introduces process-level observability directly inside the database:
 including lifecycle tracking, metrics, and rule-based reactions.
+
+LILAM does not introduce entirely new primitives, but combines process lifecycle tracking, metrics, and rule-based reactions into a unified in-database observability model.
 
 > This table compares different approaches to logging, instrumentation and observability in PL/SQL.
 > It highlights conceptual focus areas rather than full feature parity.
