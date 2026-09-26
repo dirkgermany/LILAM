@@ -82,6 +82,65 @@ LILAM is developed by a developer who hates over-engineered tools. Focus: 5 minu
 10. **Small Footprint:**  <5k lines of logical PL/SQL code ensures simple quality and security control, fast compilation, zero bloat and minimal Shared Pool utilization (reducing memory pressure and fragmentation)
 
 ---
+## Comparison
+While traditional PL/SQL tools focus on logging or low-level tracing,
+LILAM introduces process-level observability directly inside the database:
+including lifecycle tracking, metrics, and rule-based reactions.
+
+> This table compares different approaches to logging, instrumentation and observability in PL/SQL.
+> It highlights conceptual focus areas rather than full feature parity.
+
+### Logging Frameworks
+
+| Capability                          | LILAM | Logger | PIT | log4plsql |
+|-------------------------------------|-------|--------|-----|-----------|
+| Logging                             | ✅    | ✅     | ✅  | ✅        |
+| Log Levels                          | ✅    | ✅     | ✅  | ✅        |
+| Error Context (Stack, Backtrace)    | ✅    | ⚠️     | ✅  | ⚠️        |
+| Autonomous Transaction Logging      | ✅    | ✅     | ⚠️  | ❌        |
+| Minimal Setup (Package-based)       | ✅    | ✅     | ⚠️  | ❌        |
+
+---
+
+### Instrumentation & Debugging
+
+| Capability                          | LILAM | Console | Custom Instrumentation |
+|-------------------------------------|-------|---------|------------------------|
+| Logging                             | ✅    | ✅      | ⚠️                     |
+| Runtime Instrumentation             | ✅    | ✅      | ✅                     |
+| Session / Context Tracking          | ✅    | ⚠️      | ❌                     |
+| Performance Insights                | ✅    | ⚠️      | ⚠️                     |
+| Centralized Data Model              | ✅    | ❌      | ❌                     |
+
+---
+
+### Native Oracle Tools
+
+| Capability                          | LILAM | DBMS_TRACE / PROFILER |
+|-------------------------------------|-------|------------------------|
+| Low-level Tracing                   | ⚠️    | ✅                     |
+| Profiling                           | ❌    | ✅                     |
+| Process Lifecycle                   | ✅    | ❌                     |
+| Aggregated Metrics                  | ✅    | ❌                     |
+| Real-time Monitoring                | ✅    | ❌                     |
+| Developer-friendly API              | ✅    | ❌                     |
+
+---
+
+### Process Monitoring & Observability
+
+| Capability                          | LILAM | Others |
+|-------------------------------------|-------|--------|
+| Process Lifecycle (start/end)       | ✅    | ❌     |
+| Progress Tracking (steps todo/done) | ✅    | ❌     |
+| Real-time Process Status            | ✅    | ❌     |
+| Metrics per Action (MARK/TRACE)     | ✅    | ❌     |
+| Incremental Metric Calculation      | ✅    | ❌     |
+| Rule-based Reactions (JSON)         | ✅    | ❌     |
+| Event-driven Orchestration          | ✅    | ❌     |
+| Decoupled / Async Processing        | ✅    | ❌     |
+| In-Database Observability Layer     | ✅    | ❌     |
+---
 
 ## Architecture at a Glance
 
