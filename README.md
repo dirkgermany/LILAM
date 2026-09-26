@@ -129,17 +129,17 @@ including lifecycle tracking, metrics, and rule-based reactions.
 
 ### Process Monitoring & Observability
 
-| Capability                          | LILAM | Others |
-|-------------------------------------|-------|--------|
-| Process Lifecycle (start/end)       | ✅    | ❌     |
-| Progress Tracking (steps todo/done) | ✅    | ❌     |
-| Real-time Process Status            | ✅    | ❌     |
-| Metrics per Action (MARK/TRACE)     | ✅    | ❌     |
-| Incremental Metric Calculation      | ✅    | ❌     |
-| Rule-based Reactions (JSON)         | ✅    | ❌     |
-| Event-driven Orchestration          | ✅    | ❌     |
-| Decoupled / Async Processing        | ✅    | ❌     |
-| In-Database Observability Layer     | ✅    | ❌     |
+| Capability                          | LILAM | Typical Logging / Instrumentation |
+|-------------------------------------|-------|----------------------------------|
+| Process Lifecycle (start/end)       | ✅    | ⚠️ (implicit / manual)           |
+| Progress Tracking (steps todo/done) | ✅    | ❌                               |
+| Real-time Process Status            | ✅    | ❌                               |
+| Metrics per Action (MARK/TRACE)     | ✅    | ⚠️ (basic timing only)           |
+| Aggregated Metrics (incremental)    | ✅    | ❌                               |
+| Rule-based Reactions                | ✅    | ❌                               |
+| Event-driven Orchestration          | ✅    | ❌                               |
+| Decoupled / Async Processing        | ✅    | ⚠️ (custom extensions)           |
+| In-Database Observability Model     | ✅    | ❌                               |
 ---
 
 ## Architecture at a Glance
