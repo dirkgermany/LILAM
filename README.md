@@ -1,5 +1,6 @@
-# LILAM - LILAM Is Logging And Monitoring
+# LILAM - PL/SQL Process Monitoring & Observability Framework
 
+LILAM = "**L**ILAM **I**s **L**ogging **A**nd **M**onitoring"
 
 [![Release](https://img.shields.io/github/v/release/dirkgermany/LILAM)](https://github.com/dirkgermany/LILAM/releases/latest)
 [![Status](https://img.shields.io/badge/Status-Production--Ready-brightgreen)](https://github.com/dirkgermany/LILAM)
