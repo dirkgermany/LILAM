@@ -14,7 +14,7 @@ LILAM = "**L**ILAM **I**s **L**ogging **A**nd **M**onitoring"
   <img src="images/lilam-logging.svg" alt="Lila Logger Logo" width="300">
 </p>
 
-LILAM is a high-performance logging, monitoring and event-driven orchestration framework for Oracle PL/SQL. It provides deep real-time insights into process metrics and utilizes a dynamic JSON-based rule engine to trigger autonomous responses and coordinate complex workflows.
+LILAM is a high-performance process monitoring, observability and logging framework for Oracle PL/SQL. It provides deep real-time insights into process metrics and utilizes a dynamic JSON-based rule engine to trigger autonomous responses and coordinate complex workflows.
 Its simple API allows for seamless integration into existing applications with minimal overhead.
 
 LILAM utilizes **autonomous transactions** to ensure that process states, log entries, and performance metrics are persisted independently of the main execution flow. This decoupled approach guarantees a complete audit trail and reliable monitoring data, even if the primary business process undergoes a rollback.
