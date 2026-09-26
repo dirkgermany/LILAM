@@ -1095,7 +1095,7 @@ AS
             return null;
         when others then
             logLilamErr(sqlCode, sqlErrM, 'getServerPipeAvailable', 'EXECUTE IMMEDIATE');
-            
+            return null;
     end;
     
     ---------------------------------------------------------------
@@ -1221,6 +1221,7 @@ AS
         when others then
             logLilamErr(sqlCode, sqlErrM, 'should_raise_error');
             error(p_processId, 'Check "should raise error" failed: ' || sqlErrM);
+            return false;
     end;  
 
     --------------------------------------------------------------------------
