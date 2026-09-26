@@ -4096,7 +4096,8 @@ AS
     EXCEPTION
         WHEN OTHERS THEN
         if SQLCODE != NUM_ERR_NO_SERVER then
-            logLilamErr(sqlCode, sqlErrM, 'SERVER_NEW_SESSION'); 
+            logLilamErr(sqlCode, sqlErrM, 'SERVER_NEW_SESSION');
+            return NUM_ERR_NO_SERVER;
         else
             return NUM_ERR_NO_SERVER;
         end if;
