@@ -2827,7 +2827,7 @@ AS
     as
         l_payload JSON_OBJ_LILAM; -- Puffer für den JSON-String
         l_serverMsg varchar2(100);
-        l_response PLS_INTEGER;
+        l_response  varchar2(1000);
     begin
         -- Erzeugung des JSON-Objekts
         jsonPut(l_payload, 'process_id', p_processId);
@@ -3213,14 +3213,29 @@ AS
 
     FUNCTION GET_PROCESS_DATA_JSON(p_processId NUMBER) return varchar2
     as
-        l_payload varchar2(32767);
+        l_payload       JSON_OBJ_LILAM;
+        l_process_rec   t_process_rec;    
     begin
         select json_object(
             'process_id'   value p_processId
             returning varchar2
         )
         into l_payload from dual;    
-        return l_payload;
+        
+        l_process_rec := GET_PROCESS_DATA(p_processId); 
+        jsonPut(l_payload, 'process_id', l_process_rec.id);
+        jsonPut(l_payload, 'process_name', l_process_rec.processName);
+        jsonPut(l_payload, 'log_level', l_process_rec.logLevel);
+        jsonPut(l_payload, 'process_start', l_process_rec.processStart);
+        jsonPut(l_payload, 'process_end', l_process_rec.processEnd);
+        jsonPut(l_payload, 'last_update', l_process_rec.lastUpdate);
+        jsonPut(l_payload, 'process_info', l_process_rec.info); 
+        jsonPut(l_payload, 'process_status', l_process_rec.status); 
+        jsonPut(l_payload, 'steps_todo', l_process_rec.stepsTodo); 
+        jsonPut(l_payload, 'steps_done', l_process_rec.stepsDone); 
+        jsonPut(l_payload, 'tabname_master', l_process_rec.tabNameMaster);
+        
+        return l_payload;   
     end;
 
     --------------------------------------------------------------------------
