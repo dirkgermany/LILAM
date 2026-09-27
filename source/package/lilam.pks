@@ -111,6 +111,7 @@ create or replace PACKAGE LILAM AS
     FUNCTION SERVER_NEW_SESSION(p_processName varchar2, p_logLevel PLS_INTEGER, p_procStepsToDo PLS_INTEGER, p_daysToKeep PLS_INTEGER, p_tabNameMaster varchar2) RETURN NUMBER;
     FUNCTION SERVER_NEW_SESSION(p_processName varchar2, p_groupName VARCHAR2, p_logLevel PLS_INTEGER, p_procStepsToDo PLS_INTEGER, p_daysToKeep PLS_INTEGER, p_tabNameMaster varchar2) RETURN NUMBER;
     FUNCTION SERVER_NEW_SESSION(p_jsonObject JSON_OBJ_LILAM) RETURN NUMBER;
+    FUNCTION SERVER_RECONNECT(p_processId NUMBER, p_pipeName varchar2) RETURN NUMBER;
 
     PROCEDURE CLOSE_SESSION(p_processId NUMBER);
     PROCEDURE CLOSE_SESSION(p_processId NUMBER, p_processInfo VARCHAR2, p_processStatus PLS_INTEGER);
