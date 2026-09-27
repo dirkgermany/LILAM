@@ -41,11 +41,11 @@ create or replace PACKAGE LILAM AS
     NUM_DATA_ANSWER     CONSTANT VARCHAR2(30) := 102;
 
     -- SUFFIXES of the three main tables
-    C_SUFFIX_PROC_TABLE CONSTANT varchar2(6) := '_PROC'; -- Process
-    C_SUFFIX_LOG_TABLE  CONSTANT varchar2(6) := '_LOG';  -- Logging
-    C_SUFFIX_MON_TABLE  CONSTANT varchar2(6) := '_MON';  -- Monitoring
-    C_LILAM_RULES       CONSTANT VARCHAR2(16) := 'LILAM_RULES';
-    C_LILAM_ALERTS      CONSTANT VARCHAR2(16) := 'LILAM_ALERTS';
+    C_SUFFIX_PROC_TABLE  CONSTANT varchar2(6)  := '_PROC'; -- Process
+    C_SUFFIX_LOG_TABLE   CONSTANT varchar2(6)  := '_LOG';  -- Logging
+    C_SUFFIX_MON_TABLE   CONSTANT varchar2(6)  := '_MON';  -- Monitoring
+    C_LILAM_RULES_TABLE  CONSTANT VARCHAR2(16) := 'LILAM_RULES';
+    C_LILAM_ALERTS_TABLE CONSTANT VARCHAR2(16) := 'LILAM_ALERTS';
 
     -- ================================
     -- Record representing process data
