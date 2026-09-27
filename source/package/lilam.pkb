@@ -4103,6 +4103,23 @@ AS
     end;
     --------------------------------------------------------------------------
 
+    FUNCTION SERVER_RECONNECT(p_processId NUMBER, p_pipeName varchar2) RETURN NUMBER
+    AS
+    BEGIN
+        if isServerPipeActive(p_pipeName) then
+            g_remote_sessions(p_processId) := TRUE;
+            g_client_pipes(p_processId)    := p_pipeName;
+
+            -- PIPE ist aktiv
+            return p_processId;
+        end if;
+
+        -- PIPE nicht (mehr) verfügbar
+        return null;
+    END;
+
+    --------------------------------------------------------------------------
+
     PROCEDURE DUMP_BUFFER_STATS AS
         v_key VARCHAR2(100);
         v_log_total NUMBER := 0;
