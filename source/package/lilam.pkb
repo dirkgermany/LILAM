@@ -1387,9 +1387,9 @@ AS
             run_sql(sqlStmt);
         end if;
 
-        if not objectExists(C_LILAM_RULES, 'TABLE') then
+        if not objectExists(C_LILAM_RULES_TABLE, 'TABLE') then
             sqlStmt := '
-            CREATE TABLE ' || C_LILAM_RULES || ' (
+            CREATE TABLE ' || C_LILAM_RULES_TABLE || ' (
                 rule_set       CLOB CONSTRAINT ensure_json_rules CHECK (rule_set IS JSON),
                 set_name       VARCHAR2(30),
                 version        NUMBER,
@@ -4375,7 +4375,7 @@ AS
         l_sqlStmt varchar2(200);
         l_serverRuleSet CLOB;
     begin
-        l_sqlStmt := 'SELECT rule_set FROM ' || C_LILAM_RULES || ' where set_name = :1 and version = :2';
+        l_sqlStmt := 'SELECT rule_set FROM ' || C_LILAM_RULES_TABLE || ' where set_name = :1 and version = :2';
         execute immediate l_sqlStmt into l_serverRuleSet using p_ruleSetName, p_ruleSetVersion; 
         load_rules_from_json(l_serverRuleSet);
 
