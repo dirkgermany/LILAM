@@ -3733,25 +3733,26 @@ AS
     procedure doRemote_reconnectProcess(p_clientChannel varchar2, p_message varchar2)
     as
         l_status        PLS_INTEGER;
+        l_processId     NUMBER;
         l_header        JSON_OBJ_LILAM;
         l_payload       JSON_OBJ_LILAM;
+        l_response      JSON_OBJ_LILAM;
         l_msg           JSON_OBJ_LILAM;
     begin
         l_payload       := JSON_QUERY(p_message, '$.payload');
         l_processId     := jsonNumber(l_payload, 'process_id');
 
-        jsonPut(l_header, 'msg_type', 'SERVER_RESPONSE');
-        jsonPut(l_header, 'msg_name', 'RECONNECT_PROCESS_RESP');
-
-        if v_indexSession.EXISTS(p_processId) then
-            jsonPut(l_payload, 'server_code', get_serverCode(TXT_ACK_SERVER_PROC));
-            jsonPut(l_payload, 'process_id', p_processId);
+        if v_indexSession.EXISTS(l_processId) then
+            jsonPut(l_response, 'server_code', get_serverCode(TXT_ACK_SERVER_PROC));
+            jsonPut(l_response, 'process_id', l_processId);
         else
-            jsonPut(l_payload, 'server_code', get_serverCode(TXT_ERR_SERVER_PROC));
+            jsonPut(l_response, 'server_code', get_serverCode(TXT_ERR_SERVER_PROC));
         end if;
 
+        jsonPut(l_header, 'msg_type', 'SERVER_RESPONSE');
+        jsonPut(l_header, 'msg_name', 'RECONNECT_PROCESS_RESP');
         l_msg := jsonObject(l_header, 'header');
-        jsonPut(l_msg, 'payload', l_payload);
+        jsonPut(l_msg, 'payload', l_response);
 
         DBMS_PIPE.RESET_BUFFER;
         DBMS_PIPE.PACK_MESSAGE(l_msg);        
@@ -4140,15 +4141,16 @@ AS
 
     function reconnectRemote(p_processId number, p_pipeName varchar2) return number
     as
-        l_payload JSON_OBJ_LILAM;
-        l_response JSON_OBJ_LILAM;
+        l_payload     JSON_OBJ_LILAM;
+        l_response    JSON_OBJ_LILAM;
+        l_serverCode  NUMBER;
     begin
         jsonPut(l_payload,'process_id', p_processId);
         jsonPut(l_payload,'pipe_name', p_pipeName);
 
         l_response := waitForResponse(
             p_processId     => p_processId,
-            p_request       => 'VALIDATE_PROCESS',
+            p_request       => 'RECONNECT_PROCESS',
             p_payload       => l_payload,
             p_timeoutSec    => 5
         );
@@ -4163,7 +4165,7 @@ AS
 
     EXCEPTION
         WHEN OTHERS THEN
-        logLilamErr(sqlCode, sqlErrM, 'SERVER_SHUTDOWN'); 
+        logLilamErr(sqlCode, sqlErrM, 'RECONNECT_PROCESS'); 
         return NUM_ERR_SERVER_PROC;
 
     end;
@@ -4173,13 +4175,25 @@ AS
     FUNCTION server_reconnect(p_processId NUMBER, p_pipeName varchar2) RETURN NUMBER
     AS
         l_startTime timestamp(6);
+        l_respProcId number;
     BEGIN
         -- optimistisch die assoziativen Arrays füllen
         -- das erleichtert den Testaufruf an den Server
         g_remote_sessions(p_processId) := TRUE;
         g_client_pipes(p_processId)    := p_pipeName;
 
-        return reconnectRemote(p_processId, p_pipeName);
+        l_respProcId := reconnectRemote(p_processId, p_pipeName);
+        if nvl(l_respProcId, NUM_ERR_SERVER_PROC) = NUM_ERR_SERVER_PROC then
+            g_remote_sessions.DELETE(p_processId);
+            g_client_pipes.DELETE(p_processId);
+        end if;
+
+        return l_respProcId;
+
+    EXCEPTION
+        WHEN OTHERS THEN
+        logLilamErr(sqlCode, sqlErrM, 'RECONNECT_PROCESS'); 
+        return NUM_ERR_SERVER_PROC;
 
     END;
 
