@@ -3741,7 +3741,7 @@ AS
         l_processId     := jsonNumber(l_payload, 'process_id');
 
         jsonPut(l_header, 'msg_type', 'SERVER_RESPONSE');
-        jsonPut(l_header, 'msg_name', 'VALIDATE_PROCESS');
+        jsonPut(l_header, 'msg_name', 'RECONNECT_PROCESS_RESP');
 
         if v_indexSession.EXISTS(p_processId) then
             jsonPut(l_payload, 'server_code', get_serverCode(TXT_ACK_SERVER_PROC));
@@ -4672,8 +4672,8 @@ AS
             WHEN 'PROC_STEP_DONE' then
                 doRemote_procStepDone(p_message);
 
-            WHEN 'VALIDATE_PROCESS' then
-                doRemote_validateProcess(p_message);
+            WHEN 'RECONNECT_PROCESS' then
+                doRemote_reconnectProcess(p_clientChannel, p_message);
 
             WHEN 'GET_PROCESS_DATA' then
                 doRemote_getProcessData(p_clientChannel, p_message);
