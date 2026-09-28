@@ -1262,7 +1262,8 @@ AS
         
     exception
         when others then
-            dbms_output.put_line('Error in function objectExists. p_objectName: ' || p_objectName || '; p_objectType: ' || p_objectType);
+            logLilamErr(sqlCode, sqlErrM, 'objectExists');
+            return false;
     end;
 
     --------------------------------------------------------------------------
