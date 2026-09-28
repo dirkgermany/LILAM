@@ -4938,118 +4938,140 @@ AS
 
     --------------------------------------------------------------------------
 
-    PROCEDURE CALL_BY_JSON(
-        p_callObject  IN  JSON_OBJ_LILAM,
-        p_respObject  OUT JSON_OBJ_LILAM
-    )
-    AS
-        l_InObject JSON_OBJ_LILAM := p_callObject;
+PROCEDURE CALL_BY_JSON(
+    p_callObject  IN  JSON_OBJ_LILAM,
+    p_respObject  OUT JSON_OBJ_LILAM
+)
+AS
+    l_InObject      JSON_OBJ_LILAM := p_callObject;
+    l_jsonHeaderIn  JSON_OBJ_LILAM;   -- Header aus der Anfrage
+    l_jsonParams    JSON_OBJ_LILAM;   -- Params aus der Anfrage (jetzt tatsächlich befüllt)
+    l_jsonHeader    JSON_OBJ_LILAM;   -- Header der Antwort
+    l_jsonPayload   JSON_OBJ_LILAM;   -- Payload der Antwort
+    l_api_call      VARCHAR2(30);
+    l_proc_id       NUMBER;
+    p_session_init  t_session_init;
+BEGIN
+    if not p_callObject IS JSON then
+        RAISE_APPLICATION_ERROR(-20005, 'In-Parameter is invalid JSON-Format');
+    end if;
 
-        l_jsonHelper    JSON_OBJ_LILAM;
-        l_jsonParams    JSON_OBJ_LILAM;
-        l_jsonHeader    JSON_OBJ_LILAM;
-        l_jsonPayload   JSON_OBJ_LILAM;
-        l_api_call  VARCHAR2(30);
-        l_proc_id NUMBER;  
-        p_session_init  t_session_init;
-    BEGIN
-        if not p_callObject IS JSON then
-            RAISE_APPLICATION_ERROR(-20005, 'In-Parameter is invalid JSON-Format');
-        end if;
-        l_jsonHelper := jsonObject(l_InObject, 'header');
-        jsonPut(l_jsonHeader, 'header', l_jsonHelper);
-        jsonPut(l_jsonHeader, 'status', 'UNKNOWN');
-        l_api_call   := jsonString(l_jsonHeader, 'api_call');
+    -- Header und Params aus der Anfrage extrahieren
+    l_jsonHeaderIn := jsonObject(l_InObject, 'header');
+    l_api_call     := jsonString(l_jsonHeaderIn, 'api_call');
+    l_jsonParams   := jsonObject(l_InObject, 'params');
 
-        l_jsonHelper := jsonObject(l_InObject, 'params');
-        jsonPut(l_jsonParams, 'params', l_jsonHelper);
-        jsonPut(l_jsonPayload, 'returns', 'RESPONSE_VALUE');
-        jsonPut(l_jsonPayload, 'value', 0);
+    -- Antwort-Grundgerüst; 'status' wird bewusst NUR EINMAL gesetzt,
+    -- entweder unten im jeweiligen Zweig oder im ELSE-Fallback
+    jsonPut(l_jsonHeader, 'header', l_jsonHeaderIn);
+    jsonPut(l_jsonPayload, 'returns', 'NO_VALUE');
+    jsonPut(l_jsonPayload, 'value', 'NULL');
 
-        -- Logik-Verzweigung
-        case  l_api_call
-            when 'SERVER_NEW_SESSION' THEN
-                l_proc_id := SERVER_NEW_SESSION(l_jsonParams);
-                if l_proc_id < 0 then
-                    jsonPut(l_jsonHeader, 'status', 'ERROR');
-                    jsonPut(l_jsonPayload, 'returns', 'ERR_NO');
-                    jsonPut(l_jsonPayload, 'value', NUM_ERR_NO_SERVER);
-                else
-                    jsonPut(l_jsonHeader, 'status', 'SUCESS');
-                    jsonPut(l_jsonPayload, 'returns', 'PROCESS_ID');
-                    jsonPut(l_jsonPayload, 'value', l_proc_id);
-                end if;
-
-            when 'NEW_SESSION' THEN
-                p_session_init.processName   := jsonString(l_jsonParams, 'process_name');
-                p_session_init.logLevel      := jsonNumber(l_jsonParams, 'log_level');
-                p_session_init.stepsToDo     := jsonNumber(l_jsonParams, 'steps_todo');
-                p_session_init.daysToKeep    := jsonNumber(l_jsonParams, 'days_to_keep');
-                p_session_init.procImmortal  := jsonNumber(l_jsonParams, 'process_immortal');
-                p_session_init.tabNameMaster := jsonString(l_jsonParams, 'tabname_master');
-
-                l_proc_id := NEW_SESSION(p_session_init);
+    case l_api_call
+        when 'SERVER_NEW_SESSION' THEN
+            l_proc_id := SERVER_NEW_SESSION(l_jsonParams);
+            if l_proc_id < 0 then
+                jsonPut(l_jsonHeader, 'status', 'ERROR');
+                jsonPut(l_jsonPayload, 'returns', 'ERR_NO');
+                jsonPut(l_jsonPayload, 'value', NUM_ERR_NO_SERVER);
+            else
                 jsonPut(l_jsonHeader, 'status', 'SUCCESS');
                 jsonPut(l_jsonPayload, 'returns', 'PROCESS_ID');
                 jsonPut(l_jsonPayload, 'value', l_proc_id);
+            end if;
 
-            when 'SERVER_SHUTDOWN' then
-                SERVER_SHUTDOWN(jsonNumber(l_jsonParams, 'process_id'), jsonString(l_jsonParams, 'process_name'), jsonString(l_jsonParams, 'password'));
-                jsonPut(l_jsonHeader, 'status', NUM_ACK_OK);
-                jsonPut(l_jsonPayload, 'returns', 'NO_VALUE');
-                jsonPut(l_jsonPayload, 'value', 'NULL');
+        when 'NEW_SESSION' THEN
+            p_session_init.processName   := jsonString(l_jsonParams, 'process_name');
+            p_session_init.logLevel      := jsonNumber(l_jsonParams, 'log_level');
+            p_session_init.stepsToDo     := jsonNumber(l_jsonParams, 'steps_todo');
+            p_session_init.daysToKeep    := jsonNumber(l_jsonParams, 'days_to_keep');
+            p_session_init.procImmortal  := jsonNumber(l_jsonParams, 'process_immortal');
+            p_session_init.tabNameMaster := jsonString(l_jsonParams, 'tabname_master');
 
-            when 'CLOSE_SESSION' THEN
-                CLOSE_SESSION(l_jsonParams);
+            l_proc_id := NEW_SESSION(p_session_init);
+            jsonPut(l_jsonHeader, 'status', 'SUCCESS');
+            jsonPut(l_jsonPayload, 'returns', 'PROCESS_ID');
+            jsonPut(l_jsonPayload, 'value', l_proc_id);
 
-            when 'SET_PROCESS_STATUS' THEN
-                SET_PROCESS_STATUS(jsonNumber(l_jsonParams, 'process_id'), jsonNumber(l_jsonParams, 'process_status'), jsonString(l_jsonParams, 'process_info'));
+        when 'SERVER_SHUTDOWN' then
+            SERVER_SHUTDOWN(
+                jsonNumber(l_jsonParams, 'process_id'),
+                jsonString(l_jsonParams, 'pipe_name'),   -- korrigiert: war 'process_name'
+                jsonString(l_jsonParams, 'password')
+            );
+            jsonPut(l_jsonHeader, 'status', 'SUCCESS');
 
-            when 'SET_STEP_TODO' THEN
-                SET_PROC_STEPS_TODO(jsonNumber(l_jsonParams, 'process_id'), jsonNumber(l_jsonParams, 'steps_todo'));
+        when 'CLOSE_SESSION' THEN
+            CLOSE_SESSION(jsonNumber(l_jsonParams, 'process_id'));
+            jsonPut(l_jsonHeader, 'status', 'SUCCESS');
 
-            when 'SET_steps_done' THEN
-                SET_PROC_steps_done(jsonNumber(l_jsonParams, 'process_id'), jsonNumber(l_jsonParams, 'steps_done'));
+        when 'SET_PROCESS_STATUS' THEN
+            SET_PROCESS_STATUS(jsonNumber(l_jsonParams, 'process_id'), jsonNumber(l_jsonParams, 'process_status'), jsonString(l_jsonParams, 'process_info'));
+            jsonPut(l_jsonHeader, 'status', 'SUCCESS');
 
-            when 'PROC_STEP_DONE' THEN
-                PROC_STEP_DONE(jsonNumber(l_jsonParams, 'process_id'));
+        when 'SET_STEP_TODO' THEN
+            SET_PROC_STEPS_TODO(jsonNumber(l_jsonParams, 'process_id'), jsonNumber(l_jsonParams, 'steps_todo'));
+            jsonPut(l_jsonHeader, 'status', 'SUCCESS');
 
-            when 'SET_PROC_IMMORTAL' THEN
-                SET_PROC_IMMORTAL(jsonNumber(l_jsonParams, 'process_id'), jsonNumber(l_jsonParams, 'process_immortal'));
+        when 'SET_STEPS_DONE' THEN
+            SET_PROC_STEPS_DONE(jsonNumber(l_jsonParams, 'process_id'), jsonNumber(l_jsonParams, 'steps_done'));
+            jsonPut(l_jsonHeader, 'status', 'SUCCESS');
 
-            when 'INFO' THEN
-                INFO(jsonNumber(l_jsonParams, 'process_id'), jsonString(l_jsonParams, 'process_info'));
+        when 'PROC_STEP_DONE' THEN
+            PROC_STEP_DONE(jsonNumber(l_jsonParams, 'process_id'));
+            jsonPut(l_jsonHeader, 'status', 'SUCCESS');
 
-            when 'DEBUG' THEN
-                DEBUG(jsonNumber(l_jsonParams, 'process_id'), jsonString(l_jsonParams, 'process_info'));
+        when 'SET_PROC_IMMORTAL' THEN
+            SET_PROC_IMMORTAL(jsonNumber(l_jsonParams, 'process_id'), jsonNumber(l_jsonParams, 'process_immortal'));
+            jsonPut(l_jsonHeader, 'status', 'SUCCESS');
 
-            when 'WARN' THEN
-                WARN(jsonNumber(l_jsonParams, 'process_id'), jsonString(l_jsonParams, 'process_info'));
+        when 'INFO' THEN
+            INFO(jsonNumber(l_jsonParams, 'process_id'), jsonString(l_jsonParams, 'process_info'));
+            jsonPut(l_jsonHeader, 'status', 'SUCCESS');
 
-            when 'ERROR' THEN
-                ERROR(jsonNumber(l_jsonParams, 'process_id'), jsonString(l_jsonParams, 'process_info'));
+        when 'DEBUG' THEN
+            DEBUG(jsonNumber(l_jsonParams, 'process_id'), jsonString(l_jsonParams, 'process_info'));
+            jsonPut(l_jsonHeader, 'status', 'SUCCESS');
 
-            when C_MARK_EVENT THEN
-                MARK_EVENT(jsonNumber(l_jsonParams, 'process_id'), jsonString(l_jsonParams, 'action_name'), jsonString(l_jsonParams, 'context_name'), jsonTime(l_jsonParams, 'timestamp'));
+        when 'WARN' THEN
+            WARN(jsonNumber(l_jsonParams, 'process_id'), jsonString(l_jsonParams, 'process_info'));
+            jsonPut(l_jsonHeader, 'status', 'SUCCESS');
 
-            when C_TRACE_START THEN
-                TRACE_START(jsonNumber(l_jsonParams, 'process_id'), jsonString(l_jsonParams, 'action_name'), jsonString(l_jsonParams, 'context_name'), jsonTime(l_jsonParams, 'timestamp'));
+        when 'ERROR' THEN
+            ERROR(jsonNumber(l_jsonParams, 'process_id'), jsonString(l_jsonParams, 'process_info'));
+            jsonPut(l_jsonHeader, 'status', 'SUCCESS');
 
-            when C_TRACE_STOP THEN
-                TRACE_STOP(jsonNumber(l_jsonParams, 'process_id'), jsonString(l_jsonParams, 'action_name'), jsonString(l_jsonParams, 'context_name'), jsonTime(l_jsonParams, 'timestamp'));                    
+        when C_MARK_EVENT THEN
+            MARK_EVENT(jsonNumber(l_jsonParams, 'process_id'), jsonString(l_jsonParams, 'action_name'), jsonString(l_jsonParams, 'context_name'), jsonTime(l_jsonParams, 'timestamp'));
+            jsonPut(l_jsonHeader, 'status', 'SUCCESS');
 
-        END CASE;
+        when C_TRACE_START THEN
+            TRACE_START(jsonNumber(l_jsonParams, 'process_id'), jsonString(l_jsonParams, 'action_name'), jsonString(l_jsonParams, 'context_name'), jsonTime(l_jsonParams, 'timestamp'));
+            jsonPut(l_jsonHeader, 'status', 'SUCCESS');
 
-        jsonPut(p_respObject, 'header', l_jsonHeader);
-        jsonPut(p_respObject, 'payload', l_jsonPayload);
+        when C_TRACE_STOP THEN
+            TRACE_STOP(jsonNumber(l_jsonParams, 'process_id'), jsonString(l_jsonParams, 'action_name'), jsonString(l_jsonParams, 'context_name'), jsonTime(l_jsonParams, 'timestamp'));
+            jsonPut(l_jsonHeader, 'status', 'SUCCESS');
 
+        ELSE
+            jsonPut(l_jsonHeader, 'status', 'ERROR');
+            jsonPut(l_jsonPayload, 'returns', 'ERR_NO');
+            jsonPut(l_jsonPayload, 'value', NUM_ERR_ILLEGAL_REQ);
+    END CASE;
 
-    EXCEPTION
-        WHEN OTHERS THEN
-        logLilamErr(sqlCode, sqlErrM, 'CALL_BY_JSON'); 
+    jsonPut(p_respObject, 'header', l_jsonHeader);
+    jsonPut(p_respObject, 'payload', l_jsonPayload);
 
-    END;
+EXCEPTION
+    WHEN OTHERS THEN
+    logLilamErr(sqlCode, sqlErrM, 'CALL_BY_JSON');
+    jsonPut(l_jsonHeader, 'status', 'ERROR');
+    jsonPut(l_jsonPayload, 'returns', 'ERR_NO');
+    jsonPut(l_jsonPayload, 'value', NUM_ERR_UNKNOWN);
+    jsonPut(p_respObject, 'header', l_jsonHeader);
+    jsonPut(p_respObject, 'payload', l_jsonPayload);
 
+END;
     PROCEDURE CALL_BY_JSON (
         p_callObject  IN  JSON_OBJECT_T,
         p_respObject  OUT JSON_OBJECT_T
