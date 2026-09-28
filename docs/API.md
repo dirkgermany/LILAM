@@ -337,7 +337,8 @@ FUNCTION SERVER_LINK(
   * -20021 (PROCESS_AT_SERVER_INVALID) if the process could not be determined
   * -20020 (SERVER_AT_PIPE_INVALID) if communication with the server failed.
 
-Background: When a PL/SQL application utilizes the database session pool, Oracle is not guaranteed to provide the same session every time. As a consequence, session-specific PL/SQL variables in the private memory (PGA) have an undefined or unknown state (session state) with respect to the application.
+#### Background
+When a PL/SQL application utilizes the database session pool, Oracle is not guaranteed to provide the same session every time. As a consequence, session-specific PL/SQL variables in the private memory (PGA) have an undefined or unknown state (session state) with respect to the application.
 
 This is typically the case with APEX applications – especially when asynchronous requests (AJAX) are integrated, as these are often executed in changing database sessions in the background.The SERVER_LINK() function ensures the application's communication with the LILAM-SERVER.
 
