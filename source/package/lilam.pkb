@@ -4146,6 +4146,13 @@ AS
         l_response    JSON_OBJ_LILAM;
         l_serverCode  NUMBER;
     begin
+
+if g_remote_sessions.EXISTS(p_processId)
+   and g_client_pipes.EXISTS(p_processId)
+   and g_client_pipes(p_processId) = p_pipeName then
+    return p_processId;
+end if;
+
         jsonPut(l_payload,'process_id', p_processId);
         jsonPut(l_payload,'pipe_name', p_pipeName);
 
