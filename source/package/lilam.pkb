@@ -573,7 +573,7 @@ AS
     --------------------------------------------------------------------------
     -- Look for free Server-Pipe 
     --------------------------------------------------------------------------
-    function getServerPipeForSession(p_processId number, p_groupName varchar2, p_initialize BOOLEAN default TRUE) return varchar2
+    function getServerPipeForSession(p_processId number, p_groupName varchar2) return varchar2
     as
         l_serverPipe varchar2(50);
         l_key        BINARY_INTEGER;
@@ -1017,9 +1017,8 @@ AS
         jsonPut(l_jsonHeader, 'msg_type', 'API_CALL');
         jsonPut(l_jsonHeader, 'request', p_request);
         jsonPut(l_jsonHeader, 'response', l_clientChannel);
--- ???
+
         l_jsonPayload := p_payLoad;
--- ???
         jsonPut(l_jsonMain, 'header', l_jsonHeader);
         jsonPut(l_jsonMain, 'payload', l_jsonPayload);
 
@@ -1043,10 +1042,12 @@ AS
         logLilamErr(sqlCode, sqlErrM, 'waitForResponse');
         begin
             l_status := DBMS_PIPE.REMOVE_PIPE(l_clientChannel);
+            return null;
         exception
             when others then
             logLilamErr(sqlCode, sqlErrM, 'waitForResponse', 'DBMS_PIPE.REMOVE_PIPE');
-            error(p_processId, 'Wait for response failed: ' || sqlErrM);
+--            error(p_processId, 'Wait for response failed: ' || sqlErrM);
+            return null;
         end;
     end;
 
@@ -1061,7 +1062,7 @@ AS
         l_sqlStmt := '
             SELECT count(*) FROM ' || C_LILAM_SERVER_REGISTRY || ' 
             WHERE is_active = 1
-            AND last_activity > SYSTIMESTAMP - INTERVAL ''15'' SECOND '
+            AND last_activity > SYSTIMESTAMP - INTERVAL ''15'' SECOND
             AND upper(pipe_name) = :1';
 
         execute immediate l_sqlStmt into l_counter using upper(p_pipeName);
