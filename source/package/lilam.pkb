@@ -4170,7 +4170,7 @@ AS
     EXCEPTION
         WHEN OTHERS THEN
         logLilamErr(sqlCode, sqlErrM, 'RECONNECT_PROCESS'); 
-        return NUM_ERR_SERVER_PROC;
+        return NUM_ERR_PIPE_SERVER;
 
     END;
 
@@ -4219,11 +4219,57 @@ AS
     EXCEPTION
         WHEN OTHERS THEN
         logLilamErr(sqlCode, sqlErrM, 'RECONNECT_PROCESS'); 
-        return NUM_ERR_SERVER_PROC;
+        return NUM_ERR_PIPE_SERVER;
 
     END;
 
     --------------------------------------------------------------------------
+    
+    PROCEDURE SERVER_LINK(p_processId NUMBER, p_pipeName varchar2)
+    AS
+        l_respProcId number;
+    BEGIN
+        -- wenn alles bekannt ist, ist keine weitere Aktion notwendig
+        if g_remote_sessions.EXISTS(p_processId)
+           and g_client_pipes.EXISTS(p_processId)
+           and g_client_pipes(p_processId) = p_pipeName then
+           return;
+        end if;
+
+        -- optimistisch die assoziativen Arrays füllen
+        -- das erleichtert den Testaufruf an den Server
+        g_remote_sessions(p_processId) := TRUE;
+        g_client_pipes(p_processId)    := p_pipeName;
+
+        -- wenn die Server PIPE nicht aktiv ist, direkt abbrechen
+        if not isServerPipeActive(p_pipeName) then
+            g_remote_sessions.DELETE(p_processId);
+            g_client_pipes.DELETE(p_processId);
+            RAISE_APPLICATION_ERROR(
+                num => -20020,
+                msg => 'NUM_ERR_PIPE_SERVER: Kommunikation mit LILAM-SERVER ' ||
+                       'ist fehlgeschlagen.'
+            );
+        end if;
+
+        -- Frage den Server über die PIPE, ob er die PROCESS_ID kennt
+        l_respProcId := reconnectRemote(p_processId, p_pipeName);
+        if nvl(l_respProcId, NUM_ERR_SERVER_PROC) != p_processId then
+            g_remote_sessions.DELETE(p_processId);
+            g_client_pipes.DELETE(p_processId);
+            
+            RAISE_APPLICATION_ERROR(
+                num => -20021,
+                msg => 'NUM_ERR_SERVER_PROC: Der Sitzungskontext zum LILAM-SERVER ' ||
+                       'konnte nicht hergestellt oder verifiziert werden.'
+            );
+        end if;
+
+    EXCEPTION
+        WHEN OTHERS THEN
+        logLilamErr(sqlCode, sqlErrM, 'RECONNECT_PROCESS'); 
+
+    END;
 
     PROCEDURE DUMP_BUFFER_STATS AS
         v_key VARCHAR2(100);
