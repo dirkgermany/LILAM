@@ -155,7 +155,6 @@ END;
 ```
 
 #### Step 3: Shut down the server
-
 A client must first establish a server session. The server pipe associated with that session can then be obtained with `GET_SERVER_PIPE` and passed to `SERVER_SHUTDOWN`.
 
 ```sql
@@ -198,7 +197,6 @@ Use `SET_PROC_STEPS_TODO`, `PROC_STEP_DONE`, and `SET_PROC_STEPS_DONE` to descri
 Use `MARK_EVENT`, `TRACE_START`, and `TRACE_STOP` to record measurable activities within that process. The number of process steps does not have to correspond to the number of metric events or traces.
 
 ### Events vs. Traces
-
 A simple rule of thumb:
 
 - **Something happened:** use `MARK_EVENT`.
@@ -211,7 +209,6 @@ A metric is identified by the combination of `p_actionName` and `p_contextName`.
 ## Functions and Procedures
 
 ### Parameter Requirements
-
 The following markers are used in parameter descriptions:
 
 - **M**: Mandatory
@@ -222,7 +219,6 @@ The following markers are used in parameter descriptions:
 ---
 
 ## Session Handling
-
 Session handling controls the lifecycle of a LILAM process.
 
 | API | Purpose |
@@ -322,8 +318,45 @@ FUNCTION SERVER_NEW_SESSION(
 
 **Returns:** `NUMBER`, the process ID.
 
-### Procedure CLOSE_SESSION
+### Function SERVER_LINK
+Ensures the usage of a connection to the LILAM-SERVER across different database sessions.
 
+> [!IMPORTANT]
+> **Important for APEX Projects**
+> This function should always be used at first whenever a decoupled call is executed by the application.
+
+```sql
+FUNCTION SERVER_LINK(
+    p_processId NUMBER,
+    p_pipeName VARCHAR2
+) RETURNS NUMBER
+```
+
+**Returns** `NUMBER`
+  * the verified Process-ID upon successful linking.
+  * -20021 (PROCESS_AT_SERVER_INVALID) if the process could not be determined
+  * -20020 (SERVER_AT_PIPE_INVALID) if communication with the server failed.
+
+Background: When a PL/SQL application utilizes the database session pool, Oracle is not guaranteed to provide the same session every time. As a consequence, session-specific PL/SQL variables in the private memory (PGA) have an undefined or unknown state (session state) with respect to the application.
+
+This is typically the case with APEX applications – especially when asynchronous requests (AJAX) are integrated, as these are often executed in changing database sessions in the background.The SERVER_LINK() function ensures the application's communication with the LILAM-SERVER.
+
+#### Exception Handling
+* If the return value does **not** match the provided `p_process_id`, the linking mechanism has failed. In this event, the calling application must abort immediately (raise an exception), as no valid session context to the LILAM-SERVER could be established.
+
+```sql
+l_processId  NUMBER := apex_util.get_session_state('G_LILAM_PROCESS_ID');
+l_serverPipe VARCHAR2(100) := apex_util.get_session_state('G_LILAM_SERVER_PIPE');
+l_result      NUMBER;
+...
+l_result := lilam.server_link(l_processId, l_serverPipe);
+if l_result != l_processId then
+    RAISE_APPLICATION_ERROR(l_result, 'Could not link to LILAM-SERVER.');
+end if;
+-- resume with business logic
+```
+
+### Procedure CLOSE_SESSION
 Finalizes a LILAM process. Depending on the overload, final process information, progress, and status can be supplied.
 
 > [!IMPORTANT]
@@ -376,7 +409,6 @@ EXCEPTION
 ```
 
 ### Procedure FINAL_RESCUE
-
 LILAM caches logging, monitoring, and process entries for performance. `FINAL_RESCUE` persists all currently cached data in the current database session.
 
 ```sql
@@ -392,7 +424,6 @@ END;
 ---
 
 ## Process Control
-
 Process-control APIs manage overall process progress and status.
 
 | API | Purpose |
@@ -532,7 +563,6 @@ FUNCTION GET_PROCESS_DATA(
 ---
 
 ## Logging
-
 Logging APIs write messages to the LILAM log according to the active log level.
 
 | API | Severity |
@@ -578,14 +608,12 @@ See [Log Levels](#log-levels) for the complete mapping.
 ---
 
 ## Metrics
-
 Metrics record events and logical transactions within a process.
 
 > [!IMPORTANT]
 > `p_actionName` and `p_contextName` together identify a metric. A trace started with a context must be stopped with the same action and context.
 
 ### Procedure MARK_EVENT
-
 Use `MARK_EVENT` for a discrete occurrence at a point in the process.
 
 For repeated markers sharing an action and context, LILAM tracks elapsed time, occurrence count, average duration, and significant timing deviations.
@@ -600,7 +628,6 @@ PROCEDURE MARK_EVENT(
 ```
 
 ### Procedure TRACE_START
-
 Starts a timed logical transaction.
 
 ```sql
@@ -613,7 +640,6 @@ PROCEDURE TRACE_START(
 ```
 
 ### Procedure TRACE_STOP
-
 Stops a matching logical transaction.
 
 ```sql
@@ -706,7 +732,6 @@ PROCEDURE SERVER_SHUTDOWN(
 ```
 
 ### Function GET_SERVER_PIPE
-
 Returns the server pipe associated with the connected client process.
 
 ```sql
@@ -716,7 +741,6 @@ FUNCTION GET_SERVER_PIPE(
 ```
 
 ### Procedure SERVER_UPDATE_RULES
-
 Rules are stored as JSON objects in `LILAM_RULES`. After a rule set has been inserted or modified, call `SERVER_UPDATE_RULES` through an active server connection to apply it.
 
 ```sql
