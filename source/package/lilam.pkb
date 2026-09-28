@@ -1059,6 +1059,7 @@ AS
         l_sqlStmt varchar2(200);
     begin
         l_sqlStmt := 'SELECT count(*) FROM ' || C_LILAM_SERVER_REGISTRY || ' WHERE is_active = 1 and upper(pipe_name) = :1';
+AND letztes HEARTBEAT nicht älter als...
         execute immediate l_sqlStmt into l_counter using upper(p_pipeName);
         if l_counter >= 1 then return TRUE; end if;
         if l_counter = 0  then return FALSE; end if;
@@ -4146,6 +4147,9 @@ AS
         l_response    JSON_OBJ_LILAM;
         l_serverCode  NUMBER;
     begin
+
+if not isServerPipeActive(p_pipeName) then
+... auch auf die letzte Aktivität prüfen...
 
 if g_remote_sessions.EXISTS(p_processId)
    and g_client_pipes.EXISTS(p_processId)
