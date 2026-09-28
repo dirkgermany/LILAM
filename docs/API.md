@@ -14,6 +14,7 @@
   - [Events vs. Traces](#events-vs-traces)
 - [Functions and Procedures](#functions-and-procedures)
   - [Session Handling](#session-handling)
+  - [Decoupled Calls](#decoupled-calls)
   - [Process Control](#process-control)
   - [Logging](#logging)
   - [Metrics](#metrics)
@@ -388,8 +389,7 @@ END;
 ## Decoupled Calls
 
 > [!IMPORTANT]
-> **Important for APEX Projects**
-> This section is highly important for applications that depend on the Oracle session pool (APEX, AJAX, etc.).
+> **This section is highly important for applications that depend on the Oracle session pool (APEX, AJAX, etc.)**.
 
 When a PL/SQL application utilizes the database session pool, Oracle is not guaranteed to provide the same session every time. As a consequence, session-specific PL/SQL variables in the private memory (PGA) have an undefined or unknown state (session state) with respect to the application.
 
