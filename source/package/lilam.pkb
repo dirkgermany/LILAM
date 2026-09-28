@@ -4209,7 +4209,7 @@ AS
 
         -- Frage den Server über die PIPE, ob er die PROCESS_ID kennt
         l_respProcId := reconnectRemote(p_processId, p_pipeName);
-        if nvl(l_respProcId, NUM_ERR_SERVER_PROC) = NUM_ERR_SERVER_PROC then
+        if nvl(l_respProcId, NUM_ERR_SERVER_PROC) != p_processId then
             g_remote_sessions.DELETE(p_processId);
             g_client_pipes.DELETE(p_processId);
         end if;
