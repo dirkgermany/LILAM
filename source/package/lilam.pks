@@ -109,15 +109,16 @@ create or replace PACKAGE LILAM AS
     ------------------------------
     -- Life cycle of a log session
     ------------------------------
-    FUNCTION NEW_SESSION(p_session_init t_session_init) RETURN NUMBER;
-    FUNCTION NEW_SESSION(p_processName VARCHAR2, p_logLevel PLS_INTEGER default logLevelMonitor, p_tabNameMaster VARCHAR2 default 'LILAM') RETURN NUMBER;
-    FUNCTION NEW_SESSION(p_processName VARCHAR2, p_logLevel PLS_INTEGER, p_daysToKeep PLS_INTEGER, p_tabNameMaster VARCHAR2 default 'LILAM') RETURN NUMBER;
-    FUNCTION NEW_SESSION(p_processName VARCHAR2, p_logLevel PLS_INTEGER, p_procStepsToDo PLS_INTEGER, p_daysToKeep PLS_INTEGER, p_tabNameMaster VARCHAR2 DEFAULT 'LILAM') RETURN NUMBER;
+    FUNCTION  NEW_SESSION(p_session_init t_session_init) RETURN NUMBER;
+    FUNCTION  NEW_SESSION(p_processName VARCHAR2, p_logLevel PLS_INTEGER default logLevelMonitor, p_tabNameMaster VARCHAR2 default 'LILAM') RETURN NUMBER;
+    FUNCTION  NEW_SESSION(p_processName VARCHAR2, p_logLevel PLS_INTEGER, p_daysToKeep PLS_INTEGER, p_tabNameMaster VARCHAR2 default 'LILAM') RETURN NUMBER;
+    FUNCTION  NEW_SESSION(p_processName VARCHAR2, p_logLevel PLS_INTEGER, p_procStepsToDo PLS_INTEGER, p_daysToKeep PLS_INTEGER, p_tabNameMaster VARCHAR2 DEFAULT 'LILAM') RETURN NUMBER;
 
-    FUNCTION SERVER_NEW_SESSION(p_processName varchar2, p_logLevel PLS_INTEGER, p_procStepsToDo PLS_INTEGER, p_daysToKeep PLS_INTEGER, p_tabNameMaster varchar2) RETURN NUMBER;
-    FUNCTION SERVER_NEW_SESSION(p_processName varchar2, p_groupName VARCHAR2, p_logLevel PLS_INTEGER, p_procStepsToDo PLS_INTEGER, p_daysToKeep PLS_INTEGER, p_tabNameMaster varchar2) RETURN NUMBER;
-    FUNCTION SERVER_NEW_SESSION(p_jsonObject JSON_OBJ_LILAM) RETURN NUMBER;
-    FUNCTION SERVER_LINK(p_processId NUMBER, p_pipeName varchar2) RETURN NUMBER;
+    FUNCTION  SERVER_NEW_SESSION(p_processName varchar2, p_logLevel PLS_INTEGER, p_procStepsToDo PLS_INTEGER, p_daysToKeep PLS_INTEGER, p_tabNameMaster varchar2) RETURN NUMBER;
+    FUNCTION  SERVER_NEW_SESSION(p_processName varchar2, p_groupName VARCHAR2, p_logLevel PLS_INTEGER, p_procStepsToDo PLS_INTEGER, p_daysToKeep PLS_INTEGER, p_tabNameMaster varchar2) RETURN NUMBER;
+    FUNCTION  SERVER_NEW_SESSION(p_jsonObject JSON_OBJ_LILAM) RETURN NUMBER;
+    FUNCTION  SERVER_LINK(p_processId NUMBER, p_pipeName varchar2) RETURN NUMBER;
+    PROCEDURE SERVER_LINK(p_processId NUMBER, p_pipeName varchar2);
 
     PROCEDURE CLOSE_SESSION(p_processId NUMBER);
     PROCEDURE CLOSE_SESSION(p_processId NUMBER, p_processInfo VARCHAR2, p_processStatus PLS_INTEGER);
@@ -136,16 +137,16 @@ create or replace PACKAGE LILAM AS
     -------------------------------
     -- Request process informations
     -------------------------------
-    FUNCTION GET_PROC_STEPS_DONE(p_processId NUMBER) RETURN PLS_INTEGER;
-    FUNCTION GET_PROC_STEPS_TODO(p_processId NUMBER) RETURN PLS_INTEGER;
-    FUNCTION GET_PROCESS_START(p_processId NUMBER) RETURN TIMESTAMP;
-    FUNCTION GET_PROCESS_END(p_processId NUMBER) RETURN TIMESTAMP;
-    FUNCTION GET_PROCESS_STATUS(p_processId NUMBER) RETURN PLS_INTEGER;
-    FUNCTION GET_PROCESS_INFO(p_processId NUMBER) RETURN VARCHAR2;
-    FUNCTION GET_PROCESS_DATA(p_processId NUMBER) RETURN t_process_rec;
-    FUNCTION GET_PROCESS_DATA_JSON(p_processId NUMBER) return varchar2;
-    FUNCTION GET_COUNTER_WARN(p_processId NUMBER) return PLS_INTEGER;
-    FUNCTION GET_COUNTER_ERROR(p_processId NUMBER) return PLS_INTEGER;
+    FUNCTION  GET_PROC_STEPS_DONE(p_processId NUMBER) RETURN PLS_INTEGER;
+    FUNCTION  GET_PROC_STEPS_TODO(p_processId NUMBER) RETURN PLS_INTEGER;
+    FUNCTION  GET_PROCESS_START(p_processId NUMBER) RETURN TIMESTAMP;
+    FUNCTION  GET_PROCESS_END(p_processId NUMBER) RETURN TIMESTAMP;
+    FUNCTION  GET_PROCESS_STATUS(p_processId NUMBER) RETURN PLS_INTEGER;
+    FUNCTION  GET_PROCESS_INFO(p_processId NUMBER) RETURN VARCHAR2;
+    FUNCTION  GET_PROCESS_DATA(p_processId NUMBER) RETURN t_process_rec;
+    FUNCTION  GET_PROCESS_DATA_JSON(p_processId NUMBER) return varchar2;
+    FUNCTION  GET_COUNTER_WARN(p_processId NUMBER) return PLS_INTEGER;
+    FUNCTION  GET_COUNTER_ERROR(p_processId NUMBER) return PLS_INTEGER;
 
     ------------------
     -- Logging details
@@ -161,16 +162,16 @@ create or replace PACKAGE LILAM AS
     PROCEDURE MARK_EVENT(p_processId NUMBER, p_actionName VARCHAR2, p_contextName VARCHAR2 default null, p_timestamp TIMESTAMP DEFAULT NULL);
     PROCEDURE TRACE_START(p_processId NUMBER, p_actionName VARCHAR2, p_contextName VARCHAR2 default null, p_timestamp TIMESTAMP DEFAULT NULL);
     PROCEDURE TRACE_STOP(p_processId NUMBER, p_actionName VARCHAR2, p_contextName VARCHAR2 default null, p_timestamp TIMESTAMP DEFAULT NULL);
-    FUNCTION GET_METRIC_AVG_DURATION(p_processId NUMBER, p_actionName VARCHAR2, p_contextName VARCHAR2 default null) return NUMBER;
-    FUNCTION GET_METRIC_STEPS(p_processId NUMBER, p_actionName VARCHAR2, p_contextName VARCHAR2 default null) return NUMBER;
+    FUNCTION  GET_METRIC_AVG_DURATION(p_processId NUMBER, p_actionName VARCHAR2, p_contextName VARCHAR2 default null) return NUMBER;
+    FUNCTION  GET_METRIC_STEPS(p_processId NUMBER, p_actionName VARCHAR2, p_contextName VARCHAR2 default null) return NUMBER;
 
     -----------------
     -- Server control
     -----------------
-    FUNCTION CREATE_SERVER(p_pipeName varchar2, p_groupName varchar2, p_password varchar2) RETURN VARCHAR2;
+    FUNCTION  CREATE_SERVER(p_pipeName varchar2, p_groupName varchar2, p_password varchar2) RETURN VARCHAR2;
     PROCEDURE START_SERVER(p_pipeName varchar2, p_groupName varchar2, p_password varchar2);
     PROCEDURE SERVER_SHUTDOWN(p_processId number, p_pipeName varchar2, p_password varchar2);
-    FUNCTION GET_SERVER_PIPE(p_processId NUMBER) RETURN VARCHAR2;
+    FUNCTION  GET_SERVER_PIPE(p_processId NUMBER) RETURN VARCHAR2;
     PROCEDURE SERVER_UPDATE_RULES(p_processId NUMBER, p_ruleSetName VARCHAR2, p_ruleSetVersion PLS_INTEGER);
 
     PROCEDURE SERVER_SEND_ANY_MSG(p_processId number, p_message varchar2);
