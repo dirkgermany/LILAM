@@ -11,21 +11,23 @@ AS
     ---------------------------------------------------------------
 
     -- Dedicated to SERVER_LOOP
-    C_SERVER_SYNC_INTERVAL          CONSTANT PLS_INTEGER := 500;
-    C_SERVER_HEARTBEAT_INTERVAL     CONSTANT PLS_INTEGER := 60000;
-    C_SERVER_MAX_LOOPS_IN_TIME      CONSTANT PLS_INTEGER := 10000; -- 1000
-    C_SERVER_TIMEOUT_WAIT_FOR_MSG   CONSTANT NUMBER      := 0.2; -- Timeout nach Sekunden Warten auf Nachricht
-    C_SERVER_TIMEOUT_MAX_WAIT       CONSTANT NUMBER      := C_SERVER_SYNC_INTERVAL; -- Max. Timeout in IDLE State
-    C_MAX_SERVER_PIPE_SIZE          CONSTANT PLS_INTEGER := 16777216; --  16777216, 67108864 
+    C_SERVER_SYNC_INTERVAL_MS          CONSTANT PLS_INTEGER := 500;
+    C_SERVER_HEARTBEAT_INTERVAL_MS     CONSTANT PLS_INTEGER := 60000;
+    C_SERVER_MAX_LOOPS_IN_TIME_NO      CONSTANT PLS_INTEGER := 10000; -- 1000
+    C_SERVER_TIMEOUT_WAIT_FOR_MSG_SEC  CONSTANT NUMBER      := 0.2; -- Timeout nach Sekunden Warten auf Nachricht
+    C_SERVER_TIMEOUT_MAX_WAIT_SEC      CONSTANT NUMBER      := 5;
+    C_MAX_SERVER_PIPE_SIZE             CONSTANT PLS_INTEGER := 16777216; --  16777216, 67108864
+    
+    C_MAX_REGISTRY_HEARTBEAT_AGE_SEC   CONSTANT PLS_INTEGER  := 15;  --  Server HEARTBEAT in Registry mustn't be older
 
     -- Dedicated to Client
-    C_THROTTLE_LIMIT                CONSTANT PLS_INTEGER := 1000; -- Max logs until unfreeze handshake (depends to C_THROTTLE_INTERVAL)
-    C_THROTTLE_INTERVAL             CONSTANT PLS_INTEGER := 1000; -- Max logs within this interval
+    C_THROTTLE_LIMIT_NO                CONSTANT PLS_INTEGER := 1000; -- Max logs until unfreeze handshake (depends to C_THROTTLE_INTERVAL_NO)
+    C_THROTTLE_INTERVAL_NO             CONSTANT PLS_INTEGER := 1000; -- Max logs within this interval
 
     -- Max Dirty Buffers and 
-    C_FLUSH_MILLIS_THRESHOLD        PLS_INTEGER          := 1500;  -- 1500 Max. Millis until flush
-    C_FLUSH_LOG_THRESHOLD           PLS_INTEGER          := 50000; -- 50000 Max. number of dirty buffered logs until flush
-    C_FLUSH_MONITOR_THRESHOLD       PLS_INTEGER          := 50000; -- 20000 Max. number of dirty buffered metrics until flush
+    C_FLUSH_MILLIS_THRESHOLD_MS        CONSTANT PLS_INTEGER := 1500;  -- 1500 Max. Millis until flush
+    C_FLUSH_LOG_THRESHOLD_NO           CONSTANT PLS_INTEGER := 50000; -- 50000 Max. number of dirty buffered logs until flush
+    C_FLUSH_MONITOR_THRESHOLD_NO       CONSTANT PLS_INTEGER := 50000; -- 50000 Max. number of dirty buffered metrics until flush
 
     ---------------------------------------------------------------
     -- Placeholders for tables
@@ -39,8 +41,8 @@ AS
     ---------------------------------------------------------------
     -- Other general Parameters
     ---------------------------------------------------------------
-    C_TIMEOUT_NEW_SESSION           CONSTANT NUMBER      := 3.0;  -- NEW_SESSION max. time waiting for server response
-    C_METRIC_ALERT_FACTOR           CONSTANT NUMBER      := 2.0;   -- Max. Ausreißer in der Dauer eines Verarbeitungsschrittes
+    C_TIMEOUT_NEW_SESSION_SEC           CONSTANT NUMBER      := 3.0;  -- NEW_SESSION max. time waiting for server response
+    C_METRIC_ALERT_FACTOR_SEC           CONSTANT NUMBER      := 2.0;   -- Max. Ausreißer in der Dauer eines Verarbeitungsschrittes
 
     -- Pipe handling
     C_PIPE_ID_PENDING               CONSTANT BINARY_INTEGER := -1; 
@@ -1046,7 +1048,6 @@ AS
         exception
             when others then
             logLilamErr(sqlCode, sqlErrM, 'waitForResponse', 'DBMS_PIPE.REMOVE_PIPE');
---            error(p_processId, 'Wait for response failed: ' || sqlErrM);
             return null;
         end;
     end;
@@ -1062,12 +1063,17 @@ AS
         l_sqlStmt := '
             SELECT count(*) FROM ' || C_LILAM_SERVER_REGISTRY || ' 
             WHERE is_active = 1
-            AND last_activity > SYSTIMESTAMP - INTERVAL ''15'' SECOND
+            AND last_activity > SYSTIMESTAMP - INTERVAL ''' ||C_MAX_REGISTRY_HEARTBEAT_AGE_SEC || ''' SECOND
             AND upper(pipe_name) = :1';
 
         execute immediate l_sqlStmt into l_counter using upper(p_pipeName);
         if l_counter >= 1 then return TRUE; end if;
         if l_counter = 0  then return FALSE; end if;
+        
+    exception
+        when others then
+            logLilamErr(sqlCode, sqlErrM, 'isServerPipeActive', 'EXECUTE IMMEDIATE');
+            return false;
     end;
 
     ---------------------------------------------------------------
@@ -1084,7 +1090,7 @@ AS
         SELECT pipe_name 
         FROM ' || C_LILAM_SERVER_REGISTRY || ' 
         WHERE is_active = 1 
-          AND last_activity > SYSTIMESTAMP - INTERVAL ''15'' SECOND ';
+          AND last_activity > SYSTIMESTAMP - INTERVAL ''' || C_MAX_REGISTRY_HEARTBEAT_AGE_SEC || ''' SECOND ';
 
         if p_groupName is not null then
             l_sqlStmt := l_sqlStmt || ' AND upper(group_name) = ''' || upper(p_groupName) || '''';
@@ -1141,9 +1147,9 @@ AS
             g_local_throttle_cache(p_processId).msg_count := g_local_throttle_cache(p_processId).msg_count + 1;
 
             -- Check-Intervall erreicht?
-            if g_local_throttle_cache(p_processId).msg_count >= C_THROTTLE_LIMIT THEN        
+            if g_local_throttle_cache(p_processId).msg_count >= C_THROTTLE_LIMIT_NO THEN        
                 -- Wenn zu schnell gefeuert wurde
-                if get_ms_diff(g_local_throttle_cache(p_processId).last_check, l_now) < C_THROTTLE_INTERVAL THEN
+                if get_ms_diff(g_local_throttle_cache(p_processId).last_check, l_now) < C_THROTTLE_INTERVAL_NO THEN
                     -- Erzwinge Synchronisation (Warten auf Server-Antwort)
                     -- Das verschafft dem Remote-Server die nötige "Atempause"
                     send_sync_signal(p_processId);
@@ -1997,14 +2003,14 @@ AS
 
         -- Falls noch nie geflusht wurde (Start), setzen wir die Differenz hoch
         if g_sessionList(v_idx).last_monitor_flush is null then
-            v_ms_since_flush := C_FLUSH_MILLIS_THRESHOLD + 1;
+            v_ms_since_flush := C_FLUSH_MILLIS_THRESHOLD_MS + 1;
         else
             v_ms_since_flush := get_ms_diff(g_sessionList(v_idx).last_monitor_flush, v_now);
         end if ;
         -- 4. Die "Smarte" Flush-Bedingung: Menge ODER Zeit ODER Force
         if p_force 
-           or g_sessionList(v_idx).monitor_dirty_count >= C_FLUSH_MONITOR_THRESHOLD 
-           or v_ms_since_flush >= C_FLUSH_MILLIS_THRESHOLD
+           or g_sessionList(v_idx).monitor_dirty_count >= C_FLUSH_MONITOR_THRESHOLD_NO 
+           or v_ms_since_flush >= C_FLUSH_MILLIS_THRESHOLD_MS
         then        
             flushMonitor(p_processId);
             g_firstMonTimeStamp := null;
@@ -2741,7 +2747,7 @@ AS
 
         -- 2. Zeit seit dem letzten Master-Update berechnen
         if g_sessionList(v_idx).last_process_flush is null then
-            v_ms_since_flush := C_FLUSH_MILLIS_THRESHOLD + 1;
+            v_ms_since_flush := C_FLUSH_MILLIS_THRESHOLD_MS + 1;
         else
             v_ms_since_flush := get_ms_diff(g_sessionList(v_idx).last_process_flush, v_now);
         end if ;
@@ -2750,8 +2756,8 @@ AS
         -- Wir flushen nur, wenn FORCE (z.B. Session-Ende), der Zeit-Threshold erreicht ist
         -- ODER wenn dieser spezifische Prozess als "dirty" markiert wurde.
         if p_force 
-           or (g_sessionList(v_idx).process_is_dirty AND v_ms_since_flush >= C_FLUSH_MILLIS_THRESHOLD)
-           or (p_force = false AND v_ms_since_flush >= (C_FLUSH_MILLIS_THRESHOLD * 10)) -- Safety Sync
+           or (g_sessionList(v_idx).process_is_dirty AND v_ms_since_flush >= C_FLUSH_MILLIS_THRESHOLD_MS)
+           or (p_force = false AND v_ms_since_flush >= (C_FLUSH_MILLIS_THRESHOLD_MS * 10)) -- Safety Sync
         then
             -- Nur schreiben, wenn es auch wirklich Änderungen im Cache gibt
             if g_process_cache.EXISTS(p_processId) then
@@ -2805,14 +2811,14 @@ AS
 
         -- (get_ms_diff ist Ihre optimierte Funktion)
         if g_sessionList(v_idx).last_log_flush is null then
-            v_ms_since_flush := C_FLUSH_MILLIS_THRESHOLD + 1;
+            v_ms_since_flush := C_FLUSH_MILLIS_THRESHOLD_MS + 1;
         else
             v_ms_since_flush := get_ms_diff(g_sessionList(v_idx).last_log_flush, v_now);
         end if ;
         -- 4. Flush-Bedingung: Menge ODER Zeit ODER Force
         if p_force 
-           or g_sessionList(v_idx).log_dirty_count >= C_FLUSH_LOG_THRESHOLD 
-           or v_ms_since_flush >= C_FLUSH_MILLIS_THRESHOLD
+           or g_sessionList(v_idx).log_dirty_count >= C_FLUSH_LOG_THRESHOLD_NO 
+           or v_ms_since_flush >= C_FLUSH_MILLIS_THRESHOLD_MS
         then            
             -- Alle gepufferten Logs dieses Prozesses in die DB schreiben
             flushLogs(p_processId);
@@ -3222,13 +3228,7 @@ AS
     as
         l_payload       JSON_OBJ_LILAM;
         l_process_rec   t_process_rec;    
-    begin
-        select json_object(
-            'process_id'   value p_processId
-            returning varchar2
-        )
-        into l_payload from dual;    
-        
+    begin   
         l_process_rec := GET_PROCESS_DATA(p_processId); 
         jsonPut(l_payload, 'process_id', l_process_rec.id);
         jsonPut(l_payload, 'process_name', l_process_rec.processName);
@@ -4015,7 +4015,7 @@ AS
     begin
         jsonPut(l_message, 'rule_set_name', p_ruleSetName);
         jsonPut(l_message, 'rule_set_version', p_ruleSetVersion);
-        sendNoWait(p_processId, 'UPDATE_RULE', l_message, C_TIMEOUT_NEW_SESSION);               
+        sendNoWait(p_processId, 'UPDATE_RULE', l_message, C_TIMEOUT_NEW_SESSION_SEC);               
     end;
 
     -------------------------------------------------------------------------- 
@@ -4110,7 +4110,7 @@ AS
         l_response  varchar2(100);        
     begin                        
         -- zunächst mal schauen, welche Server bereitstehen
-        l_response := waitForResponse(null, 'NEW_SESSION', p_jsonObject, C_TIMEOUT_NEW_SESSION);
+        l_response := waitForResponse(null, 'NEW_SESSION', p_jsonObject, C_TIMEOUT_NEW_SESSION_SEC);
 
         CASE
             WHEN l_response = 'TIMEOUT' THEN
@@ -4158,6 +4158,12 @@ AS
             p_payload       => l_payload,
             p_timeoutSec    => 5
         );
+        l_response := trim(l_response);
+        if upper(l_response) in ('TIMEOUT', 'THROTTLED') or
+            upper(l_response) like 'ERROR%' then
+            return NUM_ERR_PIPE_SERVER;
+        end if;
+            
         l_payload := JSON_QUERY(l_response, '$.payload');
         l_serverCode := jsonNumber(l_payload, 'server_code');
 
@@ -4169,7 +4175,7 @@ AS
 
     EXCEPTION
         WHEN OTHERS THEN
-        logLilamErr(sqlCode, sqlErrM, 'RECONNECT_PROCESS'); 
+        logLilamErr(sqlCode, sqlErrM, 'reconnectRemote'); 
         return NUM_ERR_PIPE_SERVER;
 
     END;
@@ -4218,7 +4224,7 @@ AS
 
     EXCEPTION
         WHEN OTHERS THEN
-        logLilamErr(sqlCode, sqlErrM, 'RECONNECT_PROCESS'); 
+        logLilamErr(sqlCode, sqlErrM, 'SERVER_LINK'); 
         return NUM_ERR_PIPE_SERVER;
 
     END;
@@ -4267,7 +4273,7 @@ AS
 
     EXCEPTION
         WHEN OTHERS THEN
-        logLilamErr(sqlCode, sqlErrM, 'RECONNECT_PROCESS'); 
+        logLilamErr(sqlCode, sqlErrM, 'SERVER_LINK'); 
 
     END;
 
@@ -4677,13 +4683,13 @@ AS
     as
         l_status    PLS_INTEGER;
         l_message   VARCHAR2(32767);
-        c_max_timeout CONSTANT NUMBER := C_SERVER_TIMEOUT_MAX_WAIT; -- Maximum für den Eco-Mode
-        c_min_timeout CONSTANT NUMBER := C_SERVER_TIMEOUT_WAIT_FOR_MSG;
+        c_max_timeout CONSTANT NUMBER := C_SERVER_TIMEOUT_MAX_WAIT_SEC; -- Maximum für den Eco-Mode
+        c_min_timeout CONSTANT NUMBER := C_SERVER_TIMEOUT_WAIT_FOR_MSG_SEC;
     begin
-        l_status := DBMS_PIPE.RECEIVE_MESSAGE(l_pipeName, timeout => p_cur_timeout); --=> C_SERVER_TIMEOUT_WAIT_FOR_MSG);
+        l_status := DBMS_PIPE.RECEIVE_MESSAGE(l_pipeName, timeout => p_cur_timeout); --=> C_SERVER_TIMEOUT_WAIT_FOR_MSG_SEC);
 
         if l_status = 0 THEN
-            p_cur_timeout := C_SERVER_TIMEOUT_WAIT_FOR_MSG;
+            p_cur_timeout := C_SERVER_TIMEOUT_WAIT_FOR_MSG_SEC;
 
             begin   
                 DBMS_PIPE.UNPACK_MESSAGE(l_message);
@@ -4696,7 +4702,7 @@ AS
                         end if;
                 END; 
         else
-             p_cur_timeout := LEAST(p_cur_timeout + C_SERVER_TIMEOUT_WAIT_FOR_MSG, c_max_timeout);
+             p_cur_timeout := LEAST(p_cur_timeout + C_SERVER_TIMEOUT_WAIT_FOR_MSG_SEC, c_max_timeout);
             return null;
         end if;
         
@@ -4804,7 +4810,7 @@ AS
         l_lastSync       TIMESTAMP := sysTimestamp;  
         l_loopCounter    PLS_INTEGER := 0;
         l_msgCnt         PLS_INTEGER := 0;
-        l_serverTimeout  NUMBER := C_SERVER_TIMEOUT_WAIT_FOR_MSG;
+        l_serverTimeout  NUMBER := C_SERVER_TIMEOUT_WAIT_FOR_MSG_SEC;
     begin
         g_shutdownPassword := p_password;
         g_serverPipeName := p_pipeName; --l_pipe;
@@ -4837,8 +4843,8 @@ AS
                 END; 
             end if;
 
-            if l_message is null or l_loopCounter > C_SERVER_MAX_LOOPS_IN_TIME then
-                if get_ms_diff(l_lastSync, sysTimestamp) >= C_SERVER_SYNC_INTERVAL  THEN
+            if l_message is null or l_loopCounter > C_SERVER_MAX_LOOPS_IN_TIME_NO then
+                if get_ms_diff(l_lastSync, sysTimestamp) >= C_SERVER_SYNC_INTERVAL_MS  THEN
                     -- Housekeeping
                     updateServerRegistry(TRUE, l_msgCnt);
                     SYNC_ALL_DIRTY;
@@ -4847,8 +4853,8 @@ AS
                     l_msgCnt := 0;
                 end if;
 
-                -- Timeout erreicht. Passiert, wenn 10 Sekunden kein Signal kam.
-                if get_ms_diff(l_lastHeartbeat, sysTimestamp) >= C_SERVER_HEARTBEAT_INTERVAL then
+                -- Timeout erreicht. Passiert, wenn innerhalb eines Intervalls kein Signal kam.
+                if get_ms_diff(l_lastHeartbeat, sysTimestamp) >= C_SERVER_HEARTBEAT_INTERVAL_MS then
                     INFO(g_serverProcessId, g_serverPipeName || 'HEARTBEAT ' || g_serverPipeName);
                     l_lastHeartbeat := sysTimestamp;
                 end if ;
@@ -4956,7 +4962,7 @@ AS
         l_api_call   := jsonString(l_jsonHeader, 'api_call');
 
         l_jsonHelper := jsonObject(l_InObject, 'params');
-        jsonPut(l_jsonPayload, 'params', l_jsonHelper);
+        jsonPut(l_jsonParams, 'params', l_jsonHelper);
         jsonPut(l_jsonPayload, 'returns', 'RESPONSE_VALUE');
         jsonPut(l_jsonPayload, 'value', 0);
 
@@ -5113,7 +5119,7 @@ AS
 
     EXCEPTION
         WHEN OTHERS THEN
-        logLilamErr(sqlCode, sqlErrM, 'createLogTables', 'bla'); 
+        logLilamErr(sqlCode, sqlErrM, 'createLogTables'); 
         return 'Internal CREATE_SERVER; job_action = ' || l_action || '; Critical Error while processing command: ' || SQLERRM;
 
     END;
