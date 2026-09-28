@@ -318,45 +318,6 @@ FUNCTION SERVER_NEW_SESSION(
 
 **Returns:** `NUMBER`, the process ID.
 
-### Function SERVER_LINK
-Ensures the usage of a connection to the LILAM-SERVER across different database sessions.
-
-> [!IMPORTANT]
-> **Important for APEX Projects**
-> This function should always be used at first whenever a decoupled call is executed by the application.
-
-```sql
-FUNCTION SERVER_LINK(
-    p_processId NUMBER,
-    p_pipeName VARCHAR2
-) RETURNS NUMBER
-```
-
-**Returns** `NUMBER`
-  * the verified Process-ID upon successful linking.
-  * -20021 (PROCESS_AT_SERVER_INVALID) if the process could not be determined
-  * -20020 (SERVER_AT_PIPE_INVALID) if communication with the server failed.
-
-#### Background
-When a PL/SQL application utilizes the database session pool, Oracle is not guaranteed to provide the same session every time. As a consequence, session-specific PL/SQL variables in the private memory (PGA) have an undefined or unknown state (session state) with respect to the application.
-
-This is typically the case with APEX applications – especially when asynchronous requests (AJAX) are integrated, as these are often executed in changing database sessions in the background.The SERVER_LINK() function ensures the application's communication with the LILAM-SERVER.
-
-#### Exception Handling
-* If the return value does **not** match the provided `p_process_id`, the linking mechanism has failed. In this event, the calling application must abort immediately (raise an exception), as no valid session context to the LILAM-SERVER could be established.
-
-```sql
-l_processId  NUMBER := apex_util.get_session_state('G_LILAM_PROCESS_ID');
-l_serverPipe VARCHAR2(100) := apex_util.get_session_state('G_LILAM_SERVER_PIPE');
-l_result      NUMBER;
-...
-l_result := lilam.server_link(l_processId, l_serverPipe);
-if l_result != l_processId then
-    RAISE_APPLICATION_ERROR(l_result, 'Could not link to LILAM-SERVER.');
-end if;
--- resume with business logic
-```
-
 ### Procedure CLOSE_SESSION
 Finalizes a LILAM process. Depending on the overload, final process information, progress, and status can be supplied.
 
@@ -422,6 +383,110 @@ END;
 > [!IMPORTANT]
 > `FINAL_RESCUE` must be called from the database session in which the affected processes originated.
 
+---
+
+## Decoupled Calls
+
+> [!IMPORTANT]
+> **Important for APEX Projects**
+> This section is highly important for applications that depend on the Oracle session pool (APEX, AJAX, etc.).
+
+When a PL/SQL application utilizes the database session pool, Oracle is not guaranteed to provide the same session every time. As a consequence, session-specific PL/SQL variables in the private memory (PGA) have an undefined or unknown state (session state) with respect to the application.
+
+One of the core design concepts of LILAM is to avoid impacting the calling application in the event of an error.
+If an unexpected error occurs within the framework, it is logged via an internal path without endangering the flow of the primary business logic.
+However, in the case of decoupled applications – such as Oracle APEX or asynchronous AJAX requests – it can be reasonable to interrupt or terminate the business logic in a controlled manner.
+
+If core LILAM functionalities are no longer available due to a loss of connection to the LILAM-SERVER, continuing the process is often not expedient.
+To meet both requirements, the API provides two alternatives for ensuring the server connection.
+
+The non-invasive **function** `SERVER_LINK`: It intercepts internal framework errors as usual and does not endanger the process. The success of the link must be explicitly queried and evaluated by the application via the return value.
+
+The invasive **procedure** `SERVER_LINK`: It follows the "fail-fast" approach and immediately raises a hard exception in the event of a connection loss to the LILAM-SERVER. This saves the developer from writing repetitive validation code (so-called boilerplate code) in the form of IF / ELSE / END IF constructs.
+
+The function or procedure must be called at the beginning of a decoupled code block or a decoupled application component.
+
+### Function SERVER_LINK
+Ensures the usage of a connection to the LILAM-SERVER across different database sessions.
+
+```sql
+FUNCTION SERVER_LINK(
+    p_processId NUMBER,
+    p_pipeName VARCHAR2
+) RETURNS NUMBER
+```
+
+**Returns** `NUMBER`
+  * the verified Process-ID upon successful linking.
+  * -20021 (PROCESS_AT_SERVER_INVALID) if the process could not be determined
+  * -20020 (SERVER_AT_PIPE_INVALID) if communication with the server failed.
+
+
+#### Exception Handling
+* If the return value does **not** match the provided `p_process_id`, the linking mechanism has failed. In this event, the calling application must abort immediately (raise an exception), as no valid session context to the LILAM-SERVER could be established.
+
+```sql
+DECLARE
+    l_processId  NUMBER := apex_util.get_session_state('G_LILAM_PROCESS_ID');
+    l_serverPipe VARCHAR2(100) := apex_util.get_session_state('G_LILAM_SERVER_PIPE');
+    l_result     NUMBER;
+BEGIN
+...
+    l_result := lilam.server_link(l_processId, l_serverPipe);
+    if l_result != l_processId then
+        RAISE_APPLICATION_ERROR(l_result, 'Could not link to LILAM-SERVER.');
+    end if;
+    -- resume with business logic
+END;
+```
+
+### Procedure SERVER_LINK
+Ensures the usage of a connection to the LILAM-SERVER across different database sessions.
+
+```sql
+PROCEDURE SERVER_LINK(
+    p_processId NUMBER,
+    p_pipeName VARCHAR2
+)
+```
+
+#### Exception Handling
+Raises specific custom application errors depending on the root cause. This allows your application to intercept and handle different failure states individually:
+
+* `-20021` (`PROCESS_AT_SERVER_INVALID`): The process could not be determined or verified on the server.
+* `-20020` (`PIPE_COMMUNICATION_FAILED`): The communication via the server pipe failed.
+
+```sql
+DECLARE
+    l_processId  NUMBER := apex_util.get_session_state('G_LILAM_PROCESS_ID');
+    l_serverPipe VARCHAR2(100) := apex_util.get_session_state('G_LILAM_SERVER_PIPE');
+    
+    -- Map custom error codes to named exceptions
+    e_lilam_err_proc EXCEPTION; PRAGMA EXCEPTION_INIT(e_lilam_err_proc, -20021);
+    e_lilam_err_pipe EXCEPTION; PRAGMA EXCEPTION_INIT(e_lilam_err_pipe, -20020);
+BEGIN
+    -- The procedure throws an exception immediately if the link fails
+    lilam.server_link(l_processId, l_serverPipe);
+    
+    -- Resume with business logic
+    NULL; 
+
+EXCEPTION
+    WHEN e_lilam_err_proc THEN
+        -- Handle invalid process state (e.g., session expired)
+        apex_debug.error('LILAM: Process is invalid or could not be determined.');
+        RAISE;
+        
+    WHEN e_lilam_err_pipe THEN
+        -- Handle pipe communication failure (e.g., background service down)
+        apex_debug.error('LILAM: Connection via server pipe failed.');
+        RAISE;
+        
+    WHEN OTHERS THEN
+        -- General fallback exception handling
+        RAISE;
+END;
+```
 ---
 
 ## Process Control
