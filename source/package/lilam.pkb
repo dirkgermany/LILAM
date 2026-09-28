@@ -63,7 +63,7 @@ AS
         serial_no           PLS_INTEGER := 0,
         log_level           PLS_INTEGER := 0,
         monitoring          PLS_INTEGER := 0,
-        last_monitor_flush    TIMESTAMP, -- Zeitpunkt des letzten Monitor-Flushes
+        last_monitor_flush  TIMESTAMP, -- Zeitpunkt des letzten Monitor-Flushes
         last_log_flush      TIMESTAMP(6), -- Zeitpunkt des letzten Log-Flushes
         monitor_dirty_count PLS_INTEGER := 0,  -- monitor entries per process counter
         log_dirty_count     PLS_INTEGER := 0,  -- Logs per process counter
@@ -1058,8 +1058,12 @@ AS
         l_counter PLS_INTEGER;
         l_sqlStmt varchar2(200);
     begin
-        l_sqlStmt := 'SELECT count(*) FROM ' || C_LILAM_SERVER_REGISTRY || ' WHERE is_active = 1 and upper(pipe_name) = :1';
-AND letztes HEARTBEAT nicht älter als...
+        l_sqlStmt := '
+            SELECT count(*) FROM ' || C_LILAM_SERVER_REGISTRY || ' 
+            WHERE is_active = 1
+            AND last_activity > SYSTIMESTAMP - INTERVAL ''15'' SECOND '
+            AND upper(pipe_name) = :1';
+
         execute immediate l_sqlStmt into l_counter using upper(p_pipeName);
         if l_counter >= 1 then return TRUE; end if;
         if l_counter = 0  then return FALSE; end if;
@@ -3179,7 +3183,6 @@ AND letztes HEARTBEAT nicht älter als...
     function getProcessDataRemote(p_processId number) return t_process_rec
     as
         l_payload JSON_OBJ_LILAM; -- Puffer für den JSON-String
---        l_serverMsg varchar2(100);
         l_response varchar2(20000);
         l_process_rec t_process_rec;
     begin
@@ -3193,7 +3196,6 @@ AND letztes HEARTBEAT nicht älter als...
 
         if l_response in ('TIMEOUT', 'THROTTLED') or
             l_response like 'ERROR%' then
---           l_serverMsg := 'Server Response Get_PROCESS_DATA: ' || l_response;
             return NULL;
         else                
             l_payload := JSON_QUERY(l_response, '$.payload');
@@ -3732,7 +3734,7 @@ AND letztes HEARTBEAT nicht älter als...
 
     --------------------------------------------------------------------------
 
-    procedure doRemote_reconnectProcess(p_clientChannel varchar2, p_message varchar2)
+    procedure doRemote_reconnectProcess(p_clientChannel varchar2, p_message JSON_OBJ_LILAM)
     as
         l_status        PLS_INTEGER;
         l_processId     NUMBER;
@@ -4141,24 +4143,13 @@ AND letztes HEARTBEAT nicht älter als...
 
     --------------------------------------------------------------------------
 
-    function reconnectRemote(p_processId number, p_pipeName varchar2) return number
-    as
+    FUNCTION reconnectRemote(p_processId number, p_pipeName varchar2) RETURN NUMBER
+    AS
         l_payload     JSON_OBJ_LILAM;
         l_response    JSON_OBJ_LILAM;
         l_serverCode  NUMBER;
-    begin
-
-if not isServerPipeActive(p_pipeName) then
-... auch auf die letzte Aktivität prüfen...
-
-if g_remote_sessions.EXISTS(p_processId)
-   and g_client_pipes.EXISTS(p_processId)
-   and g_client_pipes(p_processId) = p_pipeName then
-    return p_processId;
-end if;
-
+    BEGIN
         jsonPut(l_payload,'process_id', p_processId);
-        jsonPut(l_payload,'pipe_name', p_pipeName);
 
         l_response := waitForResponse(
             p_processId     => p_processId,
@@ -4180,26 +4171,48 @@ end if;
         logLilamErr(sqlCode, sqlErrM, 'RECONNECT_PROCESS'); 
         return NUM_ERR_SERVER_PROC;
 
-    end;
+    END;
 
     --------------------------------------------------------------------------
 
-    FUNCTION server_reconnect(p_processId NUMBER, p_pipeName varchar2) RETURN NUMBER
+    /*
+      Möglichst schnell sicherstellen, dass die Verbindung existiert oder
+      sie bei Bedarf wiederherstellen.
+      1. Wenn Prozess und Pipe bekannt: return p_processId
+      2. Wenn Pipe nicht verfügbar (REGISTRY): return NUM_ERR_PIPE_SERVER
+      3. Anfrage bei Server
+         a) wenn der den Prozess nicht kennt: return NUM_ERR_SERVER_PROC
+         b) wenn bekannt: return p_processId
+    */
+    FUNCTION SERVER_LINK(p_processId NUMBER, p_pipeName varchar2) RETURN NUMBER
     AS
-        l_startTime timestamp(6);
         l_respProcId number;
     BEGIN
+        -- wenn alles bekannt ist, ist keine weitere Aktion notwendig
+        if g_remote_sessions.EXISTS(p_processId)
+           and g_client_pipes.EXISTS(p_processId)
+           and g_client_pipes(p_processId) = p_pipeName then
+            return p_processId;
+        end if;
+
         -- optimistisch die assoziativen Arrays füllen
         -- das erleichtert den Testaufruf an den Server
         g_remote_sessions(p_processId) := TRUE;
         g_client_pipes(p_processId)    := p_pipeName;
 
+        -- wenn die Server PIPE nicht aktiv ist, direkt abbrechen
+        if not isServerPipeActive(p_pipeName) then
+            g_remote_sessions.DELETE(p_processId);
+            g_client_pipes.DELETE(p_processId);
+            return NUM_ERR_PIPE_SERVER;
+        end if;
+
+        -- Frage den Server über die PIPE, ob er die PROCESS_ID kennt
         l_respProcId := reconnectRemote(p_processId, p_pipeName);
         if nvl(l_respProcId, NUM_ERR_SERVER_PROC) = NUM_ERR_SERVER_PROC then
             g_remote_sessions.DELETE(p_processId);
             g_client_pipes.DELETE(p_processId);
         end if;
-
         return l_respProcId;
 
     EXCEPTION
