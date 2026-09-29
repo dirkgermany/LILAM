@@ -332,7 +332,8 @@ AS
     EXCEPTION
         when others then
         begin
-            dbms_output.put_line('LILAM ERR: ' || substr(sqlErrM, 1, 1000));
+            dbms_output.enable();
+            dbms_output.put_line('LILAM INTERNAL ERROR in Procedure logLilamErr: ' || substr(sqlErrM, 1, 1000));
         end;
     END;
 
@@ -588,8 +589,9 @@ AS
 
         l_serverPipe := getServerPipeAvailable(p_groupName);
         if l_serverPipe is null then 
-            RAISE_APPLICATION_ERROR(NUM_ERR_NO_SERVER, 'LILAM: Kein aktiver Server gefunden.');
+            RAISE_APPLICATION_ERROR(NUM_ERR_NO_SERVER, 'LILAM: Keinen aktiven Server gefunden.');
         end if;
+        
         g_client_pipes(l_key) := l_serverPipe;
         return g_client_pipes(l_key);
 
@@ -981,6 +983,11 @@ AS
         -- Historien-Zustand für den Monitor wegschreiben
         g_last_action_per_process(p_monitorRec.process_id).full_key  := p_monitorRec.action_name || p_monitorRec.context_name;
         g_last_action_per_process(p_monitorRec.process_id).stop_time := coalesce(p_monitorRec.stop_time, p_monitorRec.start_time);
+        
+    EXCEPTION
+    WHEN OTHERS THEN
+        logLilamErr(sqlCode, sqlErrM, 'evaluateRules'); 
+
     END evaluateRules;
 
     -- Methode dient dem Mapping für die zentrale evaluate Methode
@@ -997,8 +1004,8 @@ AS
         p_processId   in number,
         p_request       in varchar2, -- Wird für die Zuordnung/Verzweigung im Server benötigt
         p_payload       IN varchar2, 
-        p_timeoutSec    IN PLS_INTEGER,
-        p_pipeName   in varchar2 default null
+        p_timeoutSec    IN PLS_INTEGER
+--        p_pipeName   in varchar2 default null
     ) return varchar2
     as
         l_msgReceive    JSON_OBJ_LILAM;
@@ -1044,11 +1051,11 @@ AS
         logLilamErr(sqlCode, sqlErrM, 'waitForResponse');
         begin
             l_status := DBMS_PIPE.REMOVE_PIPE(l_clientChannel);
-            return null;
+            return 'ERROR: ' || TXT_COMM_ERR;
         exception
             when others then
             logLilamErr(sqlCode, sqlErrM, 'waitForResponse', 'DBMS_PIPE.REMOVE_PIPE');
-            return null;
+            return 'ERROR: ' || TXT_COMM_ERR;
         end;
     end;
 
@@ -1206,8 +1213,7 @@ AS
             dbms_session.sleep(0.3);
         end loop;
 
-        if l_status != 0 and p_processId != g_serverProcessId then
-            -- ich bin ein Client und kann keine Nachricht in die Pipe schreiben
+        if l_status != 0 AND p_processId != g_serverProcessId then
             -- Neuanmeldung an alternativem Server
             DBMS_PIPE.RESET_BUFFER;
             RAISE_APPLICATION_ERROR(-20006, 'LILAM: Client kann keine Nachrichten an Server senden:  ' || sqlErrM);
@@ -1305,7 +1311,13 @@ AS
                     module_name     varchar2(200),
                     log_operation   varchar2(200)
                 )';
+            execute immediate l_sql;
         end if;
+        
+    EXCEPTION
+        WHEN OTHERS THEN
+            dbms_output.enable(10000);
+            dbms_output.put_line('LILAM INTERNAL ERROR in Procedure createInternalLogTable: ' || substr(sqlErrM, 1, 1000) || chr(13) || chr(10) || l_sql);
     end;
 
     -- Creates LOG tables and the sequence for the process IDs if tables or sequence don't exist
@@ -1329,11 +1341,12 @@ AS
                 process_start    TIMESTAMP(6) DEFAULT SYSTIMESTAMP,
                 process_end      TIMESTAMP(6),
                 last_update      TIMESTAMP(6),
-                steps_todo  NUMBER,
-                steps_done  NUMBER,
+                steps_todo       NUMBER,
+                steps_done       NUMBER,
                 status           NUMBER(2,0),
                 info             VARCHAR2(2000),
                 process_immortal NUMBER(1,0) DEFAULT 0,
+                server_pipe      VARCHAR2(100),
                 tab_name_master  VARCHAR2(100)
             )';
             sqlStmt := replaceNameTable(sqlStmt, C_PARAM_MASTER_TABLE, C_SUFFIX_PROC_TABLE, p_TabNameMaster);
@@ -1466,7 +1479,7 @@ AS
             run_sql(sqlStmt);
         end if ;
 
-        if not objectExists('idx_lilam_LOG_info', 'INDEX') then
+        if not objectExists('IDX_LILAM_LOG_INFO', 'INDEX') then
             sqlStmt := '
             CREATE INDEX idx_lilam_LOG_info
             ON ' || C_PARAM_LOG_TABLE || ' (info)';
@@ -1474,9 +1487,9 @@ AS
             run_sql(sqlStmt);
         end if ;
 
-       if not objectExists('idx_lilam_cleanup', 'INDEX') then
+       if not objectExists('IDX_LILAM_CLEANUP', 'INDEX') then
             sqlStmt := '
-            CREATE INDEX idx_lilam_cleanup 
+            CREATE INDEX IDX_LILAM_CLEANUP 
             ON ' || C_PARAM_MASTER_TABLE || ' (process_name, process_end)';
             sqlStmt := replaceNameTable(sqlStmt, C_PARAM_MASTER_TABLE, C_SUFFIX_PROC_TABLE, p_TabNameMaster);
             run_sql(sqlStmt);
@@ -1649,7 +1662,7 @@ AS
             forall i in 1 .. p_levels.count SAVE EXCEPTIONS
                 execute immediate 
                     'insert into ' || v_safe_table || ' 
-                    (PROCESS_ID, LOG_LEVEL, INFO, SESSION_TIME, NO, CALLER, ERR_STACK, ERR_BACKTRACE, ERR_CALLSTACK, SESSION_USER, HOST_NAME)
+                    (PROCESS_ID, LOG_LEVEL, LOG_LEVEL_C, INFO, SESSION_TIME, NO, CALLER, ERR_STACK, ERR_BACKTRACE, ERR_CALLSTACK, SESSION_USER, HOST_NAME)
                     values (:1, :2, :3, :4, :5, :6, :7, :8, :9, :10, :11, :12)'
                 USING p_processId, p_levels(i), p_levelsC(i), p_texts(i), p_times(i), p_seqs(i), p_callers(i), p_stacks(i), p_backtraces(i), p_callstacks(i),
                 SYS_CONTEXT('USERENV','SESSION_USER'), SYS_CONTEXT('USERENV','HOST');
@@ -2264,6 +2277,10 @@ AS
 
         evaluateRules(v_dummyMonRec, C_TRACE_START);
         g_monitor_shadows(v_key) := v_dummyMonRec;
+        
+    exception
+        when others then
+            logLilamErr(sqlCode, sqlErrM, 'startTrace'); 
     end;
 
     --------------------------------------------------------------------------
@@ -2704,6 +2721,7 @@ AS
             log_level,
             info,
             process_immortal,
+            server_pipe,
             tab_name_master
         )
         values (
@@ -2718,11 +2736,13 @@ AS
             :PH_LOG_LEVEL,
             ''START'',
             :PH_IMMORTAL,
+            :PH_PIPE,
             :PH_TABNAME_MASTER
         )';
         sqlStatement := replaceNameTable(sqlStatement, C_PARAM_MASTER_TABLE, C_SUFFIX_PROC_TABLE, p_TabNameMaster);
-        execute immediate sqlStatement USING p_processId, p_processName, p_procStepsToDo, p_logLevel, p_procImmortal, upper(p_tabNameMaster);     
+        execute immediate sqlStatement USING p_processId, p_processName, p_procStepsToDo, p_logLevel, p_procImmortal, g_serverPipeName, upper(p_tabNameMaster);     
         commit;
+
     exception
         when others then
             rollback; -- Auch im Fehlerfall die Transaktion beenden
@@ -3533,17 +3553,15 @@ AS
         l_session_init t_session_init := p_session_init;
     begin
 
-       -- if silent log mode don't do anything
---            if p_session_init.logLevel > logLevelSilent then
-            -- Sicherstellen, dass die LOG-Tabellen existieren
         createLogTables(p_session_init.tabNameMaster);
---            end if ;
 
         -- New Process ID by Sequence
         execute immediate 'select seq_lilam_log.nextVal from dual' into p_processId;
         
-        -- persist to session internal table
+        -- default LogLevel logLevelMonitorr
         if l_session_init.logLevel is null then l_session_init.logLevel := logLevelMonitor; end if;
+        
+        -- persist to session internal table
         insertSession (p_session_init.tabNameMaster, p_processId, l_session_init.logLevel);
         deleteOldLogs(p_processId, upper(trim(l_session_init.processName)), l_session_init.daysToKeep);
 
@@ -3992,7 +4010,6 @@ AS
         l_status PLS_INTEGER;
     begin
         l_payload := JSON_QUERY(p_message, '$.payload');
---        l_processId := jsonNumber(l_payload, 'process_id');
         l_session_init.processName := jsonString(l_payload, 'process_name');
         l_session_init.logLevel    := jsonNumber(l_payload, 'log_level');
         l_session_init.stepsToDo   := jsonNumber(l_payload, 'steps_todo');
@@ -4114,16 +4131,24 @@ AS
 
         CASE
             WHEN l_response = 'TIMEOUT' THEN
-                l_ProcessId := -110;
+                l_ProcessId := -20110;
             WHEN l_response = 'THROTTLED' THEN
-                l_ProcessId := -120;                
+                l_ProcessId := -20120;                
             WHEN l_response LIKE 'ERROR%' THEN
-                l_ProcessId := - 100;
+                l_ProcessId := -20100;
             else
             -- Erfolgsfall: JSON parsen
             l_ProcessId := jsonNumber(l_response, 'process_id');
         end case;
-
+        
+        -- Wenn Server nicht bereitsteht
+        if l_ProcessId < 0 then
+            RAISE_APPLICATION_ERROR(
+                num => l_ProcessId,
+                msg => 'Could not establish connection to LILAM-Server: ' || l_response
+            );
+        end if;
+        
         -- Nur valide IDs registrieren
         if l_ProcessId > 0 THEN
             g_client_pipes(l_ProcessId) := g_client_pipes(C_PIPE_ID_PENDING);
@@ -4131,7 +4156,8 @@ AS
             g_remote_sessions(l_ProcessId) := TRUE; -- in die Liste der RemoteSessions eintragen
         end if ;
         RETURN l_ProcessId;
-
+    
+/*
     EXCEPTION
         WHEN OTHERS THEN
         if SQLCODE != NUM_ERR_NO_SERVER then
@@ -4140,6 +4166,7 @@ AS
         else
             return NUM_ERR_NO_SERVER;
         end if;
+*/
     end;
 
     --------------------------------------------------------------------------
@@ -4816,6 +4843,8 @@ AS
         g_serverPipeName := p_pipeName; --l_pipe;
         g_serverGroupName := p_groupName;
         g_serverProcessId := new_session('LILAM_SERVER', logLevelMonitor, 'LILAM_SERVER');
+        SET_PROCESS_STATUS(g_serverProcessId, 1, 'RUNNING');
+
         registerServerPipe;
         preparePipe(g_serverPipeName);
         loadServerRules;
@@ -4865,6 +4894,7 @@ AS
         END LOOP;
         -- Ab jetzt ist der Server nicht mehr erreichbar
         updateServerRegistry(FALSE, l_msgCnt);
+        SET_PROCESS_STATUS(g_serverProcessId, 0, 'STOPPED');
 
         -- +++ NEU: DRAIN-PHASE +++
         -- Wir leeren die Pipe, falls während des Shutdowns noch Nachrichten reinkamen.
