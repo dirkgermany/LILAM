@@ -32,11 +32,12 @@ AS
     ---------------------------------------------------------------
     -- Placeholders for tables
     ---------------------------------------------------------------
-    C_PARAM_MASTER_TABLE            CONSTANT varchar2(50) := 'PH_MASTER_TABLE';
-    C_PARAM_LOG_TABLE               CONSTANT varchar2(50) := 'PH_LOG_TABLE';
-    C_PARAM_MON_TABLE               CONSTANT varchar2(50) := 'PH_MON_TABLE';
+    C_PARAM_MASTER_TABLE            CONSTANT varchar2(20) := 'PH_MASTER_TABLE';
+    C_PARAM_LOG_TABLE               CONSTANT varchar2(20) := 'PH_LOG_TABLE';
+    C_PARAM_MON_TABLE               CONSTANT varchar2(20) := 'PH_MON_TABLE';
     C_LILAM_SERVER_REGISTRY         CONSTANT VARCHAR2(50) := 'LILAM_SERVER_REGISTRY';
     C_LILAM_LOG_TABLE               CONSTANT VARCHAR2(20) := 'LILAM_LOG_INTERNAL';
+    C_LILAM_PROCESS_ROUTE           CONSTANT VARCHAR2(50) := 'LILAM_PROCESS_ROUTE';
 
     ---------------------------------------------------------------
     -- Other general Parameters
@@ -243,6 +244,10 @@ AS
     -- Tabelle der Clients und von ihnen verwendeter Pipes
     TYPE t_client_pipe IS TABLE OF VARCHAR2(128) INDEX BY BINARY_INTEGER;
     g_client_pipes t_client_pipe;
+    g_dispatch_route_cache t_client_pipe;
+    
+    TYPE t_dispatcher_map IS TABLE OF VARCHAR2(50) INDEX BY VARCHAR2(50);
+    g_dispatcher_config t_dispatcher_map;
 
     ---------------------------------------------------------------
     -- General Variables
@@ -264,6 +269,7 @@ AS
     g_serverProcessId                   PLS_INTEGER             := -1;
     g_serverGroupName                   VARCHAR2(50)            := NULL;
     g_shutdownPassword                  varchar2(50);
+    g_serverIsDispatcher                BOOLEAN                 := FALSE;
 
     g_is_high_perf                      BOOLEAN                 := FALSE;
     g_last_check_time                   TIMESTAMP               := SYSTIMESTAMP;
@@ -290,7 +296,7 @@ AS
     procedure flushMonitor(p_processId number);
     function getServerPipeAvailable(p_groupName varchar2) return varchar2;
     procedure createInternalLogTable;
-
+    FUNCTION SERVER_LINK(p_processId NUMBER, p_pipeName varchar2) RETURN NUMBER;
     ------------------------------------------------------------------------
     
     ---------------------------------------------------------------
@@ -400,8 +406,31 @@ AS
     -- Erkennung ob ein Prozess auf einem Server läuft
     ---------------------------------------------------------------
     FUNCTION is_remote(p_processId IN NUMBER) RETURN BOOLEAN IS
+        l_dispatcherPipe varchar2(80);
+        l_result         number;
     BEGIN
-        RETURN g_remote_sessions.EXISTS(p_processId);
+        IF g_remote_sessions.EXISTS(p_processId) THEN
+            RETURN TRUE;
+        END IF;
+    
+        IF v_indexSession.EXISTS(p_processId) THEN
+            RETURN FALSE; -- echter lokaler In-Session-Prozess
+        END IF;
+    
+        -- Weder lokal noch als remote bekannt: automatischer Reconnect-Versuch,
+        -- aber nur, wenn ein Dispatcher konfiguriert wurde
+        IF NOT g_dispatcher_config.EXISTS('DEFAULT_DISPATCHER') THEN
+            RETURN FALSE;
+        END IF;
+    
+        l_dispatcherPipe := g_dispatcher_config('DEFAULT_DISPATCHER');
+        l_result := SERVER_LINK(p_processId, l_dispatcherPipe);
+        RETURN (l_result = p_processId);
+    
+    EXCEPTION
+        WHEN OTHERS THEN
+            logLilamErr(sqlCode, sqlErrM, 'is_remote');
+            RETURN FALSE;
     END is_remote;
     
     ------------------------------------------------------------------------
@@ -586,15 +615,21 @@ AS
         IF g_client_pipes.EXISTS(p_processId) THEN
             RETURN g_client_pipes(p_processId);
         END IF;
-
-        l_serverPipe := getServerPipeAvailable(p_groupName);
+    
+        -- 2. Dispatcher hat Vorrang vor der Registry-Suche, falls konfiguriert
+        IF g_dispatcher_config.EXISTS('DEFAULT_DISPATCHER') THEN
+            l_serverPipe := g_dispatcher_config('DEFAULT_DISPATCHER');
+        ELSE
+            l_serverPipe := getServerPipeAvailable(p_groupName);
+        END IF;
+    
         if l_serverPipe is null then 
             RAISE_APPLICATION_ERROR(NUM_ERR_NO_SERVER, 'LILAM: Keinen aktiven Server gefunden.');
         end if;
         
         g_client_pipes(l_key) := l_serverPipe;
         return g_client_pipes(l_key);
-
+    
     end;
 
     --------------------------------------------------------------------------
@@ -1291,16 +1326,37 @@ AS
     begin
         return replace(p_sqlStatement, p_placeHolder, p_tableName || p_tableSuffix);
     end;
+    
+    --------------------------------------------------------------------------
+
+    procedure createDispatchTable
+    as
+        l_sql varchar2(1000);
+    begin
+        if not objectExists(C_LILAM_PROCESS_ROUTE, 'TABLE') then
+            l_sql := '
+                CREATE TABLE ' || C_LILAM_PROCESS_ROUTE || '(
+                    process_id  NUMBER(19,0) PRIMARY KEY,
+                    pipe_name   VARCHAR2(50) NOT NULL,
+                    created     TIMESTAMP(6) DEFAULT SYSTIMESTAMP
+                )';
+            execute immediate l_sql;
+        end if;
+    EXCEPTION
+        WHEN OTHERS THEN
+            dbms_output.enable(10000);
+            dbms_output.put_line('LILAM INTERNAL ERROR in Procedure createDispatchTable: ' || substr(sqlErrM, 1, 1000) || chr(13) || chr(10) || l_sql);
+    end;
 
     --------------------------------------------------------------------------
+
     procedure createInternalLogTable
     as
         l_sql varchar2(1000);
     begin
         if not objectExists(C_LILAM_LOG_TABLE, 'TABLE') then
             l_sql := '
-                create table ' || C_LILAM_LOG_TABLE || '
-                (
+                create table ' || C_LILAM_LOG_TABLE || '(
                     id              number generated always as identity,
                     log_timestamp   timestamp(6) default systimestamp not null,            
                     error_code      number,
@@ -3479,6 +3535,7 @@ AS
         if is_remote(p_processId) then
             close_sessionRemote(p_processId, p_procStepsToDo, p_procStepsDone, p_processInfo, p_processStatus);
             g_remote_sessions.delete(p_processId);
+            g_client_pipes.delete(p_processId);
             return;
         end if ;
 
@@ -3633,6 +3690,23 @@ AS
 
         return new_session(p_session_init);
     end;
+
+    --------------------------------------------------------------------------
+    
+    PROCEDURE SET_DISPATCHER_PIPE(p_pipeName varchar2, p_groupName varchar2 DEFAULT 'DEFAULT_DISPATCHER', p_processId number DEFAULT null)
+    AS
+        l_result number;
+    BEGIN
+        g_dispatcher_config(nvl(upper(p_groupName), 'DEFAULT_DISPATCHER')) := p_pipeName;
+    
+        -- Vorwärmen nur, wenn eine process_id mitgegeben wurde
+        if p_processId is not null then
+            l_result := SERVER_LINK(p_processId, p_pipeName);
+            -- bewusst kein Raise hier: SERVER_LINK (Function) fängt selbst alles ab
+            -- und loggt über logLilamErr; schlägt das Vorwärmen fehl, greift beim
+            -- nächsten echten API-Aufruf ohnehin der automatische Fallback in is_remote()
+        end if;
+    END;
 
     --------------------------------------------------------------------------
 
@@ -3810,7 +3884,21 @@ AS
         log_any(l_processId, l_level, l_logText, l_caller, l_errStack, l_errBacktrace, l_errCallstack, l_timestamp);
     end;
 
-    -------------------------------------------------------------------------- 
+    --------------------------------------------------------------------------
+    
+    procedure unregisterProcessRoute(p_processId number)
+    as
+        pragma autonomous_transaction;
+    begin
+        execute immediate 'delete from ' || C_LILAM_PROCESS_ROUTE || ' where process_id = :1'
+        using p_processId;
+        commit;
+    exception
+        when others then
+            logLilamErr(sqlCode, sqlErrM, 'unregisterProcessRoute');
+    end;
+
+    --------------------------------------------------------------------------
 
     procedure doRemote_closeSession(p_clientChannel varchar2, p_message VARCHAR2)
     as
@@ -3831,6 +3919,7 @@ AS
         checkLogsBuffer(l_processId, 'vor CLOSE_SESSION');
 
         CLOSE_SESSION(l_processId, l_procStepsToDo, l_procStepsDone, l_processInfo, l_status);
+        unregisterProcessRoute(l_processId); 
 
         DBMS_PIPE.RESET_BUFFER;
         DBMS_PIPE.PACK_MESSAGE('{"process_id":' || l_processId || '}');        
@@ -4000,7 +4089,22 @@ AS
             error(p_clientChannel, 'Could not send unlock signal to client: ' || sqlErrM);
     end;    
 
-    -------------------------------------------------------------------------- 
+    --------------------------------------------------------------------------
+    
+    procedure registerProcessRoute(p_processId number, p_pipeName varchar2)
+    as
+        pragma autonomous_transaction;
+    begin
+        createDispatchTable;
+        execute immediate 'insert into ' || C_LILAM_PROCESS_ROUTE || '(process_id, pipe_name) values (:1, :2)'
+        using p_processId, p_pipeName;
+        commit;
+    exception
+        when others then
+            logLilamErr(sqlCode, sqlErrM, 'registerProcessRoute');
+    end;
+
+    --------------------------------------------------------------------------
 
     procedure doRemote_newSession(p_clientChannel varchar2, p_message VARCHAR2)
     as
@@ -4017,6 +4121,8 @@ AS
         l_session_init.tabNameMaster := jsonString(l_payload, 'tabname_master');
 
         l_processId := NEW_SESSION(l_session_init);
+        registerProcessRoute(l_processId, g_serverPipeName); 
+
         DBMS_PIPE.RESET_BUFFER;
         DBMS_PIPE.PACK_MESSAGE('{"process_id":' || l_processId || '}');        
         l_status := DBMS_PIPE.SEND_MESSAGE(p_clientChannel, timeout => 1);
@@ -4156,17 +4262,6 @@ AS
             g_remote_sessions(l_ProcessId) := TRUE; -- in die Liste der RemoteSessions eintragen
         end if ;
         RETURN l_ProcessId;
-    
-/*
-    EXCEPTION
-        WHEN OTHERS THEN
-        if SQLCODE != NUM_ERR_NO_SERVER then
-            logLilamErr(sqlCode, sqlErrM, 'SERVER_NEW_SESSION');
-            return NUM_ERR_NO_SERVER;
-        else
-            return NUM_ERR_NO_SERVER;
-        end if;
-*/
     end;
 
     --------------------------------------------------------------------------
@@ -4443,6 +4538,26 @@ AS
             logLilamErr(sqlCode, sqlErrM, 'registerServerPipe', 'EXECUTE IMMEDIATE'); 
     end;
 
+    --------------------------------------------------------------------------
+    
+    function resolveDispatchTarget(p_processId number) return varchar2
+    as
+        l_pipe varchar2(50);
+        l_sql varchar2(200);
+    begin
+        if g_dispatch_route_cache.EXISTS(p_processId) then
+            return g_dispatch_route_cache(p_processId);
+        end if;
+        
+        l_sql := 'select pipe_name from ' || C_LILAM_PROCESS_ROUTE || ' where process_id = :1';
+        execute immediate l_sql into l_pipe using p_processId;
+    
+        g_dispatch_route_cache(p_processId) := l_pipe;
+        return l_pipe;
+    exception
+        when NO_DATA_FOUND then return null;
+    end;
+    
     --------------------------------------------------------------------------
 
     PROCEDURE updateRulesInRegistry(p_ruleSetName varchar2, p_ruleSetVersion pls_integer)
@@ -4756,7 +4871,32 @@ AS
 
     function processRequest(p_request varchar2, p_message varchar2, p_clientChannel varchar2, p_drain BOOLEAN DEFAULT FALSE, p_forceDrain BOOLEAN DEFAULT FALSE) return boolean
     as
+        l_targetPipe varchar2(100);
+        l_processId  number (19,0);
+        l_status PLS_INTEGER;        
     begin
+        -- Dispatcher-Modus: alles weiterleiten, nichts selbst verarbeiten
+        if g_serverIsDispatcher then
+            if p_request in ('NEW_SESSION', 'SERVER_NEW_SESSION') then
+                -- Noch keine process_id vorhanden; Auswahl rein lastbasiert
+                l_targetPipe := getServerPipeAvailable(g_serverGroupName);
+            else
+                l_processId := jsonNumber(JSON_QUERY(p_message, '$.payload'), 'process_id');
+                l_targetPipe := resolveDispatchTarget(l_processId); -- Cache, sonst DB-Fallback
+            end if;
+    
+            if l_targetPipe is null then
+                -- kein Worker verfügbar/gefunden; hier bewusst entscheiden, wie reagiert wird
+                return false;
+            end if;
+    
+            -- unverändert weiterreichen, inkl. des ursprünglichen Client-Rückkanals im Header
+            DBMS_PIPE.RESET_BUFFER;
+            DBMS_PIPE.PACK_MESSAGE(p_message);        
+            l_status := DBMS_PIPE.SEND_MESSAGE(l_targetPipe, timeout => 1);
+            return false;
+        end if;
+
         CASE p_request
             WHEN 'SERVER_SHUTDOWN' then
                 if handleServerShutdown(p_clientChannel, p_message) then 
@@ -4824,7 +4964,7 @@ AS
 
     --------------------------------------------------------------------------
 
-    procedure START_SERVER(p_pipeName varchar2, p_groupName varchar2, p_password varchar2)
+    procedure START_SERVER(p_pipeName varchar2, p_groupName varchar2, p_password varchar2, p_isDispatcher PLS_INTEGER DEFAULT 0)
     as
         v_key            VARCHAR2(100); 
         l_clientChannel  varchar2(50);
@@ -4839,6 +4979,7 @@ AS
         l_msgCnt         PLS_INTEGER := 0;
         l_serverTimeout  NUMBER := C_SERVER_TIMEOUT_WAIT_FOR_MSG_SEC;
     begin
+        g_serverIsDispatcher := CASE nvl(p_isDispatcher, 0) WHEN 1 THEN TRUE ELSE FALSE END;
         g_shutdownPassword := p_password;
         g_serverPipeName := p_pipeName; --l_pipe;
         g_serverGroupName := p_groupName;
@@ -4999,16 +5140,19 @@ BEGIN
 
     case l_api_call
         when 'SERVER_NEW_SESSION' THEN
-            l_proc_id := SERVER_NEW_SESSION(l_jsonParams);
-            if l_proc_id < 0 then
-                jsonPut(l_jsonHeader, 'status', 'ERROR');
-                jsonPut(l_jsonPayload, 'returns', 'ERR_NO');
-                jsonPut(l_jsonPayload, 'value', NUM_ERR_NO_SERVER);
-            else
+            begin
+                l_proc_id := SERVER_NEW_SESSION(l_jsonParams);
                 jsonPut(l_jsonHeader, 'status', 'SUCCESS');
                 jsonPut(l_jsonPayload, 'returns', 'PROCESS_ID');
                 jsonPut(l_jsonPayload, 'value', l_proc_id);
-            end if;
+
+            exception
+                when others then
+                    logLilamErr(sqlCode, sqlErrM, 'CALL_BY_JSON', 'SERVER_NEW_SESSION');
+                    jsonPut(l_jsonHeader, 'status', 'ERROR');
+                    jsonPut(l_jsonPayload, 'returns', 'ERR_NO');
+                    jsonPut(l_jsonPayload, 'value', SQLCODE);
+            end;
 
         when 'NEW_SESSION' THEN
             p_session_init.processName   := jsonString(l_jsonParams, 'process_name');
@@ -5126,11 +5270,7 @@ END;
 
     --------------------------------------------------------------------------
 
-    FUNCTION CREATE_SERVER(
-        p_pipeName varchar2,
-        p_groupName varchar2, -- Neu hinzugefügt für die Signatur
-        p_password  varchar2
-    ) RETURN VARCHAR2
+    FUNCTION CREATE_SERVER(p_pipeName varchar2, p_groupName varchar2, p_password  varchar2, p_isDispatcher PLS_INTEGER DEFAULT 0) RETURN VARCHAR2
     AS
         l_slot_idx PLS_INTEGER := 1; -- Beispielwert, sollte dynamisch ermittelt werden
         l_action   VARCHAR2(2000); -- Puffer leicht erhöht für längere Strings
@@ -5151,11 +5291,10 @@ END;
                     '  LILAM.START_SERVER(' ||
                     '    p_pipeName  => ' || quote_literal(p_pipeName)      || ', ' ||
                     '    p_groupName => ' || quote_literal(p_groupName) || ', ' ||
-                    '    p_password  => ' || quote_literal(p_password)  ||
+                    '    p_password  => ' || quote_literal(p_password)  || ', ' ||
+                    '    p_isDispatcher => ' || quote_literal(p_isDispatcher) || 
                     '  ); ' ||
                     'END;';
-
---        l_action := 'select * from dual';
 
         -- 3. Den Hintergrund-Prozess "zünden"
         DBMS_SCHEDULER.CREATE_JOB (
@@ -5171,7 +5310,7 @@ END;
 
     EXCEPTION
         WHEN OTHERS THEN
-        logLilamErr(sqlCode, sqlErrM, 'createLogTables'); 
+        logLilamErr(sqlCode, sqlErrM, 'CREATE_SERVER'); 
         return 'Internal CREATE_SERVER; job_action = ' || l_action || '; Critical Error while processing command: ' || SQLERRM;
 
     END;
