@@ -119,8 +119,6 @@ create or replace PACKAGE LILAM AS
     FUNCTION  SERVER_NEW_SESSION(p_processName varchar2, p_logLevel PLS_INTEGER, p_procStepsToDo PLS_INTEGER, p_daysToKeep PLS_INTEGER, p_tabNameMaster varchar2) RETURN NUMBER;
     FUNCTION  SERVER_NEW_SESSION(p_processName varchar2, p_groupName VARCHAR2, p_logLevel PLS_INTEGER, p_procStepsToDo PLS_INTEGER, p_daysToKeep PLS_INTEGER, p_tabNameMaster varchar2) RETURN NUMBER;
     FUNCTION  SERVER_NEW_SESSION(p_jsonObject JSON_OBJ_LILAM) RETURN NUMBER;
-    FUNCTION  SERVER_LINK(p_processId NUMBER, p_pipeName varchar2) RETURN NUMBER;
-    PROCEDURE SERVER_LINK(p_processId NUMBER, p_pipeName varchar2);
 
     PROCEDURE CLOSE_SESSION(p_processId NUMBER);
     PROCEDURE CLOSE_SESSION(p_processId NUMBER, p_processInfo VARCHAR2, p_processStatus PLS_INTEGER);
@@ -170,11 +168,12 @@ create or replace PACKAGE LILAM AS
     -----------------
     -- Server control
     -----------------
-    FUNCTION  CREATE_SERVER(p_pipeName varchar2, p_groupName varchar2, p_password varchar2) RETURN VARCHAR2;
-    PROCEDURE START_SERVER(p_pipeName varchar2, p_groupName varchar2, p_password varchar2);
+    FUNCTION  CREATE_SERVER(p_pipeName varchar2, p_groupName varchar2, p_password varchar2, p_isDispatcher PLS_INTEGER DEFAULT 0) RETURN VARCHAR2;
+    PROCEDURE START_SERVER(p_pipeName varchar2, p_groupName varchar2, p_password varchar2, p_isDispatcher PLS_INTEGER DEFAULT 0);
     PROCEDURE SERVER_SHUTDOWN(p_processId number, p_pipeName varchar2, p_password varchar2);
     FUNCTION  GET_SERVER_PIPE(p_processId NUMBER) RETURN VARCHAR2;
     PROCEDURE SERVER_UPDATE_RULES(p_processId NUMBER, p_ruleSetName VARCHAR2, p_ruleSetVersion PLS_INTEGER);
+    PROCEDURE SET_DISPATCHER_PIPE(p_pipeName varchar2, p_groupName varchar2 DEFAULT 'DEFAULT_DISPATCHER', p_processId number DEFAULT null);
 
     PROCEDURE SERVER_SEND_ANY_MSG(p_processId number, p_message varchar2);
 
