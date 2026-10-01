@@ -98,6 +98,7 @@ BEGIN
   lilam.start_server(
     'MY_FIRST_LILAM_SERVER',
     NULL,
+    0,
     'SECURE PASSWORD'
   );
 END;
@@ -528,7 +529,6 @@ FUNCTION GET_PROCESS_INFO(
 Liefert den beim Prozess gespeicherten Informationstext.
 
 ### Function GET_PROCESS_DATA
-
 Verwende diese Funktion, wenn mehrere Eigenschaften eines Prozesses gleichzeitig benötigt werden.
 
 Dadurch werden mehrere einzelne Getter-Aufrufe vermieden. Die Funktion liefert einen vollständigen `t_process_rec` Record.
@@ -547,7 +547,6 @@ FUNCTION GET_PROCESS_DATA(
 ---
 
 ## Logging
-
 Die Logging APIs schreiben Meldungen entsprechend dem aktiven Log-Level in das LILAM Log.
 
 | API | Severity |
@@ -660,7 +659,6 @@ FUNCTION GET_METRIC_AVG_DURATION(
 ```
 
 ### Function GET_METRIC_STEPS
-
 Liefert die Anzahl der Vorkommen der angegebenen Metrik.
 
 ```sql
@@ -691,33 +689,41 @@ Server werden durch ihre Pipe-Namen identifiziert und können optional Gruppen z
 | `SERVER_UPDATE_RULES` | Aktiviert ein aktualisiertes Rule Set |
 
 ### Procedure START_SERVER
-
 Startet einen LILAM Server.
 
 Das Passwort muss beim späteren Herunterfahren des Servers erneut angegeben werden.
 
 ```sql
 PROCEDURE START_SERVER(
-  p_pipeName  VARCHAR2,
-  p_groupName VARCHAR2,
-  p_password  VARCHAR2
+  p_pipeName     VARCHAR2,
+  p_groupName    VARCHAR2,
+  p_password     VARCHAR2,
+  p_isDispatcher PLS_INTEGER DEFAULT 0
 )
 ```
 
-### Function CREATE_SERVER
+#### Parameter
+| Parameter | Typ | Bedeutung |
+| --------- | --- | --------- |
+| p_pipeName | varchar2 | Eindeutiger Pipe-Name des Servers |
+| p_groupName | varchar2 | Optionale Gruppe für die Serverauswahl |
+| p_password | varchar2 | Passwort, das für SERVER_SHUTDOWN erneut benötigt wird |
+| p_isDispatcher | pls_integer | 1 startet den Server im Dispatcher-Modus (siehe Dispatcher-Modus), 0 (Standard) startet einen regulären Server
 
+### Function CREATE_SERVER
 Startet einen LILAM Server über `DBMS_SCHEDULER` und liefert Serverinformationen als `VARCHAR2` zurück.
 
 ```sql
 FUNCTION CREATE_SERVER(
-  p_pipeName  VARCHAR2,
-  p_groupName VARCHAR2,
-  p_password  VARCHAR2
+  p_pipeName     VARCHAR2,
+  p_groupName    VARCHAR2,
+  p_password     VARCHAR2,
+  p_isDispatcher PLS_INTEGER DEFAULT 0
 ) RETURN VARCHAR2
 ```
+Parameter identisch zu START_SERVER.
 
 ### Procedure SERVER_SHUTDOWN
-
 Der Client muss bereits mit dem Server verbunden sein.
 
 Zum Herunterfahren werden die Process ID, die Server-Pipe und das beim Serverstart angegebene Passwort benötigt.
