@@ -1,5 +1,5 @@
 # LILAM API-Referenz
-### Version: 1.7
+### Version: 2.0
 
 ---
 
@@ -672,7 +672,6 @@ FUNCTION GET_METRIC_STEPS(
 ---
 
 ## Serversteuerung
-
 Im entkoppelten Modus empfängt ein LILAM Server Client-Anfragen und übernimmt Logging und Monitoring zentral.
 
 Server werden durch ihre Pipe-Namen identifiziert und können optional Gruppen zugeordnet werden.
@@ -687,6 +686,7 @@ Server werden durch ihre Pipe-Namen identifiziert und können optional Gruppen z
 | `SERVER_SHUTDOWN` | Beendet einen Server |
 | `GET_SERVER_PIPE` | Liefert die Server-Pipe eines verbundenen Clients |
 | `SERVER_UPDATE_RULES` | Aktiviert ein aktualisiertes Rule Set |
+| `SET_DISPATCHER_PIPE` | Konfiguriert einen Dispatcher für automatisches Routing und Reconnect |
 
 ### Procedure START_SERVER
 Startet einen LILAM Server.
@@ -737,7 +737,6 @@ PROCEDURE SERVER_SHUTDOWN(
 ```
 
 ### Function GET_SERVER_PIPE
-
 Liefert die Server-Pipe, die mit dem verbundenen Client-Prozess verknüpft ist.
 
 ```sql
@@ -747,7 +746,6 @@ FUNCTION GET_SERVER_PIPE(
 ```
 
 ### Procedure SERVER_UPDATE_RULES
-
 Rules werden als JSON-Objekte in `LILAM_RULES` gespeichert.
 
 Nachdem ein Rule Set eingefügt oder geändert wurde, kann `SERVER_UPDATE_RULES` über eine aktive Serververbindung aufgerufen werden, um das aktualisierte Rule Set anzuwenden.
@@ -759,6 +757,50 @@ PROCEDURE SERVER_UPDATE_RULES(
   p_ruleSetVersion PLS_INTEGER
 )
 ```
+
+## Dispatcher-Modus
+Ein mit p_isDispatcher => 1 gestarteter Server (Dispatcher) verarbeitet keine Anfragen selbst, sondern leitet sie unverändert an einen passenden Server weiter.
+
+Für NEW_SESSION/SERVER_NEW_SESSION wählt der Dispatcher dabei denselben lastbasierten Mechanismus wie die reguläre Serverauswahl;
+für alle anderen Anfragen ermittelt er anhand der bereits vergebenen process_id den Server, der für den Prozess der Anwendung zuständig ist und leitet dorthin weiter.
+
+Die Antwort des zuständigen Servers geht direkt an den Client zurück, nicht über den Dispatcher.
+
+> [!TIP]
+> Ein Dispatcher ist vor allem für Anwendungen relevant, die ihre physische Datenbankverbindung nicht durchgehend halten – typischerweise Oracle-APEX-Anwendungen mit Connection Pooling.
+> Dabei kann eine Folgeseite in einer anderen physischen Session laufen als die Seite, die den Prozess ursprünglich gestartet hat.
+> Ein konfigurierter Dispatcher ermöglicht es LILAM, die Verbindung zum zuständigen Worker in diesem Fall automatisch wiederherzustellen, ohne dass die Anwendung das selbst steuern muss.
+
+Für Anwendungen mit durchgehender Datenbanksession (klassischer In-Session- oder entkoppelter Betrieb ohne Connection Pooling) ist kein Dispatcher erforderlich.
+
+### Automatisches Reconnect
+Ist ein Dispatcher konfiguriert, versucht LILAM bei jedem API-Aufruf mit einer process_id, die der aktuellen physischen Session unbekannt ist, automatisch und transparent eine Verbindung über den Dispatcher wiederherzustellen.
+Schlägt das fehl (kein Dispatcher konfiguriert, Dispatcher nicht erreichbar, oder der Prozess existiert nicht mehr), verhält sich der Aufruf wie bei jeder anderen unbekannten process_id: Er wird ohne Fehlermeldung ignoriert.
+
+### Vorwärmen
+Der automatische Reconnect-Versuch kostet einen einmaligen Pipe-Roundtrip. Ohne Vorwärmen trägt der erste API-Aufruf nach einem Sessionwechsel diese zusätzliche Latenz.
+Wird p_processId mitgegeben, findet dieser Roundtrip bereits beim Aufruf von SET_DISPATCHER_PIPE statt – typischerweise im Seitenaufbau, bevor die Anwendung reagiert.
+
+### Procedure SET_DISPATCHER_PIPE
+Teilt LILAM mit, über welche Pipe ein Dispatcher erreichbar ist. Diese Information wird ausschließlich im Speicher der aktuellen physischen Datenbanksession gehalten.
+
+> [!IMPORTANT]
+> Da die Konfiguration nur für die aktuelle physische Session gilt, muss SET_DISPATCHER_PIPE bei jedem neuen Verbindungsaufbau erneut aufgerufen werden – bei Connection Pooling also potenziell auf jeder Seite, nicht nur einmalig beim ersten Seitenaufruf.
+
+
+```sql
+PROCEDURE SET_DISPATCHER_PIPE(
+  p_pipeName  VARCHAR2,
+  p_groupName VARCHAR2 DEFAULT 'DEFAULT_DISPATCHER',
+  p_processId NUMBER   DEFAULT NULL
+)
+```
+
+#### Parameter
+| Parameter | Typ | Besdeutung |
+| p_pipeName | varchar2 | Pipe-Name des Dispatchers |
+| p_groupName | varchar2 | Optionale Kennung, falls mehrere Dispatcher parallel genutzt werden. Automatisches Reconnect (siehe unten) verwendet ausschließlich die Standardkennung 'DEFAULT_DISPATCHER' |
+| p_processId | number | Optional. Ist bereits eine process_id bekannt, stellt LILAM die Verbindung zu dieser sofort wieder her (siehe „Vorwärmen"), statt erst beim nächsten API-Aufruf |
 
 ---
 
