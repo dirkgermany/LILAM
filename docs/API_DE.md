@@ -802,6 +802,16 @@ PROCEDURE SET_DISPATCHER_PIPE(
 | p_groupName | varchar2 | Optionale Kennung, falls mehrere Dispatcher parallel genutzt werden. Automatisches Reconnect (siehe unten) verwendet ausschließlich die Standardkennung 'DEFAULT_DISPATCHER' |
 | p_processId | number | Optional. Ist bereits eine process_id bekannt, stellt LILAM die Verbindung zu dieser sofort wieder her (siehe „Vorwärmen"), statt erst beim nächsten API-Aufruf |
 
+```sql
+-- Beispiel: APEX "Before Header"-Process
+BEGIN
+  lilam.set_dispatcher_pipe(
+    p_pipeName  => 'LILAM_DISPATCHER_SALES',
+    p_processId => :G_LILAM_PROCESS_ID  -- NULL beim allerersten Seitenaufruf
+  );
+END;
+/
+```
 ---
 
 ## Anhang
