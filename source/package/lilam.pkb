@@ -527,7 +527,7 @@ AS
 
     function jsonPutPrep(p_jsonString varchar2) return varchar2
     as
-        l_str varchar2(1000);
+        l_str JSON_OBJ_LILAM;  -- vorher varchar2(1000): längere Nachrichten (z.B. Logtexte) gingen still verloren
     begin
         l_str := p_jsonString;
         if trim(l_str) is null then
@@ -564,20 +564,18 @@ AS
             l_value := REPLACE(l_value, CHR(13), '\r');
         end if;
 
+        -- Ergebnis ist immer ein vollständiges JSON-Objekt, auch beim ersten jsonPut
+        -- (vorher entstand bei leerem p_jsonString und Objekt-Wert nur ein Fragment ohne Klammern)
         l_str := jsonPutPrep(p_jsonString);
-        if p_jsonString is null and substr(l_value, 1,1) = '{' and substr(l_value, -1) = '}' then
-            l_str := '"' || jsonKey || '": ' || l_value;    
-        else 
-            l_str := '{' || l_str || '"' || trim(jsonKey) || '":';
-            if substr(l_value, 1, 1) != '{' then
-                l_str := l_str || '"';
-            end if;
-            l_str := l_str || l_value; 
-            if SUBSTR(l_value, -1) != '}' then
-                l_str := l_str || '"}';
-            else
-                l_str := l_str || '}';
-            end if;
+        l_str := '{' || l_str || '"' || trim(jsonKey) || '":';
+        if substr(l_value, 1, 1) != '{' then
+            l_str := l_str || '"';
+        end if;
+        l_str := l_str || l_value; 
+        if SUBSTR(l_value, -1) != '}' then
+            l_str := l_str || '"}';
+        else
+            l_str := l_str || '}';
         end if;
         p_jsonString := l_str;
 --            return l_str;
@@ -587,7 +585,7 @@ AS
 
     procedure jsonPut(p_jsonString in out varchar2, jsonKey varchar2, valueNum Number) -- return varchar2
     as
-        l_str varchar2(1000);
+        l_str JSON_OBJ_LILAM;
     begin
         if valueNum is null then return; end if; -- p_jsonString; end if;
 
@@ -1309,6 +1307,12 @@ AS
 
         if p_groupName is not null then
             l_sqlStmt := l_sqlStmt || ' AND upper(group_name) = ''' || upper(p_groupName) || '''';
+        end if;
+
+        -- Ein Dispatcher darf sich bei der Auswahl eines Workers nicht selbst wählen
+        -- (er ist in derselben Gruppe registriert und würde sich die Nachricht endlos selbst zuschicken)
+        if g_serverIsDispatcher and g_serverPipeName is not null then
+            l_sqlStmt := l_sqlStmt || ' AND upper(pipe_name) != ''' || upper(g_serverPipeName) || '''';
         end if;
 
         l_sqlStmt := l_sqlStmt || '
@@ -2657,6 +2661,11 @@ AS
             return;
         end if ;
 
+        -- Unbekannter Prozess (weder lokal noch über Dispatcher erreichbar): still ignorieren
+        if not v_indexSession.EXISTS(p_processId) then
+            return;
+        end if;
+
         -- this event will be the oldest when flush happens
         if g_firstMonTimeStamp is null then 
             g_monLatencyCounter := g_monLatencyCounter + 1;
@@ -2732,6 +2741,11 @@ AS
             return;
         end if ;
 
+        -- Unbekannter Prozess (weder lokal noch über Dispatcher erreichbar): still ignorieren
+        if not v_indexSession.EXISTS(p_processId) then
+            return;
+        end if;
+
         -- Dummy nur für die Regeln
         v_dummyMonRec.process_id := p_processId;
         v_dummyMonRec.start_time := coalesce(p_timestamp, systimestamp);
@@ -2767,6 +2781,11 @@ AS
             insertTraceMonitorRemote(p_processId, p_actionName, p_contextName, p_timestamp);
             return;
         end if ;
+
+        -- Unbekannter Prozess (weder lokal noch über Dispatcher erreichbar): still ignorieren
+        if not v_indexSession.EXISTS(p_processId) then
+            return;
+        end if;
 
         -- this will be the oldest entry when flush happens
         if g_firstMonTimeStamp is null then g_firstMonTimeStamp := p_timestamp; end if;
@@ -4151,7 +4170,7 @@ AS
         l_contextName varchar2(100);
         l_timestamp timestamp;
         l_monType pls_integer;
-        l_payload varchar2(1600);
+        l_payload JSON_OBJ_LILAM;
     begin
         l_payload := JSON_QUERY(p_message, '$.payload');
         l_processId := jsonNumber(l_payload, 'process_id');
@@ -4172,7 +4191,7 @@ AS
         l_contextName varchar2(100);
         l_timestamp timestamp;
         l_monType pls_integer;
-        l_payload varchar2(1600);
+        l_payload JSON_OBJ_LILAM;
     begin
         l_payload := JSON_QUERY(p_message, '$.payload');
         l_processId := jsonNumber(l_payload, 'process_id');
@@ -4194,7 +4213,7 @@ AS
         l_contextName varchar2(100);
         l_timestamp timestamp;
         l_monType pls_integer;
-        l_payload varchar2(1600);
+        l_payload JSON_OBJ_LILAM;
     begin
         l_payload := JSON_QUERY(p_message, '$.payload');
         l_processId := jsonNumber(l_payload, 'process_id');
@@ -4216,7 +4235,7 @@ AS
         l_stepsToDo     PLS_INTEGER;
         l_procStepsDone PLS_INTEGER;
         l_immortal      PLS_INTEGER;
-        l_payload varchar2(1600);
+        l_payload JSON_OBJ_LILAM;
         l_timestamp     TIMESTAMP(6);
     begin
         l_payload := JSON_QUERY(p_message, '$.payload');
@@ -4235,7 +4254,7 @@ AS
     procedure doRemote_procStepDone(p_message varchar2)
     as
         l_processId     NUMBER;
-        l_payload varchar2(1600);
+        l_payload JSON_OBJ_LILAM;
     begin
         l_payload := JSON_QUERY(p_message, '$.payload');
         l_processId  := jsonNumber(l_payload, 'process_id');
@@ -4266,7 +4285,7 @@ AS
 
         jsonPut(l_header, 'msg_type', 'SERVER_RESPONSE');
         jsonPut(l_header, 'msg_name', 'RECONNECT_PROCESS_RESP');
-        l_msg := jsonObject(l_header, 'header');
+        jsonPut(l_msg, 'header', l_header);
         jsonPut(l_msg, 'payload', l_response);
 
         DBMS_PIPE.RESET_BUFFER;
@@ -4281,12 +4300,12 @@ AS
     as
         l_processId number;
         l_level number;
-        l_logText varchar2(1000);
+        l_logText varchar2(4000);
         l_caller varchar2(255);
-        l_errStack varchar2(1000);
-        l_errBacktrace varchar2(1000);
-        l_errCallstack varchar2(1000);
-        l_payload varchar2(1600);
+        l_errStack varchar2(4000);
+        l_errBacktrace varchar2(4000);
+        l_errCallstack varchar2(4000);
+        l_payload JSON_OBJ_LILAM;
         l_timestamp TIMESTAMP(6);
     begin
         l_payload       := JSON_QUERY(p_message, '$.payload');
@@ -4323,7 +4342,7 @@ AS
         l_processId     number; 
         l_procStepsToDo PLS_INTEGER; 
         l_procStepsDone PLS_INTEGER; 
-        l_processInfo   varchar2(1000);
+        l_processInfo   varchar2(2000);
         l_status        PLS_INTEGER;
         l_payload       JSON_OBJ_LILAM;
     begin
@@ -4361,7 +4380,7 @@ AS
         jsonPut(l_payload, 'server_message', TXT_PING_ECHO);
         jsonPut(l_payload, 'server_code', get_serverCode(TXT_PING_ECHO));
 
-        l_msg := jsonObject(l_header, 'header');
+        jsonPut(l_msg, 'header', l_header);
         jsonPut(l_msg, 'meta', l_meta);
         jsonPut(l_msg, 'payload', l_payload);
 
@@ -4410,7 +4429,7 @@ AS
         jsonPut(l_meta, 'server_message', TXT_DATA_ANSWER);
         jsonPut(l_meta, 'server_code', get_serverCode(TXT_DATA_ANSWER));
 
-        l_msg := jsonObject(l_header, 'header');
+        jsonPut(l_msg, 'header', l_header);
         jsonPut(l_msg, 'meta', l_meta);
         jsonPut(l_msg, 'payload', l_payload);
 
@@ -4457,7 +4476,7 @@ AS
         jsonPut(l_meta, 'server_message', TXT_DATA_ANSWER);
         jsonPut(l_meta, 'server_code', get_serverCode(TXT_DATA_ANSWER));
 
-        l_msg := jsonObject(l_header, 'header');
+        jsonPut(l_msg, 'header', l_header);
         jsonPut(l_msg, 'meta', l_meta);
         jsonPut(l_msg, 'payload', l_payload);
 
@@ -4492,7 +4511,7 @@ AS
             jsonPut(l_payload, 'server_message', TXT_ACK_OK);
             jsonPut(l_payload, 'server_code', get_serverCode(TXT_ACK_OK));
         end if;
-        l_msg := jsonObject(l_header, 'header');
+        jsonPut(l_msg, 'header', l_header);
         jsonPut(l_msg, 'meta', l_meta);
         jsonPut(l_msg, 'payload', l_payload);
 
@@ -4874,7 +4893,7 @@ AS
             jsonPut(l_payload, 'server_message', TXT_ACK_DECLINE);
             jsonPut(l_payload, 'server_code', get_serverCode(TXT_ACK_DECLINE));
         end if ;
-        l_msg := jsonObject(l_header, 'header');
+        jsonPut(l_msg, 'header', l_header);
         jsonPut(l_msg, 'meta', l_meta);
         jsonPut(l_msg, 'payload', l_payload);
 
@@ -5297,7 +5316,8 @@ AS
         l_status PLS_INTEGER;        
     begin
         -- Dispatcher-Modus: alles weiterleiten, nichts selbst verarbeiten
-        if g_serverIsDispatcher then
+        -- Ausnahme: SERVER_SHUTDOWN gilt dem Dispatcher selbst (sonst ist er nicht stoppbar)
+        if g_serverIsDispatcher and p_request != 'SERVER_SHUTDOWN' then
             if p_request in ('NEW_SESSION', 'SERVER_NEW_SESSION') then
                 -- Noch keine process_id vorhanden; Auswahl rein lastbasiert
                 l_targetPipe := getServerPipeAvailable(g_serverGroupName);
