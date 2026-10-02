@@ -165,7 +165,7 @@ LILAM offers two execution models that can be used interchangeably:
   
 > [!IMPORTANT]
 > **Unified API:** Regardless of the chosen mode, the logging API remains **identical**. You use the same `lilam.log(...)` calls throughout your application.
-> The only difference is the initial setup (`lilam.new_session` for  vs. `lilam.server_new_session` for Decoupled mode).
+> The only difference is the initial setup (`lilam.new_session` for Insession mode vs. `lilam.server_new_session` for Decoupled mode).
 
 ### Performance & Safety
 LILAM prioritizes the stability of your application. It uses a Hybrid Model to balance speed and system integrity:
