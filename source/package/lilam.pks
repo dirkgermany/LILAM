@@ -82,7 +82,8 @@ create or replace PACKAGE LILAM AS
         stepsToDo       PLS_INTEGER,
         daysToKeep      PLS_INTEGER := 100,
         procImmortal    PLS_INTEGER := 0,
-        tabNameMaster   VARCHAR2(100) DEFAULT 'LILAM'
+        tabNameMaster   VARCHAR2(100) DEFAULT 'LILAM',
+        baselineScope   VARCHAR2(100)   -- NULL = Prozessname (prozessübergreifend), '#NONE' = nur pro Prozess
     );
 
     -- ==============================
@@ -192,3 +193,5 @@ create or replace PACKAGE LILAM AS
     PROCEDURE IS_ALIVE;
 
 END LILAM;
+
+/

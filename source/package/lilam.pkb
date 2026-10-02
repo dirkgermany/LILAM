@@ -38,12 +38,24 @@ AS
     C_LILAM_SERVER_REGISTRY         CONSTANT VARCHAR2(50) := 'LILAM_SERVER_REGISTRY';
     C_LILAM_LOG_TABLE               CONSTANT VARCHAR2(20) := 'LILAM_LOG_INTERNAL';
     C_LILAM_PROCESS_ROUTE           CONSTANT VARCHAR2(50) := 'LILAM_PROCESS_ROUTE';
+    C_LILAM_SCOPES_TABLE            CONSTANT VARCHAR2(30) := 'LILAM_SCOPES';
+    C_LILAM_BASELINES_TABLE         CONSTANT VARCHAR2(30) := 'LILAM_BASELINES';
 
     ---------------------------------------------------------------
     -- Other general Parameters
     ---------------------------------------------------------------
     C_TIMEOUT_NEW_SESSION_SEC           CONSTANT NUMBER      := 3.0;  -- NEW_SESSION max. time waiting for server response
     C_METRIC_ALERT_FACTOR_SEC           CONSTANT NUMBER      := 2.0;   -- Max. Ausreißer in der Dauer eines Verarbeitungsschrittes
+
+    -- Baseline Scopes (prozessübergreifende Durchschnittswerte)
+    -- t_session_init.baselineScope:  NULL    => Scope = Prozessname (Default)
+    --                                '#NONE' => kein Scope, Durchschnitt nur pro Prozess
+    --                                sonst   => frei gewählter Scope-Name
+    C_SCOPE_NONE                        CONSTANT VARCHAR2(20) := '#NONE';
+    C_SCOPE_RESERVED_PREFIX             CONSTANT VARCHAR2(1)  := '#';      -- '#...' ist für LILAM reserviert
+    C_BASELINE_NULL_CONTEXT             CONSTANT VARCHAR2(1)  := '-';      -- Ersatz für NULL-Context im PK
+    C_BASELINE_SYNC_INTERVAL_MS         CONSTANT PLS_INTEGER  := 1500;     -- Abgleich PGA <-> LILAM_BASELINES
+    C_BASELINE_IDLE_EVICT_SEC           CONSTANT PLS_INTEGER  := 900;      -- Unbenutzte Baselines aus dem PGA entfernen
 
     -- Pipe handling
     C_PIPE_ID_PENDING               CONSTANT BINARY_INTEGER := -1; 
@@ -74,7 +86,8 @@ AS
         last_process_flush  TIMESTAMP(6),
         last_sync_check     TIMESTAMP(6),
         group_name          VARCHAR2(50),
-        tabName_master      VARCHAR2(100)
+        tabName_master      VARCHAR2(100),
+        scope_id            NUMBER(19,0)  -- NULL = kein prozessübergreifender Scope
     );
 
     -- Table for several processes
@@ -110,6 +123,7 @@ AS
         -- Monitoring Felder
         used_time     NUMBER,
         action_count  PLS_INTEGER,
+        avg_time      NUMBER,         -- Referenz-Durchschnitt VOR dieser Messung (NULL im Warm-up)
         -- Prozess-spezifische Felder
         process_end   TIMESTAMP,
         last_update   TIMESTAMP,
@@ -137,7 +151,8 @@ AS
         start_time      TIMESTAMP(6),          -- Startzeitpunkt der Aktion
         stop_time       TIMESTAMP(6),          -- Startzeitpunkt der Aktion
         used_time       NUMBER,             -- Dauer der letzten Ausführung (in Sek.)
-        action_count   PLS_INTEGER := 0    -- Arbeitsschritt einer Action / Transaktion
+        action_count   PLS_INTEGER := 0,   -- Arbeitsschritt einer Action / Transaktion (pro Prozess)
+        baseline_avg    NUMBER              -- Durchschnitt VOR dieser Messung, Referenz für Regeln (nicht persistiert)
     );
     TYPE t_monitor_history_tab IS TABLE OF t_monitor_buffer_rec;    
     TYPE t_monitor_map IS TABLE OF t_monitor_history_tab INDEX BY VARCHAR2(200);
@@ -145,6 +160,29 @@ AS
     TYPE t_monitor_shadow_map IS TABLE OF t_monitor_buffer_rec INDEX BY VARCHAR2(200);
     g_monitor_shadows t_monitor_shadow_map;
     g_monitor_averages t_monitor_shadow_map;
+
+    -- Prozessübergreifende Baselines (Scope)
+    -- avg_ms/action_count: aktueller Stand im PGA
+    -- base_avg/base_count: Stand beim letzten Laden/Abgleich mit LILAM_BASELINES (für Delta-Merge)
+    TYPE t_baseline_rec IS RECORD (
+        scope_id        NUMBER(19,0),
+        action_name     VARCHAR2(100),
+        context_name    VARCHAR2(100),
+        avg_ms          NUMBER,
+        action_count    NUMBER := 0,
+        base_avg        NUMBER,
+        base_count      NUMBER := 0,
+        in_db           BOOLEAN := FALSE,
+        dirty           BOOLEAN := FALSE,
+        last_touch      TIMESTAMP(6)
+    );
+    TYPE t_baseline_map IS TABLE OF t_baseline_rec INDEX BY VARCHAR2(250);
+    g_baselines t_baseline_map;
+    g_last_baseline_sync TIMESTAMP(6);
+
+    -- Cache Scope-Name -> Scope-ID
+    TYPE t_scope_id_map IS TABLE OF NUMBER INDEX BY VARCHAR2(100);
+    g_scope_ids t_scope_id_map;
 
     -- remember to latest action
     TYPE t_action_history_rec IS RECORD (
@@ -643,13 +681,156 @@ AS
     END;
 
     --------------------------------------------------------------------------
+    -- Baseline Scopes: prozessübergreifende Durchschnittswerte
+    --------------------------------------------------------------------------
+    -- Key für g_baselines; gleiches Format wie buildMonitorKey, aber mit scope_id
+    FUNCTION buildBaselineKey(p_scopeId NUMBER, p_actionName VARCHAR2, p_contextName VARCHAR2) RETURN VARCHAR2 AS
+    BEGIN
+        RETURN LPAD(p_scopeId, 20, '0') || '|' || p_actionName || '|' || p_contextName;
+    END;
+
+    --------------------------------------------------------------------------
+
+    FUNCTION getScopeId(p_processId NUMBER) RETURN NUMBER AS
+    BEGIN
+        IF v_indexSession.EXISTS(p_processId) THEN
+            RETURN g_sessionList(v_indexSession(p_processId)).scope_id;
+        END IF;
+        RETURN NULL;
+    END;
+
+    --------------------------------------------------------------------------
+
+    PROCEDURE setScopeId(p_processId NUMBER, p_scopeId NUMBER) AS
+    BEGIN
+        IF v_indexSession.EXISTS(p_processId) THEN
+            g_sessionList(v_indexSession(p_processId)).scope_id := p_scopeId;
+        END IF;
+    END;
+
+    --------------------------------------------------------------------------
+    -- Ermittelt den Scope-Namen aus t_session_init.baselineScope
+    --   NULL    => Prozessname
+    --   '#NONE' => kein Scope (NULL)
+    --   '#...'  => unbekannter reservierter Wert: protokollieren, Prozessname verwenden
+    --   sonst   => der angegebene Name
+    --------------------------------------------------------------------------
+    FUNCTION resolveScopeName(p_processName VARCHAR2, p_baselineScope VARCHAR2) RETURN VARCHAR2
+    AS
+        l_scope VARCHAR2(100) := upper(trim(p_baselineScope));
+    BEGIN
+        IF l_scope IS NULL THEN
+            RETURN upper(trim(p_processName));
+        END IF;
+
+        IF l_scope = C_SCOPE_NONE THEN
+            RETURN NULL;
+        END IF;
+
+        IF substr(l_scope, 1, 1) = C_SCOPE_RESERVED_PREFIX THEN
+            logLilamErr('-20030', 'Unknown reserved baseline scope ''' || l_scope || '''; using process name instead', 'resolveScopeName');
+            RETURN upper(trim(p_processName));
+        END IF;
+
+        RETURN l_scope;
+    EXCEPTION
+        WHEN OTHERS THEN
+            logLilamErr(sqlCode, sqlErrM, 'resolveScopeName');
+            RETURN NULL;
+    END;
+
+    --------------------------------------------------------------------------
+    -- Liefert die scope_id zum Namen; legt den Scope bei Bedarf an.
+    -- Fehler => NULL (Session arbeitet dann prozesslokal wie bisher)
+    --------------------------------------------------------------------------
+    FUNCTION getOrCreateScopeId(p_scopeName VARCHAR2) RETURN NUMBER
+    AS
+        pragma autonomous_transaction;
+        l_scopeId NUMBER;
+        l_select  CONSTANT VARCHAR2(200) := 'select scope_id from ' || C_LILAM_SCOPES_TABLE || ' where scope_name = :1';
+    BEGIN
+        IF p_scopeName IS NULL THEN
+            RETURN NULL;
+        END IF;
+
+        IF g_scope_ids.EXISTS(p_scopeName) THEN
+            RETURN g_scope_ids(p_scopeName);
+        END IF;
+
+        BEGIN
+            EXECUTE IMMEDIATE l_select INTO l_scopeId USING p_scopeName;
+        EXCEPTION
+            WHEN NO_DATA_FOUND THEN
+                BEGIN
+                    EXECUTE IMMEDIATE 'insert into ' || C_LILAM_SCOPES_TABLE || ' (scope_name) values (:1) returning scope_id into :2'
+                        USING p_scopeName RETURNING INTO l_scopeId;
+                    COMMIT;
+                EXCEPTION
+                    WHEN DUP_VAL_ON_INDEX THEN
+                        -- parallel von einer anderen Session angelegt
+                        ROLLBACK;
+                        EXECUTE IMMEDIATE l_select INTO l_scopeId USING p_scopeName;
+                END;
+        END;
+
+        g_scope_ids(p_scopeName) := l_scopeId;
+        RETURN l_scopeId;
+
+    EXCEPTION
+        WHEN OTHERS THEN
+            ROLLBACK;
+            logLilamErr(sqlCode, sqlErrM, 'getOrCreateScopeId', p_scopeName);
+            RETURN NULL;
+    END;
+
+    --------------------------------------------------------------------------
+    -- Stellt sicher, dass die Baseline im PGA liegt (Lazy Load, ein PK-Zugriff
+    -- pro Scope/Action/Context). Fehler werden an den Aufrufer durchgereicht.
+    --------------------------------------------------------------------------
+    PROCEDURE ensureBaseline(p_key VARCHAR2, p_scopeId NUMBER, p_actionName VARCHAR2, p_contextName VARCHAR2)
+    AS
+        l_rec t_baseline_rec;
+    BEGIN
+        IF g_baselines.EXISTS(p_key) THEN
+            RETURN;
+        END IF;
+
+        l_rec.scope_id     := p_scopeId;
+        l_rec.action_name  := p_actionName;
+        l_rec.context_name := p_contextName;
+
+        BEGIN
+            EXECUTE IMMEDIATE
+                'select avg_ms, action_count from ' || C_LILAM_BASELINES_TABLE ||
+                ' where scope_id = :1 and action_name = :2 and context_name = :3'
+                INTO l_rec.avg_ms, l_rec.action_count
+                USING p_scopeId, p_actionName, nvl(p_contextName, C_BASELINE_NULL_CONTEXT);
+            l_rec.in_db := TRUE;
+        EXCEPTION
+            WHEN NO_DATA_FOUND THEN
+                l_rec.avg_ms := NULL;
+                l_rec.action_count := 0;
+                l_rec.in_db := FALSE;
+        END;
+
+        l_rec.action_count := nvl(l_rec.action_count, 0);
+        l_rec.base_avg     := l_rec.avg_ms;
+        l_rec.base_count   := l_rec.action_count;
+        l_rec.dirty        := FALSE;
+        l_rec.last_touch   := SYSTIMESTAMP;
+
+        g_baselines(p_key) := l_rec;
+    END;
+
+    --------------------------------------------------------------------------
     -- Check if a single step needs more time than average over all steps per action
     --------------------------------------------------------------------------
     function validateDurationInAverage(p_monitor_rec t_monitor_buffer_rec, p_metricFactor number) return BOOLEAN
     as
     begin
-        -- Wenn noch kein Trend da ist (Initialstart), können wir nichts validieren.
-        if p_monitor_rec.avg_action_time is null or p_monitor_rec.avg_action_time = 0 then
+        -- Wenn noch kein Trend da ist (Initialstart / Warm-up), können wir nichts validieren.
+        if p_monitor_rec.avg_action_time is null or p_monitor_rec.avg_action_time = 0 
+           or p_monitor_rec.used_time is null or p_metricFactor is null then
             return TRUE; 
         end if;
 
@@ -665,37 +846,21 @@ AS
 
     --------------------------------------------------------------------------
 
+    -- Liefert den n-ten Wert aus 'a|b|c' (z.B. AVG_DEVIATION_PCT: 'pct|warmup|alpha').
+    -- Fehlende oder ungültige Werte => NULL (Aufrufer setzen Defaults)
     FUNCTION extractRuleValue(p_param VARCHAR2, p_position PLS_INTEGER) return number
     AS
-        l_pos1  PLS_INTEGER;
-        l_pos2  PLS_INTEGER;            
-        l_val   VARCHAR2(20);
-        l_sep   VARCHAR2(1) := '|';
+        l_val VARCHAR2(50);
     BEGIN
-        -- 1. Positionen der Trenner finden
-        l_pos1 := INSTR(p_param, l_sep);      -- Erstes Komma
-        l_pos2 := INSTR(p_param, l_sep, 1, 2); -- Zweites Komma            
-
-        if p_position = 1 then            
-            -- Erster Wert: Alles vor dem ersten Komma
-            l_val := SUBSTR(p_param, 1, l_pos1 - 1);
-            return to_number(l_val, '999D99999', 'NLS_NUMERIC_CHARACTERS = ''. ''');
+        l_val := TRIM(REGEXP_SUBSTR(p_param, '[^|]+', 1, p_position));
+        if l_val is null then
+            return null;
         end if;
-
-        if p_position = 2 then
-            -- ZWEITER WERT: Zwischen pos1 und pos2
-            -- Wir trimmen Leerzeichen direkt mit weg
-            l_val := TRIM(SUBSTR(p_param, l_pos1 + 1, l_pos2 - l_pos1 - 1));
-            return to_number(l_val, '999D99999', 'NLS_NUMERIC_CHARACTERS = ''. ''');
-        end if;
-
-        if p_position = 3 then
-            -- DRITTER WERT (0.5): Alles nach dem zweiten Komma
-            l_val := TRIM(SUBSTR(p_param, l_pos2 + 1));
-            return to_number(l_val, '999D99999', 'NLS_NUMERIC_CHARACTERS = ''. ''');
-        end if;
-
-        return 0;
+        return to_number(l_val, '999999999999D9999999999', 'NLS_NUMERIC_CHARACTERS = ''. ''');
+    EXCEPTION
+        WHEN VALUE_ERROR OR INVALID_NUMBER THEN
+            logLilamErr(sqlCode, 'Invalid rule value ''' || p_param || ''' at position ' || p_position, 'extractRuleValue');
+            return null;
     END;
 
     -------------------------------------------------------
@@ -717,7 +882,10 @@ AS
     ------------------------------------------------------------
     PROCEDURE fire_alert(p_rule t_rule_rec, p_rec t_monitor_buffer_rec) IS
         pragma autonomous_transaction;
-        v_history_key   VARCHAR2(200) := p_rec.process_id || '|' || p_rule.rule_id || '|' || p_rec.action_name;
+        -- Throttle pro Scope (falls vorhanden), damit Neustarts die Sperrzeit nicht aufheben
+        v_scope_id      NUMBER := getScopeId(p_rec.process_id);
+        v_history_key   VARCHAR2(250) := CASE WHEN v_scope_id IS NOT NULL THEN 'S' || v_scope_id ELSE 'P' || p_rec.process_id END
+                                         || '|' || p_rule.rule_id || '|' || p_rec.action_name;
         v_idx_session   PLS_INTEGER;
         v_last_fire     TIMESTAMP(6);
         v_throttle_sec  NUMBER := coalesce(p_rule.throttle_seconds, 0); -- Aus dem JSON
@@ -881,8 +1049,12 @@ AS
                         -- REINE MONITOR-OPERATOREN
                         -- =====================================================
                         WHEN p_list(i).condition_operator = 'AVG_DEVIATION_PCT' THEN
-                            p_monRec.start_time := p_ctx.start_time; 
-                            p_monRec.stop_time  := p_ctx.stop_time;
+                            -- Vergleich der aktuellen Dauer mit dem Durchschnitt VOR dieser Messung.
+                            -- avg_time ist während des Warm-ups NULL => keine Bewertung.
+                            p_monRec.start_time      := p_ctx.start_time; 
+                            p_monRec.stop_time       := p_ctx.stop_time;
+                            p_monRec.used_time       := p_ctx.used_time;
+                            p_monRec.avg_action_time := p_ctx.avg_time;
 
                             IF NOT validateDurationInAverage(p_monRec, extractRuleValue(p_list(i).condition_value, 1)) THEN
                                 fire := TRUE;
@@ -985,6 +1157,7 @@ AS
         l_ctx.stop_time    := p_monitorRec.stop_time;
         l_ctx.used_time    := p_monitorRec.used_time;
         l_ctx.action_count := p_monitorRec.action_count;
+        l_ctx.avg_time     := p_monitorRec.baseline_avg;
         return l_ctx;
     END;
 
@@ -1378,6 +1551,20 @@ AS
 
     -- Creates LOG tables and the sequence for the process IDs if tables or sequence don't exist
     -- For naming rules of the tables see package description
+    --------------------------------------------------------------------------
+    -- Legt einen Index an, falls er noch nicht existiert
+    --------------------------------------------------------------------------
+    procedure createIndexIfMissing(p_indexName varchar2, p_tableName varchar2, p_columns varchar2)
+    as
+        l_indexName varchar2(128) := upper(trim(p_indexName));
+    begin
+        if not objectExists(l_indexName, 'INDEX') then
+            run_sql('CREATE INDEX ' || l_indexName || ' ON ' || upper(trim(p_tableName)) || ' (' || p_columns || ')');
+        end if;
+    end;
+
+    --------------------------------------------------------------------------
+
     procedure createLogTables(p_TabNameMaster varchar2)
     as
         sqlStmt varchar2(4000);
@@ -1403,7 +1590,8 @@ AS
                 info             VARCHAR2(2000),
                 process_immortal NUMBER(1,0) DEFAULT 0,
                 server_pipe      VARCHAR2(100),
-                tab_name_master  VARCHAR2(100)
+                tab_name_master  VARCHAR2(100),
+                scope_name       VARCHAR2(100)
             )';
             sqlStmt := replaceNameTable(sqlStmt, C_PARAM_MASTER_TABLE, C_SUFFIX_PROC_TABLE, p_TabNameMaster);
             run_sql(sqlStmt);
@@ -1511,45 +1699,41 @@ AS
             run_sql(sqlStmt);
         end if;
 
-        if not objectExists('idx_lilam_main_id', 'INDEX') then
+        -- Baseline Scopes: feste Identität einer Anwendung über Prozesse hinweg
+        if not objectExists(C_LILAM_SCOPES_TABLE, 'TABLE') then
             sqlStmt := '
-            CREATE INDEX idx_lilam_main_id
-            ON ' || C_PARAM_MASTER_TABLE || ' (id)';
-            sqlStmt := replaceNameTable(sqlStmt, C_PARAM_MASTER_TABLE, C_SUFFIX_PROC_TABLE, p_TabNameMaster);
+            CREATE TABLE ' || C_LILAM_SCOPES_TABLE || ' (
+                scope_id    NUMBER GENERATED BY DEFAULT AS IDENTITY,
+                scope_name  VARCHAR2(100) NOT NULL,
+                created     TIMESTAMP DEFAULT SYSTIMESTAMP,
+                CONSTRAINT pk_lilam_scopes PRIMARY KEY (scope_id),
+                CONSTRAINT uq_lilam_scope_name UNIQUE (scope_name)
+            )';
             run_sql(sqlStmt);
-        end if ;
+        end if;
 
-        if not objectExists('idx_lilam_LOG_master', 'INDEX') then
+        -- Baselines: aktueller Durchschnitt je Scope/Action/Context (kein Verlauf, der liegt in _MON)
+        if not objectExists(C_LILAM_BASELINES_TABLE, 'TABLE') then
             sqlStmt := '
-            CREATE INDEX idx_lilam_LOG_master
-            ON ' || C_PARAM_LOG_TABLE || ' (process_id)';
-            sqlStmt := replaceNameTable(sqlStmt, C_PARAM_LOG_TABLE, C_SUFFIX_LOG_TABLE, p_TabNameMaster);
+            CREATE TABLE ' || C_LILAM_BASELINES_TABLE || ' (
+                scope_id      NUMBER(19,0)  NOT NULL,
+                action_name   VARCHAR2(100) NOT NULL,
+                context_name  VARCHAR2(100) DEFAULT ''' || C_BASELINE_NULL_CONTEXT || ''' NOT NULL,
+                avg_ms        NUMBER,
+                action_count  NUMBER(19,0)  DEFAULT 0 NOT NULL,
+                last_update   TIMESTAMP(6),
+                CONSTRAINT pk_lilam_baselines PRIMARY KEY (scope_id, action_name, context_name)
+            ) ORGANIZATION INDEX';
             run_sql(sqlStmt);
-        end if ;
+        end if;
 
-        if not objectExists('idx_lilam_mon_master', 'INDEX') then
-            sqlStmt := '
-            CREATE INDEX idx_lilam_mon_master
-            ON ' || C_PARAM_MON_TABLE || ' (process_id)';
-            sqlStmt := replaceNameTable(sqlStmt, C_PARAM_MON_TABLE, C_SUFFIX_MON_TABLE, p_TabNameMaster);
-            run_sql(sqlStmt);
-        end if ;
-
-        if not objectExists('IDX_LILAM_LOG_INFO', 'INDEX') then
-            sqlStmt := '
-            CREATE INDEX idx_lilam_LOG_info
-            ON ' || C_PARAM_LOG_TABLE || ' (info)';
-            sqlStmt := replaceNameTable(sqlStmt, C_PARAM_LOG_TABLE, C_SUFFIX_LOG_TABLE, p_TabNameMaster);
-            run_sql(sqlStmt);
-        end if ;
-
-       if not objectExists('IDX_LILAM_CLEANUP', 'INDEX') then
-            sqlStmt := '
-            CREATE INDEX IDX_LILAM_CLEANUP 
-            ON ' || C_PARAM_MASTER_TABLE || ' (process_name, process_end)';
-            sqlStmt := replaceNameTable(sqlStmt, C_PARAM_MASTER_TABLE, C_SUFFIX_PROC_TABLE, p_TabNameMaster);
-            run_sql(sqlStmt);
-        end if ;
+        -- Indizes der Master-Tabellen: Namen werden aus dem Master-Namen gebildet,
+        -- damit jede Master-Tabelle (LILAM, LILAM_SERVER, eigene Namen) ihre eigenen Indizes erhält
+        createIndexIfMissing(p_TabNameMaster || C_SUFFIX_PROC_TABLE || '_IX_ID',      p_TabNameMaster || C_SUFFIX_PROC_TABLE, 'id');
+        createIndexIfMissing(p_TabNameMaster || C_SUFFIX_PROC_TABLE || '_IX_CLEANUP', p_TabNameMaster || C_SUFFIX_PROC_TABLE, 'process_name, process_end');
+        createIndexIfMissing(p_TabNameMaster || C_SUFFIX_LOG_TABLE  || '_IX_PID',     p_TabNameMaster || C_SUFFIX_LOG_TABLE,  'process_id');
+        createIndexIfMissing(p_TabNameMaster || C_SUFFIX_LOG_TABLE  || '_IX_INFO',    p_TabNameMaster || C_SUFFIX_LOG_TABLE,  'info');
+        createIndexIfMissing(p_TabNameMaster || C_SUFFIX_MON_TABLE  || '_IX_PID',     p_TabNameMaster || C_SUFFIX_MON_TABLE,  'process_id');
 
        if not objectExists('idx_lilam_registry_group', 'INDEX') then
             sqlStmt := '
@@ -1905,6 +2089,178 @@ AS
     end;
 
     --------------------------------------------------------------------
+    -- Abgleich der Baselines (PGA) mit LILAM_BASELINES per Delta-Merge:
+    -- Jede Session schreibt nur ihre eigene Veränderung seit dem letzten
+    -- Abgleich (avg - base_avg, count - base_count) und übernimmt danach
+    -- den Gesamtstand aus der DB. Ein Schreiber => exakter EWMA,
+    -- mehrere parallele Schreiber => gute Näherung ohne verlorene Updates.
+    -- Unbenutzte, saubere Einträge werden aus dem PGA entfernt.
+    --------------------------------------------------------------------
+    PROCEDURE syncBaselines(p_force BOOLEAN DEFAULT FALSE)
+    AS
+        pragma autonomous_transaction;
+        l_now        CONSTANT TIMESTAMP(6) := SYSTIMESTAMP;
+        l_key        VARCHAR2(250);
+        l_next       VARCHAR2(250);
+        l_dbKey      VARCHAR2(250);
+        l_rec        t_baseline_rec;
+        l_dbAvg      NUMBER;
+        l_dbCnt      NUMBER;
+
+        -- Delta-Updates für Einträge, die in der DB existieren
+        l_upd_keys   sys.odcivarchar2list := sys.odcivarchar2list();
+        l_upd_scope  sys.odcinumberlist   := sys.odcinumberlist();
+        l_upd_action sys.odcivarchar2list := sys.odcivarchar2list();
+        l_upd_ctx    sys.odcivarchar2list := sys.odcivarchar2list();
+        l_upd_dAvg   sys.odcinumberlist   := sys.odcinumberlist();
+        l_upd_dCnt   sys.odcinumberlist   := sys.odcinumberlist();
+        l_upd_avg    sys.odcinumberlist   := sys.odcinumberlist();
+
+        -- Rückgabe der neuen DB-Werte
+        l_ret_scope  sys.odcinumberlist   := sys.odcinumberlist();
+        l_ret_action sys.odcivarchar2list := sys.odcivarchar2list();
+        l_ret_ctx    sys.odcivarchar2list := sys.odcivarchar2list();
+        l_ret_avg    sys.odcinumberlist   := sys.odcinumberlist();
+        l_ret_cnt    sys.odcinumberlist   := sys.odcinumberlist();
+
+        -- Neue (oder in der DB nicht mehr vorhandene) Einträge
+        l_ins_keys   sys.odcivarchar2list := sys.odcivarchar2list();
+        l_ins_avg    sys.odcinumberlist   := sys.odcinumberlist();
+        l_ins_cnt    sys.odcinumberlist   := sys.odcinumberlist();
+
+        TYPE t_key_lookup IS TABLE OF VARCHAR2(250) INDEX BY VARCHAR2(250);
+        l_lookup     t_key_lookup;
+
+        FUNCTION dbKey(p_scopeId NUMBER, p_action VARCHAR2, p_dbContext VARCHAR2) RETURN VARCHAR2 IS
+        BEGIN
+            RETURN p_scopeId || '|' || p_action || '|' || p_dbContext;
+        END;
+
+        PROCEDURE takeOver(p_key VARCHAR2, p_avg NUMBER, p_cnt NUMBER) IS
+        BEGIN
+            g_baselines(p_key).avg_ms       := p_avg;
+            g_baselines(p_key).base_avg     := p_avg;
+            g_baselines(p_key).action_count := p_cnt;
+            g_baselines(p_key).base_count   := p_cnt;
+            g_baselines(p_key).in_db        := TRUE;
+            g_baselines(p_key).dirty        := FALSE;
+        END;
+    BEGIN
+        IF g_baselines.COUNT = 0 THEN
+            RETURN;
+        END IF;
+
+        IF NOT p_force AND g_last_baseline_sync IS NOT NULL
+           AND get_ms_diff(g_last_baseline_sync, l_now) < C_BASELINE_SYNC_INTERVAL_MS THEN
+            RETURN;
+        END IF;
+        g_last_baseline_sync := l_now;
+
+        -- 1. Dirty-Einträge einsammeln, unbenutzte saubere Einträge entfernen
+        l_key := g_baselines.FIRST;
+        WHILE l_key IS NOT NULL LOOP
+            l_next := g_baselines.NEXT(l_key);
+            l_rec  := g_baselines(l_key);
+
+            IF l_rec.dirty THEN
+                IF l_rec.in_db AND l_rec.base_avg IS NOT NULL THEN
+                    l_upd_keys.EXTEND;   l_upd_keys(l_upd_keys.LAST)     := l_key;
+                    l_upd_scope.EXTEND;  l_upd_scope(l_upd_scope.LAST)   := l_rec.scope_id;
+                    l_upd_action.EXTEND; l_upd_action(l_upd_action.LAST) := l_rec.action_name;
+                    l_upd_ctx.EXTEND;    l_upd_ctx(l_upd_ctx.LAST)       := nvl(l_rec.context_name, C_BASELINE_NULL_CONTEXT);
+                    l_upd_dAvg.EXTEND;   l_upd_dAvg(l_upd_dAvg.LAST)     := l_rec.avg_ms - l_rec.base_avg;
+                    l_upd_dCnt.EXTEND;   l_upd_dCnt(l_upd_dCnt.LAST)     := l_rec.action_count - l_rec.base_count;
+                    l_upd_avg.EXTEND;    l_upd_avg(l_upd_avg.LAST)       := l_rec.avg_ms;
+                    l_lookup(dbKey(l_rec.scope_id, l_rec.action_name, nvl(l_rec.context_name, C_BASELINE_NULL_CONTEXT))) := l_key;
+                ELSE
+                    l_ins_keys.EXTEND;   l_ins_keys(l_ins_keys.LAST)     := l_key;
+                END IF;
+            ELSIF l_rec.last_touch IS NULL
+               OR (CAST(l_now AS DATE) - CAST(l_rec.last_touch AS DATE)) * 86400 > C_BASELINE_IDLE_EVICT_SEC THEN
+                g_baselines.DELETE(l_key);
+            END IF;
+
+            l_key := l_next;
+        END LOOP;
+
+        IF l_upd_keys.COUNT = 0 AND l_ins_keys.COUNT = 0 THEN
+            RETURN;
+        END IF;
+
+        -- 2. Delta-Merge als Bulk-Update
+        --    Ein negatives Ergebnis (extrem gegenläufige parallele Schreiber) wird durch den eigenen Wert ersetzt.
+        IF l_upd_keys.COUNT > 0 THEN
+            FORALL i IN 1 .. l_upd_keys.COUNT
+                EXECUTE IMMEDIATE
+                   'update ' || C_LILAM_BASELINES_TABLE || '
+                       set avg_ms       = CASE WHEN avg_ms + :1 > 0 THEN avg_ms + :2 ELSE :3 END,
+                           action_count = action_count + :4,
+                           last_update  = SYSTIMESTAMP
+                     where scope_id = :5 and action_name = :6 and context_name = :7
+                    returning scope_id, action_name, context_name, avg_ms, action_count into :8, :9, :10, :11, :12'
+                USING l_upd_dAvg(i), l_upd_dAvg(i), l_upd_avg(i), l_upd_dCnt(i), l_upd_scope(i), l_upd_action(i), l_upd_ctx(i)
+                RETURNING BULK COLLECT INTO l_ret_scope, l_ret_action, l_ret_ctx, l_ret_avg, l_ret_cnt;
+
+            -- In der DB nicht mehr vorhanden (z.B. manuell gelöscht) => neu anlegen
+            FOR i IN 1 .. l_upd_keys.COUNT LOOP
+                IF SQL%BULK_ROWCOUNT(i) = 0 THEN
+                    l_ins_keys.EXTEND; l_ins_keys(l_ins_keys.LAST) := l_upd_keys(i);
+                END IF;
+            END LOOP;
+        END IF;
+
+        -- 3. Neue Einträge anlegen; legt eine andere Session parallel an, wird gewichtet gemittelt
+        FOR i IN 1 .. l_ins_keys.COUNT LOOP
+            l_rec := g_baselines(l_ins_keys(i));
+            BEGIN
+                EXECUTE IMMEDIATE
+                    'insert into ' || C_LILAM_BASELINES_TABLE ||
+                    ' (scope_id, action_name, context_name, avg_ms, action_count, last_update) values (:1, :2, :3, :4, :5, SYSTIMESTAMP)'
+                    USING l_rec.scope_id, l_rec.action_name, nvl(l_rec.context_name, C_BASELINE_NULL_CONTEXT),
+                          l_rec.avg_ms, l_rec.action_count - l_rec.base_count;
+                l_dbAvg := l_rec.avg_ms;
+                l_dbCnt := l_rec.action_count - l_rec.base_count;
+            EXCEPTION
+                WHEN DUP_VAL_ON_INDEX THEN
+                    EXECUTE IMMEDIATE
+                       'update ' || C_LILAM_BASELINES_TABLE || '
+                           set avg_ms       = (nvl(avg_ms, 0) * action_count + :1 * :2) / nullif(action_count + :3, 0),
+                               action_count = action_count + :4,
+                               last_update  = SYSTIMESTAMP
+                         where scope_id = :5 and action_name = :6 and context_name = :7
+                        returning avg_ms, action_count into :8, :9'
+                        USING l_rec.avg_ms, l_rec.action_count - l_rec.base_count, l_rec.action_count - l_rec.base_count,
+                              l_rec.action_count - l_rec.base_count,
+                              l_rec.scope_id, l_rec.action_name, nvl(l_rec.context_name, C_BASELINE_NULL_CONTEXT)
+                        RETURNING INTO l_dbAvg, l_dbCnt;
+            END;
+            -- Werte merken; übernommen wird erst nach erfolgreichem Commit
+            l_ins_avg.EXTEND; l_ins_avg(l_ins_avg.LAST) := l_dbAvg;
+            l_ins_cnt.EXTEND; l_ins_cnt(l_ins_cnt.LAST) := l_dbCnt;
+        END LOOP;
+
+        COMMIT;
+
+        -- 4. Gesamtstand aus der DB übernehmen (neue Basis für das nächste Delta)
+        FOR i IN 1 .. l_ret_scope.COUNT LOOP
+            l_dbKey := dbKey(l_ret_scope(i), l_ret_action(i), l_ret_ctx(i));
+            IF l_lookup.EXISTS(l_dbKey) THEN
+                takeOver(l_lookup(l_dbKey), l_ret_avg(i), l_ret_cnt(i));
+            END IF;
+        END LOOP;
+
+        FOR i IN 1 .. l_ins_keys.COUNT LOOP
+            takeOver(l_ins_keys(i), l_ins_avg(i), l_ins_cnt(i));
+        END LOOP;
+
+    EXCEPTION
+        WHEN OTHERS THEN
+            -- Einträge bleiben dirty, das Delta wird beim nächsten Abgleich erneut geschrieben
+            ROLLBACK;
+            logLilamErr(sqlCode, sqlErrM, 'syncBaselines');
+    END;
+
+    --------------------------------------------------------------------
     -- Alle Dirty Einträge für alle Sessions wegschreiben
     --------------------------------------------------------------------
     PROCEDURE SYNC_ALL_DIRTY(p_force BOOLEAN DEFAULT FALSE, p_isShutdown BOOLEAN DEFAULT FALSE) 
@@ -1969,6 +2325,11 @@ AS
                 v_id := v_indexSession.NEXT(v_id);
             END LOOP;
         end if ;
+
+        -- ======================================================================
+        -- TEIL 3: PROZESSÜBERGREIFENDE BASELINES (zeitgesteuert oder erzwungen)
+        -- ======================================================================
+        syncBaselines(p_force OR p_isShutdown);
 
     END SYNC_ALL_DIRTY;
 
@@ -2098,55 +2459,50 @@ AS
     end;
 
     --------------------------------------------------------------------------
-    -- Calculation average time used
+    -- Arithmetisches Mittel (wird in der Warm-up-Phase verwendet)
     --------------------------------------------------------------------------
-    function calculate_ewma(
-        p_old_avg    number,      -- Der bisherige EWMA (aus deiner Status-Tabelle/RAM)
-        p_curr_count pls_integer, -- Laufender Zähler für dieses Ereignis
-        p_new_value  number,      -- Aktuell gemessene Latenz (ms)
-        p_warmup     pls_integer default 100, -- Schwelle für die Glättung
-        p_alpha      number      default 0.1  -- Gewichtung (0.1 = 10% neu, 90% alt)
-    ) return number is
-    begin
-        -- Fall 1: Initialisierung (Der allererste Datensatz überhaupt)
-        -- Wenn noch kein Durchschnitt da ist, ist der erste Wert unser Startpunkt.
-        if p_old_avg is null or p_old_avg = 0 or p_curr_count <= 1 then
-            return p_new_value;
-        end if;
-
-        -- Fall 2: Warm-up Phase
-        -- Wir reichen den aktuellen Wert 1:1 durch, bis wir genug Daten für 
-        -- eine statistisch stabile Glättung haben.
-        if p_curr_count < p_warmup then
-            return p_new_value;
-        end if;
-
-        -- Fall 3: Die echte EWMA-Berechnung (Phase 3)
-        -- Mathematisch optimierte Formel: Alt + Alpha * (Neu - Alt)
-        return p_old_avg + p_alpha * (p_new_value - p_old_avg);
-    end;
-
-    --------------------------------------------------------------------------
-
     function calculate_avg(
         p_old_avg    number,
         p_curr_count pls_integer,
         p_new_value  number
     ) return number 
     is
-        v_meas_count pls_integer;
     begin
-        -- Die Anzahl der Intervalle ist die Anzahl der bisherigen Punkte
-        v_meas_count := p_curr_count;
-
         -- Erster Messwert: Der Durchschnitt ist der Wert selbst
-        if v_meas_count = 1 then
+        if p_old_avg is null or p_curr_count <= 1 then
             return p_new_value;
         end if ;
 
-        -- Gleitender Durchschnitt über n Intervalle
         -- Formel: ((Schnitt_alt * (n-1)) + Wert_neu) / n
-        return ((p_old_avg * (v_meas_count - 1)) + p_new_value) / v_meas_count;
+        return ((p_old_avg * (p_curr_count - 1)) + p_new_value) / p_curr_count;
+    end;
+
+    --------------------------------------------------------------------------
+    -- Calculation average time used
+    --------------------------------------------------------------------------
+    function calculate_ewma(
+        p_old_avg    number,      -- Der bisherige Durchschnitt
+        p_curr_count pls_integer, -- Laufender Zähler inkl. der aktuellen Messung
+        p_new_value  number,      -- Aktuell gemessene Dauer (ms)
+        p_warmup     pls_integer default 100, -- Schwelle für die Glättung
+        p_alpha      number      default 0.1  -- Gewichtung (0.1 = 10% neu, 90% alt)
+    ) return number is
+    begin
+        -- Fall 1: Initialisierung (Der allererste Datensatz überhaupt)
+        if p_old_avg is null or p_old_avg = 0 or p_curr_count <= 1 then
+            return p_new_value;
+        end if;
+
+        -- Fall 2: Warm-up Phase
+        -- Arithmetisches Mittel, bis genug Daten für eine stabile Glättung vorliegen.
+        -- So ist auch während des Warm-ups ein brauchbarer Durchschnitt vorhanden.
+        if p_curr_count <= coalesce(p_warmup, 0) then
+            return calculate_avg(p_old_avg, p_curr_count, p_new_value);
+        end if;
+
+        -- Fall 3: EWMA
+        -- Formel: Alt + Alpha * (Neu - Alt)
+        return p_old_avg + coalesce(p_alpha, 0.1) * (p_new_value - p_old_avg);
     end;
 
     --------------------------------------------------------------------------
@@ -2234,6 +2590,58 @@ AS
     end;
 
     --------------------------------------------------------------------------
+    -- Berechnet Durchschnitt (avg_action_time) und Regel-Referenz (baseline_avg)
+    -- für eine neue Messung in p_rec (used_time muss gesetzt sein).
+    -- Mit Scope:  prozessübergreifende Baseline (g_baselines)
+    -- Ohne Scope oder bei Fehlern: prozesslokal wie bisher
+    -- baseline_avg ist der Durchschnitt VOR der Messung; während des Warm-ups NULL,
+    -- damit AVG_DEVIATION_PCT erst bei stabiler Baseline greift.
+    --------------------------------------------------------------------------
+    procedure applyBaseline(
+        p_processId   number,
+        p_prevAvg     number,        -- prozesslokaler Durchschnitt vor der Messung
+        p_prevCount   pls_integer,   -- prozesslokale Anzahl Messungen vor dieser
+        p_rec         in out nocopy t_monitor_buffer_rec
+    )
+    as
+        l_params  t_avg_params;
+        l_scopeId number;
+        l_key     varchar2(250);
+        l_oldAvg  number;
+        l_oldCnt  number;
+    begin
+        l_params  := findAvgRule(p_rec.action_name, p_rec.context_name);
+        l_scopeId := getScopeId(p_processId);
+
+        if l_scopeId is not null then
+            begin
+                l_key := buildBaselineKey(l_scopeId, p_rec.action_name, p_rec.context_name);
+                ensureBaseline(l_key, l_scopeId, p_rec.action_name, p_rec.context_name);
+
+                l_oldAvg := g_baselines(l_key).avg_ms;
+                l_oldCnt := g_baselines(l_key).action_count;
+
+                g_baselines(l_key).action_count := l_oldCnt + 1;
+                g_baselines(l_key).avg_ms       := calculate_ewma(l_oldAvg, l_oldCnt + 1, p_rec.used_time, l_params.warmup, l_params.alpha);
+                g_baselines(l_key).dirty        := TRUE;
+                g_baselines(l_key).last_touch   := SYSTIMESTAMP;
+
+                p_rec.avg_action_time := g_baselines(l_key).avg_ms;
+                p_rec.baseline_avg    := CASE WHEN l_oldCnt >= coalesce(l_params.warmup, 0) THEN l_oldAvg END;
+                return;
+            exception
+                when others then
+                    -- Scope für diese Session abschalten und prozesslokal weiterarbeiten
+                    logLilamErr(sqlCode, sqlErrM, 'applyBaseline', 'scope_id=' || l_scopeId || '; scope disabled for process ' || p_processId);
+                    setScopeId(p_processId, null);
+            end;
+        end if;
+
+        p_rec.avg_action_time := calculate_ewma(p_prevAvg, p_prevCount + 1, p_rec.used_time, l_params.warmup, l_params.alpha);
+        p_rec.baseline_avg    := CASE WHEN p_prevCount >= coalesce(l_params.warmup, 0) THEN p_prevAvg END;
+    end;
+
+    --------------------------------------------------------------------------
 
     procedure writeEventToMonitorBuffer (p_processId number, p_actionName varchar2, p_contextName varchar2, p_timestamp timestamp)
     as
@@ -2242,7 +2650,7 @@ AS
         l_new_idx    PLS_INTEGER;
         v_idx        PLS_INTEGER;
         l_prev       t_monitor_buffer_rec; 
-        l_avg_params t_avg_params;
+        l_rec        t_monitor_buffer_rec;
     begin
         if is_remote(p_processId) then
             insertEventMonitorRemote(p_processId, p_actionName, p_contextName, p_timestamp);
@@ -2261,39 +2669,40 @@ AS
             return;
         end if ;
 
+        l_rec.process_id   := p_processId;
+        l_rec.action_name  := p_actionName;
+        l_rec.context_name := p_contextName;
+        l_rec.monitor_type := C_MON_TYPE_EVENT;
+        l_rec.start_time   := coalesce(p_timestamp, systimestamp);
+
+        -- Die nächsten Werte abhängig davon ob es einen Vorgänger gibt
+        -- Gemessen wird der Abstand zum vorherigen Event (innerhalb des Prozesses).
+        if g_monitor_shadows.EXISTS(v_key) then            -- Es gibt einen Vorgänger
+            l_prev := g_monitor_shadows(v_key);
+            l_rec.action_count := l_prev.action_count + 1;
+            l_rec.used_time    := get_ms_diff(l_prev.start_time, l_rec.start_time);
+
+            -- Anzahl gemessener Abstände vor diesem = action_count des Vorgängers - 1
+            applyBaseline(
+                p_processId => p_processId,
+                p_prevAvg   => CASE WHEN l_prev.action_count > 1 THEN l_prev.avg_action_time END,
+                p_prevCount => l_prev.action_count - 1,
+                p_rec       => l_rec
+            );
+        ELSE
+            -- Erster Eintrag der Session/Action
+            l_rec.action_count    := 1;
+            l_rec.used_time       := 0; -- Erster Marker hat keine Dauer
+            l_rec.avg_action_time := 0;
+            l_rec.baseline_avg    := NULL;
+        end if ;
+
         if NOT g_monitor_groups.EXISTS(v_key) THEN
             g_monitor_groups(v_key) := t_monitor_history_tab();
         end if ;
         g_monitor_groups(v_key).EXTEND;
         l_new_idx := g_monitor_groups(v_key).LAST;
-
-        -- Die nächsten Werte abhängig davon ob es einen Vorgänger gibt
-        if g_monitor_shadows.EXISTS(v_key) then            -- Es gibt einen Vorgänger
-            l_prev := g_monitor_shadows(v_key);
-            g_monitor_groups(v_key)(l_new_idx).action_count   := l_prev.action_count + 1;
-            g_monitor_groups(v_key)(l_new_idx).used_time       := get_ms_diff(l_prev.start_time, coalesce(p_timestamp, systimestamp));
-
-            l_avg_params := findAvgRule(p_actionName, p_contextName);
-            g_monitor_groups(v_key)(l_new_idx).avg_action_time := calculate_ewma( -- calculate_avg
-                                                                    l_prev.avg_action_time, 
-                                                                    g_monitor_groups(v_key)(l_new_idx).action_count, 
-                                                                    g_monitor_groups(v_key)(l_new_idx).used_time,
-                                                                    l_avg_params.warmup,
-                                                                    l_avg_params.alpha
-                                                                  );
-        ELSE
-            -- Erster Eintrag der Session/Action
-            g_monitor_groups(v_key)(l_new_idx).action_count   := 1;
-            g_monitor_groups(v_key)(l_new_idx).used_time       := 0; -- Erster Marker hat keine Dauer
-            g_monitor_groups(v_key)(l_new_idx).avg_action_time := 0;
-            g_monitor_groups(v_key)(l_new_idx).monitor_type    := C_MON_TYPE_EVENT;
-        end if ;
-
-        g_monitor_groups(v_key)(l_new_idx).process_id   := p_processId;
-        g_monitor_groups(v_key)(l_new_idx).action_name  := p_actionName;
-        g_monitor_groups(v_key)(l_new_idx).context_name := p_contextName;
-        g_monitor_groups(v_key)(l_new_idx).monitor_type := C_MON_TYPE_EVENT;
-        g_monitor_groups(v_key)(l_new_idx).start_time   := coalesce(p_timestamp, systimestamp);
+        g_monitor_groups(v_key)(l_new_idx) := l_rec;
 
         -- vor dem Überschreiben des shadow-Eintrags die Regeln prüfen
         evaluateRules(g_monitor_groups(v_key)(l_new_idx), C_MARK_EVENT);
@@ -2351,7 +2760,8 @@ AS
         v_first_idx  PLS_INTEGER;
         l_new_idx    PLS_INTEGER;
         v_idx        PLS_INTEGER;
-        l_avg_params t_avg_params;
+        l_prevAvg    number;
+        l_prevCnt    PLS_INTEGER;
     begin
         if is_remote(p_processId) then
             insertTraceMonitorRemote(p_processId, p_actionName, p_contextName, p_timestamp);
@@ -2375,25 +2785,18 @@ AS
         v_new_rec.stop_time := coalesce(p_timestamp, systimestamp);
         v_new_rec.used_time := get_ms_diff(v_new_rec.start_time, v_new_rec.stop_time);
 
-        IF NOT g_monitor_averages.EXISTS(v_key) THEN
-            -- Erster Durchlauf für diese Aktion/Kontext
-            v_new_rec.action_count   := 1;
-            v_new_rec.avg_action_time := v_new_rec.used_time;
+        -- action_count bleibt prozesslokal (n-te Ausführung im Prozess; _MON und MAX_OCCURRENCE)
+        IF g_monitor_averages.EXISTS(v_key) THEN
+            l_prevAvg := g_monitor_averages(v_key).avg_action_time;
+            l_prevCnt := g_monitor_averages(v_key).action_count;
         ELSE
-            -- Bestehende Werte aus dem Gedächtnis holen
-            v_new_rec.action_count    := g_monitor_averages(v_key).action_count + 1;
-            -- Gleitender Durchschnitt berechnen
-            -- Formel: ((Alter Schnitt * Alte Anzahl) + Neue Zeit) / Neue Anzahl
-
-            l_avg_params := findAvgRule(p_actionName, p_contextName);                
-            v_new_rec.avg_action_time := calculate_ewma( -- calculate_avg
-                                                        g_monitor_averages(v_key).avg_action_time, 
-                                                        g_monitor_averages(v_key).action_count, 
-                                                        v_new_rec.used_time,
-                                                        l_avg_params.warmup,
-                                                        l_avg_params.alpha
-                                                      );
+            l_prevAvg := NULL;
+            l_prevCnt := 0;
         END IF;
+        v_new_rec.action_count := l_prevCnt + 1;
+
+        -- Durchschnitt: prozessübergreifend (Scope) oder prozesslokal
+        applyBaseline(p_processId, l_prevAvg, l_prevCnt, v_new_rec);
 
         -- Gedächtnis für den nächsten Lauf aktualisieren
         g_monitor_averages(v_key) := v_new_rec;
@@ -2407,7 +2810,6 @@ AS
         -- Das Event an die Regelprüfung durchreichen
         evaluateRules(v_new_rec, C_TRACE_STOP);
         g_monitor_shadows.delete(v_key);
-        g_monitor_averages(v_key) := v_new_rec;
 
         v_idx := v_indexSession(p_processId);            
         g_sessionList(v_idx).monitor_dirty_count := coalesce(g_sessionList(v_idx).monitor_dirty_count, 0) + 1;
@@ -2759,7 +3161,7 @@ AS
 
     --------------------------------------------------------------------------
 
-    procedure persist_new_session(p_processId NUMBER, p_processName VARCHAR2, p_logLevel PLS_INTEGER, p_procStepsToDo PLS_INTEGER, p_daysToKeep PLS_INTEGER, p_procImmortal PLS_INTEGER, p_tabNameMaster VARCHAR2)
+    procedure persist_new_session(p_processId NUMBER, p_processName VARCHAR2, p_logLevel PLS_INTEGER, p_procStepsToDo PLS_INTEGER, p_daysToKeep PLS_INTEGER, p_procImmortal PLS_INTEGER, p_tabNameMaster VARCHAR2, p_scopeName VARCHAR2)
     as
         pragma autonomous_transaction;
         sqlStatement varchar2(2000);
@@ -2778,7 +3180,8 @@ AS
             info,
             process_immortal,
             server_pipe,
-            tab_name_master
+            tab_name_master,
+            scope_name
         )
         values (
             :PH_PROCESS_ID, 
@@ -2793,10 +3196,11 @@ AS
             ''START'',
             :PH_IMMORTAL,
             :PH_PIPE,
-            :PH_TABNAME_MASTER
+            :PH_TABNAME_MASTER,
+            :PH_SCOPE_NAME
         )';
         sqlStatement := replaceNameTable(sqlStatement, C_PARAM_MASTER_TABLE, C_SUFFIX_PROC_TABLE, p_TabNameMaster);
-        execute immediate sqlStatement USING p_processId, p_processName, p_procStepsToDo, p_logLevel, p_procImmortal, g_serverPipeName, upper(p_tabNameMaster);     
+        execute immediate sqlStatement USING p_processId, p_processName, p_procStepsToDo, p_logLevel, p_procImmortal, g_serverPipeName, upper(p_tabNameMaster), p_scopeName;     
         commit;
 
     exception
@@ -3390,6 +3794,12 @@ AS
     procedure clearServerData
     as
     begin
+        -- offene Baseline-Deltas sichern (eigene Fehlerbehandlung)
+        syncBaselines(TRUE);
+        g_baselines.DELETE;
+        g_scope_ids.DELETE;
+        g_last_baseline_sync := NULL;
+
         g_monitor_groups.delete;
         g_log_groups.delete;
         g_dirty_queue.delete;
@@ -3608,6 +4018,8 @@ AS
         p_processId number(19,0);   
         v_new_rec t_process_rec;
         l_session_init t_session_init := p_session_init;
+        l_scopeName VARCHAR2(100);
+        l_scopeId   NUMBER;
     begin
 
         createLogTables(p_session_init.tabNameMaster);
@@ -3622,8 +4034,14 @@ AS
         insertSession (p_session_init.tabNameMaster, p_processId, l_session_init.logLevel);
         deleteOldLogs(p_processId, upper(trim(l_session_init.processName)), l_session_init.daysToKeep);
 
+        -- Baseline Scope (Default: Prozessname); bei Fehlern NULL => prozesslokal
+        l_scopeName := resolveScopeName(l_session_init.processName, l_session_init.baselineScope);
+        l_scopeId   := getOrCreateScopeId(l_scopeName);
+        setScopeId(p_processId, l_scopeId);
+        if l_scopeId is null then l_scopeName := null; end if;
+
         persist_new_session(p_processId, l_session_init.processName, l_session_init.logLevel,  
-            l_session_init.stepsToDo, l_session_init.daysToKeep, l_session_init.procImmortal, l_session_init.tabNameMaster);
+            l_session_init.stepsToDo, l_session_init.daysToKeep, l_session_init.procImmortal, l_session_init.tabNameMaster, l_scopeName);
 
         -- copy new details data to memory
         v_new_rec.id             := p_processId;
@@ -4119,6 +4537,7 @@ AS
         l_session_init.stepsToDo   := jsonNumber(l_payload, 'steps_todo');
         l_session_init.daysToKeep  := jsonNumber(l_payload, 'days_to_keep');
         l_session_init.tabNameMaster := jsonString(l_payload, 'tabname_master');
+        l_session_init.baselineScope := jsonString(l_payload, 'baseline_scope');
 
         l_processId := NEW_SESSION(l_session_init);
         registerProcessRoute(l_processId, g_serverPipeName); 
@@ -4630,8 +5049,9 @@ AS
                     g_rules_by_context(l_key)(g_rules_by_context(l_key).LAST) := l_new_rule;
 
                     if l_new_rule.condition_operator = 'AVG_DEVIATION_PCT' then
-                        g_avg_params(l_key).warmup := extractRuleValue(l_new_rule.condition_value, 2);
-                        g_avg_params(l_key).alpha  := extractRuleValue(l_new_rule.condition_value, 3);
+                        -- 'pct|warmup|alpha'; fehlende Werte => Default
+                        g_avg_params(l_key).warmup := coalesce(extractRuleValue(l_new_rule.condition_value, 2), g_avg_params('DEFAULT').warmup);
+                        g_avg_params(l_key).alpha  := coalesce(extractRuleValue(l_new_rule.condition_value, 3), g_avg_params('DEFAULT').alpha);
                     end if;
                 ELSE
                     l_key := r.action;
@@ -4642,8 +5062,9 @@ AS
                     g_rules_by_action(l_key)(g_rules_by_action(l_key).LAST) := l_new_rule;
 
                     if l_new_rule.condition_operator = 'AVG_DEVIATION_PCT' then
-                        g_avg_params(l_key).warmup := extractRuleValue(l_new_rule.condition_value, 2);
-                        g_avg_params(l_key).alpha  := extractRuleValue(l_new_rule.condition_value, 3);
+                        -- 'pct|warmup|alpha'; fehlende Werte => Default
+                        g_avg_params(l_key).warmup := coalesce(extractRuleValue(l_new_rule.condition_value, 2), g_avg_params('DEFAULT').warmup);
+                        g_avg_params(l_key).alpha  := coalesce(extractRuleValue(l_new_rule.condition_value, 3), g_avg_params('DEFAULT').alpha);
                     end if;
                 END IF;
             END;
@@ -5161,6 +5582,7 @@ BEGIN
             p_session_init.daysToKeep    := jsonNumber(l_jsonParams, 'days_to_keep');
             p_session_init.procImmortal  := jsonNumber(l_jsonParams, 'process_immortal');
             p_session_init.tabNameMaster := jsonString(l_jsonParams, 'tabname_master');
+            p_session_init.baselineScope := jsonString(l_jsonParams, 'baseline_scope');
 
             l_proc_id := NEW_SESSION(p_session_init);
             jsonPut(l_jsonHeader, 'status', 'SUCCESS');
@@ -5339,3 +5761,5 @@ END;
         g_avg_params('DEFAULT').warmup := 3; 
 
 END LILAM;
+
+/
