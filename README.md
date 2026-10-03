@@ -159,13 +159,13 @@ LILAM offers two execution models that can be used interchangeably:
 1. **In-Session Mode (Direct):** Initiated by `lilam.new_session`. LILAM acts as embedded library, Log and Metric calls are executed immediately within your current database session. This is ideal for straightforward debugging and ensuring data is persisted synchronously.
 2. **Decoupled Mode (Server-based):**
    In this mode, LILAM decouples the request from the execution. It acts as a proxy within the application session, offloading the heavy lifting to dedicated background worker processes. 
-   * **Server Side:** Launch one or more LILAM-Servers using `lilam.start_server('SERVER_NAME');`. These background processes register under a custom name and monitor for incoming commands. You can scale by running multiple servers for the same name or use different names for logical separation.
-   * **Client Side:** Register via `lilam.server_new_session('SERVER_NAME');`. LILAM automatically identifies and connects to the specified available server.
+   * **Server Side:** Launch one or more LILAM servers using `lilam.start_server('PIPE_NAME', 'GROUP_NAME', 'PASSWORD');` (or `lilam.create_server(...)` to run them as scheduler jobs). Each server listens on its own pipe and registers under a group name. You can scale by running multiple servers in the same group or use different groups for logical separation.
+   * **Client Side:** Register via `lilam.server_new_session('PROCESS_NAME', 'GROUP_NAME');`. LILAM automatically selects an available server of that group (or any available server if no group is given).
    * **Execution:** Log calls are serialized into a pipe and processed by the background server, minimizing the impact on your transaction time.
   
 > [!IMPORTANT]
 > **Unified API:** Regardless of the chosen mode, the logging API remains **identical**. You use the same `lilam.log(...)` calls throughout your application.
-> The only difference is the initial setup (`lilam.new_session` for  vs. `lilam.server_new_session` for Decoupled mode).
+> The only difference is the initial setup (`lilam.new_session` for In-Session mode vs. `lilam.server_new_session` for Decoupled mode).
 
 ### Performance & Safety
 LILAM prioritizes the stability of your application. It uses a Hybrid Model to balance speed and system integrity:
