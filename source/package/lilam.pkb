@@ -617,6 +617,76 @@ AS
     end;
 
     --------------------------------------------------------------------------
+    -- PERFORMANCE: Bausteine für die direkte Verkettung von JSON-Nachrichten
+    --
+    -- jsonPut zerlegt bei jedem Aufruf das bisher gebaute Objekt und kopiert es
+    -- neu. Bei 8-10 Feldern pro Nachricht war das im Decoupled-Mode der größte
+    -- Kostenblock auf Client-Seite (HPROF: 39 % bei INFO, 47 % bei MARK_EVENT).
+    -- In den häufig durchlaufenen Pfaden (Logs, Traces, Events, Steps, Status)
+    -- wird die Nachricht deshalb in EINEM Ausdruck verkettet:
+    --
+    --     '{"process_id":' || jNum(p_processId) || jStr('action_name', p_actionName) || ... || '}'
+    --
+    -- Jeder Baustein liefert ',"key":wert' oder - bei NULL - einen Leerstring.
+    -- Das erste Feld wird daher immer ohne Baustein und ohne Komma geschrieben.
+    -- Die selten genutzten Pfade (Antworten des Servers, Verwaltung) verwenden
+    -- weiterhin jsonPut.
+    --------------------------------------------------------------------------
+
+    -- Textwert für JSON maskieren (gleiche Regeln wie jsonPut, zusätzlich Tab)
+    function jEsc(p_value varchar2) return varchar2
+    as
+    begin
+        return replace(replace(replace(replace(replace(p_value,
+                   '\', '\\'),          -- ZUERST Backslash
+                   '"', '\"'),
+                   chr(10), '\n'),
+                   chr(13), '\r'),
+                   chr(9), '\t');
+    end;
+
+    -- Zahl unabhängig von NLS_NUMERIC_CHARACTERS (immer Dezimalpunkt, führende 0)
+    function jNum(p_value number) return varchar2
+    as
+        l_str varchar2(64);
+    begin
+        if p_value = trunc(p_value) then
+            return to_char(p_value);       -- Ganzzahl: NLS spielt keine Rolle (Normalfall)
+        end if;
+        l_str := to_char(p_value, 'TM9', 'NLS_NUMERIC_CHARACTERS=''.,''');
+        if substr(l_str, 1, 1) = '.' then
+            l_str := '0' || l_str;
+        elsif substr(l_str, 1, 2) = '-.' then
+            l_str := '-0' || substr(l_str, 2);
+        end if;
+        return l_str;
+    end;
+
+    -- ',"key":"text"' bzw. '' bei NULL
+    function jStr(p_key varchar2, p_value varchar2) return varchar2
+    as
+    begin
+        if p_value is null then return null; end if;
+        return ',"' || p_key || '":"' || jEsc(p_value) || '"';
+    end;
+
+    -- ',"key":zahl' bzw. '' bei NULL
+    function jNum(p_key varchar2, p_value number) return varchar2
+    as
+    begin
+        if p_value is null then return null; end if;
+        return ',"' || p_key || '":' || jNum(p_value);
+    end;
+
+    -- ',"key":"YYYY-MM-DDTHH24:MI:SS.FF6"' bzw. '' bei NULL
+    function jTs(p_key varchar2, p_value timestamp) return varchar2
+    as
+    begin
+        if p_value is null then return null; end if;
+        return ',"' || p_key || '":"' || to_char(p_value, 'YYYY-MM-DD"T"HH24:MI:SS.FF6') || '"';
+    end;
+
+    --------------------------------------------------------------------------
     -- Millis between two timestamps
     --------------------------------------------------------------------------
     function get_ms_diff(p_start timestamp, p_end timestamp) return number is
@@ -1355,15 +1425,16 @@ AS
     --------------------------------------------------------------------------
     PROCEDURE stabilizeInLowPerfEnvironments(p_processId number)
     IS
-        l_now TIMESTAMP := SYSTIMESTAMP;
-        l_diff_millis PLS_INTEGER;
+        -- PERFORMANCE: SYSTIMESTAMP wird nur noch gelesen, wenn die Zeit gebraucht wird
+        -- (beim ersten Aufruf und alle C_THROTTLE_LIMIT_NO Nachrichten), nicht bei jedem Aufruf
+        l_now TIMESTAMP;
         l_new_throttle t_throttle_stat;
     BEGIN
         if NOT g_is_high_perf THEN 
             -- In nicht hochperformanten Umgebungen den Client etwas einbremsen
             if NOT g_local_throttle_cache.EXISTS(p_processId) THEN
               l_new_throttle.msg_count := 0;
-              l_new_throttle.last_check := l_now;
+              l_new_throttle.last_check := SYSTIMESTAMP;
 
               g_local_throttle_cache(p_processId) := l_new_throttle;
 
@@ -1374,6 +1445,7 @@ AS
 
             -- Check-Intervall erreicht?
             if g_local_throttle_cache(p_processId).msg_count >= C_THROTTLE_LIMIT_NO THEN        
+                l_now := SYSTIMESTAMP;
                 -- Wenn zu schnell gefeuert wurde
                 if get_ms_diff(g_local_throttle_cache(p_processId).last_check, l_now) < C_THROTTLE_INTERVAL_NO THEN
                     -- Erzwinge Synchronisation (Warten auf Server-Antwort)
@@ -1399,24 +1471,16 @@ AS
     )
     as        
         l_pipeName      VARCHAR2(100);
-        l_msg           JSON_OBJ_LILAM;
         l_status        PLS_INTEGER;
-        l_now           TIMESTAMP := SYSTIMESTAMP;
-        l_retryInterval INTERVAL DAY TO SECOND := INTERVAL '30' SECOND;
-
-        l_jsonHeader  JSON_OBJ_LILAM;
-        l_jsonPayload JSON_OBJ_LILAM;
-        l_jsonMain    JSON_OBJ_LILAM;
+        l_jsonMain      JSON_OBJ_LILAM;   -- (unbenutzte Variablen l_now/l_retryInterval entfernt: sparte ein SYSTIMESTAMP je Aufruf)
     begin
         stabilizeInLowPerfEnvironments(p_processId);
 
-        jsonPut(l_jsonHeader, 'msg_type', 'API_CALL');
-        jsonPut(l_jsonHeader, 'request', p_request);
--- ???
-        l_jsonPayload := p_payload;
--- ???
-        jsonPut(l_jsonMain, 'header', l_jsonHeader);
-        jsonPut(l_jsonMain, 'payload', l_jsonPayload);
+        -- PERFORMANCE: Nachricht in einem Schritt verketten statt über jsonPut (siehe jStr/jNum/jTs).
+        -- p_request ist immer eine interne Konstante und muss nicht maskiert werden.
+        l_jsonMain := '{"header":{"msg_type":"API_CALL","request":"' || p_request || '"}'
+                   || case when p_payload is not null then ',"payload":' || p_payload end
+                   || '}';
 
         l_pipeName := getServerPipeForSession(p_processId, null);
         DBMS_PIPE.PACK_MESSAGE(l_jsonMain);
@@ -1427,7 +1491,7 @@ AS
             end if ;
             if l_status = 2 then
                 DBMS_PIPE.RESET_BUFFER;
-                DBMS_PIPE.PACK_MESSAGE(l_msg);
+                DBMS_PIPE.PACK_MESSAGE(l_jsonMain);   -- vorher l_msg (nie befüllt): Wiederholung sendete leere Nachricht
             end if;
             dbms_session.sleep(0.3);
         end loop;
@@ -2568,10 +2632,11 @@ AS
     as
         l_payload JSON_OBJ_LILAM; -- Puffer für den JSON-String
     begin
-        jsonPut(l_payload,'process_id', p_processId);
-        jsonPut(l_payload,'action_name', p_actionName);
-        jsonPut(l_payload,'context_name', p_contextName);
-        jsonPut(l_payload,'timestamp', p_timestamp);
+        -- PERFORMANCE: Nachricht direkt verketten statt über jsonPut (siehe jStr/jNum/jTs)
+        l_payload := '{"process_id":' || jNum(p_processId)
+                  || jStr('action_name',  p_actionName)
+                  || jStr('context_name', p_contextName)
+                  || jTs ('timestamp',    p_timestamp) || '}';
 
         sendNoWait(p_processId, 'START_TRACE', l_payload, 0.5);
 
@@ -2591,10 +2656,11 @@ AS
         -- späterem Aufruf von insertMonitor im Server der Zeitpunkt 'in time' ist,
         -- muss der Zeitpunkt vom Client bei Aufruf gesetzt werden.
         -- Erzeugung des JSON-Objekts
-        jsonPut(l_payload, 'process_id', p_processId);
-        jsonPut(l_payload, 'action_name', p_actionName);
-        jsonPut(l_payload, 'context_name', p_contextName);
-        jsonPut(l_payload, 'timestamp', p_timestamp);     
+        -- PERFORMANCE: Nachricht direkt verketten statt über jsonPut (siehe jStr/jNum/jTs)
+        l_payload := '{"process_id":' || jNum(p_processId)
+                  || jStr('action_name',  p_actionName)
+                  || jStr('context_name', p_contextName)
+                  || jTs ('timestamp',    p_timestamp) || '}';
 
         sendNoWait(p_processId, 'STOP_TRACE', l_payload, 0.5);
 
@@ -2618,10 +2684,11 @@ AS
         -- späterem Aufruf von insertMonitor im Server der Zeitpunkt 'in time' ist,
         -- muss der Zeitpunkt vom Client bei Aufruf gesetzt werden.
         -- Erzeugung des JSON-Objekts
-        jsonPut(l_payload,'process_id', p_processId);
-        jsonPut(l_payload,'action_name', p_actionName);
-        jsonPut(l_payload,'context_name', p_contextName);
-        jsonPut(l_payload,'timestamp', TO_CHAR(p_timestamp, 'YYYY-MM-DD"T"HH24:MI:SS.FF6'));
+        -- PERFORMANCE: Nachricht direkt verketten statt über jsonPut (siehe jStr/jNum/jTs)
+        l_payload := '{"process_id":' || jNum(p_processId)
+                  || jStr('action_name',  p_actionName)
+                  || jStr('context_name', p_contextName)
+                  || jTs ('timestamp',    p_timestamp) || '}';
 
         sendNoWait(p_processId, C_MARK_EVENT, l_payload, 0.5);
 
@@ -3397,11 +3464,12 @@ AS
         l_response  varchar2(1000);
     begin
         -- Erzeugung des JSON-Objekts
-        jsonPut(l_payload, 'process_id', p_processId);
-        jsonPut(l_payload, 'steps_todo', p_procStepsToDo);
-        jsonPut(l_payload, 'steps_done', p_procStepsDone);
-        jsonPut(l_payload, 'process_info', p_processInfo);
-        jsonPut(l_payload, 'process_status', p_processStatus);
+        -- PERFORMANCE: Nachricht direkt verketten statt über jsonPut (siehe jStr/jNum/jTs)
+        l_payload := '{"process_id":' || jNum(p_processId)
+                  || jNum('steps_todo',     p_procStepsToDo)
+                  || jNum('steps_done',     p_procStepsDone)
+                  || jStr('process_info',   p_processInfo)
+                  || jNum('process_status', p_processStatus) || '}';
 
         l_response := waitForResponse(p_processId, 'CLOSE_SESSION', l_payload, 1);
 
@@ -3426,8 +3494,9 @@ AS
         l_serverMsg varchar2(100);
     begin
         -- Erzeugung des JSON-Objekts
-        jsonPut(l_payload,'process_id', p_processId);
-        jsonPut(l_payload,'timestamp', p_timestamp);
+        -- PERFORMANCE: Nachricht direkt verketten statt über jsonPut (siehe jStr/jNum/jTs)
+        l_payload := '{"process_id":' || jNum(p_processId)
+                  || jTs('timestamp', p_timestamp) || '}';
 
         sendNoWait(p_processId, 'PROC_STEP_DONE', l_payload, 0.5);
     end;
@@ -3437,13 +3506,14 @@ AS
     as
         l_payload JSON_OBJ_LILAM; -- Puffer für den JSON-String
     begin
-        jsonPut(l_payload,'process_id', p_processId);
-        jsonPut(l_payload,'steps_todo', p_procStepsToDo);
-        jsonPut(l_payload,'steps_done', p_procStepsDone);
-        jsonPut(l_payload,'process_info', p_processInfo);
-        jsonPut(l_payload,'process_status', p_status);
-        jsonPut(l_payload,'process_immortal', p_immortal);
-        jsonPut(l_payload,'timestamp', p_timestamp);
+        -- PERFORMANCE: Nachricht direkt verketten statt über jsonPut (siehe jStr/jNum/jTs)
+        l_payload := '{"process_id":' || jNum(p_processId)
+                  || jNum('steps_todo',       p_procStepsToDo)
+                  || jNum('steps_done',       p_procStepsDone)
+                  || jStr('process_info',     p_processInfo)
+                  || jNum('process_status',   p_status)
+                  || jNum('process_immortal', p_immortal)
+                  || jTs ('timestamp',        p_timestamp) || '}';
 
         sendNoWait(p_processId, 'SET_ANY_STATUS', l_payload, 0.5);
     end;
@@ -3454,14 +3524,15 @@ AS
     as
         l_payload JSON_OBJ_LILAM; -- Puffer für den JSON-String
     begin
-        jsonPut(l_payload, 'process_id', p_processId);
-        jsonPut(l_payload, 'level', p_level);
-        jsonPut(l_payload, 'log_text', p_logText);
-        jsonPut(l_payload, 'caller', p_caller);
-        jsonPut(l_payload, 'err_stack', p_errStack);
-        jsonPut(l_payload, 'err_backtr', p_errBacktrace);
-        jsonPut(l_payload, 'err_callstack', p_errCallstack);
-        jsonPut(l_payload, 'timestamp', p_timestamp);
+        -- PERFORMANCE: Nachricht direkt verketten statt über jsonPut (siehe jStr/jNum/jTs)
+        l_payload := '{"process_id":' || jNum(p_processId)
+                  || jNum('level',         p_level)
+                  || jStr('log_text',      p_logText)
+                  || jStr('caller',        p_caller)
+                  || jStr('err_stack',     p_errStack)
+                  || jStr('err_backtr',    p_errBacktrace)
+                  || jStr('err_callstack', p_errCallstack)
+                  || jTs ('timestamp',     p_timestamp) || '}';
 
         sendNoWait(p_processId, 'LOG_ANY', l_payload, 0.5);
 
