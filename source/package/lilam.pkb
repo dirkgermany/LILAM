@@ -185,6 +185,10 @@ AS
     TYPE t_scope_id_map IS TABLE OF NUMBER INDEX BY VARCHAR2(100);
     g_scope_ids t_scope_id_map;
 
+    -- Master-Tabellen, deren Tabellen in dieser Session bereits geprueft/angelegt wurden
+    TYPE t_checked_masters IS TABLE OF BOOLEAN INDEX BY VARCHAR2(100);
+    g_checked_masters t_checked_masters;
+
     -- remember to latest action
     TYPE t_action_history_rec IS RECORD (
         full_key VARCHAR2(100),
@@ -1573,7 +1577,13 @@ AS
     procedure createLogTables(p_TabNameMaster varchar2)
     as
         sqlStmt varchar2(4000);
+        l_master constant varchar2(100) := upper(trim(p_TabNameMaster));
     begin
+        -- Pro Session und Master-Tabelle nur einmal pruefen (spart je NEW_SESSION rund ein Dutzend Dictionary-Abfragen)
+        if g_checked_masters.EXISTS(l_master) then
+            return;
+        end if;
+
         if not objectExists('SEQ_LILAM_LOG', 'SEQUENCE') then
             sqlStmt := 'CREATE SEQUENCE SEQ_LILAM_LOG MINVALUE 0 MAXVALUE 9999999999999999999999999999 INCREMENT BY 1 START WITH 1 CACHE 10 NOORDER  NOCYCLE  NOKEEP  NOSCALE  GLOBAL';
             execute immediate sqlStmt;
@@ -1756,6 +1766,8 @@ AS
             run_sql(sqlStmt);
         end if ;
 
+        g_checked_masters(l_master) := TRUE;
+
     exception      
         when others then
             logLilamErr(sqlCode, sqlErrM, 'createLogTables');
@@ -1925,6 +1937,8 @@ AS
                 commit;
             else
                 rollback;
+                -- Tabelle fehlt: beim naechsten NEW_SESSION erneut pruefen und anlegen
+                if sqlcode = -942 then g_checked_masters.DELETE; end if;
                 logLilamErr(sqlCode, sqlErrM, 'persist_log_data');
             end if;
 
@@ -2106,6 +2120,8 @@ AS
                 commit;
             else
                 rollback;
+                -- Tabelle fehlt: beim naechsten NEW_SESSION erneut pruefen und anlegen
+                if sqlcode = -942 then g_checked_masters.DELETE; end if;
                 logLilamErr(sqlCode, sqlErrM, 'persist_monitor_data');
             end if;
 
@@ -3244,6 +3260,8 @@ AS
     exception
         when others then
             rollback; -- Auch im Fehlerfall die Transaktion beenden
+            -- Tabelle fehlt: beim naechsten NEW_SESSION erneut pruefen und anlegen
+            if sqlcode = -942 then g_checked_masters.DELETE; end if;
             logLilamErr(sqlCode, sqlErrM, 'persist_new_session'); 
             
     end;
@@ -3844,6 +3862,7 @@ AS
         syncBaselines(TRUE);
         g_baselines.DELETE;
         g_scope_ids.DELETE;
+        g_checked_masters.DELETE;
         g_last_baseline_sync := NULL;
 
         g_monitor_groups.delete;
