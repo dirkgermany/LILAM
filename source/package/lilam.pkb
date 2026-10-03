@@ -28,6 +28,7 @@ AS
     C_FLUSH_MILLIS_THRESHOLD_MS        CONSTANT PLS_INTEGER := 1500;  -- 1500 Max. Millis until flush
     C_FLUSH_LOG_THRESHOLD_NO           CONSTANT PLS_INTEGER := 50000; -- 50000 Max. number of dirty buffered logs until flush
     C_FLUSH_MONITOR_THRESHOLD_NO       CONSTANT PLS_INTEGER := 50000; -- 50000 Max. number of dirty buffered metrics until flush
+    C_SYNC_ALL_INTERVAL_MS             CONSTANT PLS_INTEGER := 500;   -- SYNC_ALL_DIRTY (ohne Force) hoechstens alle n ms
 
     ---------------------------------------------------------------
     -- Placeholders for tables
@@ -315,6 +316,7 @@ AS
     g_serverIsDispatcher                BOOLEAN                 := FALSE;
 
     g_is_high_perf                      BOOLEAN                 := FALSE;
+    g_last_sync_all                     TIMESTAMP               := NULL;   -- letzter Durchlauf von SYNC_ALL_DIRTY
     g_last_check_time                   TIMESTAMP               := SYSTIMESTAMP;
 
     -- Latencies between event generation and persistance in DB
@@ -2307,7 +2309,22 @@ AS
         v_id      BINARY_INTEGER;
         v_next_id BINARY_INTEGER;
         v_idx     PLS_INTEGER;
+        v_now     CONSTANT TIMESTAMP := SYSTIMESTAMP;
     BEGIN
+        -- ======================================================================
+        -- TEIL 0: ZEITSPERRE
+        -- Ohne Force hoechstens alle C_SYNC_ALL_INTERVAL_MS einen Durchlauf ueber alle
+        -- Prozesse. So kostet z.B. jedes INFO nur einen Zeitvergleich, unabhaengig von
+        -- der Zahl offener Prozesse. Die Flush-Schwellen (Zeit/Menge) bleiben unveraendert.
+        -- ======================================================================
+        if NOT p_force AND NOT p_isShutdown
+           AND g_last_sync_all IS NOT NULL
+           AND get_ms_diff(g_last_sync_all, v_now) < C_SYNC_ALL_INTERVAL_MS
+        then
+            return;
+        end if;
+        g_last_sync_all := v_now;
+
         -- ======================================================================
         -- TEIL 1: BEARBEITUNG DER DRECKIGEN LISTE (Queue)
         -- ======================================================================
@@ -4023,8 +4040,11 @@ AS
 
         -- Hier nur weiter, wenn lokale processId
         if v_indexSession.EXISTS(p_processId) then
-            g_dirty_queue(p_processId) := TRUE;
-            SYNC_ALL_DIRTY(true);
+            -- Nur die Puffer dieses Prozesses wegschreiben (nicht die aller offenen Prozesse)
+            sync_log(p_processId, true);
+            sync_monitor(p_processId, true);
+            sync_process(p_processId, true);
+            syncBaselines(true);
 
             g_process_cache(p_processId).processEnd := systimestamp;
 
