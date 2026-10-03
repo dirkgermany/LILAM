@@ -3984,7 +3984,14 @@ AS
 
     --------------------------------------------------------------------------
 
-    procedure CLOSE_SESSION(p_processId number, p_procStepsToDo PLS_INTEGER, p_procStepsDone PLS_INTEGER, p_processInfo varchar2, p_processStatus PLS_INTEGER)
+    -- Ends an earlier started logging session by the process ID.
+    -- Important! Ignores if the process doesn't exist! No exception is thrown!
+    procedure CLOSE_SESSION(
+        p_processId     NUMBER,
+        p_processInfo   VARCHAR2    DEFAULT NULL,
+        p_processStatus PLS_INTEGER DEFAULT NULL,
+        p_procStepsDone PLS_INTEGER DEFAULT NULL,
+        p_procStepsToDo PLS_INTEGER DEFAULT NULL)
     as
         v_idx PLS_INTEGER;
     begin
@@ -4015,50 +4022,6 @@ AS
     
     --------------------------------------------------------------------------
 
-    PROCEDURE CLOSE_SESSION(p_processId NUMBER, p_processInfo VARCHAR2, p_processStatus PLS_INTEGER)
-    as
-    begin
-        close_session(
-            p_processId      => p_processId, 
-            p_procStepsToDo  => null, 
-            p_procStepsDone  => null, 
-            p_processInfo    => p_processInfo, 
-            p_processStatus   => p_processStatus
-        );
-    end;
-
-    --------------------------------------------------------------------------
-
-    PROCEDURE CLOSE_SESSION(p_processId NUMBER, p_procStepsDone PLS_INTEGER, p_processInfo VARCHAR2, p_processStatus PLS_INTEGER)
-    as
-    begin
-        close_session(
-            p_processId      => p_processId, 
-            p_procStepsToDo  => null, 
-            p_procStepsDone  => p_procStepsDone, 
-            p_processInfo    => p_processInfo, 
-            p_processStatus   => p_processStatus
-        );
-    end;
-
-    --------------------------------------------------------------------------
-
-    -- Ends an earlier started logging session by the process ID.
-    -- Important! Ignores if the process doesn't exist! No exception is thrown!
-    procedure CLOSE_SESSION(p_processId number)
-    as
-    begin
-        close_session(
-            p_processId      => p_processId, 
-            p_procStepsToDo  => null, 
-            p_procStepsDone  => null, 
-            p_processInfo    => null, 
-            p_processStatus   => null
-        );
-    end;
-
-    --------------------------------------------------------------------------
-
     FUNCTION NEW_SESSION(p_session_init t_session_init) RETURN NUMBER
     as
         p_processId number(19,0);   
@@ -4068,7 +4031,9 @@ AS
         l_scopeId   NUMBER;
     begin
 
-        createLogTables(p_session_init.tabNameMaster);
+        -- leere Master-Tabelle (z.B. aus JSON ohne tabname_master) => Standard
+        l_session_init.tabNameMaster := nvl(trim(l_session_init.tabNameMaster), 'LILAM');
+        createLogTables(l_session_init.tabNameMaster);
 
         -- New Process ID by Sequence
         execute immediate 'select seq_lilam_log.nextVal from dual' into p_processId;
@@ -4077,7 +4042,7 @@ AS
         if l_session_init.logLevel is null then l_session_init.logLevel := logLevelMonitor; end if;
         
         -- persist to session internal table
-        insertSession (p_session_init.tabNameMaster, p_processId, l_session_init.logLevel);
+        insertSession (l_session_init.tabNameMaster, p_processId, l_session_init.logLevel);
         deleteOldLogs(p_processId, upper(trim(l_session_init.processName)), l_session_init.daysToKeep);
 
         -- Baseline Scope (Default: Prozessname); bei Fehlern NULL => prozesslokal
@@ -4108,51 +4073,26 @@ AS
     end;
 
 
-    FUNCTION NEW_SESSION(p_processName VARCHAR2, p_logLevel PLS_INTEGER, p_procStepsToDo PLS_INTEGER, p_daysToKeep PLS_INTEGER, p_tabNameMaster varchar2 default 'LILAM') return number
-    as
-        p_session_init t_session_init;
-    begin
-
-
-        p_session_init.processName := p_processName;
-        p_session_init.logLevel := p_logLevel;
-        p_session_init.daysToKeep := p_daysToKeep;
-        p_session_init.stepsToDo := p_procStepsToDo;
-        p_session_init.tabNameMaster := p_tabNameMaster;
-
-        return new_session(p_session_init);
-    end;
-
-    --------------------------------------------------------------------------
-
-    function NEW_SESSION(p_processName varchar2, p_logLevel PLS_INTEGER default logLevelMonitor, p_tabNameMaster varchar2 default 'LILAM') return number
-    as
-        p_session_init t_session_init;
-    begin
-        p_session_init.processName := p_processName;
-        p_session_init.logLevel := p_logLevel;
-        p_session_init.daysToKeep := null;
-        p_session_init.stepsToDo := null;
-        p_session_init.tabNameMaster := p_tabNameMaster;
-
-        return new_session(p_session_init);
-    end;
-
-
     -- Opens/starts a new logging session.
     -- The returned process id must be stored within the calling procedure because it is the reference
     -- which is recommended for all following actions (e.g. CLOSE_SESSION, DEBUG, SET_PROCESS_STATUS).
-    function NEW_SESSION(p_processName varchar2, p_logLevel PLS_INTEGER, p_daysToKeep PLS_INTEGER, p_tabNameMaster varchar2 default 'LILAM') return number
+    FUNCTION NEW_SESSION(
+        p_processName   VARCHAR2,
+        p_logLevel      PLS_INTEGER DEFAULT logLevelMonitor,
+        p_procStepsToDo PLS_INTEGER DEFAULT NULL,
+        p_daysToKeep    PLS_INTEGER DEFAULT NULL,
+        p_tabNameMaster VARCHAR2    DEFAULT 'LILAM',
+        p_baselineScope VARCHAR2    DEFAULT NULL) RETURN NUMBER
     as
-        p_session_init t_session_init;
+        l_session_init t_session_init;
     begin
-        p_session_init.processName := p_processName;
-        p_session_init.logLevel := p_logLevel;
-        p_session_init.daysToKeep := p_daysToKeep;
-        p_session_init.stepsToDo := null;
-        p_session_init.tabNameMaster := p_tabNameMaster;
-
-        return new_session(p_session_init);
+        l_session_init.processName   := p_processName;
+        l_session_init.logLevel      := p_logLevel;
+        l_session_init.stepsToDo     := p_procStepsToDo;
+        l_session_init.daysToKeep    := p_daysToKeep;
+        l_session_init.tabNameMaster := p_tabNameMaster;
+        l_session_init.baselineScope := p_baselineScope;
+        return new_session(l_session_init);
     end;
 
     --------------------------------------------------------------------------
@@ -4382,7 +4322,8 @@ AS
 
         checkLogsBuffer(l_processId, 'vor CLOSE_SESSION');
 
-        CLOSE_SESSION(l_processId, l_procStepsToDo, l_procStepsDone, l_processInfo, l_status);
+        CLOSE_SESSION(p_processId => l_processId, p_processInfo => l_processInfo, p_processStatus => l_status,
+                      p_procStepsDone => l_procStepsDone, p_procStepsToDo => l_procStepsToDo);
         unregisterProcessRoute(l_processId); 
 
         DBMS_PIPE.RESET_BUFFER;
@@ -4661,38 +4602,31 @@ AS
 
     --------------------------------------------------------------------------
 
-    FUNCTION SERVER_NEW_SESSION(p_processName varchar2, p_logLevel PLS_INTEGER, p_procStepsToDo PLS_INTEGER, p_daysToKeep PLS_INTEGER, p_tabNameMaster varchar2) RETURN NUMBER
+    FUNCTION SERVER_NEW_SESSION(
+        p_processName   VARCHAR2,
+        p_groupName     VARCHAR2    DEFAULT NULL,
+        p_logLevel      PLS_INTEGER DEFAULT logLevelMonitor,
+        p_procStepsToDo PLS_INTEGER DEFAULT NULL,
+        p_daysToKeep    PLS_INTEGER DEFAULT NULL,
+        p_tabNameMaster VARCHAR2    DEFAULT 'LILAM',
+        p_baselineScope VARCHAR2    DEFAULT NULL) RETURN NUMBER
     as
         l_payload JSON_OBJ_LILAM;
     begin
-        jsonPut(l_payload, 'process_name', p_processName);
-        jsonPut(l_payload, 'log_level', p_logLevel);
-        jsonPut(l_payload, 'steps_todo', p_procStepsToDo);
-        jsonPut(l_payload, 'days_to_keep', p_daysToKeep);
+        jsonPut(l_payload, 'process_name',   p_processName);
+        jsonPut(l_payload, 'group_name',     p_groupName);
+        jsonPut(l_payload, 'log_level',      p_logLevel);
+        jsonPut(l_payload, 'steps_todo',     p_procStepsToDo);
+        jsonPut(l_payload, 'days_to_keep',   p_daysToKeep);
         jsonPut(l_payload, 'tabname_master', p_tabNameMaster);
+        jsonPut(l_payload, 'baseline_scope', p_baselineScope);
 
-        return server_new_session(l_payload);
+        return server_new_session_json(l_payload);
     end;
 
     --------------------------------------------------------------------------
 
-    FUNCTION SERVER_NEW_SESSION(p_processName varchar2, p_groupName VARCHAR2, p_logLevel PLS_INTEGER, p_procStepsToDo PLS_INTEGER, p_daysToKeep PLS_INTEGER, p_tabNameMaster varchar2) RETURN NUMBER
-    as
-        l_payload JSON_OBJ_LILAM;
-    begin
-        jsonPut(l_payload, 'process_name', p_processName);
-        jsonPut(l_payload, 'group_name', p_groupName);
-        jsonPut(l_payload, 'log_level', p_logLevel);
-        jsonPut(l_payload, 'steps_todo', p_procStepsToDo);
-        jsonPut(l_payload, 'days_to_keep', p_daysToKeep);
-        jsonPut(l_payload, 'tabname_master', p_tabNameMaster);
-
-        return server_new_session(l_payload);
-    end;
-
-    --------------------------------------------------------------------------
-
-    FUNCTION SERVER_NEW_SESSION(p_jsonObject JSON_OBJ_LILAM) RETURN NUMBER
+    FUNCTION SERVER_NEW_SESSION_JSON(p_jsonObject JSON_OBJ_LILAM) RETURN NUMBER
     as
         l_ProcessId number(19,0) := -500;   
         l_response  varchar2(100);        
@@ -5451,7 +5385,7 @@ AS
         g_shutdownPassword := p_password;
         g_serverPipeName := p_pipeName; --l_pipe;
         g_serverGroupName := p_groupName;
-        g_serverProcessId := new_session('LILAM_SERVER', logLevelMonitor, 'LILAM_SERVER');
+        g_serverProcessId := new_session(p_processName => 'LILAM_SERVER', p_logLevel => logLevelMonitor, p_tabNameMaster => 'LILAM_SERVER');
         SET_PROCESS_STATUS(g_serverProcessId, 1, 'RUNNING');
 
         registerServerPipe;
@@ -5609,7 +5543,7 @@ BEGIN
     case l_api_call
         when 'SERVER_NEW_SESSION' THEN
             begin
-                l_proc_id := SERVER_NEW_SESSION(l_jsonParams);
+                l_proc_id := SERVER_NEW_SESSION_JSON(l_jsonParams);
                 jsonPut(l_jsonHeader, 'status', 'SUCCESS');
                 jsonPut(l_jsonPayload, 'returns', 'PROCESS_ID');
                 jsonPut(l_jsonPayload, 'value', l_proc_id);
@@ -5800,7 +5734,7 @@ END;
     begin
         pProcessName := new_session('LILAM Life Check', logLevelDebug);
         debug(pProcessName, 'First Message of LILAM');
-        close_session(pProcessName, 1, 1, 'OK', 1);
+        close_session(p_processId => pProcessName, p_processInfo => 'OK', p_processStatus => 1, p_procStepsDone => 1, p_procStepsToDo => 1);
     end;
 
     BEGIN

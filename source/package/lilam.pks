@@ -80,7 +80,7 @@ create or replace PACKAGE LILAM AS
         processName     VARCHAR2(100),
         logLevel        PLS_INTEGER := logLevelMonitor,
         stepsToDo       PLS_INTEGER,
-        daysToKeep      PLS_INTEGER := 100,
+        daysToKeep      PLS_INTEGER,    -- NULL = keine automatische Loeschung alter Prozessdaten
         procImmortal    PLS_INTEGER := 0,
         tabNameMaster   VARCHAR2(100) DEFAULT 'LILAM',
         baselineScope   VARCHAR2(100)   -- NULL = Prozessname (prozessübergreifend), '#NONE' = nur pro Prozess
@@ -113,18 +113,30 @@ create or replace PACKAGE LILAM AS
     -- Life cycle of a log session
     ------------------------------
     FUNCTION  NEW_SESSION(p_session_init t_session_init) RETURN NUMBER;
-    FUNCTION  NEW_SESSION(p_processName VARCHAR2, p_logLevel PLS_INTEGER default logLevelMonitor, p_tabNameMaster VARCHAR2 default 'LILAM') RETURN NUMBER;
-    FUNCTION  NEW_SESSION(p_processName VARCHAR2, p_logLevel PLS_INTEGER, p_daysToKeep PLS_INTEGER, p_tabNameMaster VARCHAR2 default 'LILAM') RETURN NUMBER;
-    FUNCTION  NEW_SESSION(p_processName VARCHAR2, p_logLevel PLS_INTEGER, p_procStepsToDo PLS_INTEGER, p_daysToKeep PLS_INTEGER, p_tabNameMaster VARCHAR2 DEFAULT 'LILAM') RETURN NUMBER;
+    FUNCTION  NEW_SESSION(
+        p_processName   VARCHAR2,
+        p_logLevel      PLS_INTEGER DEFAULT logLevelMonitor,
+        p_procStepsToDo PLS_INTEGER DEFAULT NULL,
+        p_daysToKeep    PLS_INTEGER DEFAULT NULL,
+        p_tabNameMaster VARCHAR2    DEFAULT 'LILAM',
+        p_baselineScope VARCHAR2    DEFAULT NULL) RETURN NUMBER;
 
-    FUNCTION  SERVER_NEW_SESSION(p_processName varchar2, p_logLevel PLS_INTEGER, p_procStepsToDo PLS_INTEGER, p_daysToKeep PLS_INTEGER, p_tabNameMaster varchar2) RETURN NUMBER;
-    FUNCTION  SERVER_NEW_SESSION(p_processName varchar2, p_groupName VARCHAR2, p_logLevel PLS_INTEGER, p_procStepsToDo PLS_INTEGER, p_daysToKeep PLS_INTEGER, p_tabNameMaster varchar2) RETURN NUMBER;
-    FUNCTION  SERVER_NEW_SESSION(p_jsonObject JSON_OBJ_LILAM) RETURN NUMBER;
+    FUNCTION  SERVER_NEW_SESSION(
+        p_processName   VARCHAR2,
+        p_groupName     VARCHAR2    DEFAULT NULL,
+        p_logLevel      PLS_INTEGER DEFAULT logLevelMonitor,
+        p_procStepsToDo PLS_INTEGER DEFAULT NULL,
+        p_daysToKeep    PLS_INTEGER DEFAULT NULL,
+        p_tabNameMaster VARCHAR2    DEFAULT 'LILAM',
+        p_baselineScope VARCHAR2    DEFAULT NULL) RETURN NUMBER;
+    FUNCTION  SERVER_NEW_SESSION_JSON(p_jsonObject JSON_OBJ_LILAM) RETURN NUMBER;
 
-    PROCEDURE CLOSE_SESSION(p_processId NUMBER);
-    PROCEDURE CLOSE_SESSION(p_processId NUMBER, p_processInfo VARCHAR2, p_processStatus PLS_INTEGER);
-    PROCEDURE CLOSE_SESSION(p_processId NUMBER, p_procStepsDone PLS_INTEGER, p_processInfo VARCHAR2, p_processStatus PLS_INTEGER);
-    PROCEDURE CLOSE_SESSION(p_processId NUMBER, p_procStepsToDo PLS_INTEGER, p_procStepsDone PLS_INTEGER, p_processInfo VARCHAR2, p_processStatus PLS_INTEGER);
+    PROCEDURE CLOSE_SESSION(
+        p_processId     NUMBER,
+        p_processInfo   VARCHAR2    DEFAULT NULL,
+        p_processStatus PLS_INTEGER DEFAULT NULL,
+        p_procStepsDone PLS_INTEGER DEFAULT NULL,
+        p_procStepsToDo PLS_INTEGER DEFAULT NULL);
 
     ---------------------------------
     -- Update the status of a process
