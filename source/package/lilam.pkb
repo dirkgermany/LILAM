@@ -189,6 +189,9 @@ AS
     -- Master-Tabellen, deren Tabellen in dieser Session bereits geprueft/angelegt wurden
     TYPE t_checked_masters IS TABLE OF BOOLEAN INDEX BY VARCHAR2(100);
     g_checked_masters t_checked_masters;
+    -- PERFORMANCE: Ergebnis von DBMS_ASSERT.SQL_OBJECT_NAME je Tabellenname (kostet sonst ca. 0,4 ms je Flush)
+    TYPE t_safe_tables IS TABLE OF VARCHAR2(150) INDEX BY VARCHAR2(150);
+    g_safe_tables t_safe_tables;
 
     -- remember to latest action
     TYPE t_action_history_rec IS RECORD (
@@ -227,6 +230,50 @@ AS
 
     -- Time precision
     TYPE t_timestamp_list_t IS TABLE OF TIMESTAMP(6);
+
+    -- PERFORMANCE: Sammelpuffer für den gebündelten Flush in SYNC_ALL_DIRTY (siehe flushBatch)
+    TYPE t_log_batch_rec IS RECORD (
+        pids       sys.odcinumberlist   := sys.odcinumberlist(),
+        seqs       sys.odcinumberlist   := sys.odcinumberlist(),
+        levels     sys.odcinumberlist   := sys.odcinumberlist(),
+        levelsC    sys.odcivarchar2list := sys.odcivarchar2list(),
+        texts      sys.odcivarchar2list := sys.odcivarchar2list(),
+        times      t_timestamp_list_t   := t_timestamp_list_t(),
+        callers    sys.odcivarchar2list := sys.odcivarchar2list(),
+        stacks     sys.odcivarchar2list := sys.odcivarchar2list(),
+        backtraces sys.odcivarchar2list := sys.odcivarchar2list(),
+        callstacks sys.odcivarchar2list := sys.odcivarchar2list()
+    );
+    TYPE t_log_batches IS TABLE OF t_log_batch_rec INDEX BY VARCHAR2(150);
+
+    TYPE t_mon_batch_rec IS RECORD (
+        pids         sys.odcinumberlist   := sys.odcinumberlist(),
+        actions      sys.odcivarchar2list := sys.odcivarchar2list(),
+        contexts     sys.odcivarchar2list := sys.odcivarchar2list(),
+        mon_types    sys.odcinumberlist   := sys.odcinumberlist(),
+        action_count sys.odcinumberlist   := sys.odcinumberlist(),
+        used         sys.odcinumberlist   := sys.odcinumberlist(),
+        avgs         sys.odcinumberlist   := sys.odcinumberlist(),
+        timesStart   t_timestamp_list_t   := t_timestamp_list_t(),
+        timesStop    t_timestamp_list_t   := t_timestamp_list_t()
+    );
+    TYPE t_mon_batches IS TABLE OF t_mon_batch_rec INDEX BY VARCHAR2(150);
+
+    TYPE t_proc_batch_rec IS RECORD (
+        ids        sys.odcinumberlist   := sys.odcinumberlist(),
+        status     sys.odcinumberlist   := sys.odcinumberlist(),
+        procEnd    t_timestamp_list_t   := t_timestamp_list_t(),
+        stepsTodo  sys.odcinumberlist   := sys.odcinumberlist(),
+        stepsDone  sys.odcinumberlist   := sys.odcinumberlist(),
+        info       sys.odcivarchar2list := sys.odcivarchar2list(),
+        immortal   sys.odcinumberlist   := sys.odcinumberlist()
+    );
+    TYPE t_proc_batches IS TABLE OF t_proc_batch_rec INDEX BY VARCHAR2(150);  -- Schlüssel: Master-Tabelle
+
+    g_batch_mode    BOOLEAN := FALSE;
+    g_log_batches   t_log_batches;
+    g_mon_batches   t_mon_batches;
+    g_proc_batches  t_proc_batches;
 
 
     ---------------------------------------------------------------
@@ -339,6 +386,7 @@ AS
     procedure sync_monitor(p_processId number, p_force boolean default false);
     procedure sync_process(p_processId number, p_force boolean default false);
     procedure flushMonitor(p_processId number);
+    procedure flushBatch;
     function getServerPipeAvailable(p_groupName varchar2) return varchar2;
     procedure createInternalLogTable;
     FUNCTION SERVER_LINK(p_processId NUMBER, p_pipeName varchar2) RETURN NUMBER;
@@ -684,6 +732,21 @@ AS
     begin
         if p_value is null then return null; end if;
         return ',"' || p_key || '":"' || to_char(p_value, 'YYYY-MM-DD"T"HH24:MI:SS.FF6') || '"';
+    end;
+
+    --------------------------------------------------------------------------
+    -- PERFORMANCE: Tabellenname nur einmal je Session über DBMS_ASSERT prüfen.
+    -- DBMS_ASSERT.SQL_OBJECT_NAME löst den Namen im Data Dictionary auf und kostete
+    -- im Server-Profil 0,4 ms je Aufruf (8 % der Serverzeit im Massentest).
+    -- Der Cache wird zusammen mit g_checked_masters geleert (z.B. bei ORA-00942).
+    --------------------------------------------------------------------------
+    function safeTableName(p_table varchar2) return varchar2
+    as
+    begin
+        if not g_safe_tables.EXISTS(p_table) then
+            g_safe_tables(p_table) := DBMS_ASSERT.SQL_OBJECT_NAME(p_table);
+        end if;
+        return g_safe_tables(p_table);
     end;
 
     --------------------------------------------------------------------------
@@ -1393,7 +1456,7 @@ AS
         end if;
 
         l_sqlStmt := l_sqlStmt || '
-        ORDER BY processing ASC, current_load ASC, last_activity DESC 
+        ORDER BY processing ASC, current_processes ASC, last_activity DESC 
         FETCH FIRST 1 ROW ONLY';
 
         execute immediate l_sqlStmt into l_serverPipeName;
@@ -1725,7 +1788,7 @@ AS
                 pipe_name      VARCHAR2(50) PRIMARY KEY,
                 group_name     VARCHAR2(50),
                 last_activity  TIMESTAMP(3),
-                current_load   NUMBER,
+                current_processes   NUMBER,
                 is_active      NUMBER(1),
                 status         VARCHAR2(20),
                 processing     NUMBER,
@@ -1819,7 +1882,7 @@ AS
        if not objectExists('idx_lilam_registry_group', 'INDEX') then
             sqlStmt := '
             CREATE INDEX idx_lilam_registry_group 
-            ON C_LILAM_SERVER_REGISTRY (group_name, is_active, current_load)';
+            ON C_LILAM_SERVER_REGISTRY (group_name, is_active, current_processes)';
             sqlStmt := replace(sqlStmt, 'C_LILAM_SERVER_REGISTRY', C_LILAM_SERVER_REGISTRY);
             run_sql(sqlStmt);
         end if ;
@@ -1961,6 +2024,120 @@ AS
     --------------------------------------------------------------------------
     -- Flush monitor data to detail table
     --------------------------------------------------------------------------
+    --------------------------------------------------------------------------
+    -- PERFORMANCE: Gebündelter Flush in SYNC_ALL_DIRTY
+    --
+    -- Vorher schrieb SYNC_ALL_DIRTY jeden fälligen Prozess einzeln: je Tabelle (_LOG, _MON, _PROC)
+    -- eine eigene autonome Transaktion mit eigenem Commit. Bei 200 offenen Prozessen waren das
+    -- je Durchlauf bis zu 600 Schreibvorgänge und 600 Commits; der Server las währenddessen
+    -- keine Nachrichten aus der Pipe.
+    --
+    -- Jetzt: Während SYNC_ALL_DIRTY ist g_batch_mode gesetzt. persist_log_data,
+    -- persist_monitor_data und persist_process_record schreiben dann nicht selbst, sondern
+    -- hängen ihre Zeilen an einen Sammelpuffer je Zieltabelle an. flushBatch schreibt am Ende
+    -- des Durchlaufs alles mit einem FORALL je Tabelle und EINEM Commit.
+    --
+    -- Was und wann geschrieben wird, bleibt unverändert (gleiche Fälligkeitsprüfung je Prozess).
+    -- CLOSE_SESSION schreibt weiterhin sofort und nur den eigenen Prozess (kein Batch-Modus).
+    --------------------------------------------------------------------------
+    -- (Typen und Sammelpuffer siehe Deklarationsteil: t_log_batch_rec, g_batch_mode ...)
+
+    procedure appendLogBatch(
+        p_processId number, p_target_table varchar2,
+        p_seqs sys.odcinumberlist, p_levels sys.odcinumberlist, p_levelsC sys.odcivarchar2list,
+        p_texts sys.odcivarchar2list, p_times t_timestamp_list_t, p_callers sys.odcivarchar2list,
+        p_stacks sys.odcivarchar2list, p_backtraces sys.odcivarchar2list, p_callstacks sys.odcivarchar2list)
+    as
+        l_n     pls_integer;
+        l_empty t_log_batch_rec;   -- Record mit leeren Listen (Defaults)
+    begin
+        if not g_log_batches.EXISTS(p_target_table) then
+            g_log_batches(p_target_table) := l_empty;
+        end if;
+        l_n := g_log_batches(p_target_table).pids.COUNT;
+        g_log_batches(p_target_table).pids.EXTEND(p_levels.COUNT);
+        g_log_batches(p_target_table).seqs.EXTEND(p_levels.COUNT);
+        g_log_batches(p_target_table).levels.EXTEND(p_levels.COUNT);
+        g_log_batches(p_target_table).levelsC.EXTEND(p_levels.COUNT);
+        g_log_batches(p_target_table).texts.EXTEND(p_levels.COUNT);
+        g_log_batches(p_target_table).times.EXTEND(p_levels.COUNT);
+        g_log_batches(p_target_table).callers.EXTEND(p_levels.COUNT);
+        g_log_batches(p_target_table).stacks.EXTEND(p_levels.COUNT);
+        g_log_batches(p_target_table).backtraces.EXTEND(p_levels.COUNT);
+        g_log_batches(p_target_table).callstacks.EXTEND(p_levels.COUNT);
+        for i in 1 .. p_levels.COUNT loop
+            g_log_batches(p_target_table).pids(l_n + i)       := p_processId;
+            g_log_batches(p_target_table).seqs(l_n + i)       := p_seqs(i);
+            g_log_batches(p_target_table).levels(l_n + i)     := p_levels(i);
+            g_log_batches(p_target_table).levelsC(l_n + i)    := p_levelsC(i);
+            g_log_batches(p_target_table).texts(l_n + i)      := p_texts(i);
+            g_log_batches(p_target_table).times(l_n + i)      := p_times(i);
+            g_log_batches(p_target_table).callers(l_n + i)    := p_callers(i);
+            g_log_batches(p_target_table).stacks(l_n + i)     := p_stacks(i);
+            g_log_batches(p_target_table).backtraces(l_n + i) := p_backtraces(i);
+            g_log_batches(p_target_table).callstacks(l_n + i) := p_callstacks(i);
+        end loop;
+    end;
+
+    procedure appendMonBatch(
+        p_processId number, p_target_table varchar2,
+        p_actions sys.odcivarchar2list, p_contexts sys.odcivarchar2list, p_mon_types sys.odcinumberlist,
+        p_action_count sys.odcinumberlist, p_used sys.odcinumberlist, p_avgs sys.odcinumberlist,
+        p_timesStart t_timestamp_list_t, p_timesStop t_timestamp_list_t)
+    as
+        l_n     pls_integer;
+        l_empty t_mon_batch_rec;
+    begin
+        if not g_mon_batches.EXISTS(p_target_table) then
+            g_mon_batches(p_target_table) := l_empty;
+        end if;
+        l_n := g_mon_batches(p_target_table).pids.COUNT;
+        g_mon_batches(p_target_table).pids.EXTEND(p_actions.COUNT);
+        g_mon_batches(p_target_table).actions.EXTEND(p_actions.COUNT);
+        g_mon_batches(p_target_table).contexts.EXTEND(p_actions.COUNT);
+        g_mon_batches(p_target_table).mon_types.EXTEND(p_actions.COUNT);
+        g_mon_batches(p_target_table).action_count.EXTEND(p_actions.COUNT);
+        g_mon_batches(p_target_table).used.EXTEND(p_actions.COUNT);
+        g_mon_batches(p_target_table).avgs.EXTEND(p_actions.COUNT);
+        g_mon_batches(p_target_table).timesStart.EXTEND(p_actions.COUNT);
+        g_mon_batches(p_target_table).timesStop.EXTEND(p_actions.COUNT);
+        for i in 1 .. p_actions.COUNT loop
+            g_mon_batches(p_target_table).pids(l_n + i)         := p_processId;
+            g_mon_batches(p_target_table).actions(l_n + i)      := p_actions(i);
+            g_mon_batches(p_target_table).contexts(l_n + i)     := p_contexts(i);
+            g_mon_batches(p_target_table).mon_types(l_n + i)    := p_mon_types(i);
+            g_mon_batches(p_target_table).action_count(l_n + i) := p_action_count(i);
+            g_mon_batches(p_target_table).used(l_n + i)         := p_used(i);
+            g_mon_batches(p_target_table).avgs(l_n + i)         := p_avgs(i);
+            g_mon_batches(p_target_table).timesStart(l_n + i)   := p_timesStart(i);
+            g_mon_batches(p_target_table).timesStop(l_n + i)    := p_timesStop(i);
+        end loop;
+    end;
+
+    procedure appendProcBatch(p_process_rec t_process_rec)
+    as
+        l_key   varchar2(150) := p_process_rec.tabNameMaster;
+        l_n     pls_integer;
+        l_empty t_proc_batch_rec;
+    begin
+        if not g_proc_batches.EXISTS(l_key) then
+            g_proc_batches(l_key) := l_empty;
+        end if;
+        g_proc_batches(l_key).ids.EXTEND;       l_n := g_proc_batches(l_key).ids.COUNT;
+        g_proc_batches(l_key).status.EXTEND;    g_proc_batches(l_key).procEnd.EXTEND;
+        g_proc_batches(l_key).stepsTodo.EXTEND; g_proc_batches(l_key).stepsDone.EXTEND;
+        g_proc_batches(l_key).info.EXTEND;      g_proc_batches(l_key).immortal.EXTEND;
+        g_proc_batches(l_key).ids(l_n)       := p_process_rec.id;
+        g_proc_batches(l_key).status(l_n)    := p_process_rec.status;
+        g_proc_batches(l_key).procEnd(l_n)   := p_process_rec.processEnd;
+        g_proc_batches(l_key).stepsTodo(l_n) := p_process_rec.stepsTodo;
+        g_proc_batches(l_key).stepsDone(l_n) := p_process_rec.stepsDone;
+        g_proc_batches(l_key).info(l_n)      := p_process_rec.info;
+        g_proc_batches(l_key).immortal(l_n)  := p_process_rec.procImmortal;
+    end;
+
+    --------------------------------------------------------------------------
+
     procedure persist_log_data(
         p_processId    number,
         p_target_table varchar2,
@@ -1978,9 +2155,18 @@ AS
         pragma autonomous_transaction;
         v_safe_table varchar2(150);
     begin
+        -- PERFORMANCE: im gebündelten Flush nur sammeln, flushBatch schreibt (siehe g_batch_mode)
+        if g_batch_mode then
+            if p_levels.count > 0 then
+                appendLogBatch(p_processId, p_target_table, p_seqs, p_levels, p_levelsC, p_texts, p_times,
+                               p_callers, p_stacks, p_backtraces, p_callstacks);
+            end if;
+            return;
+        end if;
+
         if p_levels.count > 0 then            
             -- Sicherheit: Tabellenname validieren
-            v_safe_table := DBMS_ASSERT.SQL_OBJECT_NAME(p_target_table);
+            v_safe_table := safeTableName(p_target_table);
             -- Bulk-Insert über alle gesammelten Log-Einträge
             forall i in 1 .. p_levels.count SAVE EXCEPTIONS
                 execute immediate 
@@ -2004,7 +2190,7 @@ AS
             else
                 rollback;
                 -- Tabelle fehlt: beim naechsten NEW_SESSION erneut pruefen und anlegen
-                if sqlcode = -942 then g_checked_masters.DELETE; end if;
+                if sqlcode = -942 then g_checked_masters.DELETE; g_safe_tables.DELETE; end if;
                 logLilamErr(sqlCode, sqlErrM, 'persist_log_data');
             end if;
 
@@ -2163,9 +2349,18 @@ AS
         v_host varchar2(128) := SYS_CONTEXT('USERENV','HOST');
         v_safe_table varchar2(150);
     begin
+        -- PERFORMANCE: im gebündelten Flush nur sammeln, flushBatch schreibt (siehe g_batch_mode)
+        if g_batch_mode then
+            if p_actions.count > 0 then
+                appendMonBatch(p_processId, p_target_table, p_actions, p_contexts, p_mon_types,
+                               p_action_count, p_used, p_avgs, p_timesStart, p_timesStop);
+            end if;
+            return;
+        end if;
+
         if p_actions.count > 0 then
             -- Sicherheit: Tabellenname validieren
-            v_safe_table := DBMS_ASSERT.SQL_OBJECT_NAME(p_target_table);
+            v_safe_table := safeTableName(p_target_table);
             forall i in 1 .. p_actions.count SAVE EXCEPTIONS
                 execute immediate
                 'insert into ' || v_safe_table || ' 
@@ -2187,7 +2382,7 @@ AS
             else
                 rollback;
                 -- Tabelle fehlt: beim naechsten NEW_SESSION erneut pruefen und anlegen
-                if sqlcode = -942 then g_checked_masters.DELETE; end if;
+                if sqlcode = -942 then g_checked_masters.DELETE; g_safe_tables.DELETE; end if;
                 logLilamErr(sqlCode, sqlErrM, 'persist_monitor_data');
             end if;
 
@@ -2391,7 +2586,10 @@ AS
 
         -- ======================================================================
         -- TEIL 1: BEARBEITUNG DER DRECKIGEN LISTE (Queue)
+        -- PERFORMANCE: Im Batch-Modus sammeln persist_* nur; flushBatch schreibt danach
+        -- alle fälligen Prozesse gemeinsam (je Tabelle ein FORALL, ein Commit).
         -- ======================================================================
+        g_batch_mode := TRUE;
         v_id := g_dirty_queue.FIRST;
 
         WHILE v_id IS NOT NULL LOOP
@@ -2431,6 +2629,9 @@ AS
             v_id := v_next_id;
         END LOOP;
 
+        g_batch_mode := FALSE;
+        flushBatch;
+
         -- ======================================================================
         -- TEIL 2: MASTER-CLEANUP BEI SHUTDOWN
         -- Hier räumen wir die RAM-Reste (Round-Robin) aller bekannten Sessions weg
@@ -2451,6 +2652,12 @@ AS
         -- ======================================================================
         syncBaselines(p_force OR p_isShutdown);
 
+    EXCEPTION
+        WHEN OTHERS THEN
+            -- Batch-Modus darf nie aktiv bleiben, sonst würden auch spätere Einzel-Flushes nur gesammelt
+            g_batch_mode := FALSE;
+            logLilamErr(sqlCode, sqlErrM, 'SYNC_ALL_DIRTY');
+            flushBatch;
     END SYNC_ALL_DIRTY;
 
 
@@ -2479,7 +2686,14 @@ AS
         v_idx_session := v_indexSession(p_processId);
         v_targetTable := g_sessionList(v_idx_session).tabName_master || C_SUFFIX_MON_TABLE;
 
-        v_group_key := g_monitor_groups.FIRST;
+        -- PERFORMANCE: Die Schlüssel sind sortiert ("<process_id 20-stellig>|Aktion|Kontext").
+        -- Statt alle Puffer aller Prozesse zu durchlaufen und per LIKE zu filtern (quadratischer
+        -- Aufwand bei vielen offenen Prozessen), direkt beim ersten Schlüssel dieses Prozesses
+        -- einsteigen und abbrechen, sobald der Präfix nicht mehr passt.
+        v_group_key := g_monitor_groups.NEXT(v_id_prefix);
+        if v_group_key is not null and substr(v_group_key, 1, length(v_id_prefix)) != v_id_prefix then
+            v_group_key := null;
+        end if;
 
         if v_group_key is not null then
             -- calculate latency of oldest monitor entry until persistance
@@ -2489,8 +2703,8 @@ AS
         end if;
 
         while v_group_key is not null loop     
-            -- Filter: Gehört dieser "Eimer" zum aktuellen Prozess?
-           if v_group_key like v_id_prefix || '%' then  
+            -- Ende der Schlüssel dieses Prozesses erreicht
+            exit when substr(v_group_key, 1, length(v_id_prefix)) != v_id_prefix;
                 -- 1. Alles einsammeln, was aktuell im Eimer ist
                     for i in 1 .. g_monitor_groups(v_group_key).COUNT loop
                         v_actions.extend;      v_actions(v_actions.last)          := g_monitor_groups(v_group_key)(i).action_name;
@@ -2505,7 +2719,6 @@ AS
 
                 -- 3. Radikaler Kahlschlag im RAM (SGA/PGA Hygiene)
                 g_monitor_groups(v_group_key).DELETE;
-            end if ;
 
             v_group_key := g_monitor_groups.NEXT(v_group_key);
         end loop;
@@ -3196,6 +3409,12 @@ AS
         pragma autonomous_transaction;
         sqlStatement varchar2(1000);
     begin
+        -- PERFORMANCE: im gebündelten Flush nur sammeln, flushBatch schreibt (siehe g_batch_mode)
+        if g_batch_mode then
+            appendProcBatch(p_process_rec);
+            return;
+        end if;
+
         sqlStatement := '
         update ' || C_PARAM_MASTER_TABLE || '
         set status           = :PH_STATUS,
@@ -3224,6 +3443,115 @@ AS
             rollback; -- im Fehlerfall die Transaktion beenden
             logLilamErr(sqlCode, sqlErrM, 'persist_process_record', 'EXECUTE IMMEDIATE');
             
+    end;
+
+    --------------------------------------------------------------------------
+    -- PERFORMANCE: Schreibt die in SYNC_ALL_DIRTY gesammelten Zeilen aller Prozesse.
+    -- Je Zieltabelle ein FORALL, für alles zusammen EIN Commit (autonome Transaktion).
+    -- Ein fehlerhafter Datensatz wird über SAVE EXCEPTIONS einzeln protokolliert, die übrigen
+    -- Zeilen bleiben erhalten. Scheitert eine Anweisung insgesamt (z.B. Tabelle fehlt), wird nur
+    -- diese Anweisung zurückgerollt; die anderen Tabellen werden trotzdem geschrieben.
+    --------------------------------------------------------------------------
+    procedure flushBatch
+    as
+        pragma autonomous_transaction;
+        v_user  constant varchar2(128) := SYS_CONTEXT('USERENV','SESSION_USER');
+        v_host  constant varchar2(128) := SYS_CONTEXT('USERENV','HOST');
+        v_key   varchar2(150);
+        v_table varchar2(150);
+        v_stmt  varchar2(1000);
+
+        procedure handleErr(p_code number, p_msg varchar2, p_module varchar2) is
+        begin
+            if p_code = -24381 then
+                for i in 1 .. sql%bulk_exceptions.count loop
+                    logLilamErr(-sql%bulk_exceptions(i).error_code, sqlerrm(-sql%bulk_exceptions(i).error_code),
+                                p_module, 'row ' || sql%bulk_exceptions(i).error_index || ' skipped');
+                end loop;
+            else
+                if p_code = -942 then g_checked_masters.DELETE; g_safe_tables.DELETE; end if;
+                logLilamErr(p_code, p_msg, p_module);
+            end if;
+        end;
+    begin
+        -- Logs
+        v_key := g_log_batches.FIRST;
+        while v_key is not null loop
+            begin
+                v_table := safeTableName(v_key);
+                forall i in 1 .. g_log_batches(v_key).pids.COUNT SAVE EXCEPTIONS
+                    execute immediate
+                        'insert into ' || v_table || '
+                        (PROCESS_ID, LOG_LEVEL, LOG_LEVEL_C, INFO, SESSION_TIME, NO, CALLER, ERR_STACK, ERR_BACKTRACE, ERR_CALLSTACK, SESSION_USER, HOST_NAME)
+                        values (:1, :2, :3, :4, :5, :6, :7, :8, :9, :10, :11, :12)'
+                    USING g_log_batches(v_key).pids(i), g_log_batches(v_key).levels(i), g_log_batches(v_key).levelsC(i),
+                          g_log_batches(v_key).texts(i), g_log_batches(v_key).times(i), g_log_batches(v_key).seqs(i),
+                          g_log_batches(v_key).callers(i), g_log_batches(v_key).stacks(i), g_log_batches(v_key).backtraces(i),
+                          g_log_batches(v_key).callstacks(i), v_user, v_host;
+            exception
+                when others then handleErr(sqlcode, sqlerrm, 'flushBatch/LOG');
+            end;
+            v_key := g_log_batches.NEXT(v_key);
+        end loop;
+
+        -- Monitor
+        v_key := g_mon_batches.FIRST;
+        while v_key is not null loop
+            begin
+                v_table := safeTableName(v_key);
+                forall i in 1 .. g_mon_batches(v_key).pids.COUNT SAVE EXCEPTIONS
+                    execute immediate
+                        'insert into ' || v_table || '
+                        (PROCESS_ID, ACTION, CONTEXT, MON_TYPE, ACTION_COUNT, USED_MILLIS, AVG_MILLIS, START_TIME, STOP_TIME, SESSION_USER, HOST_NAME)
+                        values (:1, :2, :3, :4, :5, :6, :7, :8, :9, :10, :11)'
+                    USING g_mon_batches(v_key).pids(i), g_mon_batches(v_key).actions(i), g_mon_batches(v_key).contexts(i),
+                          g_mon_batches(v_key).mon_types(i), g_mon_batches(v_key).action_count(i), g_mon_batches(v_key).used(i),
+                          g_mon_batches(v_key).avgs(i), g_mon_batches(v_key).timesStart(i), g_mon_batches(v_key).timesStop(i),
+                          v_user, v_host;
+            exception
+                when others then handleErr(sqlcode, sqlerrm, 'flushBatch/MON');
+            end;
+            v_key := g_mon_batches.NEXT(v_key);
+        end loop;
+
+        -- Prozess-Datensätze (_PROC)
+        v_key := g_proc_batches.FIRST;
+        while v_key is not null loop
+            begin
+                v_stmt := '
+                update ' || C_PARAM_MASTER_TABLE || '
+                set status           = :1,
+                    last_update      = current_timestamp,
+                    process_end      = :2,
+                    steps_todo       = :3,
+                    steps_done       = :4,
+                    info             = :5,
+                    process_immortal = :6
+                where id = :7';
+                v_stmt := replaceNameTable(v_stmt, C_PARAM_MASTER_TABLE, C_SUFFIX_PROC_TABLE, v_key);
+                forall i in 1 .. g_proc_batches(v_key).ids.COUNT SAVE EXCEPTIONS
+                    execute immediate v_stmt
+                    USING g_proc_batches(v_key).status(i), g_proc_batches(v_key).procEnd(i), g_proc_batches(v_key).stepsTodo(i),
+                          g_proc_batches(v_key).stepsDone(i), g_proc_batches(v_key).info(i), g_proc_batches(v_key).immortal(i),
+                          g_proc_batches(v_key).ids(i);
+            exception
+                when others then handleErr(sqlcode, sqlerrm, 'flushBatch/PROC');
+            end;
+            v_key := g_proc_batches.NEXT(v_key);
+        end loop;
+
+        commit;
+        g_log_batches.DELETE;
+        g_mon_batches.DELETE;
+        g_proc_batches.DELETE;
+
+    exception
+        when others then
+            rollback;
+            g_log_batches.DELETE;
+            g_mon_batches.DELETE;
+            g_proc_batches.DELETE;
+            logLilamErr(sqlCode, sqlErrM, 'flushBatch');
     end;
 
     -------------------------------------------------------------------
@@ -3345,7 +3673,7 @@ AS
         when others then
             rollback; -- Auch im Fehlerfall die Transaktion beenden
             -- Tabelle fehlt: beim naechsten NEW_SESSION erneut pruefen und anlegen
-            if sqlcode = -942 then g_checked_masters.DELETE; end if;
+            if sqlcode = -942 then g_checked_masters.DELETE; g_safe_tables.DELETE; end if;
             logLilamErr(sqlCode, sqlErrM, 'persist_new_session'); 
             
     end;
@@ -3951,6 +4279,7 @@ AS
         g_baselines.DELETE;
         g_scope_ids.DELETE;
         g_checked_masters.DELETE;
+        g_safe_tables.DELETE;
         g_last_baseline_sync := NULL;
 
         g_monitor_groups.delete;
@@ -3987,15 +4316,13 @@ AS
 
         -- A) MONITOR-DATEN & CACHES RÄUMEN
         -- Wir nutzen den sicheren Loop (Sichern vor Löschen)
-        v_key := g_monitor_groups.FIRST;
+        -- PERFORMANCE: direkt beim ersten Schlüssel dieses Prozesses einsteigen (Schlüssel sind sortiert)
+        v_key := g_monitor_groups.NEXT(v_search_prefix);
         WHILE v_key IS NOT NULL LOOP
-            EXIT WHEN SUBSTR(v_key, 1, 20) > LPAD(p_processId, 20, '0');
+            EXIT WHEN SUBSTR(v_key, 1, LENGTH(v_search_prefix)) != v_search_prefix;
             v_next_key := g_monitor_groups.NEXT(v_key);
-
-            if v_key LIKE v_search_prefix || '%' THEN
-                -- Historie löschen
-                g_monitor_groups.DELETE(v_key);
-            end if ;
+            -- Historie löschen
+            g_monitor_groups.DELETE(v_key);
             v_key := v_next_key;
         END LOOP;
 
@@ -5010,7 +5337,7 @@ AS
             set last_activity = systimestamp,
                 is_active = 1,
                 group_name = :1,
-                current_load = 0
+                current_processes = 0
             where upper(pipe_name) = :2';            
             execute immediate l_sqlStmt using g_serverGroupName, upper(g_serverPipeName);
         else
@@ -5021,7 +5348,7 @@ AS
                 group_name,
                 last_activity,
                 is_active,
-                current_load,
+                current_processes,
                 avg_log_lat,
                 max_log_lat,
                 avg_mon_lat,
@@ -5309,7 +5636,7 @@ AS
         UPDATE ' || C_LILAM_SERVER_REGISTRY || '
         SET last_activity = SYSTIMESTAMP, 
             is_active = :1,
-            current_load = nvl((SELECT pipe_size FROM v$db_pipes WHERE upper(name) = :2), 0),
+            current_processes = :2,  -- Anzahl offener Prozesse (vorher Spalte current_load = pipe_size aus v$db_pipes, siehe unten)
             status = :3,
             processing = :4,
             avg_log_lat = :5,
@@ -5317,7 +5644,12 @@ AS
             avg_mon_lat = :7,
             max_mon_lat = :8
         WHERE upper(pipe_name) = :9';
-        execute immediate l_sqlStmt USING l_booleanAsInt, upper(g_serverPipeName), l_status, p_eventCounter, 
+        -- CURRENT_PROCESSES = Anzahl der offenen Prozesse dieses Servers (ohne den Server-Prozess selbst).
+        -- Vorher: pipe_size aus v$db_pipes. Das war ungeeignet und teuer:
+        --   * pipe_size ist ein Höchststand des belegten Speichers und sinkt nach dem Abarbeiten nicht wieder
+        --   * v$db_pipes durchsucht den gesamten Library Cache (ca. 120-190 ms je Abfrage, Server blockiert)
+        --   * erforderte einen zusätzlichen Grant auf V_$DB_PIPES
+        execute immediate l_sqlStmt USING l_booleanAsInt, greatest(v_indexSession.COUNT - 1, 0), l_status, p_eventCounter, 
             g_avgLatencyLogs, g_maxLatencyLogs, g_avgLatencyMon, g_maxLatencyMon, upper(g_serverPipeName);
         COMMIT; -- Muss autonom sein!
 
