@@ -46,6 +46,7 @@ AS
     ---------------------------------------------------------------
     C_TIMEOUT_NEW_SESSION_SEC           CONSTANT NUMBER      := 3.0;  -- NEW_SESSION max. time waiting for server response
     C_METRIC_ALERT_FACTOR_SEC           CONSTANT NUMBER      := 2.0;   -- Max. Ausreißer in der Dauer eines Verarbeitungsschrittes
+    C_MAX_LOG_TEXT_LEN                  CONSTANT PLS_INTEGER := 1900;  -- Logtexte werden pauschal auf diese Länge gekürzt (Spalte INFO: 2000)
 
     -- Baseline Scopes (prozessübergreifende Durchschnittswerte)
     -- t_session_init.baselineScope:  NULL    => Scope = Prozessname (Default)
@@ -1915,8 +1916,17 @@ AS
 
     exception
         when others then
-            rollback;
-            logLilamErr(sqlCode, sqlErrM, 'persist_log_data');
+            if sqlcode = -24381 then
+                -- FORALL ... SAVE EXCEPTIONS: erfolgreiche Zeilen behalten, nur fehlerhafte protokollieren
+                for i in 1 .. sql%bulk_exceptions.count loop
+                    logLilamErr(-sql%bulk_exceptions(i).error_code, sqlerrm(-sql%bulk_exceptions(i).error_code),
+                                'persist_log_data', 'row ' || sql%bulk_exceptions(i).error_index || ' skipped');
+                end loop;
+                commit;
+            else
+                rollback;
+                logLilamErr(sqlCode, sqlErrM, 'persist_log_data');
+            end if;
 
     end;
 
@@ -2087,8 +2097,17 @@ AS
         end if ;
     exception
         when others then
-            rollback;
-            logLilamErr(sqlCode, sqlErrM, 'persist_monitor_data');
+            if sqlcode = -24381 then
+                -- FORALL ... SAVE EXCEPTIONS: erfolgreiche Zeilen behalten, nur fehlerhafte protokollieren
+                for i in 1 .. sql%bulk_exceptions.count loop
+                    logLilamErr(-sql%bulk_exceptions(i).error_code, sqlerrm(-sql%bulk_exceptions(i).error_code),
+                                'persist_monitor_data', 'row ' || sql%bulk_exceptions(i).error_index || ' skipped');
+                end loop;
+                commit;
+            else
+                rollback;
+                logLilamErr(sqlCode, sqlErrM, 'persist_monitor_data');
+            end if;
 
     end;
 
@@ -3437,7 +3456,15 @@ AS
         l_module      VARCHAR2(255) := p_caller;
         v_dummyMonRec   t_monitor_buffer_rec;
         v_stack_unit  UTL_CALL_STACK.unit_qualified_name;        
+        l_logText     VARCHAR2(8000);
     begin
+        -- Pauschal kürzen: gilt für Insession und Decoupled (vor dem Versand über die Pipe).
+        -- Zusätzlich auf die 2000 Bytes der Spalte INFO begrenzen (Mehrbyte-Zeichen, z.B. Umlaute)
+        l_logText := substr(p_logText, 1, C_MAX_LOG_TEXT_LEN);
+        while lengthb(l_logText) > 2000 loop
+            l_logText := substr(l_logText, 1, length(l_logText) - 50);
+        end loop;
+
         -- lookup in stack - who called me?
         if l_module is null then
             -- Name von LILAM könnte sich theoretisch ändern
@@ -3467,7 +3494,7 @@ AS
         end if;
             
         if is_remote(p_processId) then
-            log_anyRemote(p_processId, p_level, p_logText, l_module, p_errStack, p_errBacktrace, p_errCallstack, p_timestamp);
+            log_anyRemote(p_processId, p_level, l_logText, l_module, p_errStack, p_errBacktrace, p_errCallstack, p_timestamp);
             return;
         end if ;
 
@@ -3476,7 +3503,7 @@ AS
             write_to_log_buffer(
                 p_processId, 
                 p_level,
-                p_logText,
+                l_logText,
                 p_timestamp,
                 l_module,
                 p_errStack,
