@@ -17,15 +17,23 @@ INSESSION/                  LILAM als Bibliothek in der Session der Anwendung
 
 DECOUPLED/
   SERVER/                   Client direkt am LILAM-Server (ohne Dispatcher)
-    LASTTEST/  MASSENTEST/  PARALLELBETRIEB/  PROZESSZYKLEN/  DAUERTEST/  WAKEUP/
+    LASTTEST/  MASSENTEST/  PARALLELBETRIEB/  PROZESSZYKLEN/  DAUERTEST/  WAKEUP/  LASTSPITZE/
   DISPATCHER/               Client über den Dispatcher (z.B. APEX mit Connection Pool)
-    LASTTEST/  MASSENTEST/  PARALLELBETRIEB/  PROZESSZYKLEN/  DAUERTEST/  WAKEUP/
+    LASTTEST/  MASSENTEST/  PARALLELBETRIEB/  PROZESSZYKLEN/  DAUERTEST/  WAKEUP/  LASTSPITZE/
 
 FEATURES/                   Funktionstests einzelner Merkmale (modusübergreifend)
   BASELINE_SCOPE/  LOGTEXT_GRENZEN/  DISPATCHER_APEX/  FEHLERFAELLE/
+
+DAUERTEST/                  Dauertest über alle Modi gleichzeitig (Kombination der Tests)
 ```
 
 Jeder Testordner enthält das Skript `test_*.sql` und einen Ordner `results/` für die Auswertungen.
+
+Die Testlogik steht im Package `LT` (`_COMMON/01_install_testbasis.sql`): je Test eine Funktion
+(`lt.t_lasttest`, `lt.t_massentest`, `lt.t_parallel`, `lt.t_zyklen`, `lt.t_wakeup`, `lt.t_lastspitze`,
+`lt.t_logtext`, `lt.t_baseline_scope`). Die Skripte rufen diese Funktionen mit sichtbaren, anpassbaren Parametern auf.
+So kann der Dauertest dieselben Tests wiederverwenden. FEHLERFAELLE und DISPATCHER_APEX bleiben eigenständige Skripte
+(sie stoppen bewusst Server bzw. legen Hilfstabellen an).
 
 ## Testarten
 
@@ -35,8 +43,9 @@ Jeder Testordner enthält das Skript `test_*.sql` und einen Ordner `results/` f�
 | MASSENTEST | ein Client öffnet viele Prozesse gleichzeitig und bedient sie reihum | 200 Prozesse × 20 Operationen |
 | PARALLELBETRIEB | viele Client-Jobs gleichzeitig, in vier Varianten: A gleicher Prozessname (gemeinsame Baseline), B eigene Namen (getrennte Baselines), C eigene Namen mit gemeinsamem `p_baselineScope`, D Scope `#NONE` (keine Baseline) | je Variante 10 Clients (Insession 8) × 2 Prozesse × 200 Operationen |
 | PROZESSZYKLEN | viele Prozesse mit vollem Lebenszyklus parallel starten, bearbeiten und beenden (je Client 3 gleichzeitig offen); Status-Updates, Rueckleseprobe, Endzustand jedes Prozesses in `_PROC`, Verteilung auf die Worker | 10 Clients (Insession 8) × 30 Prozesse × 20 Operationen |
-| DAUERTEST | Prozesszyklen mit zufälligen Pausen (oft > 15 s) über viele Stunden | 3 Clients, 10 Stunden |
+| DAUERTEST | Kombination der Tests über viele Stunden: ein Steuer-Job führt Teiltests mit verkleinertem Umfang aus (gewichtet zufällig oder der Reihe nach), jeder als eigener Job; dazwischen Pausen (oft > 15 s); daneben Hintergrund-Clients mit Prozesszyklen. Die Server laufen durchgehend. Daten bestandener Teiltests werden gelöscht | 10 Stunden; je Modus oder über alle Modi (`DAUERTEST/`) |
 | WAKEUP | Aufrufe nach Ruhephasen des Servers von 5, 16, 30 und 65 s | nur DECOUPLED |
+| LASTSPITZE | mehrere Clients senden eine Zeit lang ohne Pause; danach Erholung: alle Daten vollständig, Prozesse geschlossen, keine Routen übrig, ein neuer Prozess arbeitet wieder normal | 6 Clients × 30 s, nur DECOUPLED |
 | FEATURES/BASELINE_SCOPE | prozessübergreifende Baseline: Default-Scope, `#NONE`, frei gewählter gemeinsamer Scope; INSESSION und SERVER | je Modus 7 kurze Prozesse |
 | FEATURES/LOGTEXT_GRENZEN | Kürzung langer Logtexte (1.500–5.000 Zeichen, Umlaute); INSESSION und SERVER | 9 Texte je Modus |
 | FEATURES/DISPATCHER_APEX | APEX/AJAX mit Connection Pool: jeder Request ein eigener Job mit leerem PGA, Trace über zwei Requests, parallele Requests, Request ohne Dispatcher, veraltete ID nach CLOSE | 13 Requests |
@@ -53,8 +62,22 @@ die Zählung der Baseline, übrig gebliebene Routen sowie Fehler in Client-Jobs 
 3. Gewünschten Test ausführen, z.B. `@DECOUPLED/SERVER/PARALLELBETRIEB/test_parallelbetrieb.sql`.
 4. Ergebnis steht am Ende der Ausgabe; Übersicht aller Läufe mit `_COMMON/03_ergebnisse.sql`.
 
-Dauertests bestehen aus zwei Skripten: `test_dauertest_start.sql` startet Server und Clients und kehrt sofort zurück,
-`test_dauertest_auswertung.sql` wird nach Ablauf der Laufzeit ausgeführt.
+Dauertests bestehen aus zwei Skripten: `test_dauertest_start.sql` startet Server, Hintergrund-Clients und den Steuer-Job
+und kehrt sofort zurück, `test_dauertest_auswertung.sql` wird nach Ablauf der Laufzeit ausgeführt. Die Teiltests eines
+Dauertests stehen in `LT_RUN` mit `PARENT_RUN_ID` = run_id des Dauertests. Umfang der Teiltests im Dauertest:
+
+| Teiltest | Umfang | Gewicht (RANDOM) |
+|---|---|---|
+| PROZESSZYKLEN | 4 Clients × 10 Prozesse × 10 Operationen | 4 |
+| PARALLELBETRIEB | eine zufällige Variante, 4 Clients × 2 Prozesse × 50 Operationen | 3 |
+| LASTTEST | 1.000 Operationen | 2 |
+| MASSENTEST | 50 Prozesse × 10 Operationen | 2 |
+| WAKEUP | Ruhephasen 5 und 20 s (nur decoupled) | 1 |
+| LASTSPITZE | 4 Clients × 20 s (nur decoupled) | 1 |
+| LOGTEXT_GRENZEN, BASELINE_SCOPE | vollständig (wenn ein Server läuft) | je 1 |
+
+Im Dauertest über alle Modi laufen Worker und Dispatcher in derselben Gruppe. Clients im SERVER-Modus erhalten
+trotzdem immer direkt einen Worker, weil Dispatcher in der Registry gekennzeichnet sind (`IS_DISPATCHER`).
 
 ## Voraussetzungen
 
