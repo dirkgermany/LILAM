@@ -2027,7 +2027,7 @@ create or replace package body lt as
             start_server('LT_S1');
             wait_servers_ready(sys.odcivarchar2list('LT_S1'));
             execute immediate 'select count(*) from lilam_log_internal where log_timestamp >= :1
-                                  and module_name = ''load_rules_from_json'''
+                                  and module_name = ''refreshGroupRules'' and error_code = ''-20130'''
                into l_n using run_started(l_run);
             check_that(l_run, 'L3b Server lehnt ungueltiges Rule Set beim Start ab (1 interner Fehler)', l_n = 1, l_n);
         end if;
@@ -2051,7 +2051,7 @@ create or replace package body lt as
         end if;
         reset_rules;   -- sonst laden spaetere Server der Gruppe LT dieses Rule Set
         execute immediate 'select count(*) from lilam_log_internal where log_timestamp >= :1
-                              and module_name != ''load_rules_from_json'''
+                              and not (module_name = ''refreshGroupRules'' and error_code = ''-20130'')'
            into l_n using run_started(l_run);
         check_that(l_run, 'Keine weiteren internen LILAM-Fehler', l_n = 0, l_n);
         end_run(l_run);
