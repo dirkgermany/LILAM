@@ -24,6 +24,7 @@
   - [Log-Level](#log-level)
   - [Record-Typ t_session_init](#record-typ-t_session_init)
   - [Record-Typ t_process_rec](#record-typ-t_process_rec)
+  - [Procedure IS_ALIVE](#procedure-is_alive)
   - [JSON API Interface](#json-api-interface)
 
 </details>
@@ -48,11 +49,11 @@ Das folgende Beispiel initialisiert LILAM, schreibt einen Log-Eintrag und zeichn
 ```sql
 DECLARE
   l_processId   NUMBER;
-  l_sessionInit t_session_init;
+  l_sessionInit lilam.t_session_init;
 BEGIN
   -- 1. Configure the session
   l_sessionInit.processName := 'MY_FIRST_SYNC';
-  l_sessionInit.logLevel    := logLevelInfo; -- default: logLevelMonitor
+  l_sessionInit.logLevel    := lilam.logLevelInfo; -- default: logLevelMonitor
 
   -- 2. Initialize LILAM
   l_processId := lilam.new_session(
@@ -416,7 +417,9 @@ Die APIs zur Prozesssteuerung verwalten den Gesamtfortschritt und Status eines P
 | `GET_PROCESS_END` | Liefert die Endzeit des Prozesses |
 | `GET_PROCESS_STATUS` | Liefert den Prozessstatus |
 | `GET_PROCESS_INFO` | Liefert die Prozessinformation |
+| `SET_PROC_IMMORTAL` | Schützt einen Prozess vor der automatischen Bereinigung |
 | `GET_PROCESS_DATA` | Liefert sämtliche Prozessdaten in einem Record |
+| `GET_PROCESS_DATA_JSON` | Liefert sämtliche Prozessdaten als JSON |
 
 > [!NOTE]
 > Bei Änderungen an Prozessdaten wird der Wert `lastUpdate` des Prozessdatensatzes implizit aktualisiert.
@@ -466,6 +469,17 @@ Ein Aufruf überschreibt einen zuvor mit `PROC_STEP_DONE` aufgebauten Fortschrit
 PROCEDURE SET_PROC_STEPS_DONE(
   p_processId     NUMBER,
   p_procStepsDone NUMBER
+)
+```
+
+### Procedure SET_PROC_IMMORTAL
+
+Kennzeichnet einen Prozess als dauerhaft aufzubewahren (`1`) oder hebt die Kennzeichnung auf (`0`). Prozesse mit `procImmortal = 1` werden bei der automatischen Bereinigung über `p_daysToKeep` nicht gelöscht. Beim Start lässt sich der Wert auch über `t_session_init.procImmortal` setzen.
+
+```sql
+PROCEDURE SET_PROC_IMMORTAL(
+  p_processId NUMBER,
+  p_immortal  NUMBER
 )
 ```
 
@@ -545,6 +559,16 @@ FUNCTION GET_PROCESS_DATA(
 >
 > Der Name der Prozesstabelle wird aus dem Master-Tabellennamen gebildet, indem `_PROC` angehängt wird.
 
+### Function GET_PROCESS_DATA_JSON
+
+Liefert dieselben Daten wie `GET_PROCESS_DATA` als JSON-Objekt mit den Schlüsseln `process_id`, `process_name`, `log_level`, `process_start`, `process_end`, `last_update`, `process_info`, `process_status`, `steps_todo`, `steps_done` und `tabname_master`.
+
+```sql
+FUNCTION GET_PROCESS_DATA_JSON(
+  p_processId NUMBER
+) RETURN VARCHAR2
+```
+
 ---
 
 ## Logging
@@ -586,9 +610,26 @@ PROCEDURE DEBUG(
 
 `ERROR` besitzt die höchste Priorität und wird immer gespeichert, sofern das Logging nicht vollständig mit `logLevelSilent` deaktiviert wurde.
 
-Ist `logLevelDebug` aktiv, werden von LILAM abgefangene Exceptions erneut ausgelöst, anstatt sie still zu behandeln.
+Interne Fehler behandelt LILAM grundsätzlich still und protokolliert sie in `LILAM_LOG_INTERNAL`; die Anwendung erhält keine Exception. Ist `logLevelDebug` aktiv, schreibt LILAM solche Fehler zusätzlich als `ERROR` in das Log des betroffenen Prozesses.
 
 Die vollständige Zuordnung findest Du unter [Log-Level](#log-level).
+
+### Function GET_COUNTER_WARN / GET_COUNTER_ERROR
+
+```sql
+FUNCTION GET_COUNTER_WARN(
+  p_processId NUMBER
+) RETURN PLS_INTEGER
+
+FUNCTION GET_COUNTER_ERROR(
+  p_processId NUMBER
+) RETURN PLS_INTEGER
+```
+
+Liefern die Anzahl der Aufrufe von `WARN` bzw. `ERROR` seit Beginn der Datenbanksession.
+
+> [!NOTE]
+> Gezählt wird derzeit je Datenbanksession über alle Prozesse; `p_processId` wird nicht ausgewertet.
 
 ---
 
@@ -935,11 +976,47 @@ TYPE t_process_rec IS RECORD (
 );
 ```
 
+### Procedure IS_ALIVE
+
+Einfacher Funktionstest nach der Installation: legt im In-Session-Modus den Prozess `LILAM Life Check` an, schreibt einen DEBUG-Eintrag und schließt den Prozess. Beim ersten Aufruf legt LILAM dabei seine Tabellen an; fehlende Rechte fallen so sofort auf (Einträge in `LILAM_LOG_INTERNAL`).
+
+```sql
+exec lilam.is_alive;
+```
+
 ### JSON API Interface
 
-LILAM JSON Requests bestehen grundsätzlich aus einem Header und einem Parameterobjekt.
+Über `CALL_BY_JSON` lassen sich die wichtigsten API-Aufrufe als JSON übergeben, z. B. aus Anwendungen, die JSON leichter erzeugen als PL/SQL-Aufrufe.
 
-Die Header-Parameter `version` und `client_id` werden derzeit nicht verwendet.
+```sql
+PROCEDURE CALL_BY_JSON(
+  p_callObject IN  VARCHAR2,      -- JSON_OBJ_LILAM
+  p_respObject OUT VARCHAR2
+)
+
+PROCEDURE CALL_BY_JSON(
+  p_callObject IN  JSON_OBJECT_T,
+  p_respObject OUT JSON_OBJECT_T
+)
+```
+
+LILAM JSON Requests bestehen aus einem Header und einem Parameterobjekt. Der Header enthält in `api_call` den Aufruf; die Header-Parameter `version` und `client_id` werden derzeit nicht verwendet.
+
+| `api_call` | entspricht | Parameter (`params`) |
+| --- | --- | --- |
+| `NEW_SESSION` | `NEW_SESSION` (Record) | `process_name`, `log_level`, `steps_todo`, `days_to_keep`, `process_immortal`, `tabname_master`, `baseline_scope` |
+| `SERVER_NEW_SESSION` | `SERVER_NEW_SESSION_JSON` | wie `SERVER_NEW_SESSION`, siehe Tabelle dort |
+| `CLOSE_SESSION` | `CLOSE_SESSION` | `process_id` |
+| `SET_PROCESS_STATUS` | `SET_PROCESS_STATUS` | `process_id`, `process_status`, `process_info` |
+| `SET_STEP_TODO` | `SET_PROC_STEPS_TODO` | `process_id`, `steps_todo` |
+| `SET_STEPS_DONE` | `SET_PROC_STEPS_DONE` | `process_id`, `steps_done` |
+| `PROC_STEP_DONE` | `PROC_STEP_DONE` | `process_id` |
+| `SET_PROC_IMMORTAL` | `SET_PROC_IMMORTAL` | `process_id`, `process_immortal` |
+| `INFO`, `DEBUG`, `WARN`, `ERROR` | Logging | `process_id`, `process_info` (Logtext) |
+| `MARK_EVENT`, `TRACE_START`, `TRACE_STOP` | Metriken | `process_id`, `action_name`, `context_name`, `timestamp` |
+| `SERVER_SHUTDOWN` | `SERVER_SHUTDOWN` | `process_id`, `pipe_name`, `password` |
+
+Die Antwort enthält den Header der Anfrage, `status` (`SUCCESS` oder `ERROR`) und eine `payload` mit `returns` und `value`, z. B. `"returns": "PROCESS_ID", "value": 4711`. Bei einem unbekannten `api_call` ist `value` = `NUM_ERR_ILLEGAL_REQ` (-20010). Ist `p_callObject` kein gültiges JSON, endet der Aufruf mit der Exception -20005.
 
 Beispiel für `SERVER_NEW_SESSION`:
 
