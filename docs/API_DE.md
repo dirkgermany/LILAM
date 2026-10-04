@@ -6,20 +6,24 @@
 <details>
 <summary>📖 <b>Inhalt</b></summary>
 
-- #schnellstart
-  - #in-session-modus
-  - [Entkoppelter Server-modus
-- #grundkonzepte
-  - [Prozessfortschritt vs. Metriken](#prozessfortschritt-vs-metrikenen-und-prozeduren
-  - [Session-Verwaltung](#session-sssteuerung
+- [Schnellstart](#schnellstart)
+  - [In-Session-Modus](#in-session-modus)
+  - [Entkoppelter Server-Modus](#entkoppelter-server-modus)
+- [Grundkonzepte](#grundkonzepte)
+  - [Prozessfortschritt vs. Metriken](#prozessfortschritt-vs-metriken)
+  - [Events vs. Traces](#events-vs-traces)
+- [Funktionen und Prozeduren](#funktionen-und-prozeduren)
+  - [Session-Verwaltung](#session-verwaltung)
+  - [Prozesssteuerung](#prozesssteuerung)
   - [Logging](#logging)
-  - #metriken
-  - #serversteuerung
-- #anhang
-  - #parameterkennzeichnung
+  - [Metriken](#metriken)
+  - [Serversteuerung](#serversteuerung)
+  - [Dispatcher-Modus](#dispatcher-modus)
+- [Anhang](#anhang)
+  - [Parameterkennzeichnung](#parameterkennzeichnung-1)
   - [Log-Level](#log-level)
-  - [Record-typ-t_session_init
-  - #record-typ-t_process_rec
+  - [Record-Typ t_session_init](#record-typ-t_session_init)
+  - [Record-Typ t_process_rec](#record-typ-t_process_rec)
   - [JSON API Interface](#json-api-interface)
 
 </details>
@@ -843,10 +847,11 @@ PROCEDURE SET_DISPATCHER_PIPE(
 ```
 
 #### Parameter
-| Parameter | Typ | Besdeutung |
+| Parameter | Typ | Bedeutung |
+| --------- | --- | --------- |
 | p_pipeName | varchar2 | Pipe-Name des Dispatchers |
-| p_groupName | varchar2 | Optionale Kennung, falls mehrere Dispatcher parallel genutzt werden. Automatisches Reconnect (siehe unten) verwendet ausschließlich die Standardkennung 'DEFAULT_DISPATCHER' |
-| p_processId | number | Optional. Ist bereits eine process_id bekannt, stellt LILAM die Verbindung zu dieser sofort wieder her (siehe „Vorwärmen"), statt erst beim nächsten API-Aufruf |
+| p_groupName | varchar2 | Optionale Kennung, falls mehrere Dispatcher parallel genutzt werden. [Automatisches Reconnect](#automatisches-reconnect) verwendet ausschließlich die Standardkennung 'DEFAULT_DISPATCHER' |
+| p_processId | number | Optional. Ist bereits eine process_id bekannt, stellt LILAM die Verbindung zu dieser sofort wieder her (siehe [Vorwärmen](#vorwärmen)), statt erst beim nächsten API-Aufruf |
 
 ```sql
 -- Beispiel: APEX "Before Header"-Process

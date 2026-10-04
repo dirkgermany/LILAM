@@ -31,9 +31,8 @@ GRANT EXECUTE ON LILAM TO USER_NAME;
 GRANT EXECUTE ON DBMS_ALERT TO USER_NAME;   -- Allows LILAM to send alerts
 GRANT EXECUTE ON DBMS_PIPE TO USER_NAME;
 
--- Job and Network Privileges (Background & Modern Features)
+-- Job Privileges (Background)
 GRANT CREATE JOB TO USER_NAME;              -- Required to run LILAM servers as background jobs
-GRANT EXECUTE ON UTL_HTTP TO USER_NAME;     -- Allows LILAM to stream metrics via external web services
 ```
 
 ## Installing the Package
@@ -45,6 +44,17 @@ The package code is located within the `source` folder of each release. Alternat
 3. Execute the scripts. 
 
 Once compiled, the package will appear in your database object tree (you may need to refresh the view).
+
+### Install and uninstall scripts
+Alternatively, run the scripts in the `source` folder with SQL*Plus or SQLcl while connected to the target schema:
+
+```sql
+@source/install.sql    -- compiles the package and runs the life check
+@source/uninstall.sql  -- stops the LILAM server jobs and drops the package
+```
+
+By default `uninstall.sql` keeps all tables and data. To remove all LILAM tables, their data and the sequence as well, set `define LILAM_DROP_DATA = 'J'` at the top of the script. This cannot be undone.
+Servers started with `START_SERVER` in a separate session are not stopped by the script; shut them down with `SERVER_SHUTDOWN` first.
 
 ## Testing the Installation
 
