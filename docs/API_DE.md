@@ -770,24 +770,28 @@ FUNCTION GET_SERVER_PIPE(
 ```
 
 ### Procedure SERVER_UPDATE_RULES
-Rules werden als JSON-Objekte in `LILAM_RULES` gespeichert.
-
-Nachdem ein Rule Set eingefügt oder geändert wurde, kann `SERVER_UPDATE_RULES` über eine aktive Serververbindung aufgerufen werden, um das aktualisierte Rule Set anzuwenden.
+Rules werden als JSON-Objekte in `LILAM_RULES` gespeichert. Ein Rule Set gilt für alle Server einer Gruppe.
 
 ```sql
 PROCEDURE SERVER_UPDATE_RULES(
-  p_processId      NUMBER,
+  p_groupName      VARCHAR2,
   p_ruleSetName    VARCHAR2,
   p_ruleSetVersion PLS_INTEGER
 )
 ```
 
-Der Server prüft das Rule Set vollständig, bevor er es übernimmt. Ist eine Regel ungültig, lehnt er das ganze Rule Set ab, behält die bisherigen Regeln und protokolliert den Grund in `LILAM_LOG_INTERNAL` und im Log des Serverprozesses. Erst nach erfolgreichem Laden trägt er Name und Version in `LILAM_SERVER_REGISTRY` ein; nach einem Neustart lädt er sie von dort.
+Ablauf:
+1. Das Rule Set wird in der aufrufenden Session vollständig geprüft. Fehlt es, ist eine Regel ungültig oder hat die Gruppe keinen Server, endet der Aufruf mit der Exception `NUM_ERR_RULE_SET` (-20130) und einer Begründung; es ändert sich nichts.
+2. Name und Version werden für alle Server der Gruppe in `LILAM_SERVER_REGISTRY` eingetragen (Dispatcher ausgenommen).
+3. Laufende Server erhalten die Anweisung direkt in ihre Pipe, also auch ohne laufenden Prozess und am Dispatcher vorbei. Gestoppte Server laden das Rule Set beim nächsten Start.
+
+Ein neu registrierter Server übernimmt beim Start das Rule Set seiner Gruppe. Lädt ein Server ein Rule Set beim Start oder Neuladen nicht (z. B. weil es inzwischen geändert wurde), behält er die bisherigen Regeln und protokolliert den Grund in `LILAM_LOG_INTERNAL` und im Log des Serverprozesses.
+
+```sql
+exec LILAM.SERVER_UPDATE_RULES('METRO', 'METRO_RULES', 2);
+```
 
 Regeln wirken nur in Servern, nicht im INSESSION-Modus. Aufbau der Rule Sets und Operatoren: [Rules Engine](../rules/README.md).
-
-> [!WARNING]
-> Der Aufruf erreicht derzeit nur den Server, der `p_processId` **in der aufrufenden Session** bedient. Andere Server der Gruppe behalten ihre Regeln; über einen Dispatcher bleibt der Aufruf wirkungslos.
 
 ## Dispatcher-Modus
 Ein mit p_isDispatcher => 1 gestarteter Server (Dispatcher) verarbeitet keine Anfragen selbst, sondern leitet sie unverändert an einen passenden Server weiter.

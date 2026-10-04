@@ -813,22 +813,28 @@ FUNCTION GET_SERVER_PIPE(
 ```
 
 ### Procedure SERVER_UPDATE_RULES
-Rules are stored as JSON objects in `LILAM_RULES`. After a rule set has been inserted or modified, call `SERVER_UPDATE_RULES` through an active server connection to apply it.
+Rules are stored as JSON objects in `LILAM_RULES`. A rule set applies to all servers of a group.
 
 ```sql
 PROCEDURE SERVER_UPDATE_RULES(
-  p_processId      NUMBER,
+  p_groupName      VARCHAR2,
   p_ruleSetName    VARCHAR2,
   p_ruleSetVersion PLS_INTEGER
 )
 ```
 
-The server checks the rule set completely before it uses it. If one rule is invalid, it rejects the whole rule set, keeps the previous rules and logs the reason to `LILAM_LOG_INTERNAL` and to the log of the server process. Only after a successful load does it store name and version in `LILAM_SERVER_REGISTRY`; after a restart it loads them from there.
+Steps:
+1. The rule set is checked completely in the calling session. If it is missing, a rule is invalid or the group has no server, the call raises `NUM_ERR_RULE_SET` (-20130) with the reason; nothing is changed.
+2. Name and version are stored in `LILAM_SERVER_REGISTRY` for all servers of the group (dispatchers excluded).
+3. Running servers receive the instruction directly in their pipe, so no running process is needed and the dispatcher is bypassed. Stopped servers load the rule set at their next start.
+
+A newly registered server takes over the rule set of its group at startup. If a server cannot load a rule set at startup or reload (e.g. because it was changed in the meantime), it keeps its previous rules and logs the reason to `LILAM_LOG_INTERNAL` and to the log of the server process.
+
+```sql
+exec LILAM.SERVER_UPDATE_RULES('METRO', 'METRO_RULES', 2);
+```
 
 Rules are evaluated by servers only, not in INSESSION mode. Structure of rule sets and operators: [Rules Engine](../rules/README.md).
-
-> [!WARNING]
-> The call currently reaches only the server that serves `p_processId` **in the calling session**. Other servers of the group keep their rules; via a dispatcher the call has no effect.
 
 ---
 

@@ -146,19 +146,19 @@ This table serves as the central repository for all rule sets. Each rule set is 
 Alerts and the consumer refer to a rule by `SET_NAME`, `VERSION` and `rules.id`.
 
 > **Implementation Note**
-> The LILAM servers load the rule set into RAM at startup (or when `SERVER_UPDATE_RULES` is called). All rule evaluations work on this cached structure, without database access. Only a firing rule writes to `LILAM_ALERTS`.
+> The LILAM servers load the rule set of their group into RAM at startup (or when `SERVER_UPDATE_RULES` is called). All rule evaluations work on this cached structure, without database access. Only a firing rule writes to `LILAM_ALERTS`.
 
 ---
 ## Loading a Rule Set
 
-LILAM servers support rule set updates at runtime. The active rule set of a server is stored in `LILAM_SERVER_REGISTRY` (`RULE_SET_NAME`, `SET_IN_USE`), so a server reloads it on restart. The registry is changed only after the rule set has been loaded successfully.
+A rule set applies to a **server group**. `SERVER_UPDATE_RULES` checks the rule set, stores it in `LILAM_SERVER_REGISTRY` (`RULE_SET_NAME`, `SET_IN_USE`) for all servers of the group (dispatchers excluded) and sends it directly to every running server. Stopped servers load it at their next start; a newly registered server takes over the rule set of its group.
 
 ```sql
-exec LILAM.SERVER_UPDATE_RULES(p_processId => 1202, p_ruleSetName => 'METRO_RULES', p_ruleSetVersion => 2);
+exec LILAM.SERVER_UPDATE_RULES(p_groupName => 'METRO', p_ruleSetName => 'METRO_RULES', p_ruleSetVersion => 2);
 ```
 
-> [!WARNING]
-> `SERVER_UPDATE_RULES` currently reaches only the server that serves `p_processId` **in the calling session**. Other servers of the group keep their rules. Via a dispatcher the call has no effect.
+An invalid or missing rule set, or a group without servers, raises `NUM_ERR_RULE_SET` (-20130) with the reason; nothing is changed.
+
 ---
 
 ## Performance
