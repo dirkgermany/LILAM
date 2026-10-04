@@ -289,6 +289,8 @@ flowchart LR
         E2 --> T2[("Tables<br/>NAME_PROC / _LOG / _MON")]
         R2 --> AL[("LILAM_ALERTS<br/>+ DBMS_ALERT")]
     end
+
+    INS ~~~ DEC
 ```
 
 Rules are currently evaluated by LILAM Servers only: the rule set of a server group is loaded at server start (`loadServerRules`). An In-Session process records data and averages, but raises no alerts.
