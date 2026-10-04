@@ -56,6 +56,7 @@ begin
     for i in 1 .. l_jobs.count loop
         begin
             dbms_scheduler.stop_job(job_name => l_jobs(i), force => false);
+            dbms_output.put_line('Server-Job gestoppt: ' || l_jobs(i));
         exception
             when others then
                 null; -- Job läuft nicht (mehr)
