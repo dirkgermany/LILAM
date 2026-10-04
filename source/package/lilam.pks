@@ -47,6 +47,13 @@ create or replace PACKAGE LILAM AS
     NUM_ACK_SERVER_PROC CONSTANT PLS_INTEGER  := 220;
     TXT_ERR_SERVER_PROC CONSTANT VARCHAR2(30) := 'PROCESS_AT_SERVER_INVALID';
     NUM_ERR_SERVER_PROC CONSTANT PLS_INTEGER  := -20021;
+    -- Rückgabewerte von SERVER_NEW_SESSION / SERVER_NEW_SESSION_JSON, wenn kein Prozess angelegt werden konnte.
+    -- Es wird keine Exception geworfen; alle weiteren API-Aufrufe mit dieser ID werden still ignoriert.
+    TXT_ERR_SESSION_TIMEOUT   CONSTANT VARCHAR2(30) := 'SESSION_TIMEOUT';
+    NUM_ERR_SESSION_TIMEOUT   CONSTANT PLS_INTEGER  := -20110;  -- Server hat nicht rechtzeitig geantwortet
+    TXT_ERR_SESSION_THROTTLED CONSTANT VARCHAR2(30) := 'SESSION_THROTTLED';
+    NUM_ERR_SESSION_THROTTLED CONSTANT PLS_INTEGER  := -20120;  -- Server hat abgelehnt (Überlast)
+    -- Kommunikationsfehler beim Anlegen: NUM_COMM_ERR (-20003)
 
     -- SUFFIXES of the three main tables
     C_SUFFIX_PROC_TABLE  CONSTANT varchar2(6)  := '_PROC'; -- Process
@@ -80,9 +87,10 @@ create or replace PACKAGE LILAM AS
         processName     VARCHAR2(100),
         logLevel        PLS_INTEGER := logLevelMonitor,
         stepsToDo       PLS_INTEGER,
-        daysToKeep      PLS_INTEGER := 100,
+        daysToKeep      PLS_INTEGER,    -- NULL = keine automatische Loeschung alter Prozessdaten
         procImmortal    PLS_INTEGER := 0,
-        tabNameMaster   VARCHAR2(100) DEFAULT 'LILAM'
+        tabNameMaster   VARCHAR2(100) DEFAULT 'LILAM',
+        baselineScope   VARCHAR2(100)   -- NULL = Prozessname (prozessübergreifend), '#NONE' = nur pro Prozess
     );
 
     -- ==============================
@@ -112,20 +120,30 @@ create or replace PACKAGE LILAM AS
     -- Life cycle of a log session
     ------------------------------
     FUNCTION  NEW_SESSION(p_session_init t_session_init) RETURN NUMBER;
-    FUNCTION  NEW_SESSION(p_processName VARCHAR2, p_logLevel PLS_INTEGER default logLevelMonitor, p_tabNameMaster VARCHAR2 default 'LILAM') RETURN NUMBER;
-    FUNCTION  NEW_SESSION(p_processName VARCHAR2, p_logLevel PLS_INTEGER, p_daysToKeep PLS_INTEGER, p_tabNameMaster VARCHAR2 default 'LILAM') RETURN NUMBER;
-    FUNCTION  NEW_SESSION(p_processName VARCHAR2, p_logLevel PLS_INTEGER, p_procStepsToDo PLS_INTEGER, p_daysToKeep PLS_INTEGER, p_tabNameMaster VARCHAR2 DEFAULT 'LILAM') RETURN NUMBER;
+    FUNCTION  NEW_SESSION(
+        p_processName   VARCHAR2,
+        p_logLevel      PLS_INTEGER DEFAULT logLevelMonitor,
+        p_procStepsToDo PLS_INTEGER DEFAULT NULL,
+        p_daysToKeep    PLS_INTEGER DEFAULT NULL,
+        p_tabNameMaster VARCHAR2    DEFAULT 'LILAM',
+        p_baselineScope VARCHAR2    DEFAULT NULL) RETURN NUMBER;
 
-    FUNCTION  SERVER_NEW_SESSION(p_processName varchar2, p_logLevel PLS_INTEGER, p_procStepsToDo PLS_INTEGER, p_daysToKeep PLS_INTEGER, p_tabNameMaster varchar2) RETURN NUMBER;
-    FUNCTION  SERVER_NEW_SESSION(p_processName varchar2, p_groupName VARCHAR2, p_logLevel PLS_INTEGER, p_procStepsToDo PLS_INTEGER, p_daysToKeep PLS_INTEGER, p_tabNameMaster varchar2) RETURN NUMBER;
-    FUNCTION  SERVER_NEW_SESSION(p_jsonObject JSON_OBJ_LILAM) RETURN NUMBER;
-    FUNCTION  SERVER_LINK(p_processId NUMBER, p_pipeName varchar2) RETURN NUMBER;
-    PROCEDURE SERVER_LINK(p_processId NUMBER, p_pipeName varchar2);
+    FUNCTION  SERVER_NEW_SESSION(
+        p_processName   VARCHAR2,
+        p_groupName     VARCHAR2    DEFAULT NULL,
+        p_logLevel      PLS_INTEGER DEFAULT logLevelMonitor,
+        p_procStepsToDo PLS_INTEGER DEFAULT NULL,
+        p_daysToKeep    PLS_INTEGER DEFAULT NULL,
+        p_tabNameMaster VARCHAR2    DEFAULT 'LILAM',
+        p_baselineScope VARCHAR2    DEFAULT NULL) RETURN NUMBER;
+    FUNCTION  SERVER_NEW_SESSION_JSON(p_jsonObject JSON_OBJ_LILAM) RETURN NUMBER;
 
-    PROCEDURE CLOSE_SESSION(p_processId NUMBER);
-    PROCEDURE CLOSE_SESSION(p_processId NUMBER, p_processInfo VARCHAR2, p_processStatus PLS_INTEGER);
-    PROCEDURE CLOSE_SESSION(p_processId NUMBER, p_procStepsDone PLS_INTEGER, p_processInfo VARCHAR2, p_processStatus PLS_INTEGER);
-    PROCEDURE CLOSE_SESSION(p_processId NUMBER, p_procStepsToDo PLS_INTEGER, p_procStepsDone PLS_INTEGER, p_processInfo VARCHAR2, p_processStatus PLS_INTEGER);
+    PROCEDURE CLOSE_SESSION(
+        p_processId     NUMBER,
+        p_processInfo   VARCHAR2    DEFAULT NULL,
+        p_processStatus PLS_INTEGER DEFAULT NULL,
+        p_procStepsDone PLS_INTEGER DEFAULT NULL,
+        p_procStepsToDo PLS_INTEGER DEFAULT NULL);
 
     ---------------------------------
     -- Update the status of a process
@@ -170,11 +188,12 @@ create or replace PACKAGE LILAM AS
     -----------------
     -- Server control
     -----------------
-    FUNCTION  CREATE_SERVER(p_pipeName varchar2, p_groupName varchar2, p_password varchar2) RETURN VARCHAR2;
-    PROCEDURE START_SERVER(p_pipeName varchar2, p_groupName varchar2, p_password varchar2);
+    FUNCTION  CREATE_SERVER(p_pipeName varchar2, p_groupName varchar2, p_password varchar2, p_isDispatcher PLS_INTEGER DEFAULT 0) RETURN VARCHAR2;
+    PROCEDURE START_SERVER(p_pipeName varchar2, p_groupName varchar2, p_password varchar2, p_isDispatcher PLS_INTEGER DEFAULT 0);
     PROCEDURE SERVER_SHUTDOWN(p_processId number, p_pipeName varchar2, p_password varchar2);
     FUNCTION  GET_SERVER_PIPE(p_processId NUMBER) RETURN VARCHAR2;
     PROCEDURE SERVER_UPDATE_RULES(p_processId NUMBER, p_ruleSetName VARCHAR2, p_ruleSetVersion PLS_INTEGER);
+    PROCEDURE SET_DISPATCHER_PIPE(p_pipeName varchar2, p_groupName varchar2 DEFAULT 'DEFAULT_DISPATCHER', p_processId number DEFAULT null);
 
     PROCEDURE SERVER_SEND_ANY_MSG(p_processId number, p_message varchar2);
 
@@ -193,3 +212,5 @@ create or replace PACKAGE LILAM AS
     PROCEDURE IS_ALIVE;
 
 END LILAM;
+
+/
