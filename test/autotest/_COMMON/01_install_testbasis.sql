@@ -204,6 +204,9 @@ create or replace package lt authid definer as
     function t_logtext(p_manage boolean default true, p_parent number default null) return number;
     function t_baseline_scope(p_manage boolean default true, p_parent number default null) return number;
 
+    -- Regeln (Rules Engine) im SERVER-Modus: Laden, Operatoren, Alerts. Nur einzeln (aendert das Rule Set von LT_S1)
+    function t_regeln(p_manage boolean default true, p_parent number default null) return number;
+
     -- Speicher: PGA-Wachstum je Prozess in Client, Workern und Dispatcher (INSESSION, SERVER, DISPATCHER)
     -- sowie Fallback beim Schreiben (fehlerhafte Zeile wird uebersprungen, die uebrigen bleiben erhalten)
     function t_speicher(p_procs number default 5000, p_manage boolean default true, p_parent number default null) return number;
@@ -1674,6 +1677,334 @@ create or replace package body lt as
         return l_run;
     exception
         when others then
+            abort_run(l_run, p_manage, sqlerrm || ' ' || dbms_utility.format_error_backtrace);
+            if p_manage then raise; end if;
+            return l_run;
+    end;
+
+    ----------------------------------------------------------------------
+    -- REGELN: Rules Engine im SERVER-Modus (Laden, Operatoren, Alerts)
+    -- Rule Set LT_REGELN, Versionen 1 (vollstaendig), 2 (klein), 3-5 ungueltig.
+    -- #P# wird durch den Prozess-Praefix des Laufs ersetzt (Prozess-Regeln haengen am Prozessnamen).
+    ----------------------------------------------------------------------
+    function t_regeln(p_manage boolean default true, p_parent number default null) return number is
+        c_set     constant varchar2(30) := 'LT_REGELN';
+        c_handler constant varchar2(30) := 'LT_REGELN_ALERT';
+        l_run     number;
+        l_p       varchar2(60);   -- Prozess-Praefix, z.B. LT_700_RG
+        l_ctl     number;         -- Steuerprozess fuer SERVER_UPDATE_RULES
+        l_pid     number;
+        l_ok      boolean;
+        l_msg     varchar2(1800);
+        l_st      integer;
+        l_n       number;
+        l_name    varchar2(100);
+        l_ver     number;
+
+        -- eine Regel als JSON
+        function r(p_id varchar2, p_trig varchar2, p_action varchar2, p_op varchar2, p_val varchar2,
+                   p_ctx varchar2 default null, p_thr number default 0, p_handler varchar2 default c_handler) return varchar2 is
+        begin
+            return '{"id":"' || p_id || '","trigger_type":"' || p_trig || '"'
+                || case when p_action is not null then ',"action":"' || p_action || '"' end
+                || case when p_ctx is not null then ',"context":"' || p_ctx || '"' end
+                || ',"condition":{"operator":"' || p_op || '","value":"' || p_val || '"}'
+                || ',"alert":{' || case when p_handler is not null then '"handler":"' || p_handler || '",' end
+                || '"severity":"WARN","throttle_seconds":' || p_thr || '}}';
+        end;
+
+        function rule_set(p_ver number, p_rules clob) return clob is
+        begin
+            return '{"header":{"rule_set":"' || c_set || '","rule_set_version":' || p_ver
+                || ',"description":"Test FEATURES/REGELN"},"rules":[' || replace(p_rules, '#P#', l_p) || ']}';
+        end;
+
+        procedure ins(p_ver number, p_rules clob) is
+            l_json clob := rule_set(p_ver, p_rules);
+        begin
+            insert into lilam_rules(set_name, version, created, author, rule_set) values (c_set, p_ver, systimestamp, 'LT', l_json);
+        end;
+
+        procedure put_rules is
+            l clob;
+        begin
+            -- Version 1: alle Szenarien
+            l :=          r('VG-01', 'MARK_EVENT',  'RG_B',  'PRECEDED_BY', 'RG_A');
+            l := l || ',' || r('VG-02', 'MARK_EVENT',  'RG_B2', 'PRECEDED_BY', 'RG_A|C1');
+            l := l || ',' || r('VG-03', 'MARK_EVENT',  'RG_D',  'PRECEDED_BY_WITHIN_SECS', 'RG_C|1');
+            l := l || ',' || r('VG-04', 'TRACE_START', 'RG_T',  'PRECEDED_BY', 'RG_A');
+            l := l || ',' || r('NF-01', 'MARK_EVENT',  'RG_NF_B', 'PRECEDED_BY_WITHIN_SECS', 'RG_NF_A|1');
+            l := l || ',' || r('GP-01', 'MARK_EVENT',  'RG_G',  'MAX_GAP_SECONDS', '0.8');
+            l := l || ',' || r('GP-02', 'TRACE_START', 'RG_GT', 'MAX_GAP_SECONDS', '0.8');
+            l := l || ',' || r('DU-01', 'TRACE_STOP',  'RG_DT', 'MAX_DURATION_MS', '100');
+            l := l || ',' || r('DU-02', 'MARK_EVENT',  'RG_DE', 'MAX_DURATION_MS', '500');
+            l := l || ',' || r('OC-01', 'MARK_EVENT',  'RG_OC', 'MAX_OCCURRENCE', '3');
+            l := l || ',' || r('AV-01', 'TRACE_STOP',  'RG_AV', 'AVG_DEVIATION_PCT', '50|3|0.5');
+            l := l || ',' || r('PR-01', 'PROCESS_START',  '#P#_PS', 'ON_START', '');
+            l := l || ',' || r('PR-02', 'PROCESS_UPDATE', '#P#_ST', 'STATUS_EQUALS', '3');
+            l := l || ',' || r('PR-03', 'PROCESS_UPDATE', '#P#_IN', 'INFO_CONTAINS', 'kaputt');
+            l := l || ',' || r('PR-04', 'PROCESS_STOP',   '#P#_SD', 'STEPS_LEFT_HIGH', '2');
+            l := l || ',' || r('PR-05', 'PROCESS_STOP',   '#P#_SD', 'SUCCESS_RATE_LOW', '80');
+            l := l || ',' || r('PR-06', 'PROCESS_UPDATE', '#P#_SD', 'MAX_OCCURRENCE', '3');
+            l := l || ',' || r('PR-07', 'PROCESS_STOP',   '#P#_RT', 'MAX_RUNTIME_EXCEEDED', '500');
+            l := l || ',' || r('PR-08', 'PROCESS_UPDATE', '#P#_RT', 'RUNTIME_EXCEEDED', '500');
+            l := l || ',' || r('LG-01', 'LOGGING', 'LOGGING', 'SEVERITY', 'ERROR');
+            l := l || ',' || r('LG-02', 'LOGGING', null, 'SEVERITY', 'WARN');
+            l := l || ',' || r('KX-01', 'MARK_EVENT',  'RG_K',  'ON_EVENT', '', 'C1');
+            l := l || ',' || r('KX-02', 'MARK_EVENT',  'RG_K',  'ON_EVENT', '');
+            l := l || ',' || r('TF-01', 'TRACE_STOP',  'RG_TF', 'ON_STOP', '');
+            l := l || ',' || r('TH-01', 'MARK_EVENT',  'RG_TH', 'ON_EVENT', '', null, 2);
+            l := l || ',' || r('L-01',  'MARK_EVENT',  'RG_L',  'ON_EVENT', '');
+            delete from lilam_rules where set_name = c_set;
+            ins(1, l);
+            -- Version 2: klein, ersetzt Version 1 vollstaendig
+            ins(2, r('V2-01', 'MARK_EVENT', 'RG_V2', 'ON_EVENT', ''));
+            -- Versionen 3-5: ungueltig (fehlender Handler, unbekannter Operator, Operator passt nicht zum Trigger)
+            ins(3, r('X3-01', 'MARK_EVENT', 'RG_V2', 'ON_EVENT', '', null, 0, null));
+            ins(4, r('X4-01', 'MARK_EVENT', 'RG_V2', 'PRECEDED_BY_WITHIN_MS', 'RG_A|1000'));
+            ins(5, r('X5-01', 'TRACE_STOP', 'RG_V2', 'MAX_GAP_SECONDS', '1'));
+            commit;
+        end;
+
+        function alerts(p_proc varchar2, p_rule varchar2) return number is
+            l_cnt number;
+        begin
+            execute immediate 'select count(*) from lilam_alerts where process_name = :1 and rule_id = :2 and rule_set_name = :3'
+               into l_cnt using l_p || p_proc, p_rule, c_set;
+            return l_cnt;
+        end;
+
+        procedure expect(p_proc varchar2, p_rule varchar2, p_expected number, p_text varchar2) is
+            l_cnt number := alerts(p_proc, p_rule);
+        begin
+            check_that(l_run, p_rule || ' ' || p_text, l_cnt = p_expected, 'Alerts ' || l_cnt || ', erwartet ' || p_expected);
+        end;
+
+        function proc(p_suffix varchar2, p_steps number default null) return number is
+        begin
+            return lilam.server_new_session(l_p || p_suffix, c_group, lilam.logLevelInfo, p_procStepsToDo => p_steps);
+        end;
+
+        procedure registry(p_name out varchar2, p_ver out number) is
+        begin
+            execute immediate 'select rule_set_name, set_in_use from lilam_server_registry where pipe_name = ''LT_S1'''
+               into p_name, p_ver;
+        end;
+
+        procedure update_rules(p_ver number) is
+        begin
+            lilam.server_update_rules(l_ctl, c_set, p_ver);
+            dbms_session.sleep(1);
+        end;
+
+    begin
+        l_run := begin_run('REGELN', c_server, 'Rule Set ' || c_set, p_parent);
+        l_p   := 'LT_' || l_run || '_RG';
+        put_rules;
+        if p_manage then
+            stop_all_servers;
+            execute immediate 'update lilam_server_registry set rule_set_name = null, set_in_use = 0 where pipe_name = ''LT_S1''';
+            commit;
+            setup_servers(c_server, 1);
+        end if;
+
+        -- ---------------------------------------------------------------
+        -- L1: Laden per SERVER_UPDATE_RULES
+        -- ---------------------------------------------------------------
+        l_ctl := proc('_CTL');
+        update_rules(1);
+        registry(l_name, l_ver);
+        check_that(l_run, 'L1 SERVER_UPDATE_RULES: Registry zeigt das Rule Set', l_name = c_set and l_ver = 1, l_name || ' v' || l_ver);
+
+        -- Alert-Signal: diese Session lauscht auf den Handler
+        dbms_alert.register(c_handler);
+
+        -- ---------------------------------------------------------------
+        -- Vorgaenger (nur Events und Traces zaehlen)
+        -- ---------------------------------------------------------------
+        l_pid := proc('_VG');
+        lilam.mark_event(l_pid, 'RG_A', 'C1'); lilam.mark_event(l_pid, 'RG_B');                       -- 0: Kontext des Vorgaengers egal
+        lilam.mark_event(l_pid, 'RG_A'); lilam.info(l_pid, 'dazwischen'); lilam.mark_event(l_pid, 'RG_B'); -- 0: Log ist kein Vorgaenger
+        lilam.mark_event(l_pid, 'RG_X'); lilam.mark_event(l_pid, 'RG_B');                             -- 1: falscher Vorgaenger
+        lilam.mark_event(l_pid, 'RG_A', 'C1'); lilam.mark_event(l_pid, 'RG_B2');                      -- 0
+        lilam.mark_event(l_pid, 'RG_A', 'C2'); lilam.mark_event(l_pid, 'RG_B2');                      -- 1: falscher Kontext
+        lilam.mark_event(l_pid, 'RG_C'); lilam.mark_event(l_pid, 'RG_D');                             -- 0
+        lilam.mark_event(l_pid, 'RG_C'); dbms_session.sleep(1.3); lilam.mark_event(l_pid, 'RG_D');    -- 1: zu spaet
+        lilam.mark_event(l_pid, 'RG_X'); lilam.mark_event(l_pid, 'RG_D');                             -- 1: falscher Vorgaenger
+        lilam.mark_event(l_pid, 'RG_A'); lilam.trace_start(l_pid, 'RG_T'); lilam.trace_stop(l_pid, 'RG_T');  -- 0
+        lilam.mark_event(l_pid, 'RG_X'); lilam.trace_start(l_pid, 'RG_T'); lilam.trace_stop(l_pid, 'RG_T');  -- 1
+        lilam.close_session(l_pid);
+        expect('_VG', 'VG-01', 1, 'PRECEDED_BY: Kontext egal, Log kein Vorgaenger, falscher Vorgaenger');
+        expect('_VG', 'VG-02', 1, 'PRECEDED_BY mit Kontext RG_A|C1');
+        expect('_VG', 'VG-03', 2, 'PRECEDED_BY_WITHIN_SECS: zu spaet und falscher Vorgaenger');
+        expect('_VG', 'VG-04', 1, 'PRECEDED_BY bei TRACE_START');
+
+        -- ---------------------------------------------------------------
+        -- Nachfolger: "B folgt A innerhalb 1 s" (Pruefung beim Eintreffen von B)
+        -- ---------------------------------------------------------------
+        l_pid := proc('_NF');
+        lilam.mark_event(l_pid, 'RG_NF_A'); lilam.mark_event(l_pid, 'RG_NF_B');                          -- 0
+        lilam.mark_event(l_pid, 'RG_NF_A'); dbms_session.sleep(1.3); lilam.mark_event(l_pid, 'RG_NF_B'); -- 1
+        lilam.close_session(l_pid);
+        expect('_NF', 'NF-01', 1, 'Nachfolger zu spaet');
+        dbms_output.put_line('    Hinweis: ein ganz ausbleibender Nachfolger wird nicht erkannt (keine zeitgesteuerte Pruefung)');
+
+        -- ---------------------------------------------------------------
+        -- Abstand, Dauer, Haeufigkeit, Abweichung
+        -- ---------------------------------------------------------------
+        l_pid := proc('_MON');
+        lilam.mark_event(l_pid, 'RG_G'); lilam.mark_event(l_pid, 'RG_G');                           -- 0
+        dbms_session.sleep(1.2); lilam.mark_event(l_pid, 'RG_G');                                   -- 1
+        lilam.trace_start(l_pid, 'RG_GT'); lilam.trace_stop(l_pid, 'RG_GT');
+        lilam.trace_start(l_pid, 'RG_GT'); lilam.trace_stop(l_pid, 'RG_GT');                        -- 0
+        dbms_session.sleep(1.2); lilam.trace_start(l_pid, 'RG_GT'); lilam.trace_stop(l_pid, 'RG_GT'); -- 1
+        lilam.trace_start(l_pid, 'RG_DT'); dbms_session.sleep(0.01); lilam.trace_stop(l_pid, 'RG_DT'); -- 0
+        lilam.trace_start(l_pid, 'RG_DT'); dbms_session.sleep(0.25); lilam.trace_stop(l_pid, 'RG_DT'); -- 1
+        lilam.mark_event(l_pid, 'RG_DE'); lilam.mark_event(l_pid, 'RG_DE');                         -- 0
+        dbms_session.sleep(0.7); lilam.mark_event(l_pid, 'RG_DE');                                  -- 1
+        for i in 1 .. 5 loop lilam.mark_event(l_pid, 'RG_OC'); end loop;                            -- 2 (4. und 5.)
+        for i in 1 .. 4 loop
+            lilam.trace_start(l_pid, 'RG_AV'); dbms_session.sleep(0.1); lilam.trace_stop(l_pid, 'RG_AV');
+        end loop;
+        lilam.trace_start(l_pid, 'RG_AV'); dbms_session.sleep(0.11); lilam.trace_stop(l_pid, 'RG_AV');  -- 0: +10 %
+        lilam.trace_start(l_pid, 'RG_AV'); dbms_session.sleep(0.4);  lilam.trace_stop(l_pid, 'RG_AV');  -- 1: +300 %
+        lilam.close_session(l_pid);
+        expect('_MON', 'GP-01', 1, 'MAX_GAP_SECONDS 0.8 bei Events (Dezimalpunkt)');
+        expect('_MON', 'GP-02', 1, 'MAX_GAP_SECONDS 0.8 bei TRACE_START');
+        expect('_MON', 'DU-01', 1, 'MAX_DURATION_MS bei TRACE_STOP');
+        expect('_MON', 'DU-02', 1, 'MAX_DURATION_MS bei Events (Abstand)');
+        expect('_MON', 'OC-01', 2, 'MAX_OCCURRENCE 3 bei 5 Events');
+        expect('_MON', 'AV-01', 1, 'AVG_DEVIATION_PCT 50 % nach Warm-up');
+
+        -- ---------------------------------------------------------------
+        -- Prozess-Regeln (je ein Prozess, die Werte bleiben im Prozess stehen)
+        -- ---------------------------------------------------------------
+        l_pid := proc('_PS'); lilam.close_session(l_pid);
+        expect('_PS', 'PR-01', 1, 'ON_START bei PROCESS_START');
+
+        l_pid := proc('_ST');
+        lilam.set_process_status(l_pid, 2); lilam.set_process_status(l_pid, 3);
+        lilam.close_session(l_pid);
+        expect('_ST', 'PR-02', 1, 'STATUS_EQUALS 3');
+
+        l_pid := proc('_IN');
+        lilam.set_process_status(l_pid, 1, 'alles gut'); lilam.set_process_status(l_pid, 1, 'Teil KAPUTT');
+        lilam.close_session(l_pid);
+        expect('_IN', 'PR-03', 1, 'INFO_CONTAINS (ohne Gross/Klein)');
+
+        l_pid := proc('_SD', 10);
+        for i in 1 .. 5 loop lilam.proc_step_done(l_pid); end loop;
+        lilam.close_session(l_pid, p_procStepsDone => 7);
+        expect('_SD', 'PR-06', 2, 'MAX_OCCURRENCE 3 bei 5 Schritten');
+        expect('_SD', 'PR-04', 1, 'STEPS_LEFT_HIGH mit Endstand aus CLOSE_SESSION (7 von 10)');
+        expect('_SD', 'PR-05', 1, 'SUCCESS_RATE_LOW 80 % mit Endstand 70 %');
+
+        l_pid := proc('_RT');
+        lilam.set_process_status(l_pid, 1);                                                 -- 0
+        dbms_session.sleep(0.7); lilam.set_process_status(l_pid, 1);                        -- 1
+        lilam.close_session(l_pid);
+        expect('_RT', 'PR-08', 1, 'RUNTIME_EXCEEDED 500 ms (laufender Prozess)');
+        expect('_RT', 'PR-07', 1, 'MAX_RUNTIME_EXCEEDED 500 ms (bei PROCESS_STOP)');
+
+        -- ---------------------------------------------------------------
+        -- Log-Regeln: zwei SEVERITY-Regeln, viele nicht passende Logs
+        -- ---------------------------------------------------------------
+        l_pid := proc('_LG');
+        for i in 1 .. 10 loop lilam.info(l_pid, 'info ' || i); end loop;
+        lilam.warn(l_pid, 'Warnung'); lilam.error(l_pid, 'Fehler');
+        lilam.close_session(l_pid);
+        expect('_LG', 'LG-01', 1, 'SEVERITY ERROR');
+        expect('_LG', 'LG-02', 1, 'SEVERITY WARN als zweite Log-Regel (ohne "action")');
+
+        -- ---------------------------------------------------------------
+        -- Kontext- und Action-Regel, Trigger-Filter, Drosselung
+        -- ---------------------------------------------------------------
+        l_pid := proc('_KX');
+        lilam.mark_event(l_pid, 'RG_K', 'C1'); lilam.mark_event(l_pid, 'RG_K', 'C2');
+        lilam.mark_event(l_pid, 'RG_TF'); lilam.trace_start(l_pid, 'RG_TF'); lilam.trace_stop(l_pid, 'RG_TF');
+        for i in 1 .. 3 loop lilam.mark_event(l_pid, 'RG_TH'); end loop;
+        dbms_session.sleep(2.5); lilam.mark_event(l_pid, 'RG_TH');
+        lilam.close_session(l_pid);
+        expect('_KX', 'KX-01', 1, 'Kontext-Regel nur fuer C1');
+        expect('_KX', 'KX-02', 2, 'Action-Regel zusaetzlich fuer alle Kontexte');
+        expect('_KX', 'TF-01', 1, 'Trigger-Filter: nur TRACE_STOP, kein MARK_EVENT');
+        expect('_KX', 'TH-01', 2, 'Drosselung 2 s: 3 Events, Pause, 1 Event');
+
+        -- ---------------------------------------------------------------
+        -- Alert-Zeile und Signal
+        -- ---------------------------------------------------------------
+        execute immediate 'select count(*) from lilam_alerts where process_name = :1 and rule_id = ''PR-02''
+                              and rule_set_name = :2 and rule_set_version = 1 and handler_type = :3 and alert_severity = ''WARN''
+                              and status = ''PENDING'' and process_id is not null and action_name = :4
+                              and master_table_name = ''LILAM_PROC'' and monitor_table_name = ''LILAM_MON'' and logging_table_name = ''LILAM_LOG'''
+            into l_n using l_p || '_ST', c_set, c_handler, l_p || '_ST';
+        check_that(l_run, 'A1 Alert-Zeile vollstaendig (Rule Set, Version, Handler, Severity, Tabellen, PENDING)', l_n = 1, l_n);
+        dbms_alert.waitone(c_handler, l_msg, l_st, 2);
+        if l_st = 0 then
+            execute immediate 'select count(*) from lilam_alerts where alert_id = :1 and rule_set_name = :2'
+               into l_n using json_value(l_msg, '$.alert_id' returning number), c_set;
+        else
+            l_n := 0;
+        end if;
+        check_that(l_run, 'A2 DBMS_ALERT-Signal mit gueltiger alert_id', l_st = 0 and l_n = 1,
+                   'Status ' || l_st || ', ' || substr(l_msg, 1, 120));
+        dbms_alert.remove(c_handler);
+
+        -- ---------------------------------------------------------------
+        -- L2: Neustart laedt die Regeln aus der Registry
+        -- ---------------------------------------------------------------
+        if p_manage then
+            lilam.close_session(l_ctl);
+            l_ok := stop_server('LT_S1');
+            start_server('LT_S1');
+            wait_servers_ready(sys.odcivarchar2list('LT_S1'));
+            l_ctl := proc('_CTL2');
+            l_pid := proc('_L2'); lilam.mark_event(l_pid, 'RG_L'); lilam.close_session(l_pid);
+            expect('_L2', 'L-01', 1, 'L2 nach Neustart aktiv');
+        end if;
+
+        -- ---------------------------------------------------------------
+        -- L3: ungueltige Rule Sets werden abgelehnt, die alten Regeln bleiben aktiv
+        -- ---------------------------------------------------------------
+        update_rules(3); update_rules(4); update_rules(5); update_rules(9);   -- 9 gibt es nicht
+        registry(l_name, l_ver);
+        check_that(l_run, 'L3 ungueltige/fehlende Rule Sets: Registry unveraendert', l_name = c_set and l_ver = 1, l_name || ' v' || l_ver);
+        l_pid := proc('_L3'); lilam.mark_event(l_pid, 'RG_L'); lilam.close_session(l_pid);
+        expect('_L3', 'L-01', 1, 'L3 alte Regeln bleiben aktiv');
+        execute immediate 'select count(*) from lilam_log_internal where log_timestamp >= :1
+                              and module_name in (''load_rules_from_json'', ''readServerRules'')'
+           into l_n using run_started(l_run);
+        check_that(l_run, 'L3 je abgelehntem Rule Set genau ein interner Fehler (4)', l_n = 4, l_n);
+
+        -- ---------------------------------------------------------------
+        -- L4: Wechsel auf Version 2 ersetzt alle Regeln
+        -- ---------------------------------------------------------------
+        update_rules(2);
+        registry(l_name, l_ver);
+        check_that(l_run, 'L4 Wechsel auf Version 2 in der Registry', l_name = c_set and l_ver = 2, l_name || ' v' || l_ver);
+        l_pid := proc('_L4'); lilam.mark_event(l_pid, 'RG_L'); lilam.mark_event(l_pid, 'RG_V2'); lilam.close_session(l_pid);
+        expect('_L4', 'L-01', 0, 'L4 Regel aus Version 1 entfernt');
+        expect('_L4', 'V2-01', 1, 'L4 Regel aus Version 2 aktiv');
+        lilam.close_session(l_ctl);
+
+        -- ---------------------------------------------------------------
+        -- Abschluss
+        -- ---------------------------------------------------------------
+        if p_manage then
+            stop_all_servers;
+            execute immediate 'update lilam_server_registry set rule_set_name = null, set_in_use = 0 where pipe_name = ''LT_S1''';
+            commit;
+        end if;
+        execute immediate 'select count(*) from lilam_log_internal where log_timestamp >= :1
+                              and module_name not in (''load_rules_from_json'', ''readServerRules'')'
+           into l_n using run_started(l_run);
+        check_that(l_run, 'Keine weiteren internen LILAM-Fehler', l_n = 0, l_n);
+        end_run(l_run);
+        return l_run;
+
+    exception
+        when others then
+            begin dbms_alert.remove(c_handler); exception when others then null; end;
             abort_run(l_run, p_manage, sqlerrm || ' ' || dbms_utility.format_error_backtrace);
             if p_manage then raise; end if;
             return l_run;

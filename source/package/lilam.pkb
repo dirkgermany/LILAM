@@ -201,10 +201,11 @@ AS
     TYPE t_safe_tables IS TABLE OF VARCHAR2(150) INDEX BY VARCHAR2(150);
     g_safe_tables t_safe_tables;
 
-    -- remember to latest action
+    -- Letztes Event bzw. letzter Trace je Prozess (Vorgänger für PRECEDED_BY); Logs zählen nicht
     TYPE t_action_history_rec IS RECORD (
-        full_key VARCHAR2(100),
-        stop_time   TIMESTAMP
+        action_name  VARCHAR2(100),
+        context_name VARCHAR2(100),
+        stop_time    TIMESTAMP
     );
     TYPE t_last_action_map IS TABLE OF t_action_history_rec INDEX BY PLS_INTEGER; 
     g_last_action_per_process t_last_action_map;
@@ -291,14 +292,19 @@ AS
     TYPE t_rule_rec IS RECORD (
         rule_id             VARCHAR2(50),
         trigger_type        VARCHAR2(50),  -- TRACE_STOP, MARK_EVENT
-        target_action       VARCHAR2(50),
-        target_context      VARCHAR2(50),
+        target_action       VARCHAR2(100),
+        target_context      VARCHAR2(100),
         condition_metric    VARCHAR2(50),
-        condition_operator  VARCHAR2(50),  -- GREATER_THAN_AVG_PERCENT, etc.
-        condition_value     VARCHAR2(50),
-        alert_handler       VARCHAR2(50),  -- LOG_AND_MAIL, etc.
+        condition_operator  VARCHAR2(50),  -- MAX_DURATION_MS, PRECEDED_BY, etc.
+        condition_value     VARCHAR2(250),
+        alert_handler       VARCHAR2(30),  -- Name des DBMS_ALERT-Signals (max. 30 Zeichen)
         alert_severity      VARCHAR2(30),
-        throttle_seconds    NUMBER         -- Warten bis zum nächsten Alarm
+        throttle_seconds    NUMBER,        -- Warten bis zum nächsten Alarm
+        -- PERFORMANCE: beim Laden aufbereitete Werte (keine Umwandlung je Signal)
+        cond_num            NUMBER,        -- Zahlenwert (NLS-unabhängig), z.B. Grenze in ms
+        cond_action         VARCHAR2(100), -- PRECEDED_BY*: erwartete Vorgänger-Action
+        cond_context        VARCHAR2(100), -- PRECEDED_BY*: erwarteter Kontext (NULL = beliebig)
+        cond_upper          VARCHAR2(100)  -- SEVERITY, INFO_CONTAINS: Wert in Großbuchstaben
     );
     TYPE t_rule_list IS TABLE OF t_rule_rec;
     TYPE t_rule_map IS TABLE OF t_rule_list INDEX BY VARCHAR2(250);
@@ -803,7 +809,8 @@ AS
     -- Millis between two timestamps
     --------------------------------------------------------------------------
     function get_ms_diff(p_start timestamp, p_end timestamp) return number is
-        v_diff interval day(0) to second(3); -- Präzision auf ms begrenzen
+        -- STABILITÄT: day(9) statt day(0), sonst ORA-01873 ab einem Tag Abstand (z.B. RUNTIME_EXCEEDED)
+        v_diff interval day(9) to second(3); -- Präzision auf ms begrenzen
     begin
         v_diff := p_end - p_start;
         -- Wir extrahieren nur die Sekunden inklusive der Nachkommastellen (ms)
@@ -1161,7 +1168,9 @@ AS
 
     exception
         when others then
-        logLilamErr(sqlCode, sqlErrM, 'fire_alert');
+        -- STABILITÄT: autonome Transaktion abschließen, sonst ORA-06519 beim Verlassen
+        logLilamErr(sqlCode, sqlErrM, 'fire_alert', 'rule ' || p_rule.rule_id);
+        rollback;
     END;
     
     ------------------------------------------------------------
@@ -1172,9 +1181,17 @@ AS
     AS
         v_key       VARCHAR2(200);
         fire        BOOLEAN := FALSE;
-        l_diff_ms   PLS_INTEGER := 0;
-        l_condVal   NUMBER := 0;
+        l_diff_ms   NUMBER := 0;
         p_monRec    t_monitor_buffer_rec; -- Hilfsvariable für fire_alert
+
+        -- Passt der letzte Vorgänger (Event/Trace) des Prozesses zur Regel?
+        -- cond_context NULL: jeder Kontext der erwarteten Action ist zulässig.
+        FUNCTION predecessorMatches(p_rule t_rule_rec) RETURN BOOLEAN IS
+        BEGIN
+            RETURN NVL(g_last_action_per_process(p_ctx.process_id).action_name = p_rule.cond_action
+               AND (p_rule.cond_context IS NULL
+                    OR g_last_action_per_process(p_ctx.process_id).context_name = p_rule.cond_context), FALSE);
+        END;
 
         PROCEDURE apply_rule_list(p_list t_rule_list) IS
         BEGIN
@@ -1182,173 +1199,128 @@ AS
 
             FOR i IN 1 .. p_list.COUNT LOOP
                 fire := FALSE;
-                
-                IF upper(p_list(i).trigger_type) = upper(p_trigger) THEN
-                    CASE
+
+                -- Trigger und Operator sind beim Laden geprüft und in Großbuchstaben abgelegt
+                IF p_list(i).trigger_type = p_trigger THEN
+                  -- STABILITÄT: ein Fehler in einer Regel darf die übrigen Regeln nicht verhindern
+                  BEGIN
+                    CASE p_list(i).condition_operator
                         -- =====================================================
                         -- LOGGING OPERATOREN
                         -- =====================================================
-                        -- ohne SEVERITY gibt's kein fire
-                        WHEN upper(p_list(i).condition_operator) = 'SEVERITY' AND upper(p_list(i).condition_value) = upper(p_ctx.context_name) THEN
-                            fire := TRUE;
-                        
+                        WHEN 'SEVERITY' THEN
+                            fire := p_list(i).cond_upper = upper(p_ctx.context_name);
+
                         -- =====================================================
                         -- GEMEINSAME OPERATOREN
                         -- =====================================================
-                        WHEN p_list(i).condition_operator IN ('ON_START', 'ON_STOP', 'ON_UPDATE', 'ON_EVENT') THEN
-                            fire := TRUE;
+                        WHEN 'ON_START' THEN fire := TRUE;
+                        WHEN 'ON_STOP'  THEN fire := TRUE;
+                        WHEN 'ON_UPDATE' THEN fire := TRUE;
+                        WHEN 'ON_EVENT' THEN fire := TRUE;
 
-                        WHEN p_list(i).condition_operator = 'MAX_OCCURRENCE' THEN
-                            -- Konsolidierte Logik: Prozess nutzt stepsTodo/stepsDone, Monitor nutzt action_count
-                            IF p_ctx.steps_todo IS NOT NULL THEN
-                                IF p_ctx.steps_todo - p_ctx.steps_done > p_list(i).condition_value THEN 
-                                    fire := TRUE; 
-                                END IF;
+                        WHEN 'MAX_OCCURRENCE' THEN
+                            -- Prozess: erledigte Schritte; Monitor: n-te Ausführung der Action im Prozess
+                            IF p_ctx.action_count IS NULL THEN
+                                fire := p_ctx.steps_done > p_list(i).cond_num;
                             ELSE
-                                IF p_ctx.action_count > p_list(i).condition_value THEN
-                                    fire := TRUE; 
-                                END IF;
+                                fire := p_ctx.action_count > p_list(i).cond_num;
                             END IF;
 
-                        WHEN p_list(i).condition_operator = 'PRECEDED_BY' THEN
-                            IF g_last_action_per_process.EXISTS(p_ctx.process_id) THEN
-                                DECLARE
-                                    l_actual_history_key VARCHAR2(500) := g_last_action_per_process(p_ctx.process_id).full_key;
+                        WHEN 'PRECEDED_BY' THEN
+                            fire := NOT (g_last_action_per_process.EXISTS(p_ctx.process_id) AND predecessorMatches(p_list(i)));
 
-                                BEGIN
-                                    IF l_actual_history_key = p_list(i).condition_value 
-                                       OR l_actual_history_key LIKE p_list(i).condition_value || '|%' 
-                                    THEN 
-                                        NULL; 
-                                    ELSE 
-                                        fire := TRUE; 
-                                    END IF;
-                                END;
-                            ELSE 
-                                fire := TRUE; 
-                            END IF;
-                            
-                        WHEN p_list(i).condition_operator = 'PRECEDED_BY_WITHIN_SECS' THEN
-                            IF g_last_action_per_process.EXISTS(p_ctx.process_id) THEN
-                                DECLARE
-                                    l_history     t_action_history_rec := g_last_action_per_process(p_ctx.process_id);
-                                    l_pos         PLS_INTEGER; 
-                                    l_expected    VARCHAR2(100);
-                                    l_max_seconds NUMBER;
-                                    l_gap_ms      NUMBER;
-
-                                BEGIN
-                                    l_pos := instr(p_list(i).condition_value, '|', -1);
-
-                                    IF l_pos > 0 THEN
-                                        l_expected    := substr(p_list(i).condition_value, 1, l_pos - 1);
-                                        l_max_seconds := to_number(substr(p_list(i).condition_value, l_pos + 1));                            
-
-                                        IF l_history.full_key != l_expected THEN
-                                            fire := TRUE; 
-                                        ELSE
-                                            l_gap_ms := get_ms_diff(l_history.stop_time, p_ctx.start_time);
-
-                                            IF (l_gap_ms / 1000) > l_max_seconds THEN 
-                                                fire := TRUE; 
-                                            END IF;
-                                        END IF;
-                                    END IF;
-                                END;
-                            ELSE 
-                                fire := TRUE; 
+                        WHEN 'PRECEDED_BY_WITHIN_SECS' THEN
+                            IF g_last_action_per_process.EXISTS(p_ctx.process_id) AND predecessorMatches(p_list(i)) THEN
+                                l_diff_ms := get_ms_diff(g_last_action_per_process(p_ctx.process_id).stop_time, p_ctx.start_time);
+                                fire := l_diff_ms / 1000 > p_list(i).cond_num;
+                            ELSE
+                                fire := TRUE;
                             END IF;
 
                         -- =====================================================
                         -- REINE MONITOR-OPERATOREN
                         -- =====================================================
-                        WHEN p_list(i).condition_operator = 'AVG_DEVIATION_PCT' THEN
+                        WHEN 'AVG_DEVIATION_PCT' THEN
                             -- Vergleich der aktuellen Dauer mit dem Durchschnitt VOR dieser Messung.
                             -- avg_time ist während des Warm-ups NULL => keine Bewertung.
-                            p_monRec.start_time      := p_ctx.start_time; 
+                            p_monRec.start_time      := p_ctx.start_time;
                             p_monRec.stop_time       := p_ctx.stop_time;
                             p_monRec.used_time       := p_ctx.used_time;
                             p_monRec.avg_action_time := p_ctx.avg_time;
+                            fire := NOT validateDurationInAverage(p_monRec, p_list(i).cond_num);
 
-                            IF NOT validateDurationInAverage(p_monRec, extractRuleValue(p_list(i).condition_value, 1)) THEN
-                                fire := TRUE;
-                            END IF;
+                        WHEN 'MAX_DURATION_MS' THEN
+                            fire := p_ctx.used_time > p_list(i).cond_num;
 
-                        WHEN p_list(i).condition_operator = 'MAX_DURATION_MS' THEN
-                            IF p_ctx.used_time > p_list(i).condition_value THEN 
-                                fire := TRUE; 
-                            END IF;
-
-                        WHEN p_list(i).condition_operator = 'MAX_GAP_SECONDS' THEN
+                        WHEN 'MAX_GAP_SECONDS' THEN
+                            -- Events: Abstand zum vorigen Event; Traces (TRACE_START): Abstand zum Ende des vorigen Traces
                             v_key := buildMonitorKey(p_ctx.process_id, p_ctx.action_name, p_ctx.context_name);
-
-                            IF g_monitor_shadows.EXISTS(v_key) THEN
-                                DECLARE
-                                    l_vorganger_zeit TIMESTAMP := coalesce(g_monitor_shadows(v_key).stop_time, g_monitor_shadows(v_key).start_time);
-                                BEGIN
-                                    l_diff_ms := get_ms_diff(l_vorganger_zeit, p_ctx.start_time);
-                                    IF (l_diff_ms / 1000) > TO_NUMBER(p_list(i).condition_value) THEN 
-                                        fire := TRUE; 
-                                    END IF;
-                                END;
+                            IF p_trigger = C_MARK_EVENT AND g_monitor_shadows.EXISTS(v_key) THEN
+                                l_diff_ms := get_ms_diff(g_monitor_shadows(v_key).start_time, p_ctx.start_time);
+                                fire := l_diff_ms / 1000 > p_list(i).cond_num;
+                            ELSIF p_trigger = C_TRACE_START AND g_monitor_averages.EXISTS(v_key) THEN
+                                l_diff_ms := get_ms_diff(g_monitor_averages(v_key).stop_time, p_ctx.start_time);
+                                fire := l_diff_ms / 1000 > p_list(i).cond_num;
                             END IF;
 
                         -- =====================================================
                         -- REINE PROZESS-OPERATOREN
                         -- =====================================================
-                        WHEN p_list(i).condition_operator = 'RUNTIME_EXCEEDED' THEN
-                            IF p_ctx.process_end IS NULL AND get_ms_diff(coalesce(p_ctx.last_update, systimestamp), systimestamp) > to_number(p_list(i).condition_value) THEN
-                                fire := TRUE;
-                            END IF;
+                        WHEN 'RUNTIME_EXCEEDED' THEN
+                            -- laufender Prozess; geprüft wird nur, wenn ein Signal eintrifft
+                            fire := p_ctx.process_end IS NULL
+                                AND get_ms_diff(p_ctx.start_time, systimestamp) > p_list(i).cond_num;
 
-                        WHEN p_list(i).condition_operator = 'MAX_RUNTIME_EXCEEDED' THEN
-                            IF p_ctx.process_end IS NOT NULL AND get_ms_diff(p_ctx.start_time, p_ctx.process_end) > to_number(p_list(i).condition_value) THEN
-                                fire := TRUE;
-                            END IF;
+                        WHEN 'MAX_RUNTIME_EXCEEDED' THEN
+                            fire := p_ctx.process_end IS NOT NULL
+                                AND get_ms_diff(p_ctx.start_time, p_ctx.process_end) > p_list(i).cond_num;
 
-                        WHEN p_list(i).condition_operator = 'STEPS_LEFT_HIGH' THEN
-                            IF p_ctx.steps_todo - p_ctx.steps_done > p_list(i).condition_value THEN 
-                                fire := TRUE; 
-                            END IF;
+                        WHEN 'STEPS_LEFT_HIGH' THEN
+                            fire := p_ctx.steps_todo - coalesce(p_ctx.steps_done, 0) > p_list(i).cond_num;
 
-                        WHEN p_list(i).condition_operator = 'SUCCESS_RATE_LOW' THEN
-                            IF coalesce(p_ctx.steps_todo, 0) > 0 AND (p_ctx.steps_done / p_ctx.steps_todo * 100 < to_number(p_list(i).condition_value)) THEN
-                                fire := TRUE;
-                            END IF;
+                        WHEN 'SUCCESS_RATE_LOW' THEN
+                            fire := coalesce(p_ctx.steps_todo, 0) > 0
+                                AND coalesce(p_ctx.steps_done, 0) / p_ctx.steps_todo * 100 < p_list(i).cond_num;
 
-                        WHEN p_list(i).condition_operator = 'STATUS_EQUALS' THEN
-                            IF coalesce(p_ctx.status, -1) = to_number(p_list(i).condition_value) THEN 
-                                fire := TRUE; 
-                            END IF;
-                            
-                        WHEN p_list(i).condition_operator = 'INFO_CONTAINS' THEN
-                            IF p_ctx.info IS NOT NULL AND UPPER(p_ctx.info) LIKE '%' || UPPER(p_list(i).condition_value) || '%' THEN
-                                fire := TRUE;
-                            END IF;
+                        WHEN 'STATUS_EQUALS' THEN
+                            fire := coalesce(p_ctx.status, -1) = p_list(i).cond_num;
+
+                        WHEN 'INFO_CONTAINS' THEN
+                            fire := instr(upper(p_ctx.info), p_list(i).cond_upper) > 0;
+
+                        ELSE
+                            NULL; -- unbekannte Operatoren lehnt das Laden ab
                     END CASE;
-                END IF;
-                
-                -- Wenn die Regel anschlägt, mappen wir die Daten für das Alarmsystem zurück
-                IF fire THEN
-                    p_monRec.process_id   := p_ctx.process_id;
-                    p_monRec.action_name  := p_ctx.action_name;
-                    p_monRec.context_name := p_ctx.context_name;
-                    p_monRec.action_count := coalesce(p_ctx.steps_done, p_ctx.action_count);
-                    p_monRec.start_time   := p_ctx.start_time;
-                    p_monRec.stop_time    := p_ctx.stop_time;
-                    p_monRec.used_time    := p_ctx.used_time;
-                    fire_alert(p_list(i), p_monRec);
+
+                    -- Wenn die Regel anschlägt, mappen wir die Daten für das Alarmsystem zurück
+                    -- (fire kann bei NULL-Vergleichen NULL sein => kein Alarm)
+                    IF fire THEN
+                        p_monRec.process_id   := p_ctx.process_id;
+                        p_monRec.action_name  := p_ctx.action_name;
+                        p_monRec.context_name := p_ctx.context_name;
+                        p_monRec.action_count := coalesce(p_ctx.action_count, p_ctx.steps_done, 0);
+                        p_monRec.start_time   := p_ctx.start_time;
+                        p_monRec.stop_time    := p_ctx.stop_time;
+                        p_monRec.used_time    := p_ctx.used_time;
+                        fire_alert(p_list(i), p_monRec);
+                    END IF;
+                  EXCEPTION
+                    WHEN OTHERS THEN
+                        logLilamErr(sqlCode, sqlErrM, 'evaluateRules_internal', 'rule ' || p_list(i).rule_id);
+                  END;
                 END IF;
             END LOOP;
         END;
-        
+
     BEGIN
         -- 1. Kontext-Regeln (nur für Monitore relevant)
-        IF p_check_context AND g_rules_by_context.EXISTS(p_ctx.action_name || '|' || p_ctx.context_name) THEN          
+        IF p_check_context AND p_ctx.context_name IS NOT NULL
+           AND g_rules_by_context.EXISTS(p_ctx.action_name || '|' || p_ctx.context_name) THEN
             apply_rule_list(g_rules_by_context(p_ctx.action_name || '|' || p_ctx.context_name));
         END IF;
 
-        -- 2. Allgemeine Action/Prozess-Regeln
+        -- 2. Allgemeine Action/Prozess-Regeln (gelten zusätzlich, für alle Kontexte)
         IF g_rules_by_action.EXISTS(p_ctx.action_name) THEN
             apply_rule_list(g_rules_by_action(p_ctx.action_name));
         END IF;
@@ -1356,7 +1328,7 @@ AS
     EXCEPTION
         WHEN OTHERS THEN
         logLilamErr(sqlCode, sqlErrM, 'evaluateRules_internal');
-        
+
     END evaluateRules_internal;
 
     -- Hilfsfunktion zum Mappen von Monitor-Daten
@@ -1402,10 +1374,13 @@ AS
     AS
     BEGIN
         evaluateRules_internal(mapMonitorRecToContextRec(p_monitorRec), p_trigger, p_check_context => TRUE);
-        -- Historien-Zustand für den Monitor wegschreiben
-        g_last_action_per_process(p_monitorRec.process_id).full_key  := p_monitorRec.action_name || p_monitorRec.context_name;
-        g_last_action_per_process(p_monitorRec.process_id).stop_time := coalesce(p_monitorRec.stop_time, p_monitorRec.start_time);
-        
+        -- Vorgänger für PRECEDED_BY merken: nur Events und Traces, keine Logs
+        IF p_trigger != C_LOGGING THEN
+            g_last_action_per_process(p_monitorRec.process_id).action_name  := p_monitorRec.action_name;
+            g_last_action_per_process(p_monitorRec.process_id).context_name := p_monitorRec.context_name;
+            g_last_action_per_process(p_monitorRec.process_id).stop_time    := coalesce(p_monitorRec.stop_time, p_monitorRec.start_time);
+        END IF;
+
     EXCEPTION
     WHEN OTHERS THEN
         logLilamErr(sqlCode, sqlErrM, 'evaluateRules'); 
@@ -1984,7 +1959,7 @@ AS
 
         if not objectExists('idx_lilam_rules', 'INDEX') then
             sqlStmt := '
-            CREATE INDEX idx_lilam_rules 
+            CREATE UNIQUE INDEX idx_lilam_rules 
             ON C_LILAM_RULES_TABLE (set_name, version)';
             sqlStmt := replace(sqlStmt, 'C_LILAM_RULES_TABLE', C_LILAM_RULES_TABLE);
             run_sql(sqlStmt);
@@ -4138,14 +4113,16 @@ AS
             );
         end if ;
         
-        -- raise alert
-        v_dummyMonRec.process_id := p_processId;
-        v_dummyMonRec.start_time := coalesce(p_timestamp, systimestamp);
-        v_dummyMonRec.stop_time := null;
-        v_dummyMonRec.monitor_type := C_MON_TYPE_LOG;
-        v_dummyMonRec.action_name := 'LOGGING';
-        v_dummyMonRec.context_name := logLevelToEnum(p_level);
-        evaluateRules(v_dummyMonRec, C_LOGGING);
+        -- raise alert (nur für bekannte Prozesse; fire_alert braucht die Session-Daten)
+        if g_rules_by_action.EXISTS(C_LOGGING) and v_indexSession.EXISTS(p_processId) then
+            v_dummyMonRec.process_id := p_processId;
+            v_dummyMonRec.start_time := coalesce(p_timestamp, systimestamp);
+            v_dummyMonRec.stop_time := null;
+            v_dummyMonRec.monitor_type := C_MON_TYPE_LOG;
+            v_dummyMonRec.action_name := C_LOGGING;
+            v_dummyMonRec.context_name := logLevelToEnum(p_level);
+            evaluateRules(v_dummyMonRec, C_LOGGING);
+        end if;
 
         -- Wenn harte Fehler, muss das Logfile geschrieben werden
         if p_level = logLevelError then
@@ -4638,6 +4615,11 @@ AS
             syncBaselines(true);
 
             g_process_cache(p_processId).processEnd := systimestamp;
+            -- Abschlusswerte vor der Regelprüfung übernehmen (PROCESS_STOP sieht den Endstand)
+            if p_procStepsDone is not null then g_process_cache(p_processId).stepsDone := p_procStepsDone; end if;
+            if p_procStepsToDo is not null then g_process_cache(p_processId).stepsTodo := p_procStepsToDo; end if;
+            if p_processInfo   is not null then g_process_cache(p_processId).info      := p_processInfo;   end if;
+            if p_processStatus is not null then g_process_cache(p_processId).status    := p_processStatus; end if;
 
             evaluateRules(g_process_cache(p_processId), C_PROCESS_STOP);
 
@@ -5635,138 +5617,298 @@ AS
         WHEN OTHERS THEN
             logLilamErr(sqlCode, sqlErrM, 'updateRulesInRegistry', 'EXECUTE IMMEDIATE'); 
             if should_raise_error(g_serverProcessId) then
-                error(g_serverProcessId, 'Failed to parse JSON rules: ' || sqlErrM);
+                error(g_serverProcessId, 'Failed to update rules in registry: ' || sqlErrM);
             end if ; 
             rollback;
     END;
 
     --------------------------------------------------------------------------
-
-    PROCEDURE load_rules_from_json(p_ruleSet CLOB) IS
-        l_ruleSet VARCHAR2(32000);
+    --------------------------------------------------------------------------
+    -- Zahl aus dem n-ten Teil von 'a|b|c', NLS-unabhängig ('.' als Dezimalzeichen).
+    -- Ungültig oder fehlend => NULL (ohne Fehlerprotokoll; der Aufrufer meldet)
+    --------------------------------------------------------------------------
+    FUNCTION ruleNumber(p_value VARCHAR2, p_position PLS_INTEGER := 1) RETURN NUMBER
+    AS
+        l_val  VARCHAR2(100) := TRIM(REGEXP_SUBSTR(p_value, '[^|]+', 1, p_position));
+        l_sign NUMBER := 1;
     BEGIN
-        -- Zuerst die alten Regeln löschen (Reset)
-        g_rules_by_context.DELETE;
-        g_rules_by_action.DELETE;
-        g_alert_history.DELETE;
+        IF l_val IS NULL THEN
+            RETURN NULL;
+        END IF;
+        IF substr(l_val, 1, 1) = '-' THEN
+            l_sign := -1;
+            l_val  := substr(l_val, 2);
+        END IF;
+        RETURN l_sign * to_number(l_val, '999999999999D9999999999', 'NLS_NUMERIC_CHARACTERS = ''. ''');
+    EXCEPTION
+        WHEN VALUE_ERROR OR INVALID_NUMBER THEN
+            RETURN NULL;
+    END;
+
+    --------------------------------------------------------------------------
+    -- Prüft ein Rule Set und bereitet es auf. Liefert NULL, wenn es gültig ist, sonst die Fehlermeldung.
+    -- Die Regeln landen in den OUT-Parametern; die geladenen Regeln des Servers bleiben unberührt.
+    --------------------------------------------------------------------------
+    FUNCTION parseRuleSet(p_ruleSet CLOB, p_byCtx OUT NOCOPY t_rule_map, p_byAction OUT NOCOPY t_rule_map,
+                          p_avg OUT NOCOPY t_avg_params_map) RETURN VARCHAR2
+    IS
+        TYPE t_seen_map IS TABLE OF BOOLEAN INDEX BY VARCHAR2(50);
+        l_seen   t_seen_map;
+        l_hasArr PLS_INTEGER;
+        l_no     PLS_INTEGER := 0;
+        l_parts  PLS_INTEGER;
+        l_rule   t_rule_rec;
+        l_empty  t_rule_rec;
+        l_key    VARCHAR2(250);
+        l_trig   VARCHAR2(4000);
+        l_op     VARCHAR2(4000);
+        l_ok     BOOLEAN;
+
+        FUNCTION fail(p_msg VARCHAR2) RETURN VARCHAR2 IS
+        BEGIN
+            RETURN substr('rule #' || l_no || ' (id ' || coalesce(l_rule.rule_id, '?') || '): ' || p_msg, 1, 1000);
+        END;
+    BEGIN
+        SELECT count(*) INTO l_hasArr FROM dual WHERE JSON_EXISTS(p_ruleSet, '$.rules');
+        IF l_hasArr = 0 THEN
+            RETURN 'array "rules" missing';
+        END IF;
 
         FOR r IN (
             SELECT *
             FROM JSON_TABLE(p_ruleSet, '$.rules[*]'
                 COLUMNS (
-                    rule_id      VARCHAR2(50) PATH '$.id',
-                    trigger_t    VARCHAR2(50) PATH '$.trigger_type',
-                    action       VARCHAR2(50) PATH '$.action',
-                    context      VARCHAR2(50) PATH '$.context',
-                    metric       VARCHAR2(50) PATH '$.condition.metric',
-                    operator     VARCHAR2(50) PATH '$.condition.operator',
-                    value        VARCHAR2(50) PATH '$.condition.value',
-                    handler      VARCHAR2(50) PATH '$.alert.handler',
-                    severity     VARCHAR2(30) PATH '$.alert.severity',
-                    throttle_sec NUMBER       PATH '$.alert.throttle_seconds'
+                    rule_id      VARCHAR2(4000) PATH '$.id',
+                    trigger_t    VARCHAR2(4000) PATH '$.trigger_type',
+                    action       VARCHAR2(4000) PATH '$.action',
+                    context      VARCHAR2(4000) PATH '$.context',
+                    metric       VARCHAR2(4000) PATH '$.condition.metric',
+                    operator     VARCHAR2(4000) PATH '$.condition.operator',
+                    value        VARCHAR2(4000) PATH '$.condition.value',
+                    handler      VARCHAR2(4000) PATH '$.alert.handler',
+                    severity     VARCHAR2(4000) PATH '$.alert.severity',
+                    throttle_sec VARCHAR2(4000) PATH '$.alert.throttle_seconds'
                 )
             )
         ) LOOP
-            -- Record vorbereiten
-            DECLARE
-                l_new_rule t_rule_rec;
-                l_key      VARCHAR2(250);
-            BEGIN
-                l_new_rule.rule_id            := r.rule_id;
-                l_new_rule.trigger_type       := r.trigger_t;
-                l_new_rule.target_action      := r.action;
-                l_new_rule.target_context     := r.context;
-                l_new_rule.condition_metric   := r.metric;
-                l_new_rule.condition_operator := r.operator;
-                l_new_rule.condition_value    := r.value;
-                l_new_rule.alert_handler      := r.handler;
-                l_new_rule.alert_severity     := r.severity;
-                l_new_rule.throttle_seconds   := r.throttle_sec;
+            l_no   := l_no + 1;
+            l_rule := l_empty;
+            l_trig := upper(trim(r.trigger_t));
+            l_op   := upper(trim(r.operator));
 
-                -- Entscheidung: Kontext-Regel oder allgemeine Action-Regel?
-                IF r.context IS NOT NULL THEN
-                    l_key := r.action || '|' || r.context;
-                    IF NOT g_rules_by_context.EXISTS(l_key) THEN
-                        g_rules_by_context(l_key) := t_rule_list();
-                    END IF;
-                    g_rules_by_context(l_key).EXTEND;
-                    g_rules_by_context(l_key)(g_rules_by_context(l_key).LAST) := l_new_rule;
+            -- Pflichtfelder und Längen
+            IF r.rule_id IS NULL OR length(r.rule_id) > 50 THEN
+                RETURN fail('"id" missing or longer than 50');
+            END IF;
+            l_rule.rule_id := r.rule_id;
+            IF l_seen.EXISTS(r.rule_id) THEN
+                RETURN fail('"id" not unique');
+            END IF;
+            l_seen(r.rule_id) := TRUE;
 
-                    if l_new_rule.condition_operator = 'AVG_DEVIATION_PCT' then
-                        -- 'pct|warmup|alpha'; fehlende Werte => Default
-                        g_avg_params(l_key).warmup := coalesce(extractRuleValue(l_new_rule.condition_value, 2), g_avg_params('DEFAULT').warmup);
-                        g_avg_params(l_key).alpha  := coalesce(extractRuleValue(l_new_rule.condition_value, 3), g_avg_params('DEFAULT').alpha);
-                    end if;
-                ELSE
-                    l_key := r.action;
-                    IF NOT g_rules_by_action.EXISTS(l_key) THEN
-                        g_rules_by_action(l_key) := t_rule_list();
-                    END IF;
-                    g_rules_by_action(l_key).EXTEND;
-                    g_rules_by_action(l_key)(g_rules_by_action(l_key).LAST) := l_new_rule;
+            IF l_trig IS NULL OR l_trig NOT IN (C_PROCESS_START, C_PROCESS_UPDATE, C_PROCESS_STOP,
+                                                C_MARK_EVENT, C_TRACE_START, C_TRACE_STOP, C_LOGGING) THEN
+                RETURN fail('unknown "trigger_type" ' || r.trigger_t);
+            END IF;
 
-                    if l_new_rule.condition_operator = 'AVG_DEVIATION_PCT' then
-                        -- 'pct|warmup|alpha'; fehlende Werte => Default
-                        g_avg_params(l_key).warmup := coalesce(extractRuleValue(l_new_rule.condition_value, 2), g_avg_params('DEFAULT').warmup);
-                        g_avg_params(l_key).alpha  := coalesce(extractRuleValue(l_new_rule.condition_value, 3), g_avg_params('DEFAULT').alpha);
-                    end if;
+            -- LOGGING-Regeln hängen immer an der Action LOGGING ("action" darf fehlen)
+            IF l_trig = C_LOGGING THEN
+                IF r.action IS NOT NULL AND upper(r.action) != C_LOGGING THEN
+                    RETURN fail('"action" of a LOGGING rule must be empty or LOGGING');
                 END IF;
+                l_rule.target_action := C_LOGGING;
+            ELSE
+                IF r.action IS NULL OR length(r.action) > 100 THEN
+                    RETURN fail('"action" missing or longer than 100');
+                END IF;
+                l_rule.target_action := r.action;
+            END IF;
+            IF length(r.context) > 100 THEN
+                RETURN fail('"context" longer than 100');
+            END IF;
+            IF r.handler IS NULL OR length(r.handler) > 30 THEN
+                RETURN fail('"alert.handler" missing or longer than 30 (DBMS_ALERT name)');
+            END IF;
+            IF length(r.severity) > 30 THEN
+                RETURN fail('"alert.severity" longer than 30');
+            END IF;
+            IF length(r.value) > 250 OR length(r.metric) > 50 THEN
+                RETURN fail('"condition.value" longer than 250 or "condition.metric" longer than 50');
+            END IF;
+            IF r.throttle_sec IS NOT NULL AND (ruleNumber(r.throttle_sec) IS NULL OR ruleNumber(r.throttle_sec) < 0) THEN
+                RETURN fail('"alert.throttle_seconds" is not a number >= 0');
+            END IF;
+
+            l_rule.trigger_type       := l_trig;
+            l_rule.target_context     := r.context;
+            l_rule.condition_metric   := r.metric;
+            l_rule.condition_operator := l_op;
+            l_rule.condition_value    := r.value;
+            l_rule.alert_handler      := r.handler;
+            l_rule.alert_severity     := r.severity;
+            l_rule.throttle_seconds   := ruleNumber(r.throttle_sec);
+
+            -- Operator: zulässige Trigger
+            l_ok := CASE
+                WHEN l_op IN ('ON_START', 'ON_STOP', 'ON_EVENT', 'ON_UPDATE') THEN l_trig != C_LOGGING
+                WHEN l_op = 'SEVERITY' THEN l_trig = C_LOGGING
+                WHEN l_op IN ('MAX_DURATION_MS', 'AVG_DEVIATION_PCT') THEN l_trig IN (C_MARK_EVENT, C_TRACE_STOP)
+                WHEN l_op = 'MAX_GAP_SECONDS' THEN l_trig IN (C_MARK_EVENT, C_TRACE_START)
+                WHEN l_op = 'MAX_OCCURRENCE' THEN l_trig IN (C_MARK_EVENT, C_TRACE_STOP, C_PROCESS_UPDATE, C_PROCESS_STOP)
+                WHEN l_op IN ('PRECEDED_BY', 'PRECEDED_BY_WITHIN_SECS') THEN
+                     l_trig IN (C_MARK_EVENT, C_TRACE_START, C_TRACE_STOP, C_PROCESS_UPDATE, C_PROCESS_STOP)
+                WHEN l_op = 'RUNTIME_EXCEEDED' THEN l_trig = C_PROCESS_UPDATE
+                WHEN l_op = 'MAX_RUNTIME_EXCEEDED' THEN l_trig = C_PROCESS_STOP
+                WHEN l_op IN ('STEPS_LEFT_HIGH', 'SUCCESS_RATE_LOW', 'STATUS_EQUALS', 'INFO_CONTAINS') THEN
+                     l_trig IN (C_PROCESS_START, C_PROCESS_UPDATE, C_PROCESS_STOP)
+                ELSE NULL
             END;
+            IF l_ok IS NULL THEN
+                RETURN fail('unknown "condition.operator" ' || r.operator);
+            ELSIF NOT l_ok THEN
+                RETURN fail('operator ' || l_op || ' not allowed for trigger ' || l_trig);
+            END IF;
+
+            -- Wert prüfen und aufbereiten
+            CASE
+                WHEN l_op IN ('ON_START', 'ON_STOP', 'ON_EVENT', 'ON_UPDATE') THEN
+                    NULL;
+                WHEN l_op = 'SEVERITY' THEN
+                    l_rule.cond_upper := upper(trim(r.value));
+                    IF l_rule.cond_upper IS NULL OR l_rule.cond_upper NOT IN ('ERROR', 'WARN', 'MONITOR', 'INFO', 'DEBUG') THEN
+                        RETURN fail('SEVERITY needs ERROR, WARN, MONITOR, INFO or DEBUG');
+                    END IF;
+                WHEN l_op = 'INFO_CONTAINS' THEN
+                    l_rule.cond_upper := upper(r.value);
+                    IF l_rule.cond_upper IS NULL OR length(l_rule.cond_upper) > 100 THEN
+                        RETURN fail('INFO_CONTAINS needs a text (max. 100)');
+                    END IF;
+                WHEN l_op IN ('PRECEDED_BY', 'PRECEDED_BY_WITHIN_SECS') THEN
+                    -- PRECEDED_BY: ACTION[|CONTEXT]; PRECEDED_BY_WITHIN_SECS: ACTION[|CONTEXT]|SEKUNDEN
+                    l_parts := CASE WHEN r.value IS NULL THEN 0 ELSE regexp_count(r.value, '\|') + 1 END;
+                    IF l_op = 'PRECEDED_BY_WITHIN_SECS' THEN
+                        l_rule.cond_num := ruleNumber(r.value, l_parts);
+                        l_parts := l_parts - 1;
+                        IF l_rule.cond_num IS NULL OR l_rule.cond_num < 0 THEN
+                            RETURN fail('PRECEDED_BY_WITHIN_SECS needs ACTION[|CONTEXT]|SECONDS');
+                        END IF;
+                    END IF;
+                    IF l_parts NOT IN (1, 2) THEN
+                        RETURN fail(l_op || ' needs ACTION or ACTION|CONTEXT');
+                    END IF;
+                    l_rule.cond_action := trim(regexp_substr(r.value, '[^|]+', 1, 1));
+                    IF l_parts = 2 THEN
+                        l_rule.cond_context := trim(regexp_substr(r.value, '[^|]+', 1, 2));
+                    END IF;
+                    IF l_rule.cond_action IS NULL THEN
+                        RETURN fail(l_op || ' needs ACTION or ACTION|CONTEXT');
+                    END IF;
+                ELSE
+                    -- alle übrigen Operatoren: Zahl (AVG_DEVIATION_PCT: 'pct|warmup|alpha')
+                    l_rule.cond_num := ruleNumber(r.value, 1);
+                    IF l_rule.cond_num IS NULL THEN
+                        RETURN fail(l_op || ' needs a number (decimal point ".")');
+                    END IF;
+                    IF l_op = 'AVG_DEVIATION_PCT' AND (
+                           (regexp_substr(r.value, '[^|]+', 1, 2) IS NOT NULL AND ruleNumber(r.value, 2) IS NULL)
+                        OR (regexp_substr(r.value, '[^|]+', 1, 3) IS NOT NULL AND ruleNumber(r.value, 3) IS NULL)) THEN
+                        RETURN fail('AVG_DEVIATION_PCT needs PCT[|WARMUP[|ALPHA]]');
+                    END IF;
+            END CASE;
+
+            -- Einordnen: Kontext-Regel oder allgemeine Action-Regel
+            IF l_rule.target_context IS NOT NULL THEN
+                l_key := l_rule.target_action || '|' || l_rule.target_context;
+                IF NOT p_byCtx.EXISTS(l_key) THEN
+                    p_byCtx(l_key) := t_rule_list();
+                END IF;
+                p_byCtx(l_key).EXTEND;
+                p_byCtx(l_key)(p_byCtx(l_key).LAST) := l_rule;
+            ELSE
+                l_key := l_rule.target_action;
+                IF NOT p_byAction.EXISTS(l_key) THEN
+                    p_byAction(l_key) := t_rule_list();
+                END IF;
+                p_byAction(l_key).EXTEND;
+                p_byAction(l_key)(p_byAction(l_key).LAST) := l_rule;
+            END IF;
+
+            IF l_op = 'AVG_DEVIATION_PCT' THEN
+                -- 'pct|warmup|alpha'; fehlende Werte => Default
+                p_avg(l_key).warmup := coalesce(ruleNumber(r.value, 2), g_avg_params('DEFAULT').warmup);
+                p_avg(l_key).alpha  := coalesce(ruleNumber(r.value, 3), g_avg_params('DEFAULT').alpha);
+            END IF;
         END LOOP;
 
-        -- Version aus dem Header extrahieren (optionaler zweiter Schritt)
-        l_ruleSet := JSON_QUERY(p_ruleSet, '$.header');
-        g_current_rule_set_name := jsonString(l_ruleSet, 'rule_set');
-        g_current_rule_set_version := jsonNumber(l_ruleSet, 'rule_set_version');
+        RETURN NULL;
+    EXCEPTION
+        WHEN OTHERS THEN
+            RETURN substr('rule #' || l_no || ': ' || sqlErrM, 1, 1000);
+    END;
+
+    --------------------------------------------------------------------------
+    -- Rule Set übernehmen. STABILITÄT: Ein ungültiges Rule Set wird vollständig abgelehnt,
+    -- die bisher geladenen Regeln bleiben dann aktiv.
+    --------------------------------------------------------------------------
+    FUNCTION load_rules_from_json(p_ruleSet CLOB, p_ruleSetName VARCHAR2, p_ruleSetVersion NUMBER) RETURN BOOLEAN IS
+        l_byCtx    t_rule_map;
+        l_byAction t_rule_map;
+        l_avg      t_avg_params_map;
+        l_default  t_avg_params := g_avg_params('DEFAULT');
+        l_err      VARCHAR2(1000);
+    BEGIN
+        l_err := parseRuleSet(p_ruleSet, l_byCtx, l_byAction, l_avg);
+        IF l_err IS NOT NULL THEN
+            logLilamErr(-20001, 'Rule set ' || p_ruleSetName || ' v' || p_ruleSetVersion || ' rejected: ' || l_err, 'load_rules_from_json');
+            if should_raise_error(g_serverProcessId) then
+                error(g_serverProcessId, g_serverPipeName || '=>Rule set ' || p_ruleSetName || ' v' || p_ruleSetVersion || ' rejected: ' || l_err);
+            end if;
+            RETURN FALSE;
+        END IF;
+
+        g_rules_by_context := l_byCtx;
+        g_rules_by_action  := l_byAction;
+        g_avg_params       := l_avg;
+        g_avg_params('DEFAULT') := l_default;
+        g_alert_history.DELETE;
+        -- Name/Version wie in LILAM_RULES (SET_NAME/VERSION); darüber findet der Consumer die Regel
+        g_current_rule_set_name    := p_ruleSetName;
+        g_current_rule_set_version := p_ruleSetVersion;
+        RETURN TRUE;
 
     EXCEPTION
         WHEN OTHERS THEN
-            logLilamErr(sqlCode, sqlErrM, 'load_rules_from_json'); 
+            logLilamErr(sqlCode, sqlErrM, 'load_rules_from_json');
             if should_raise_error(g_serverProcessId) then
-                error(g_serverProcessId, g_serverPipeName || '=>Failed to parse JSON rules: ' || sqlErrM);
-            end if ; 
-            
+                error(g_serverProcessId, g_serverPipeName || '=>Failed to load rules: ' || sqlErrM);
+            end if ;
+            RETURN FALSE;
     END;
 
     --------------------------------------------------------------------------
 
-    function existsNewServerRule(p_pipeName varchar2) return boolean
-    as
-        l_newestVersion PLS_INTEGER;
-        l_sqlStmt varchar2(200);
-    begin
-        l_sqlStmt := 'SELECT rule_version FROM ' || C_LILAM_SERVER_REGISTRY || ' WHERE upper(pipe_name) = :1';
-        execute immediate l_sqlStmt into l_newestVersion USING upper(p_pipeName);
-        if coalesce(l_newestVersion, 0) > g_current_rule_set_version then 
-            return TRUE;
-        else
-            return FALSE;
-        end if;
-
-    exception
-        when NO_DATA_FOUND then
-            return false;
-    end;
-
-    --------------------------------------------------------------------------
-
-    procedure readServerRules(p_ruleSetName varchar2, p_ruleSetVersion Number)
+    function readServerRules(p_ruleSetName varchar2, p_ruleSetVersion Number) return boolean
     as
         l_sqlStmt varchar2(200);
         l_serverRuleSet CLOB;
     begin
         l_sqlStmt := 'SELECT rule_set FROM ' || C_LILAM_RULES_TABLE || ' where set_name = :1 and version = :2';
-        execute immediate l_sqlStmt into l_serverRuleSet using p_ruleSetName, p_ruleSetVersion; 
-        load_rules_from_json(l_serverRuleSet);
+        execute immediate l_sqlStmt into l_serverRuleSet using p_ruleSetName, p_ruleSetVersion;
+        return load_rules_from_json(l_serverRuleSet, p_ruleSetName, p_ruleSetVersion);
 
     exception
         when NO_DATA_FOUND then
-            error(g_serverProcessId, g_serverPipeName || '=>Could not find server rule: ' || p_ruleSetName || '; version: ' || p_ruleSetVersion);
+            logLilamErr(-20001, 'Could not find rule set: ' || p_ruleSetName || '; version: ' || p_ruleSetVersion, 'readServerRules');
+            if should_raise_error(g_serverProcessId) then
+                error(g_serverProcessId, g_serverPipeName || '=>Could not find server rule: ' || p_ruleSetName || '; version: ' || p_ruleSetVersion);
+            end if ;
+            return false;
         when others then
-            logLilamErr(sqlCode, sqlErrM, 'readServerRules'); 
+            logLilamErr(sqlCode, sqlErrM, 'readServerRules');
             if should_raise_error(g_serverProcessId) then
                 error(g_serverProcessId, g_serverPipeName || '=>Could not read server rule: ' || p_ruleSetName || '; version: ' || p_ruleSetVersion || '; ' || sqlErrM);
             end if ;
+            return false;
     end;
 
     --------------------------------------------------------------------------
@@ -5776,19 +5918,19 @@ AS
         l_sqlStmt varchar2(200);
         l_ruleSetName varchar2(30);
         l_ruleSetVersion PLS_INTEGER;
+        l_dummy boolean;
     begin
-        l_sqlStmt := 'SELECT rule_set_name, set_in_use FROM ' || C_LILAM_SERVER_REGISTRY || ' WHERE upper(pipe_name) = ''' || upper(g_serverPipeName) || '''';
-        execute immediate l_sqlStmt into l_ruleSetName,  l_ruleSetVersion;
+        l_sqlStmt := 'SELECT rule_set_name, set_in_use FROM ' || C_LILAM_SERVER_REGISTRY || ' WHERE upper(pipe_name) = :1';
+        execute immediate l_sqlStmt into l_ruleSetName,  l_ruleSetVersion using upper(g_serverPipeName);
         if l_ruleSetName is not null then
-            readServerRules(l_ruleSetName, l_ruleSetVersion);
+            l_dummy := readServerRules(l_ruleSetName, l_ruleSetVersion);
         end if;
-
 
     exception
         when NO_DATA_FOUND then
-            null; -- in der Registry smüssen für den Server keine Rules hinterlegt sein
+            null; -- in der Registry müssen für den Server keine Rules hinterlegt sein
         when others then
-            logLilamErr(sqlCode, sqlErrM, 'loadServerRules'); 
+            logLilamErr(sqlCode, sqlErrM, 'loadServerRules');
             if should_raise_error(g_serverProcessId) then
                 error(g_serverProcessId, 'Could not load server ruleset: ' || sqlErrM);
             end if ;
@@ -5798,7 +5940,7 @@ AS
 
     procedure updateServerRules(l_message varchar2)
     as
-        l_payload  VARCHAR2(100);
+        l_payload  VARCHAR2(500);
         l_ruleSetName varchar2(30);
         l_ruleSetVersion PLS_INTEGER;
     begin
@@ -5806,8 +5948,10 @@ AS
         l_ruleSetName := jsonString(l_payload, 'rule_set_name');
         l_ruleSetVersion := jsonNumber(l_payload, 'rule_set_version');
 
-        updateRulesInRegistry(l_ruleSetName, l_ruleSetVersion);
-        readServerRules(l_ruleSetName, l_ruleSetVersion);
+        -- Registry erst nach erfolgreichem Laden ändern, sonst lädt der nächste Start ein ungültiges Rule Set
+        if readServerRules(l_ruleSetName, l_ruleSetVersion) then
+            updateRulesInRegistry(l_ruleSetName, l_ruleSetVersion);
+        end if;
     end;
 
     --------------------------------------------------------------------------

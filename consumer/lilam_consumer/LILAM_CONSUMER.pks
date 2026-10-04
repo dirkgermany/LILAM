@@ -2,7 +2,7 @@ CREATE OR REPLACE PACKAGE LILAM_CONSUMER AS
 
     -- JSON for ALERT data
     TYPE t_json_rec IS RECORD (
-        id                  VARCHAR2(30),
+        id                  VARCHAR2(50),
         trigger_type        VARCHAR2(30),
         action              VARCHAR2(50),
         condition_operator  VARCHAR2(50),
