@@ -2232,6 +2232,32 @@ AS
     end;
 
     --------------------------------------------------------------------------
+    -- STABILITÄT: Bulk-Schreiben ohne FORALL ... SAVE EXCEPTIONS
+    -- Dynamisches FORALL mit SAVE EXCEPTIONS gibt in Oracle bei jedem Aufruf PGA nicht frei
+    -- (ca. 40 Byte je Zeile, gemessen 23.26; siehe Test FEATURES/SPEICHER). Auf einem Server,
+    -- der tagelang läuft, wächst der Speicher dadurch unbegrenzt.
+    -- Deshalb: Normalfall ein FORALL ohne SAVE EXCEPTIONS (gleich schnell). Scheitert eine Zeile,
+    -- bricht das FORALL ab; die Anweisung wird zurückgerollt (Rollback der autonomen Transaktion
+    -- bzw. bis zum Savepoint in flushBatch) und dieselben Zeilen werden einzeln geschrieben
+    -- (nur im Fehlerfall). Fehlerhafte Zeilen werden wie bisher
+    -- übersprungen und protokolliert, die übrigen bleiben erhalten.
+    --------------------------------------------------------------------------
+    -- Protokolliert den Fehler einer Einzelzeile im Fallback.
+    -- TRUE = Fallback abbrechen (Tabelle fehlt, jede weitere Zeile würde ebenso scheitern)
+    function rowFailed(p_code number, p_msg varchar2, p_module varchar2, p_row pls_integer) return boolean
+    is
+    begin
+        if p_code = -942 then
+            -- Tabelle fehlt: beim naechsten NEW_SESSION erneut pruefen und anlegen
+            g_checked_masters.DELETE; g_safe_tables.DELETE;
+            logLilamErr(p_code, p_msg, p_module);
+            return true;
+        end if;
+        logLilamErr(p_code, p_msg, p_module, 'row ' || p_row || ' skipped');
+        return false;
+    end;
+
+    --------------------------------------------------------------------------
 
     procedure persist_log_data(
         p_processId    number,
@@ -2245,10 +2271,13 @@ AS
         p_stacks       sys.odcivarchar2list,
         p_backtraces   sys.odcivarchar2list,
         p_callstacks   sys.odcivarchar2list
-    )    
+    )
     as
         pragma autonomous_transaction;
         v_safe_table varchar2(150);
+        v_stmt       varchar2(1000);
+        v_user       varchar2(128);
+        v_host       varchar2(128);
     begin
         -- PERFORMANCE: im gebündelten Flush nur sammeln, flushBatch schreibt (siehe g_batch_mode)
         if g_batch_mode then
@@ -2262,32 +2291,41 @@ AS
         if p_levels.count > 0 then            
             -- Sicherheit: Tabellenname validieren
             v_safe_table := safeTableName(p_target_table);
-            -- Bulk-Insert über alle gesammelten Log-Einträge
-            forall i in 1 .. p_levels.count SAVE EXCEPTIONS
-                execute immediate 
-                    'insert into ' || v_safe_table || ' 
+            v_user := SYS_CONTEXT('USERENV','SESSION_USER');
+            v_host := SYS_CONTEXT('USERENV','HOST');
+            v_stmt := 'insert into ' || v_safe_table || '
                     (PROCESS_ID, LOG_LEVEL, LOG_LEVEL_C, INFO, SESSION_TIME, NO, CALLER, ERR_STACK, ERR_BACKTRACE, ERR_CALLSTACK, SESSION_USER, HOST_NAME)
-                    values (:1, :2, :3, :4, :5, :6, :7, :8, :9, :10, :11, :12)'
-                USING p_processId, p_levels(i), p_levelsC(i), p_texts(i), p_times(i), p_seqs(i), p_callers(i), p_stacks(i), p_backtraces(i), p_callstacks(i),
-                SYS_CONTEXT('USERENV','SESSION_USER'), SYS_CONTEXT('USERENV','HOST');
+                    values (:1, :2, :3, :4, :5, :6, :7, :8, :9, :10, :11, :12)';
+            begin
+                -- Bulk-Insert über alle gesammelten Log-Einträge (STABILITÄT: ohne SAVE EXCEPTIONS, siehe rowFailed)
+                forall i in 1 .. p_levels.count
+                    execute immediate v_stmt
+                    USING p_processId, p_levels(i), p_levelsC(i), p_texts(i), p_times(i), p_seqs(i), p_callers(i), p_stacks(i),
+                          p_backtraces(i), p_callstacks(i), v_user, v_host;
+            exception
+                when others then
+                    -- Fallback: einzeln schreiben, fehlerhafte Zeilen überspringen
+                    rollback;
+                    for i in 1 .. p_levels.count loop
+                        begin
+                            execute immediate v_stmt
+                            USING p_processId, p_levels(i), p_levelsC(i), p_texts(i), p_times(i), p_seqs(i), p_callers(i), p_stacks(i),
+                                  p_backtraces(i), p_callstacks(i), v_user, v_host;
+                        exception
+                            when others then
+                                exit when rowFailed(sqlcode, sqlerrm, 'persist_log_data', i);
+                        end;
+                    end loop;
+            end;
             commit;
         end if;
 
     exception
         when others then
-            if sqlcode = -24381 then
-                -- FORALL ... SAVE EXCEPTIONS: erfolgreiche Zeilen behalten, nur fehlerhafte protokollieren
-                for i in 1 .. sql%bulk_exceptions.count loop
-                    logLilamErr(-sql%bulk_exceptions(i).error_code, sqlerrm(-sql%bulk_exceptions(i).error_code),
-                                'persist_log_data', 'row ' || sql%bulk_exceptions(i).error_index || ' skipped');
-                end loop;
-                commit;
-            else
-                rollback;
-                -- Tabelle fehlt: beim naechsten NEW_SESSION erneut pruefen und anlegen
-                if sqlcode = -942 then g_checked_masters.DELETE; g_safe_tables.DELETE; end if;
-                logLilamErr(sqlCode, sqlErrM, 'persist_log_data');
-            end if;
+            rollback;
+            -- Tabelle fehlt: beim naechsten NEW_SESSION erneut pruefen und anlegen
+            if sqlcode = -942 then g_checked_masters.DELETE; g_safe_tables.DELETE; end if;
+            logLilamErr(sqlCode, sqlErrM, 'persist_log_data');
 
     end;
 
@@ -2443,6 +2481,7 @@ AS
         v_user varchar2(128) := SYS_CONTEXT('USERENV','SESSION_USER');
         v_host varchar2(128) := SYS_CONTEXT('USERENV','HOST');
         v_safe_table varchar2(150);
+        v_stmt       varchar2(1000);
     begin
         -- PERFORMANCE: im gebündelten Flush nur sammeln, flushBatch schreibt (siehe g_batch_mode)
         if g_batch_mode then
@@ -2456,30 +2495,38 @@ AS
         if p_actions.count > 0 then
             -- Sicherheit: Tabellenname validieren
             v_safe_table := safeTableName(p_target_table);
-            forall i in 1 .. p_actions.count SAVE EXCEPTIONS
-                execute immediate
-                'insert into ' || v_safe_table || ' 
+            v_stmt := 'insert into ' || v_safe_table || '
                 (PROCESS_ID, ACTION, CONTEXT, MON_TYPE, ACTION_COUNT, USED_MILLIS, AVG_MILLIS, START_TIME, STOP_TIME, SESSION_USER, HOST_NAME)
-                values (:1, :2, :3, :4, :5, :6, :7, :8, :9, :10, :11)'
-                using p_processId, p_actions(i), p_contexts(i), p_mon_types(i), p_action_count(i), p_used(i), p_avgs(i), p_timesStart(i),
-                      p_timesStop(i), v_user, v_host;
+                values (:1, :2, :3, :4, :5, :6, :7, :8, :9, :10, :11)';
+            begin
+                -- STABILITÄT: ohne SAVE EXCEPTIONS, siehe rowFailed
+                forall i in 1 .. p_actions.count
+                    execute immediate v_stmt
+                    using p_processId, p_actions(i), p_contexts(i), p_mon_types(i), p_action_count(i), p_used(i), p_avgs(i), p_timesStart(i),
+                          p_timesStop(i), v_user, v_host;
+            exception
+                when others then
+                    -- Fallback: einzeln schreiben, fehlerhafte Zeilen überspringen
+                    rollback;
+                    for i in 1 .. p_actions.count loop
+                        begin
+                            execute immediate v_stmt
+                            using p_processId, p_actions(i), p_contexts(i), p_mon_types(i), p_action_count(i), p_used(i), p_avgs(i), p_timesStart(i),
+                                  p_timesStop(i), v_user, v_host;
+                        exception
+                            when others then
+                                exit when rowFailed(sqlcode, sqlerrm, 'persist_monitor_data', i);
+                        end;
+                    end loop;
+            end;
             commit;
         end if ;
     exception
         when others then
-            if sqlcode = -24381 then
-                -- FORALL ... SAVE EXCEPTIONS: erfolgreiche Zeilen behalten, nur fehlerhafte protokollieren
-                for i in 1 .. sql%bulk_exceptions.count loop
-                    logLilamErr(-sql%bulk_exceptions(i).error_code, sqlerrm(-sql%bulk_exceptions(i).error_code),
-                                'persist_monitor_data', 'row ' || sql%bulk_exceptions(i).error_index || ' skipped');
-                end loop;
-                commit;
-            else
-                rollback;
-                -- Tabelle fehlt: beim naechsten NEW_SESSION erneut pruefen und anlegen
-                if sqlcode = -942 then g_checked_masters.DELETE; g_safe_tables.DELETE; end if;
-                logLilamErr(sqlCode, sqlErrM, 'persist_monitor_data');
-            end if;
+            rollback;
+            -- Tabelle fehlt: beim naechsten NEW_SESSION erneut pruefen und anlegen
+            if sqlcode = -942 then g_checked_masters.DELETE; g_safe_tables.DELETE; end if;
+            logLilamErr(sqlCode, sqlErrM, 'persist_monitor_data');
 
     end;
 
@@ -3543,9 +3590,10 @@ AS
     --------------------------------------------------------------------------
     -- PERFORMANCE: Schreibt die in SYNC_ALL_DIRTY gesammelten Zeilen aller Prozesse.
     -- Je Zieltabelle ein FORALL, für alles zusammen EIN Commit (autonome Transaktion).
-    -- Ein fehlerhafter Datensatz wird über SAVE EXCEPTIONS einzeln protokolliert, die übrigen
-    -- Zeilen bleiben erhalten. Scheitert eine Anweisung insgesamt (z.B. Tabelle fehlt), wird nur
-    -- diese Anweisung zurückgerollt; die anderen Tabellen werden trotzdem geschrieben.
+    -- STABILITÄT: ohne SAVE EXCEPTIONS (siehe rowFailed). Scheitert ein FORALL, wird nur diese
+    -- Anweisung bis zu ihrem Savepoint zurückgerollt und ihre Zeilen einzeln geschrieben;
+    -- fehlerhafte Zeilen werden protokolliert und übersprungen, die übrigen bleiben erhalten.
+    -- Die anderen Tabellen sind davon nicht betroffen.
     --------------------------------------------------------------------------
     procedure flushBatch
     as
@@ -3558,15 +3606,8 @@ AS
 
         procedure handleErr(p_code number, p_msg varchar2, p_module varchar2) is
         begin
-            if p_code = -24381 then
-                for i in 1 .. sql%bulk_exceptions.count loop
-                    logLilamErr(-sql%bulk_exceptions(i).error_code, sqlerrm(-sql%bulk_exceptions(i).error_code),
-                                p_module, 'row ' || sql%bulk_exceptions(i).error_index || ' skipped');
-                end loop;
-            else
-                if p_code = -942 then g_checked_masters.DELETE; g_safe_tables.DELETE; end if;
-                logLilamErr(p_code, p_msg, p_module);
-            end if;
+            if p_code = -942 then g_checked_masters.DELETE; g_safe_tables.DELETE; end if;
+            logLilamErr(p_code, p_msg, p_module);
         end;
     begin
         -- Logs
@@ -3574,15 +3615,34 @@ AS
         while v_key is not null loop
             begin
                 v_table := safeTableName(v_key);
-                forall i in 1 .. g_log_batches(v_key).pids.COUNT SAVE EXCEPTIONS
-                    execute immediate
-                        'insert into ' || v_table || '
+                v_stmt := 'insert into ' || v_table || '
                         (PROCESS_ID, LOG_LEVEL, LOG_LEVEL_C, INFO, SESSION_TIME, NO, CALLER, ERR_STACK, ERR_BACKTRACE, ERR_CALLSTACK, SESSION_USER, HOST_NAME)
-                        values (:1, :2, :3, :4, :5, :6, :7, :8, :9, :10, :11, :12)'
-                    USING g_log_batches(v_key).pids(i), g_log_batches(v_key).levels(i), g_log_batches(v_key).levelsC(i),
-                          g_log_batches(v_key).texts(i), g_log_batches(v_key).times(i), g_log_batches(v_key).seqs(i),
-                          g_log_batches(v_key).callers(i), g_log_batches(v_key).stacks(i), g_log_batches(v_key).backtraces(i),
-                          g_log_batches(v_key).callstacks(i), v_user, v_host;
+                        values (:1, :2, :3, :4, :5, :6, :7, :8, :9, :10, :11, :12)';
+                savepoint sp_flush_log;
+                begin
+                    forall i in 1 .. g_log_batches(v_key).pids.COUNT
+                        execute immediate v_stmt
+                        USING g_log_batches(v_key).pids(i), g_log_batches(v_key).levels(i), g_log_batches(v_key).levelsC(i),
+                              g_log_batches(v_key).texts(i), g_log_batches(v_key).times(i), g_log_batches(v_key).seqs(i),
+                              g_log_batches(v_key).callers(i), g_log_batches(v_key).stacks(i), g_log_batches(v_key).backtraces(i),
+                              g_log_batches(v_key).callstacks(i), v_user, v_host;
+                exception
+                    when others then
+                        -- Fallback: einzeln schreiben, fehlerhafte Zeilen überspringen
+                        rollback to savepoint sp_flush_log;
+                        for i in 1 .. g_log_batches(v_key).pids.COUNT loop
+                            begin
+                                execute immediate v_stmt
+                                USING g_log_batches(v_key).pids(i), g_log_batches(v_key).levels(i), g_log_batches(v_key).levelsC(i),
+                                      g_log_batches(v_key).texts(i), g_log_batches(v_key).times(i), g_log_batches(v_key).seqs(i),
+                                      g_log_batches(v_key).callers(i), g_log_batches(v_key).stacks(i), g_log_batches(v_key).backtraces(i),
+                                      g_log_batches(v_key).callstacks(i), v_user, v_host;
+                            exception
+                                when others then
+                                    exit when rowFailed(sqlcode, sqlerrm, 'flushBatch/LOG', i);
+                            end;
+                        end loop;
+                end;
             exception
                 when others then handleErr(sqlcode, sqlerrm, 'flushBatch/LOG');
             end;
@@ -3594,15 +3654,34 @@ AS
         while v_key is not null loop
             begin
                 v_table := safeTableName(v_key);
-                forall i in 1 .. g_mon_batches(v_key).pids.COUNT SAVE EXCEPTIONS
-                    execute immediate
-                        'insert into ' || v_table || '
+                v_stmt := 'insert into ' || v_table || '
                         (PROCESS_ID, ACTION, CONTEXT, MON_TYPE, ACTION_COUNT, USED_MILLIS, AVG_MILLIS, START_TIME, STOP_TIME, SESSION_USER, HOST_NAME)
-                        values (:1, :2, :3, :4, :5, :6, :7, :8, :9, :10, :11)'
-                    USING g_mon_batches(v_key).pids(i), g_mon_batches(v_key).actions(i), g_mon_batches(v_key).contexts(i),
-                          g_mon_batches(v_key).mon_types(i), g_mon_batches(v_key).action_count(i), g_mon_batches(v_key).used(i),
-                          g_mon_batches(v_key).avgs(i), g_mon_batches(v_key).timesStart(i), g_mon_batches(v_key).timesStop(i),
-                          v_user, v_host;
+                        values (:1, :2, :3, :4, :5, :6, :7, :8, :9, :10, :11)';
+                savepoint sp_flush_mon;
+                begin
+                    forall i in 1 .. g_mon_batches(v_key).pids.COUNT
+                        execute immediate v_stmt
+                        USING g_mon_batches(v_key).pids(i), g_mon_batches(v_key).actions(i), g_mon_batches(v_key).contexts(i),
+                              g_mon_batches(v_key).mon_types(i), g_mon_batches(v_key).action_count(i), g_mon_batches(v_key).used(i),
+                              g_mon_batches(v_key).avgs(i), g_mon_batches(v_key).timesStart(i), g_mon_batches(v_key).timesStop(i),
+                              v_user, v_host;
+                exception
+                    when others then
+                        -- Fallback: einzeln schreiben, fehlerhafte Zeilen überspringen
+                        rollback to savepoint sp_flush_mon;
+                        for i in 1 .. g_mon_batches(v_key).pids.COUNT loop
+                            begin
+                                execute immediate v_stmt
+                                USING g_mon_batches(v_key).pids(i), g_mon_batches(v_key).actions(i), g_mon_batches(v_key).contexts(i),
+                                      g_mon_batches(v_key).mon_types(i), g_mon_batches(v_key).action_count(i), g_mon_batches(v_key).used(i),
+                                      g_mon_batches(v_key).avgs(i), g_mon_batches(v_key).timesStart(i), g_mon_batches(v_key).timesStop(i),
+                                      v_user, v_host;
+                            exception
+                                when others then
+                                    exit when rowFailed(sqlcode, sqlerrm, 'flushBatch/MON', i);
+                            end;
+                        end loop;
+                end;
             exception
                 when others then handleErr(sqlcode, sqlerrm, 'flushBatch/MON');
             end;
@@ -3624,11 +3703,29 @@ AS
                     process_immortal = :6
                 where id = :7';
                 v_stmt := replaceNameTable(v_stmt, C_PARAM_MASTER_TABLE, C_SUFFIX_PROC_TABLE, v_key);
-                forall i in 1 .. g_proc_batches(v_key).ids.COUNT SAVE EXCEPTIONS
-                    execute immediate v_stmt
-                    USING g_proc_batches(v_key).status(i), g_proc_batches(v_key).procEnd(i), g_proc_batches(v_key).stepsTodo(i),
-                          g_proc_batches(v_key).stepsDone(i), g_proc_batches(v_key).info(i), g_proc_batches(v_key).immortal(i),
-                          g_proc_batches(v_key).ids(i);
+                savepoint sp_flush_proc;
+                begin
+                    forall i in 1 .. g_proc_batches(v_key).ids.COUNT
+                        execute immediate v_stmt
+                        USING g_proc_batches(v_key).status(i), g_proc_batches(v_key).procEnd(i), g_proc_batches(v_key).stepsTodo(i),
+                              g_proc_batches(v_key).stepsDone(i), g_proc_batches(v_key).info(i), g_proc_batches(v_key).immortal(i),
+                              g_proc_batches(v_key).ids(i);
+                exception
+                    when others then
+                        -- Fallback: einzeln schreiben, fehlerhafte Zeilen überspringen
+                        rollback to savepoint sp_flush_proc;
+                        for i in 1 .. g_proc_batches(v_key).ids.COUNT loop
+                            begin
+                                execute immediate v_stmt
+                                USING g_proc_batches(v_key).status(i), g_proc_batches(v_key).procEnd(i), g_proc_batches(v_key).stepsTodo(i),
+                                      g_proc_batches(v_key).stepsDone(i), g_proc_batches(v_key).info(i), g_proc_batches(v_key).immortal(i),
+                                      g_proc_batches(v_key).ids(i);
+                            exception
+                                when others then
+                                    exit when rowFailed(sqlcode, sqlerrm, 'flushBatch/PROC', i);
+                            end;
+                        end loop;
+                end;
             exception
                 when others then handleErr(sqlcode, sqlerrm, 'flushBatch/PROC');
             end;
@@ -5909,6 +6006,12 @@ AS
                 sendPing(l_targetPipe);
             else
                 l_status := DBMS_PIPE.SEND_MESSAGE(l_targetPipe, timeout => 1);
+                -- STABILITÄT: Route des beendeten Prozesses aus dem Cache entfernen, sonst wächst
+                -- g_dispatch_route_cache mit jedem Prozess, der je über den Dispatcher lief.
+                -- Spätere Nachrichten zu dieser ID fallen auf LILAM_PROCESS_ROUTE zurück (resolveDispatchTarget).
+                if p_request = 'CLOSE_SESSION' then
+                    g_dispatch_route_cache.DELETE(l_processId);
+                end if;
             end if;
             return false;
         end if;
