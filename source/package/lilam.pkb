@@ -1531,11 +1531,10 @@ AS
             l_sqlStmt := l_sqlStmt || ' AND upper(group_name) = ''' || upper(p_groupName) || '''';
         end if;
 
-        -- Ein Dispatcher darf sich bei der Auswahl eines Workers nicht selbst wählen
-        -- (er ist in derselben Gruppe registriert und würde sich die Nachricht endlos selbst zuschicken)
-        if g_serverIsDispatcher and g_serverPipeName is not null then
-            l_sqlStmt := l_sqlStmt || ' AND upper(pipe_name) != ''' || upper(g_serverPipeName) || '''';
-        end if;
+        -- Dispatcher sind nie Ziel der Serverauswahl: weder für Clients ohne Dispatcher-Einstellung
+        -- (sonst unnötiger Umweg über den Dispatcher) noch für einen Dispatcher selbst bei der Wahl
+        -- eines Workers (er würde sich die Nachricht sonst endlos selbst zuschicken)
+        l_sqlStmt := l_sqlStmt || ' AND nvl(is_dispatcher, 0) = 0';
 
         l_sqlStmt := l_sqlStmt || '
         ORDER BY processing ASC, current_processes ASC, last_activity DESC 
@@ -1790,6 +1789,7 @@ AS
     as
         sqlStmt varchar2(4000);
         l_master constant varchar2(100) := upper(trim(p_TabNameMaster));
+        l_regCols number;
     begin
         -- Pro Session und Master-Tabelle nur einmal pruefen (spart je NEW_SESSION rund ein Dutzend Dictionary-Abfragen)
         if g_checked_masters.EXISTS(l_master) then
@@ -1880,9 +1880,17 @@ AS
                 avg_log_lat    NUMBER DEFAULT 0,
                 max_log_lat    NUMBER DEFAULT 0,
                 avg_mon_lat    NUMBER DEFAULT 0,
-                max_mon_lat    NUMBER DEFAULT 0
+                max_mon_lat    NUMBER DEFAULT 0,
+                is_dispatcher  NUMBER(1) DEFAULT 0
             )';
             run_sql(sqlStmt);
+        else
+            -- Bestehende Registry um die Kennzeichnung der Dispatcher ergänzen
+            select count(*) into l_regCols from user_tab_columns
+             where table_name = upper(C_LILAM_SERVER_REGISTRY) and column_name = 'IS_DISPATCHER';
+            if l_regCols = 0 then
+                run_sql('ALTER TABLE ' || C_LILAM_SERVER_REGISTRY || ' ADD is_dispatcher NUMBER(1) DEFAULT 0');
+            end if;
         end if;
 
         if not objectExists(C_LILAM_RULES_TABLE, 'TABLE') then
@@ -5450,9 +5458,11 @@ AS
             set last_activity = systimestamp,
                 is_active = 1,
                 group_name = :1,
-                current_processes = 0
-            where upper(pipe_name) = :2';            
-            execute immediate l_sqlStmt using g_serverGroupName, upper(g_serverPipeName);
+                current_processes = 0,
+                is_dispatcher = :2
+            where upper(pipe_name) = :3';            
+            execute immediate l_sqlStmt using g_serverGroupName, case when g_serverIsDispatcher then 1 else 0 end,
+                                              upper(g_serverPipeName);
         else
                 -- new entry, server was not registered yet
             l_sqlStmt := '
@@ -5465,7 +5475,8 @@ AS
                 avg_log_lat,
                 max_log_lat,
                 avg_mon_lat,
-                max_mon_lat
+                max_mon_lat,
+                is_dispatcher
             ) values (
                 :1,
                 :2,
@@ -5475,9 +5486,10 @@ AS
                 0,
                 0,
                 0,
-                0
+                0,
+                :3
             )';
-            execute immediate l_sqlStmt using g_serverPipeName, g_serverGroupName;
+            execute immediate l_sqlStmt using g_serverPipeName, g_serverGroupName, case when g_serverIsDispatcher then 1 else 0 end;
         end if;
         commit;
 
