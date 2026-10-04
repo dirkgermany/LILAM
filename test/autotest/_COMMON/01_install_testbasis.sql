@@ -204,6 +204,10 @@ create or replace package lt authid definer as
     function t_logtext(p_manage boolean default true, p_parent number default null) return number;
     function t_baseline_scope(p_manage boolean default true, p_parent number default null) return number;
 
+    -- Speicher: PGA-Wachstum je Prozess in Client, Workern und Dispatcher (INSESSION, SERVER, DISPATCHER)
+    -- sowie Fallback beim Schreiben (fehlerhafte Zeile wird uebersprungen, die uebrigen bleiben erhalten)
+    function t_speicher(p_procs number default 5000, p_manage boolean default true, p_parent number default null) return number;
+
     -- Lastspitze: p_clients senden p_seconds lang so schnell wie moeglich; danach muessen alle Daten
     -- vollstaendig ankommen und ein neuer Prozess wieder normal arbeiten (Erholung). Nur decoupled.
     function t_lastspitze(p_mode varchar2, p_clients number default 6, p_seconds number default 30,
@@ -1345,6 +1349,206 @@ create or replace package body lt as
         if p_manage then stop_all_servers; end if;
         check_that(l_run, 'B6 Keine internen LILAM-Fehler', internal_errors_since(run_started(l_run)) = 0,
                    internal_errors_since(run_started(l_run)));
+        end_run(l_run);
+        return l_run;
+    exception
+        when others then
+            abort_run(l_run, p_manage, sqlerrm || ' ' || dbms_utility.format_error_backtrace);
+            if p_manage then raise; end if;
+            return l_run;
+    end;
+
+    ----------------------------------------------------------------------
+    -- Speicher
+    ----------------------------------------------------------------------
+    -- PGA in Byte: eigene Session (p_module NULL) oder Summe aller Sessions mit passendem MODULE
+    function pga_bytes(p_module varchar2 default null) return number is
+        l_n number;
+    begin
+        if p_module is null then
+            execute immediate 'select p.pga_used_mem from v$process p join v$session s on s.paddr = p.addr
+                                where s.sid = sys_context(''userenv'', ''sid'')' into l_n;
+        else
+            execute immediate 'select sum(p.pga_used_mem) from v$session s join v$process p on p.addr = s.paddr
+                                where s.module like :1' into l_n using p_module;
+        end if;
+        return l_n;
+    exception when others then return null;
+    end;
+
+    function t_speicher(p_procs number default 5000, p_manage boolean default true, p_parent number default null) return number is
+        -- Der PGA-Heap eines Servers waechst anfangs in 64-KB-Schritten und pendelt sich nach einigen
+        -- tausend Prozessen ein; erst danach wird gemessen. Bloecke zu 1.000 Prozessen: 64 KB = 64 Byte je Prozess.
+        c_warm    constant pls_integer := 2000;  -- Aufwaermen (Caches, Cursor, Tabellen-Pruefung, Heap)
+        c_blocks  constant pls_integer := 5;     -- Messbloecke; bewertet wird der Median der Blockzuwaechse
+        c_ops     constant pls_integer := 4;     -- je Prozess: c_ops x (info, trace, event, step)
+        c_max_b   constant number      := 100;   -- erlaubtes PGA-Wachstum in Byte je Prozess (Median)
+        c_workers constant varchar2(30) := 'LILAM_SERVER LT_S%';
+        c_disp    constant varchar2(30) := 'LILAM_SERVER ' || c_disp_pipe;
+        c_master  constant varchar2(30) := 'LT_SPM';   -- eigene Tabellen LT_SPM_PROC/_LOG/_MON fuer den Fallback
+        l_run     number;
+        l_prefix  varchar2(60);
+        l_block   pls_integer := ceil(p_procs / c_blocks);
+
+        procedure load(p_mode varchar2, p_tag varchar2, p_n pls_integer) is
+            l_pid number;
+        begin
+            for p in 1 .. p_n loop
+                l_pid := open_process(p_mode, l_prefix || '_' || p_tag);
+                for o in 1 .. c_ops loop one_op(l_pid, 0, o); end loop;
+                lilam.close_session(l_pid);
+            end loop;
+        end;
+
+        -- warten, bis alle Logs geschrieben sind; danach kurze Ruhe (Server-Flush, Baseline-Abgleich)
+        procedure settle(p_tag varchar2, p_expected number) is
+            l_n number;
+        begin
+            l_n := wait_count(l_prefix || '_' || p_tag, 'LOG', p_expected, 60);
+            if p_tag <> 'IS' then dbms_session.sleep(3); end if;
+        end;
+
+        -- Bewertung: Median der Zuwaechse je Block (Byte je Prozess).
+        -- Ein einmaliger Sprung des Oracle-Heaps trifft nur einen Block, ein Leck dagegen jeden.
+        procedure check_growth(p_name varchar2, p_vals sys.odcinumberlist, p_metric varchar2) is
+            l_d   sys.odcinumberlist := sys.odcinumberlist();
+            l_med number;
+            l_txt varchar2(400);
+        begin
+            for i in 1 .. p_vals.count loop
+                if p_vals(i) is null then
+                    check_that(l_run, p_name, false, 'keine PGA-Werte (Grants aus _COMMON/00_grants_als_sys.sql fehlen)');
+                    return;
+                end if;
+            end loop;
+            for i in 2 .. p_vals.count loop
+                l_d.extend; l_d(l_d.count) := round((p_vals(i) - p_vals(i - 1)) / l_block);
+                l_txt := l_txt || case when i > 2 then ', ' end || l_d(l_d.count);
+            end loop;
+            select median(column_value) into l_med from table(l_d);
+            metric(l_run, p_metric, l_med, 'B/Prozess');
+            check_that(l_run, p_name || ' (Median max. ' || c_max_b || ' Byte je Prozess)', l_med <= c_max_b,
+                       'Median ' || l_med || ' B; je Block ' || l_txt || '; ' || round(p_vals(1) / 1024) || ' -> '
+                       || round(p_vals(p_vals.count) / 1024) || ' KB');
+        end;
+
+        -- Speichermessung eines Modus: Aufwaermen, dann c_blocks Bloecke mit je l_block Prozessen
+        procedure run_mem(p_mode varchar2, p_tag varchar2) is
+            l_self  sys.odcinumberlist := sys.odcinumberlist();
+            l_work  sys.odcinumberlist := sys.odcinumberlist();
+            l_disp  sys.odcinumberlist := sys.odcinumberlist();
+            l_total pls_integer := c_warm + c_blocks * l_block;
+            l_n     number;
+            l_label varchar2(10) := p_tag || ' ';
+
+            procedure snap is
+            begin
+                l_self.extend; l_self(l_self.count) := pga_bytes;
+                l_work.extend; l_work(l_work.count) := pga_bytes(c_workers);
+                l_disp.extend; l_disp(l_disp.count) := pga_bytes(c_disp);
+            end;
+        begin
+            load(p_mode, p_tag, c_warm);
+            settle(p_tag, c_warm * c_ops);
+            snap;
+            for b in 1 .. c_blocks loop
+                load(p_mode, p_tag, l_block);
+                settle(p_tag, (c_warm + b * l_block) * c_ops);
+                snap;
+            end loop;
+
+            l_n := count_lilam(l_prefix || '_' || p_tag, 'LOG');
+            check_that(l_run, l_label || 'Alle Logs geschrieben', l_n = l_total * c_ops, l_n || '/' || l_total * c_ops);
+            l_n := count_lilam(l_prefix || '_' || p_tag, 'PROC_CLOSED');
+            check_that(l_run, l_label || 'Alle Prozesse geschlossen', l_n = l_total, l_n || '/' || l_total);
+
+            if p_mode = c_insession then
+                check_growth(l_label || 'PGA der Session', l_self, lower(p_tag) || '_session_b');
+            else
+                check_growth(l_label || 'PGA des Clients', l_self, lower(p_tag) || '_client_b');
+                check_growth(l_label || 'PGA der Worker', l_work, lower(p_tag) || '_worker_b');
+                if p_mode = c_dispatcher then
+                    check_growth(l_label || 'PGA des Dispatchers', l_disp, lower(p_tag) || '_dispatcher_b');
+                end if;
+            end if;
+        end;
+
+        -- Fallback: eine Zeile verletzt einen Check-Constraint; sie wird uebersprungen und protokolliert,
+        -- die uebrigen Zeilen desselben Flushs werden geschrieben
+        procedure run_fallback(p_mode varchar2, p_tag varchar2) is
+            l_pid   number;
+            l_ts    timestamp := systimestamp;
+            l_ok    number;
+            l_bad   number;
+            l_err   number;
+            l_wait  number := 0;
+            l_label varchar2(10) := p_tag || ' ';
+        begin
+            if p_mode = c_insession then
+                l_pid := lilam.new_session(p_processName => l_prefix || '_F' || p_tag, p_logLevel => lilam.logLevelInfo,
+                                           p_tabNameMaster => c_master);
+            else
+                l_pid := lilam.server_new_session(p_processName => l_prefix || '_F' || p_tag, p_groupName => c_group,
+                                                  p_logLevel => lilam.logLevelInfo, p_tabNameMaster => c_master);
+            end if;
+
+            -- Check-Constraint einmalig anlegen (die Tabelle legt LILAM beim ersten NEW_SESSION an)
+            select count(*) into l_ok from user_constraints where constraint_name = c_master || '_LOG_CK';
+            if l_ok = 0 then
+                execute immediate 'alter table ' || c_master || '_LOG add constraint ' || c_master
+                                  || '_LOG_CK check (info is null or info <> ''LT_SPM_BAD'')';
+            end if;
+
+            lilam.info(l_pid, 'LT_SPM_OK_1');
+            lilam.info(l_pid, 'LT_SPM_OK_2');
+            lilam.info(l_pid, 'LT_SPM_BAD');
+            lilam.info(l_pid, 'LT_SPM_OK_4');
+            lilam.info(l_pid, 'LT_SPM_OK_5');
+            lilam.close_session(l_pid);
+
+            loop
+                execute immediate 'select count(*) from ' || c_master || '_LOG where process_id = :1 and info like ''LT\_SPM\_OK%'' escape ''\'''
+                    into l_ok using l_pid;
+                exit when l_ok >= 4 or l_wait >= 30;
+                dbms_session.sleep(0.5); l_wait := l_wait + 0.5;
+            end loop;
+            execute immediate 'select count(*) from ' || c_master || '_LOG where process_id = :1 and info = ''LT_SPM_BAD'''
+                into l_bad using l_pid;
+            begin
+                execute immediate 'select count(*) from lilam_log_internal where log_timestamp >= :1 and error_code = -2290
+                                     and log_operation like ''row % skipped''' into l_err using l_ts;
+            exception when others then l_err := 0;
+            end;
+
+            check_that(l_run, l_label || 'Fallback: gueltige Zeilen geschrieben', l_ok = 4, l_ok || '/4');
+            check_that(l_run, l_label || 'Fallback: fehlerhafte Zeile uebersprungen', l_bad = 0, 'ist ' || l_bad);
+            check_that(l_run, l_label || 'Fallback: Fehler einmal protokolliert (ORA-02290, row skipped)', l_err = 1, l_err || ' Eintraege');
+        end;
+    begin
+        l_run := begin_run('SPEICHER', 'INSESSION+SERVER+DISPATCHER', 'warm=' || c_warm || ' procs=' || c_blocks || 'x' || l_block
+                           || ' ops=' || c_ops || ' max=' || c_max_b || ' B (Median)', p_parent);
+        l_prefix := 'LT_' || l_run || '_SPM';
+
+        run_mem(c_insession, 'IS');
+        run_fallback(c_insession, 'IS');
+
+        if p_manage then setup_servers(c_dispatcher, 1); end if;
+        run_mem(c_server, 'SV');
+        run_fallback(c_server, 'SV');
+        run_mem(c_dispatcher, 'DP');   -- zuletzt: setzt den Dispatcher fuer diese Session
+        if p_manage then stop_all_servers; end if;
+
+        -- erwartet: genau die zwei Fallback-Eintraege, sonst nichts
+        declare
+            l_n number;
+        begin
+            execute immediate 'select count(*) from lilam_log_internal where log_timestamp >= :1
+                                 and not (error_code = -2290 and log_operation like ''row % skipped'')'
+                into l_n using run_started(l_run);
+            check_that(l_run, 'Keine weiteren internen LILAM-Fehler', l_n = 0, l_n || ' Eintraege');
+        exception
+            when others then check_that(l_run, 'Keine weiteren internen LILAM-Fehler', true, 'keine Tabelle');
+        end;
         end_run(l_run);
         return l_run;
     exception

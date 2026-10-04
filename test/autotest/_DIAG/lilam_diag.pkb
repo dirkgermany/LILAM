@@ -1,0 +1,6407 @@
+create or replace PACKAGE BODY LILAM_DIAG
+AS
+    /*
+     * LILAM
+     * Dual-licensed under GPLv3 or Commercial License.
+     * See LICENSE or LICENSE_ENTERPRISE for details.
+     */
+
+    ---------------------------------------------------------------
+    -- Tuning Parameter for development
+    ---------------------------------------------------------------
+
+    -- Dedicated to SERVER_LOOP
+    C_SERVER_SYNC_INTERVAL_MS          CONSTANT PLS_INTEGER := 500;
+    C_SERVER_HEARTBEAT_INTERVAL_MS     CONSTANT PLS_INTEGER := 60000;
+    C_SERVER_MAX_LOOPS_IN_TIME_NO      CONSTANT PLS_INTEGER := 10000; -- 1000
+    C_SERVER_TIMEOUT_WAIT_FOR_MSG_SEC  CONSTANT NUMBER      := 0.2; -- Timeout nach Sekunden Warten auf Nachricht
+    C_SERVER_TIMEOUT_MAX_WAIT_SEC      CONSTANT NUMBER      := 5;
+    C_MAX_SERVER_PIPE_SIZE             CONSTANT PLS_INTEGER := 16777216; --  16777216, 67108864
+    
+    C_MAX_REGISTRY_HEARTBEAT_AGE_SEC   CONSTANT PLS_INTEGER  := 15;  --  Server HEARTBEAT in Registry mustn't be older
+
+    -- Dedicated to Client
+    -- Drosselung des Clients: Grenze je Prozess kommt vom Server (p_perfServer, siehe C_SERVER_PERF_*)
+    C_THROTTLE_INTERVAL_NO             CONSTANT PLS_INTEGER := 1000; -- Zeitfenster in ms für die Grenze
+
+    -- Max Dirty Buffers and 
+    C_FLUSH_MILLIS_THRESHOLD_MS        CONSTANT PLS_INTEGER := 1500;  -- 1500 Max. Millis until flush
+    C_FLUSH_LOG_THRESHOLD_NO           CONSTANT PLS_INTEGER := 50000; -- 50000 Max. number of dirty buffered logs until flush
+    C_FLUSH_MONITOR_THRESHOLD_NO       CONSTANT PLS_INTEGER := 50000; -- 50000 Max. number of dirty buffered metrics until flush
+    C_SYNC_ALL_INTERVAL_MS             CONSTANT PLS_INTEGER := 500;   -- SYNC_ALL_DIRTY (ohne Force) hoechstens alle n ms
+
+    ---------------------------------------------------------------
+    -- Placeholders for tables
+    ---------------------------------------------------------------
+    C_PARAM_MASTER_TABLE            CONSTANT varchar2(20) := 'PH_MASTER_TABLE';
+    C_PARAM_LOG_TABLE               CONSTANT varchar2(20) := 'PH_LOG_TABLE';
+    C_PARAM_MON_TABLE               CONSTANT varchar2(20) := 'PH_MON_TABLE';
+    C_LILAM_SERVER_REGISTRY         CONSTANT VARCHAR2(50) := 'LILAM_SERVER_REGISTRY';
+    C_LILAM_LOG_TABLE               CONSTANT VARCHAR2(20) := 'LILAM_LOG_INTERNAL';
+    C_LILAM_PROCESS_ROUTE           CONSTANT VARCHAR2(50) := 'LILAM_PROCESS_ROUTE';
+    C_LILAM_SCOPES_TABLE            CONSTANT VARCHAR2(30) := 'LILAM_SCOPES';
+    C_LILAM_BASELINES_TABLE         CONSTANT VARCHAR2(30) := 'LILAM_BASELINES';
+
+    ---------------------------------------------------------------
+    -- Other general Parameters
+    ---------------------------------------------------------------
+    C_TIMEOUT_NEW_SESSION_SEC           CONSTANT NUMBER      := 3.0;  -- NEW_SESSION max. time waiting for server response
+    C_METRIC_ALERT_FACTOR_SEC           CONSTANT NUMBER      := 2.0;   -- Max. Ausreißer in der Dauer eines Verarbeitungsschrittes
+    C_MAX_LOG_TEXT_LEN                  CONSTANT PLS_INTEGER := 1900;  -- Logtexte werden pauschal auf diese Länge gekürzt (Spalte INFO: 2000)
+
+    -- Baseline Scopes (prozessübergreifende Durchschnittswerte)
+    -- t_session_init.baselineScope:  NULL    => Scope = Prozessname (Default)
+    --                                '#NONE' => kein Scope, Durchschnitt nur pro Prozess
+    --                                sonst   => frei gewählter Scope-Name
+    C_SCOPE_NONE                        CONSTANT VARCHAR2(20) := '#NONE';
+    C_SCOPE_RESERVED_PREFIX             CONSTANT VARCHAR2(1)  := '#';      -- '#...' ist für LILAM reserviert
+    C_BASELINE_NULL_CONTEXT             CONSTANT VARCHAR2(1)  := '-';      -- Ersatz für NULL-Context im PK
+    C_BASELINE_SYNC_INTERVAL_MS         CONSTANT PLS_INTEGER  := 1500;     -- Abgleich PGA <-> LILAM_BASELINES
+    C_BASELINE_IDLE_EVICT_SEC           CONSTANT PLS_INTEGER  := 900;      -- Unbenutzte Baselines aus dem PGA entfernen
+
+    -- Pipe handling
+    C_PIPE_ID_PENDING               CONSTANT BINARY_INTEGER := -1; 
+    -- Steuer-Pipe je Server/Dispatcher: <PIPE>_CTL. Nimmt NEW_SESSION auf, damit das Anlegen eines Prozesses
+    -- nicht hinter den Datennachrichten der Daten-Pipe warten muss (ersetzt das alte, unbenutzte '_INTERLEAVE').
+    C_CTL_PIPE_SUFFIX               CONSTANT VARCHAR2(20)   := '_CTL';
+    C_MAX_CTL_PIPE_SIZE             CONSTANT PLS_INTEGER    := 1048576;
+
+    ---------------------------------------------------------------
+    -- Kind of Monitor Entries
+    ---------------------------------------------------------------
+    C_MON_TYPE_EVENT                CONSTANT PLS_INTEGER := 0; -- Simple event, no stop-time
+    C_MON_TYPE_TRACE                CONSTANT PLS_INTEGER := 1; -- Transaction with start and stop
+    C_MON_TYPE_LOG                  CONSTANT PLS_INTEGER := 2; -- Placeholder without sense
+
+    ---------------------------------------------------------------
+    -- Sessions
+    ---------------------------------------------------------------
+    -- Record representing the internal session
+    -- Per started process one session
+    TYPE t_session_rec IS RECORD (
+        process_id          NUMBER(19,0),
+        serial_no           PLS_INTEGER := 0,
+        log_level           PLS_INTEGER := 0,
+        monitoring          PLS_INTEGER := 0,
+        last_monitor_flush  TIMESTAMP, -- Zeitpunkt des letzten Monitor-Flushes
+        last_log_flush      TIMESTAMP(6), -- Zeitpunkt des letzten Log-Flushes
+        monitor_dirty_count PLS_INTEGER := 0,  -- monitor entries per process counter
+        log_dirty_count     PLS_INTEGER := 0,  -- Logs per process counter
+        process_is_dirty    BOOLEAN,
+        last_process_flush  TIMESTAMP(6),
+        last_sync_check     TIMESTAMP(6),
+        group_name          VARCHAR2(50),
+        tabName_master      VARCHAR2(100),
+        scope_id            NUMBER(19,0)  -- NULL = kein prozessübergreifender Scope
+    );
+
+    -- Table for several processes
+    TYPE t_session_tab IS TABLE OF t_session_rec;
+    g_sessionList t_session_tab := null;
+
+    -- Indexes for lists
+    TYPE t_idx IS TABLE OF PLS_INTEGER INDEX BY BINARY_INTEGER;
+    v_indexSession t_idx;
+
+    -- Private Liste im Speicher (PGA)
+    -- Index ist die Session-ID, Wert ist beliebig (hier Boolean)
+    TYPE t_remote_sessions IS TABLE OF BOOLEAN INDEX BY BINARY_INTEGER;
+    g_remote_sessions t_remote_sessions;
+    -- IDs, für die ein Reconnect über den Dispatcher gescheitert ist, mit Zeitpunkt des nächsten erlaubten
+    -- Versuchs. Verhindert, dass jeder Aufruf mit einer unbekannten ID erneut synchron beim Dispatcher anfragt.
+    TYPE t_unknown_pids IS TABLE OF TIMESTAMP INDEX BY BINARY_INTEGER;
+    g_unknown_pids t_unknown_pids;
+
+    TYPE t_throttle_stat IS RECORD (
+        msg_count  PLS_INTEGER := 0,
+        last_check TIMESTAMP    := SYSTIMESTAMP,
+        msg_limit  PLS_INTEGER := 1500  -- Nachrichten je Zeitfenster; 0 = keine Drosselung (Wert vom Server)
+    );
+    TYPE t_throttle_tab IS TABLE OF t_throttle_stat INDEX BY BINARY_INTEGER;
+    g_local_throttle_cache t_throttle_tab;
+
+    ---------------------------------------------------------------
+    -- Gemeinsamer Typ für Monitoring und Process
+    ---------------------------------------------------------------
+    TYPE t_eval_context_rec IS RECORD (
+        -- gemeinsame Daten
+        process_id    NUMBER(19,0),
+        action_name   VARCHAR2(100),
+        context_name  VARCHAR2(100),
+        start_time    TIMESTAMP(6),
+        stop_time     TIMESTAMP(6),
+        -- Monitoring Felder
+        used_time     NUMBER,
+        action_count  PLS_INTEGER,
+        avg_time      NUMBER,         -- Referenz-Durchschnitt VOR dieser Messung (NULL im Warm-up)
+        -- Prozess-spezifische Felder
+        process_end   TIMESTAMP,
+        last_update   TIMESTAMP,
+        steps_todo    PLS_INTEGER,
+        steps_done    PLS_INTEGER,
+        status        PLS_INTEGER,
+        info          VARCHAR2(4000)
+    );
+
+    ---------------------------------------------------------------
+    -- Processes
+    ---------------------------------------------------------------
+    TYPE t_process_cache_map IS TABLE OF t_process_rec INDEX BY PLS_INTEGER;
+    g_process_cache t_process_cache_map;
+
+    ---------------------------------------------------------------
+    -- Monitoring
+    ---------------------------------------------------------------
+    TYPE t_monitor_buffer_rec IS RECORD (
+        process_id      NUMBER(19,0),
+        action_name     VARCHAR2(100),
+        context_name    VARCHAR2(100),
+        monitor_type    PLS_INTEGER,
+        avg_action_time NUMBER,             -- Umbenannt
+        start_time      TIMESTAMP(6),          -- Startzeitpunkt der Aktion
+        stop_time       TIMESTAMP(6),          -- Startzeitpunkt der Aktion
+        used_time       NUMBER,             -- Dauer der letzten Ausführung (in Sek.)
+        action_count   PLS_INTEGER := 0,   -- Arbeitsschritt einer Action / Transaktion (pro Prozess)
+        baseline_avg    NUMBER              -- Durchschnitt VOR dieser Messung, Referenz für Regeln (nicht persistiert)
+    );
+    TYPE t_monitor_history_tab IS TABLE OF t_monitor_buffer_rec;    
+    TYPE t_monitor_map IS TABLE OF t_monitor_history_tab INDEX BY VARCHAR2(200);
+    g_monitor_groups t_monitor_map;
+    TYPE t_monitor_shadow_map IS TABLE OF t_monitor_buffer_rec INDEX BY VARCHAR2(200);
+    g_monitor_shadows t_monitor_shadow_map;
+    g_monitor_averages t_monitor_shadow_map;
+
+    -- Prozessübergreifende Baselines (Scope)
+    -- avg_ms/action_count: aktueller Stand im PGA
+    -- base_avg/base_count: Stand beim letzten Laden/Abgleich mit LILAM_BASELINES (für Delta-Merge)
+    TYPE t_baseline_rec IS RECORD (
+        scope_id        NUMBER(19,0),
+        action_name     VARCHAR2(100),
+        context_name    VARCHAR2(100),
+        avg_ms          NUMBER,
+        action_count    NUMBER := 0,
+        base_avg        NUMBER,
+        base_count      NUMBER := 0,
+        in_db           BOOLEAN := FALSE,
+        dirty           BOOLEAN := FALSE,
+        last_touch      TIMESTAMP(6)
+    );
+    TYPE t_baseline_map IS TABLE OF t_baseline_rec INDEX BY VARCHAR2(250);
+    g_baselines t_baseline_map;
+    g_last_baseline_sync TIMESTAMP(6);
+
+    -- Cache Scope-Name -> Scope-ID
+    TYPE t_scope_id_map IS TABLE OF NUMBER INDEX BY VARCHAR2(100);
+    g_scope_ids t_scope_id_map;
+
+    -- Master-Tabellen, deren Tabellen in dieser Session bereits geprueft/angelegt wurden
+    TYPE t_checked_masters IS TABLE OF BOOLEAN INDEX BY VARCHAR2(100);
+    g_checked_masters t_checked_masters;
+    -- PERFORMANCE: Ergebnis von DBMS_ASSERT.SQL_OBJECT_NAME je Tabellenname (kostet sonst ca. 0,4 ms je Flush)
+    TYPE t_safe_tables IS TABLE OF VARCHAR2(150) INDEX BY VARCHAR2(150);
+    g_safe_tables t_safe_tables;
+
+    -- remember to latest action
+    TYPE t_action_history_rec IS RECORD (
+        full_key VARCHAR2(100),
+        stop_time   TIMESTAMP
+    );
+    TYPE t_last_action_map IS TABLE OF t_action_history_rec INDEX BY PLS_INTEGER; 
+    g_last_action_per_process t_last_action_map;
+
+    ---------------------------------------------------------------
+    -- Logging
+    ---------------------------------------------------------------
+    TYPE t_log_buffer_rec IS RECORD (
+        process_id      NUMBER(19,0),
+        log_level       PLS_INTEGER,
+        log_text        VARCHAR2(4000),
+        log_time        TIMESTAMP(6),
+        serial_no       PLS_INTEGER,
+        caller          VARCHAR2(200),
+        err_stack       VARCHAR2(4000),
+        err_backtrace   VARCHAR2(4000),
+        err_callstack   VARCHAR2(4000)
+    );
+
+    -- Die Liste für den Bulk-Speicher
+    -- Die flache Liste der Log-Einträge
+    TYPE t_log_history_tab IS TABLE OF t_log_buffer_rec;
+
+    -- Das Haupt-Objekt für Logs: 
+    -- Key ist hier die process_id (als String gewandelt für die Map)
+    TYPE t_log_map IS TABLE OF t_log_history_tab INDEX BY VARCHAR2(100);
+    g_log_groups t_log_map;
+
+    TYPE t_dirty_queue IS TABLE OF BOOLEAN INDEX BY BINARY_INTEGER;
+    g_dirty_queue t_dirty_queue;
+
+    -- Time precision
+    TYPE t_timestamp_list_t IS TABLE OF TIMESTAMP(6);
+
+    -- PERFORMANCE: Sammelpuffer für den gebündelten Flush in SYNC_ALL_DIRTY (siehe flushBatch)
+    TYPE t_log_batch_rec IS RECORD (
+        pids       sys.odcinumberlist   := sys.odcinumberlist(),
+        seqs       sys.odcinumberlist   := sys.odcinumberlist(),
+        levels     sys.odcinumberlist   := sys.odcinumberlist(),
+        levelsC    sys.odcivarchar2list := sys.odcivarchar2list(),
+        texts      sys.odcivarchar2list := sys.odcivarchar2list(),
+        times      t_timestamp_list_t   := t_timestamp_list_t(),
+        callers    sys.odcivarchar2list := sys.odcivarchar2list(),
+        stacks     sys.odcivarchar2list := sys.odcivarchar2list(),
+        backtraces sys.odcivarchar2list := sys.odcivarchar2list(),
+        callstacks sys.odcivarchar2list := sys.odcivarchar2list()
+    );
+    TYPE t_log_batches IS TABLE OF t_log_batch_rec INDEX BY VARCHAR2(150);
+
+    TYPE t_mon_batch_rec IS RECORD (
+        pids         sys.odcinumberlist   := sys.odcinumberlist(),
+        actions      sys.odcivarchar2list := sys.odcivarchar2list(),
+        contexts     sys.odcivarchar2list := sys.odcivarchar2list(),
+        mon_types    sys.odcinumberlist   := sys.odcinumberlist(),
+        action_count sys.odcinumberlist   := sys.odcinumberlist(),
+        used         sys.odcinumberlist   := sys.odcinumberlist(),
+        avgs         sys.odcinumberlist   := sys.odcinumberlist(),
+        timesStart   t_timestamp_list_t   := t_timestamp_list_t(),
+        timesStop    t_timestamp_list_t   := t_timestamp_list_t()
+    );
+    TYPE t_mon_batches IS TABLE OF t_mon_batch_rec INDEX BY VARCHAR2(150);
+
+    TYPE t_proc_batch_rec IS RECORD (
+        ids        sys.odcinumberlist   := sys.odcinumberlist(),
+        status     sys.odcinumberlist   := sys.odcinumberlist(),
+        procEnd    t_timestamp_list_t   := t_timestamp_list_t(),
+        stepsTodo  sys.odcinumberlist   := sys.odcinumberlist(),
+        stepsDone  sys.odcinumberlist   := sys.odcinumberlist(),
+        info       sys.odcivarchar2list := sys.odcivarchar2list(),
+        immortal   sys.odcinumberlist   := sys.odcinumberlist()
+    );
+    TYPE t_proc_batches IS TABLE OF t_proc_batch_rec INDEX BY VARCHAR2(150);  -- Schlüssel: Master-Tabelle
+
+    g_batch_mode    BOOLEAN := FALSE;
+    g_diag_skip_persist BOOLEAN := FALSE;
+    g_log_batches   t_log_batches;
+    g_mon_batches   t_mon_batches;
+    g_proc_batches  t_proc_batches;
+
+
+    ---------------------------------------------------------------
+    -- Rules
+    ---------------------------------------------------------------
+    -- Typ-Definition für die Regeldetails (aus dem JSON)
+    TYPE t_rule_rec IS RECORD (
+        rule_id             VARCHAR2(50),
+        trigger_type        VARCHAR2(50),  -- TRACE_STOP, MARK_EVENT
+        target_action       VARCHAR2(50),
+        target_context      VARCHAR2(50),
+        condition_metric    VARCHAR2(50),
+        condition_operator  VARCHAR2(50),  -- GREATER_THAN_AVG_PERCENT, etc.
+        condition_value     VARCHAR2(50),
+        alert_handler       VARCHAR2(50),  -- LOG_AND_MAIL, etc.
+        alert_severity      VARCHAR2(30),
+        throttle_seconds    NUMBER         -- Warten bis zum nächsten Alarm
+    );
+    TYPE t_rule_list IS TABLE OF t_rule_rec;
+    TYPE t_rule_map IS TABLE OF t_rule_list INDEX BY VARCHAR2(250);
+
+    g_rules_by_context t_rule_map;
+    g_rules_by_action  t_rule_map;
+
+    -- Zusätzliche Variable für die aktuell geladene Version
+    g_current_rule_set_version NUMBER := 0;
+    g_current_rule_set_name    VARCHAR2(30);
+
+    TYPE t_avg_params IS RECORD (
+        alpha    NUMBER := 0.1,
+        warmup   PLS_INTEGER := 100
+    );
+    TYPE t_avg_params_map IS TABLE OF t_avg_params INDEX BY VARCHAR2(250);
+    g_avg_params t_avg_params_map;  
+
+    TYPE t_alert_history IS TABLE OF TIMESTAMP INDEX BY VARCHAR2(250);
+    g_alert_history t_alert_history;
+
+    ----------
+    -- TRIGGER
+    ----------
+    -- Process
+    C_PROCESS_START    CONSTANT VARCHAR2(20) := 'PROCESS_START';
+    C_PROCESS_UPDATE   CONSTANT VARCHAR2(20) := 'PROCESS_UPDATE';
+    C_PROCESS_STOP     CONSTANT VARCHAR2(20) := 'PROCESS_STOP';
+
+    -- ACTIONS and TRANSACTIONS
+    C_MARK_EVENT       CONSTANT VARCHAR2(20) := 'MARK_EVENT';
+    C_TRACE_START      CONSTANT VARCHAR2(20) := 'TRACE_START';
+    C_TRACE_STOP       CONSTANT VARCHAR2(20) := 'TRACE_STOP';
+    
+    -- Logging
+    C_LOGGING          CONSTANT VARCHAR2(20) := 'LOGGING';
+
+    ---------------------------------------------------------------
+    -- Automatisierte Lastverteilung
+    ---------------------------------------------------------------
+
+    -- Tabelle der Clients und von ihnen verwendeter Pipes
+    TYPE t_client_pipe IS TABLE OF VARCHAR2(128) INDEX BY BINARY_INTEGER;
+    g_client_pipes t_client_pipe;
+    g_dispatch_route_cache t_client_pipe;
+    
+    TYPE t_dispatcher_map IS TABLE OF VARCHAR2(50) INDEX BY VARCHAR2(50);
+    g_dispatcher_config t_dispatcher_map;
+
+    ---------------------------------------------------------------
+    -- General Variables
+    ---------------------------------------------------------------
+    -- Exclusive SessionId for Logging internal Errors or Warnings
+    g_lilamSessionId                    NUMBER := -1; -- -1 as Flag for not initialized
+    
+    -- Counter for ERROR and WARN Calls
+    g_counterError                      NUMBER := 0;
+    g_counterWarning                    NUMBER := 0;
+
+    -- ALERT Registration
+    g_isAlertRegistered                 BOOLEAN := false;
+
+    TYPE code_map_t IS TABLE OF PLS_INTEGER INDEX BY VARCHAR2(30);
+    g_response_codes code_map_t;
+
+    g_serverPipeName                    VARCHAR2(50)            := NULL;
+    g_serverProcessId                   PLS_INTEGER             := -1;
+    g_serverGroupName                   VARCHAR2(50)            := NULL;
+    g_shutdownPassword                  varchar2(50);
+    g_serverIsDispatcher                BOOLEAN                 := FALSE;
+
+    g_server_perf                       PLS_INTEGER             := C_SERVER_PERF_MID;  -- Leistungsstufe dieses Servers (p_perfServer)
+    g_last_sync_all                     TIMESTAMP               := NULL;   -- letzter Durchlauf von SYNC_ALL_DIRTY
+    g_last_check_time                   TIMESTAMP               := SYSTIMESTAMP;
+
+    -- Latencies between event generation and persistance in DB
+    g_firstLogTimeStamp                 TIMESTAMP               := NULL;
+    g_oldestLogTimeStamp                TIMESTAMP               := NULL;
+    g_avgLatencyLogs                    NUMBER                  := 0;
+    g_maxLatencyLogs                    NUMBER                  := 0;
+    g_logLatencyCounter                 NUMBER                  := 0;
+
+    g_firstMonTimeStamp                 TIMESTAMP               := NULL;
+    g_oldestMonTimeStamp                TIMESTAMP               := NULL;
+    g_avgLatencyMon                     NUMBER                  := 0;
+    g_maxLatencyMon                     NUMBER                  := 0;
+    g_monLatencyCounter                 NUMBER                  := 0;
+    ---------------------------------------------------------------
+    -- Functions and Procedures
+    ---------------------------------------------------------------
+    function getSessionRecord(p_processId number) return t_session_rec;
+    procedure sync_log(p_processId number, p_force boolean default false);
+    procedure sync_monitor(p_processId number, p_force boolean default false);
+    procedure sync_process(p_processId number, p_force boolean default false);
+    procedure flushMonitor(p_processId number);
+    procedure flushBatch;
+    procedure touchServerRegistry;
+    function getServerPipeAvailable(p_groupName varchar2) return varchar2;
+    procedure createInternalLogTable;
+    FUNCTION SERVER_LINK(p_processId NUMBER, p_pipeName varchar2) RETURN NUMBER;
+    ------------------------------------------------------------------------
+    
+    ---------------------------------------------------------------
+    -- Fallback Logging
+    ---------------------------------------------------------------
+    PROCEDURE logLilamErr(p_errCode varchar2, p_errMessage varchar2, p_moduleName varchar2 default 'UNKNOWN', p_logOperation varchar2 default 'UNKNONW')
+    AS
+        pragma autonomous_transaction;
+        l_stmt varchar2(4000);
+    BEGIN
+        createInternalLogTable;
+        l_stmt := '
+            insert into ' || C_LILAM_LOG_TABLE || '
+            (
+                error_code,
+                error_message,
+                error_stack,
+                error_backtrace,
+                call_stack,
+                module_name,
+                log_operation
+            )
+            values
+            (
+                :1, :2, :3, :4, :5, :6, :7
+            )';
+    
+        execute immediate l_stmt using
+                coalesce(p_errCode, sqlcode),
+                substr(coalesce(p_errMessage, sqlerrm), 1, 4000),
+                substr(dbms_utility.format_error_stack,     1, 4000),
+                substr(dbms_utility.format_error_backtrace, 1, 4000),
+                substr(dbms_utility.format_call_stack,      1, 4000),
+                substr(p_moduleName,   1, 200),
+                substr(p_logOperation, 1, 200);                
+                
+        commit;            
+            
+    EXCEPTION
+        when others then
+        begin
+            dbms_output.enable();
+            dbms_output.put_line('LILAM INTERNAL ERROR in Procedure logLilamErr: ' || substr(sqlErrM, 1, 1000));
+        end;
+    END;
+
+    ------------------------------------------------------------------------
+
+
+    ---------------------------------------------------------------
+    -- Antwort Codes stabil vereinheitlichen
+    ---------------------------------------------------------------
+    PROCEDURE initialize_map IS
+    BEGIN
+        if g_response_codes.COUNT = 0 THEN
+            g_response_codes(TXT_ACK_SHUTDOWN)    := NUM_ACK_SHUTDOWN;
+            g_response_codes(TXT_ACK_OK)          := NUM_ACK_OK;
+            g_response_codes(TXT_ACK_DECLINE)     := NUM_ACK_DECLINE;
+            g_response_codes(TXT_PING_ECHO)       := NUM_PING_ECHO;
+            g_response_codes(TXT_SERVER_INFO)     := NUM_SERVER_INFO;
+            g_response_codes(TXT_DATA_ANSWER)     := NUM_DATA_ANSWER;
+            g_response_codes(TXT_ERR_NO_SERVER)   := NUM_ERR_NO_SERVER;
+            g_response_codes(TXT_ERR_ILLEGAL_REQ) := NUM_ERR_ILLEGAL_REQ;
+            g_response_codes(TXT_ERR_UNKNOWN)     := NUM_ERR_UNKNOWN;
+            g_response_codes(TXT_ACK_SERVER_PROC) := NUM_ACK_SERVER_PROC;
+            g_response_codes(TXT_ERR_SERVER_PROC) := NUM_ERR_SERVER_PROC;
+        end if ;
+    END initialize_map;
+
+    --------------------------------------------------------------------------
+    
+    function logLevelToEnum(p_level number) return varchar2
+    as
+    begin
+        case p_level
+            when logLevelSilent     then return 'SILENT';
+            when logLevelError       then return 'ERROR';
+            when logLevelWarn        then return 'WARN';
+            when logLevelMonitor     then return 'MONITOR';
+            when logLevelInfo        then return 'INFO';
+            when logLevelDebug       then return 'DEBUG';
+        end case;
+    end;
+
+    --------------------------------------------------------------------------
+
+    FUNCTION get_serverCode(p_txt VARCHAR2) RETURN PLS_INTEGER IS
+    BEGIN
+        initialize_map; -- Stellt sicher, dass die Map befüllt ist
+
+        if g_response_codes.EXISTS(p_txt) THEN
+            RETURN g_response_codes(p_txt);
+        ELSE
+            RETURN -1; -- Oder eine Exception werfen
+        end if ;
+    END;
+
+    ---------------------------------------------------------------
+    -- Leistungsstufe normieren: NULL oder < 0 = MID (Standard), 0 = keine Drosselung, sonst der Wert selbst
+    ---------------------------------------------------------------
+    FUNCTION normPerf(p_perf PLS_INTEGER) RETURN PLS_INTEGER IS
+    BEGIN
+        IF p_perf IS NULL OR p_perf < 0 THEN
+            RETURN C_SERVER_PERF_MID;
+        END IF;
+        RETURN p_perf;
+    END;
+
+    ---------------------------------------------------------------
+    -- Grenze der Drosselung für einen Prozess setzen (Wert aus der Antwort des Servers
+    -- auf NEW_SESSION bzw. RECONNECT_PROCESS). Ersetzt SET_HIGH_PERFORMANCE / g_is_high_perf.
+    ---------------------------------------------------------------
+    PROCEDURE setPerfLimit(p_processId NUMBER, p_perf PLS_INTEGER) IS
+        l_rec t_throttle_stat;
+    BEGIN
+        IF g_local_throttle_cache.EXISTS(p_processId) THEN
+            g_local_throttle_cache(p_processId).msg_limit := normPerf(p_perf);
+        ELSE
+            l_rec.msg_limit := normPerf(p_perf);
+            g_local_throttle_cache(p_processId) := l_rec;
+        END IF;
+    END;
+
+    ---------------------------------------------------------------
+    -- Erkennung ob ein Prozess auf einem Server läuft
+    ---------------------------------------------------------------
+    FUNCTION is_remote(p_processId IN NUMBER) RETURN BOOLEAN IS
+        l_dispatcherPipe varchar2(80);
+        l_result         number;
+    BEGIN
+        IF g_remote_sessions.EXISTS(p_processId) THEN
+            RETURN TRUE;
+        END IF;
+    
+        IF v_indexSession.EXISTS(p_processId) THEN
+            RETURN FALSE; -- echter lokaler In-Session-Prozess
+        END IF;
+
+        -- Ungültige ID (z.B. NUM_ERR_SESSION_TIMEOUT aus SERVER_NEW_SESSION): nie ein Reconnect-Versuch
+        IF p_processId IS NULL OR p_processId <= 0 THEN
+            RETURN FALSE;
+        END IF;
+    
+        -- Weder lokal noch als remote bekannt: automatischer Reconnect-Versuch,
+        -- aber nur, wenn ein Dispatcher konfiguriert wurde
+        IF NOT g_dispatcher_config.EXISTS('DEFAULT_DISPATCHER') THEN
+            RETURN FALSE;
+        END IF;
+
+        -- Reconnect für diese ID kürzlich gescheitert: nicht erneut synchron anfragen
+        -- (sonst wartet jeder Aufruf mit einer veralteten ID auf den Dispatcher)
+        IF g_unknown_pids.EXISTS(p_processId) THEN
+            IF g_unknown_pids(p_processId) > systimestamp THEN
+                RETURN FALSE;
+            END IF;
+            g_unknown_pids.DELETE(p_processId);
+        END IF;
+    
+        l_dispatcherPipe := g_dispatcher_config('DEFAULT_DISPATCHER');
+        l_result := SERVER_LINK(p_processId, l_dispatcherPipe);
+        IF l_result = p_processId THEN
+            RETURN TRUE;
+        END IF;
+
+        -- Server kennt den Prozess nicht (endgültig): für diese Session merken.
+        -- Kein Server erreichbar / Timeout (vorübergehend): erst nach 10 s erneut versuchen.
+        g_unknown_pids(p_processId) := CASE WHEN l_result = NUM_ERR_SERVER_PROC
+                                            THEN systimestamp + INTERVAL '1' DAY
+                                            ELSE systimestamp + INTERVAL '10' SECOND END;
+        RETURN FALSE;
+    
+    EXCEPTION
+        WHEN OTHERS THEN
+            logLilamErr(sqlCode, sqlErrM, 'is_remote');
+            RETURN FALSE;
+    END is_remote;
+    
+    ------------------------------------------------------------------------
+
+    function jsonObject(p_jsonString varchar2, p_path varchar2) return varchar2
+    as
+    begin
+            return JSON_QUERY(p_jsonString, '$.' || p_path);
+    end;
+
+    --------------------------------------------------------------------------
+
+    function jsonString(p_json_doc varchar2, jsonPath varchar2) return varchar2
+    as
+    begin
+        return JSON_VALUE(p_json_doc, '$.' || jsonPath);
+    end;
+
+    --------------------------------------------------------------------------
+
+    function jsonNumber(p_json_doc varchar2, jsonPath varchar2) return number
+    as
+    begin
+        return JSON_VALUE(p_json_doc, '$.' || jsonPath returning NUMBER);
+    exception 
+        when others then
+        logLilamErr(sqlCode, sqlErrM, 'jsonNumber', 'JSON_VALUE');
+        return null;
+    end;
+
+    --------------------------------------------------------------------------
+
+    function extractFromJsonObjTime(p_obj JSON_OBJECT_T, p_key VARCHAR2) RETURN TIMESTAMP
+    as
+    BEGIN
+        RETURN TO_TIMESTAMP(p_obj.get_string(p_key), 'YYYY-MM-DD"T"HH24:MI:SS.FF');
+    EXCEPTION 
+        WHEN OTHERS THEN
+        logLilamErr(sqlCode, sqlErrM, 'extractFromJsonObjTime', 'RETURN TO_TIMESTAMP');
+        return null;
+    END;
+
+    --------------------------------------------------------------------------
+
+    function jsonTime(p_json_doc varchar2, jsonPath varchar2) return TIMESTAMP
+    as
+    begin
+        return JSON_VALUE(p_json_doc, '$.' || jsonPath returning TIMESTAMP);
+    exception 
+        when others then
+        logLilamErr(sqlCode, sqlErrM, 'jsonTime', 'JSON_VALUE');
+        return null;
+    end;
+
+    ------------------------------------------------------------------------
+
+    function jsonPutPrep(p_jsonString varchar2) return varchar2
+    as
+        l_str JSON_OBJ_LILAM;  -- vorher varchar2(1000): längere Nachrichten (z.B. Logtexte) gingen still verloren
+    begin
+        l_str := p_jsonString;
+        if trim(l_str) is null then
+            return null;
+        end if;
+        l_str := trim(l_str);
+        if substr(l_str, 1,1) =  '{' then
+            l_str := substr(l_str, 2);
+            l_str := substr(l_str, 1, length(l_str)-1);
+        end if;
+        if length(l_str) > 0 then
+            l_str := l_str || ', ';
+        end if;
+        return l_str;
+    end;
+
+    ------------------------------------------------------------------------
+
+    procedure jsonPut(p_jsonString in out JSON_OBJ_LILAM, jsonKey in varchar2, valueStr in varchar2) --return varchar2
+    -- Achtung! Die If-Konstruktionen sind nicht schön aber deutlich performanter, als case
+    -- Auch das Arbeiten mit einem booleschen Wert am Anfang macht die Logik um vieles langsamer
+    as
+        l_str   JSON_OBJ_LILAM;
+        l_value JSON_OBJ_LILAM := trim(valueStr);
+    begin
+        if valueStr is null or trim(valueStr) = '' then return; end if; -- p_jsonString; end if;
+
+        if substr(l_value,1,1) != '{' and substr(l_value, -1) != '}' then
+            -- Escapen!
+            l_value := REPLACE(l_value, '\', '\\'); -- ZUERST Backslash
+            l_value := REPLACE(l_value, '"', '\"'); -- DANN Anführungszeichen
+            -- Optional: Zeilenumbrüche (JSON erlaubt keine echten Linebreaks in Strings)
+            l_value := REPLACE(l_value, CHR(10), '\n');
+            l_value := REPLACE(l_value, CHR(13), '\r');
+        end if;
+
+        -- Ergebnis ist immer ein vollständiges JSON-Objekt, auch beim ersten jsonPut
+        -- (vorher entstand bei leerem p_jsonString und Objekt-Wert nur ein Fragment ohne Klammern)
+        l_str := jsonPutPrep(p_jsonString);
+        l_str := '{' || l_str || '"' || trim(jsonKey) || '":';
+        if substr(l_value, 1, 1) != '{' then
+            l_str := l_str || '"';
+        end if;
+        l_str := l_str || l_value; 
+        if SUBSTR(l_value, -1) != '}' then
+            l_str := l_str || '"}';
+        else
+            l_str := l_str || '}';
+        end if;
+        p_jsonString := l_str;
+--            return l_str;
+    end;
+
+    -------------------------------------------------------------------------------------
+
+    procedure jsonPut(p_jsonString in out varchar2, jsonKey varchar2, valueNum Number) -- return varchar2
+    as
+        l_str JSON_OBJ_LILAM;
+    begin
+        if valueNum is null then return; end if; -- p_jsonString; end if;
+
+        l_str := jsonPutPrep(p_jsonString);
+        if p_jsonString is null and substr(valueNum, 1,1) = '{' and substr(valueNum, -1) = '}' then
+            l_str := '"' || jsonKey || '": ' || valueNum;    
+        else 
+            l_str := '{' || l_str || '"' || trim(jsonKey) || '":';
+            l_str := l_str || valueNum || '}'; 
+        end if;
+        p_jsonString := l_str;
+--            return l_str;
+    end;
+
+    -------------------------------------------------------------------------------------
+
+    procedure jsonPut(p_jsonString in out JSON_OBJ_LILAM, jsonKey varchar2, valueTS timestamp) -- return varchar2
+    as
+    begin
+        jsonPut(p_jsonString, jsonKey, TO_CHAR(valueTS, 'YYYY-MM-DD"T"HH24:MI:SS.FF6'));
+--            return jsonPut(p_jsonString, jsonKey, TO_CHAR(valueTS, 'YYYY-MM-DD"T"HH24:MI:SS.FF6'));
+    end;
+
+    --------------------------------------------------------------------------
+    -- PERFORMANCE: Bausteine für die direkte Verkettung von JSON-Nachrichten
+    --
+    -- jsonPut zerlegt bei jedem Aufruf das bisher gebaute Objekt und kopiert es
+    -- neu. Bei 8-10 Feldern pro Nachricht war das im Decoupled-Mode der größte
+    -- Kostenblock auf Client-Seite (HPROF: 39 % bei INFO, 47 % bei MARK_EVENT).
+    -- In den häufig durchlaufenen Pfaden (Logs, Traces, Events, Steps, Status)
+    -- wird die Nachricht deshalb in EINEM Ausdruck verkettet:
+    --
+    --     '{"process_id":' || jNum(p_processId) || jStr('action_name', p_actionName) || ... || '}'
+    --
+    -- Jeder Baustein liefert ',"key":wert' oder - bei NULL - einen Leerstring.
+    -- Das erste Feld wird daher immer ohne Baustein und ohne Komma geschrieben.
+    -- Die selten genutzten Pfade (Antworten des Servers, Verwaltung) verwenden
+    -- weiterhin jsonPut.
+    --------------------------------------------------------------------------
+
+    -- Textwert für JSON maskieren (gleiche Regeln wie jsonPut, zusätzlich Tab)
+    function jEsc(p_value varchar2) return varchar2
+    as
+    begin
+        return replace(replace(replace(replace(replace(p_value,
+                   '\', '\\'),          -- ZUERST Backslash
+                   '"', '\"'),
+                   chr(10), '\n'),
+                   chr(13), '\r'),
+                   chr(9), '\t');
+    end;
+
+    -- Zahl unabhängig von NLS_NUMERIC_CHARACTERS (immer Dezimalpunkt, führende 0)
+    function jNum(p_value number) return varchar2
+    as
+        l_str varchar2(64);
+    begin
+        if p_value = trunc(p_value) then
+            return to_char(p_value);       -- Ganzzahl: NLS spielt keine Rolle (Normalfall)
+        end if;
+        l_str := to_char(p_value, 'TM9', 'NLS_NUMERIC_CHARACTERS=''.,''');
+        if substr(l_str, 1, 1) = '.' then
+            l_str := '0' || l_str;
+        elsif substr(l_str, 1, 2) = '-.' then
+            l_str := '-0' || substr(l_str, 2);
+        end if;
+        return l_str;
+    end;
+
+    -- ',"key":"text"' bzw. '' bei NULL
+    function jStr(p_key varchar2, p_value varchar2) return varchar2
+    as
+    begin
+        if p_value is null then return null; end if;
+        return ',"' || p_key || '":"' || jEsc(p_value) || '"';
+    end;
+
+    -- ',"key":zahl' bzw. '' bei NULL
+    function jNum(p_key varchar2, p_value number) return varchar2
+    as
+    begin
+        if p_value is null then return null; end if;
+        return ',"' || p_key || '":' || jNum(p_value);
+    end;
+
+    -- ',"key":"YYYY-MM-DDTHH24:MI:SS.FF6"' bzw. '' bei NULL
+    function jTs(p_key varchar2, p_value timestamp) return varchar2
+    as
+    begin
+        if p_value is null then return null; end if;
+        return ',"' || p_key || '":"' || to_char(p_value, 'YYYY-MM-DD"T"HH24:MI:SS.FF6') || '"';
+    end;
+
+    --------------------------------------------------------------------------
+    -- PERFORMANCE: Tabellenname nur einmal je Session über DBMS_ASSERT prüfen.
+    -- DBMS_ASSERT.SQL_OBJECT_NAME löst den Namen im Data Dictionary auf und kostete
+    -- im Server-Profil 0,4 ms je Aufruf (8 % der Serverzeit im Massentest).
+    -- Der Cache wird zusammen mit g_checked_masters geleert (z.B. bei ORA-00942).
+    --------------------------------------------------------------------------
+    function safeTableName(p_table varchar2) return varchar2
+    as
+    begin
+        if not g_safe_tables.EXISTS(p_table) then
+            g_safe_tables(p_table) := DBMS_ASSERT.SQL_OBJECT_NAME(p_table);
+        end if;
+        return g_safe_tables(p_table);
+    end;
+
+    --------------------------------------------------------------------------
+    -- Millis between two timestamps
+    --------------------------------------------------------------------------
+    function get_ms_diff(p_start timestamp, p_end timestamp) return number is
+        v_diff interval day(0) to second(3); -- Präzision auf ms begrenzen
+    begin
+        v_diff := p_end - p_start;
+        -- Wir extrahieren nur die Sekunden inklusive der Nachkommastellen (ms)
+        -- und addieren die Minuten/Stunden/Tage als Sekunden-Vielfache
+        return (extract(day from v_diff) * 86400000)
+             + (extract(hour from v_diff) * 3600000)
+             + (extract(minute from v_diff) * 60000)
+             + (extract(second from v_diff) * 1000);
+    end;   
+
+    --------------------------------------------------------------------------
+    -- Calc Timestamp as key for requests 
+    --------------------------------------------------------------------------
+    function getClientPipe return varchar2
+    as
+    begin
+
+    return 'LILAM->' || SYS_CONTEXT('USERENV', 'SID') || '-' || TO_CHAR(
+        (EXTRACT(DAY FROM (sys_extract_utc(SYSTIMESTAMP) - TO_TIMESTAMP('1970-01-01', 'YYYY-MM-DD'))) * 86400000) + 
+        TO_NUMBER(TO_CHAR(sys_extract_utc(SYSTIMESTAMP), 'SSSSSFF3')),
+        'FM999999999999999'
+    );
+    end;
+
+    --------------------------------------------------------------------------
+    -- Name der Steuer-Pipe zu einer Server-/Dispatcher-Pipe (nur per Konvention, keine Verwaltung)
+    --------------------------------------------------------------------------
+    function ctlPipe(p_pipeName varchar2) return varchar2
+    as
+    begin
+        return upper(p_pipeName) || C_CTL_PIPE_SUFFIX;
+    end;
+
+    --------------------------------------------------------------------------
+    -- Weckruf in die Daten-Pipe: Ein untätiger Server wartet blockierend auf seiner Daten-Pipe
+    -- (bis C_SERVER_TIMEOUT_MAX_WAIT_SEC) und würde eine Nachricht in der Steuer-Pipe sonst erst
+    -- nach Ablauf dieser Wartezeit bemerken. SERVER_PING bewirkt im Server nichts weiter.
+    --------------------------------------------------------------------------
+    procedure sendPing(p_pipeName varchar2)
+    as
+        l_status PLS_INTEGER;
+    begin
+        DBMS_PIPE.RESET_BUFFER;
+        DBMS_PIPE.PACK_MESSAGE('{"header":{"msg_type":"API_CALL","request":"SERVER_PING"}}');
+        l_status := DBMS_PIPE.SEND_MESSAGE(p_pipeName, timeout => 0);
+    exception
+        when others then
+            DBMS_PIPE.RESET_BUFFER;   -- Weckruf ist nur ein Hilfsmittel, Fehler sind unkritisch
+    end;
+
+    --------------------------------------------------------------------------
+    -- Look for free Server-Pipe 
+    --------------------------------------------------------------------------
+    function getServerPipeForSession(p_processId number, p_groupName varchar2) return varchar2
+    as
+        l_serverPipe varchar2(50);
+        l_key        BINARY_INTEGER;
+    begin
+        l_key := coalesce(p_processId, C_PIPE_ID_PENDING);
+        -- 1. Cache-Check (PGA)
+        IF g_client_pipes.EXISTS(p_processId) THEN
+            RETURN g_client_pipes(p_processId);
+        END IF;
+    
+        -- 2. Dispatcher hat Vorrang vor der Registry-Suche, falls konfiguriert
+        IF g_dispatcher_config.EXISTS('DEFAULT_DISPATCHER') THEN
+            l_serverPipe := g_dispatcher_config('DEFAULT_DISPATCHER');
+        ELSE
+            l_serverPipe := getServerPipeAvailable(p_groupName);
+        END IF;
+    
+        if l_serverPipe is null then 
+            RAISE_APPLICATION_ERROR(NUM_ERR_NO_SERVER, 'LILAM: Keinen aktiven Server gefunden.');
+        end if;
+        
+        g_client_pipes(l_key) := l_serverPipe;
+        return g_client_pipes(l_key);
+    
+    end;
+
+    --------------------------------------------------------------------------
+    -- Hilfsfunktion (intern): Erzeugt den einheitlichen Key für den Index
+    --------------------------------------------------------------------------
+    FUNCTION buildMonitorKey(p_processId NUMBER, p_actionName VARCHAR2, p_contextName VARCHAR2) RETURN VARCHAR2 AS
+    BEGIN
+        -- Format: "0000000000000000180|MEINE_AKTION|MEIN_CONTEXT"
+        -- LPAD sorgt für eine feste Länge, was das Filtern extrem beschleunigt
+        RETURN LPAD(p_processId, 20, '0') || '|' || p_actionName || '|' || p_contextName;
+    END;
+
+    --------------------------------------------------------------------------
+    -- Baseline Scopes: prozessübergreifende Durchschnittswerte
+    --------------------------------------------------------------------------
+    -- Key für g_baselines; gleiches Format wie buildMonitorKey, aber mit scope_id
+    FUNCTION buildBaselineKey(p_scopeId NUMBER, p_actionName VARCHAR2, p_contextName VARCHAR2) RETURN VARCHAR2 AS
+    BEGIN
+        RETURN LPAD(p_scopeId, 20, '0') || '|' || p_actionName || '|' || p_contextName;
+    END;
+
+    --------------------------------------------------------------------------
+
+    FUNCTION getScopeId(p_processId NUMBER) RETURN NUMBER AS
+    BEGIN
+        IF v_indexSession.EXISTS(p_processId) THEN
+            RETURN g_sessionList(v_indexSession(p_processId)).scope_id;
+        END IF;
+        RETURN NULL;
+    END;
+
+    --------------------------------------------------------------------------
+
+    PROCEDURE setScopeId(p_processId NUMBER, p_scopeId NUMBER) AS
+    BEGIN
+        IF v_indexSession.EXISTS(p_processId) THEN
+            g_sessionList(v_indexSession(p_processId)).scope_id := p_scopeId;
+        END IF;
+    END;
+
+    --------------------------------------------------------------------------
+    -- Ermittelt den Scope-Namen aus t_session_init.baselineScope
+    --   NULL    => Prozessname
+    --   '#NONE' => kein Scope (NULL)
+    --   '#...'  => unbekannter reservierter Wert: protokollieren, Prozessname verwenden
+    --   sonst   => der angegebene Name
+    --------------------------------------------------------------------------
+    FUNCTION resolveScopeName(p_processName VARCHAR2, p_baselineScope VARCHAR2) RETURN VARCHAR2
+    AS
+        l_scope VARCHAR2(100) := upper(trim(p_baselineScope));
+    BEGIN
+        IF l_scope IS NULL THEN
+            RETURN upper(trim(p_processName));
+        END IF;
+
+        IF l_scope = C_SCOPE_NONE THEN
+            RETURN NULL;
+        END IF;
+
+        IF substr(l_scope, 1, 1) = C_SCOPE_RESERVED_PREFIX THEN
+            logLilamErr('-20030', 'Unknown reserved baseline scope ''' || l_scope || '''; using process name instead', 'resolveScopeName');
+            RETURN upper(trim(p_processName));
+        END IF;
+
+        RETURN l_scope;
+    EXCEPTION
+        WHEN OTHERS THEN
+            logLilamErr(sqlCode, sqlErrM, 'resolveScopeName');
+            RETURN NULL;
+    END;
+
+    --------------------------------------------------------------------------
+    -- Liefert die scope_id zum Namen; legt den Scope bei Bedarf an.
+    -- Fehler => NULL (Session arbeitet dann prozesslokal wie bisher)
+    --------------------------------------------------------------------------
+    FUNCTION getOrCreateScopeId(p_scopeName VARCHAR2) RETURN NUMBER
+    AS
+        pragma autonomous_transaction;
+        l_scopeId NUMBER;
+        l_select  CONSTANT VARCHAR2(200) := 'select scope_id from ' || C_LILAM_SCOPES_TABLE || ' where scope_name = :1';
+    BEGIN
+        IF p_scopeName IS NULL THEN
+            RETURN NULL;
+        END IF;
+
+        IF g_scope_ids.EXISTS(p_scopeName) THEN
+            RETURN g_scope_ids(p_scopeName);
+        END IF;
+
+        BEGIN
+            EXECUTE IMMEDIATE l_select INTO l_scopeId USING p_scopeName;
+        EXCEPTION
+            WHEN NO_DATA_FOUND THEN
+                BEGIN
+                    EXECUTE IMMEDIATE 'insert into ' || C_LILAM_SCOPES_TABLE || ' (scope_name) values (:1) returning scope_id into :2'
+                        USING p_scopeName RETURNING INTO l_scopeId;
+                    COMMIT;
+                EXCEPTION
+                    WHEN DUP_VAL_ON_INDEX THEN
+                        -- parallel von einer anderen Session angelegt
+                        ROLLBACK;
+                        EXECUTE IMMEDIATE l_select INTO l_scopeId USING p_scopeName;
+                END;
+        END;
+
+        g_scope_ids(p_scopeName) := l_scopeId;
+        RETURN l_scopeId;
+
+    EXCEPTION
+        WHEN OTHERS THEN
+            ROLLBACK;
+            logLilamErr(sqlCode, sqlErrM, 'getOrCreateScopeId', p_scopeName);
+            RETURN NULL;
+    END;
+
+    --------------------------------------------------------------------------
+    -- Stellt sicher, dass die Baseline im PGA liegt (Lazy Load, ein PK-Zugriff
+    -- pro Scope/Action/Context). Fehler werden an den Aufrufer durchgereicht.
+    --------------------------------------------------------------------------
+    PROCEDURE ensureBaseline(p_key VARCHAR2, p_scopeId NUMBER, p_actionName VARCHAR2, p_contextName VARCHAR2)
+    AS
+        l_rec t_baseline_rec;
+    BEGIN
+        IF g_baselines.EXISTS(p_key) THEN
+            RETURN;
+        END IF;
+
+        l_rec.scope_id     := p_scopeId;
+        l_rec.action_name  := p_actionName;
+        l_rec.context_name := p_contextName;
+
+        BEGIN
+            EXECUTE IMMEDIATE
+                'select avg_ms, action_count from ' || C_LILAM_BASELINES_TABLE ||
+                ' where scope_id = :1 and action_name = :2 and context_name = :3'
+                INTO l_rec.avg_ms, l_rec.action_count
+                USING p_scopeId, p_actionName, nvl(p_contextName, C_BASELINE_NULL_CONTEXT);
+            l_rec.in_db := TRUE;
+        EXCEPTION
+            WHEN NO_DATA_FOUND THEN
+                l_rec.avg_ms := NULL;
+                l_rec.action_count := 0;
+                l_rec.in_db := FALSE;
+        END;
+
+        l_rec.action_count := nvl(l_rec.action_count, 0);
+        l_rec.base_avg     := l_rec.avg_ms;
+        l_rec.base_count   := l_rec.action_count;
+        l_rec.dirty        := FALSE;
+        l_rec.last_touch   := SYSTIMESTAMP;
+
+        g_baselines(p_key) := l_rec;
+    END;
+
+    --------------------------------------------------------------------------
+    -- Check if a single step needs more time than average over all steps per action
+    --------------------------------------------------------------------------
+    function validateDurationInAverage(p_monitor_rec t_monitor_buffer_rec, p_metricFactor number) return BOOLEAN
+    as
+    begin
+        -- Wenn noch kein Trend da ist (Initialstart / Warm-up), können wir nichts validieren.
+        if p_monitor_rec.avg_action_time is null or p_monitor_rec.avg_action_time = 0 
+           or p_monitor_rec.used_time is null or p_metricFactor is null then
+            return TRUE; 
+        end if;
+
+        -- Vergleich gegen den bestehenden Trend
+        -- Da p_old_ewma während des Warm-ups dem Trend folgt, 
+        -- greift die 10% (oder X%) Hürde erst, wenn der EWMA sich stabilisiert.
+        if p_monitor_rec.used_time > p_monitor_rec.avg_action_time * (1 + p_metricFactor / 100) then
+            return FALSE;
+        end if;
+
+        return TRUE;
+    end;
+
+    --------------------------------------------------------------------------
+
+    -- Liefert den n-ten Wert aus 'a|b|c' (z.B. AVG_DEVIATION_PCT: 'pct|warmup|alpha').
+    -- Fehlende oder ungültige Werte => NULL (Aufrufer setzen Defaults)
+    FUNCTION extractRuleValue(p_param VARCHAR2, p_position PLS_INTEGER) return number
+    AS
+        l_val VARCHAR2(50);
+    BEGIN
+        l_val := TRIM(REGEXP_SUBSTR(p_param, '[^|]+', 1, p_position));
+        if l_val is null then
+            return null;
+        end if;
+        return to_number(l_val, '999999999999D9999999999', 'NLS_NUMERIC_CHARACTERS = ''. ''');
+    EXCEPTION
+        WHEN VALUE_ERROR OR INVALID_NUMBER THEN
+            logLilamErr(sqlCode, 'Invalid rule value ''' || p_param || ''' at position ' || p_position, 'extractRuleValue');
+            return null;
+    END;
+
+    -------------------------------------------------------
+    -- Generate Action/Context - Key verifying Server Rules 
+    -------------------------------------------------------
+    FUNCTION buildRuleKey(p_action VARCHAR2, p_context VARCHAR2 := NULL) RETURN VARCHAR2 IS
+    BEGIN
+        IF p_context IS NOT NULL THEN
+            RETURN p_action || '|' || p_context;
+        ELSE
+            RETURN p_action;
+        END IF;
+    END;
+
+    ------------------------------------------------------------
+    -- Alarmierung aber unter Berücksichtigung, dass Alarme nicht
+    -- in kurzer Zeit zu häufig ausgelöst werden dürfen
+    -- Hier: Events und Transaktionen
+    ------------------------------------------------------------
+    PROCEDURE fire_alert(p_rule t_rule_rec, p_rec t_monitor_buffer_rec) IS
+        pragma autonomous_transaction;
+        -- Throttle pro Scope (falls vorhanden), damit Neustarts die Sperrzeit nicht aufheben
+        v_scope_id      NUMBER := getScopeId(p_rec.process_id);
+        v_history_key   VARCHAR2(250) := CASE WHEN v_scope_id IS NOT NULL THEN 'S' || v_scope_id ELSE 'P' || p_rec.process_id END
+                                         || '|' || p_rule.rule_id || '|' || p_rec.action_name;
+        v_idx_session   PLS_INTEGER;
+        v_last_fire     TIMESTAMP(6);
+        v_throttle_sec  NUMBER := coalesce(p_rule.throttle_seconds, 0); -- Aus dem JSON
+        v_channel_name  VARCHAR2(30); -- max. length of Alert-Name
+        v_payload       VARCHAR2(1000);
+        v_sqlStmt       VARCHAR2(2000);
+        v_alert_id      NUMBER;
+    BEGIN
+        -- 1. Prüfen, ob wir dieses spezifische Problem schon mal gemeldet haben
+        IF g_alert_history.EXISTS(v_history_key) THEN
+            v_last_fire := g_alert_history(v_history_key);
+            -- Wenn die Sperrzeit noch nicht abgelaufen ist -> Abbruch
+            IF (v_last_fire + numtodsinterval(v_throttle_sec, 'SECOND')) > SYSTIMESTAMP THEN
+                RETURN; 
+            END IF;
+        END IF;
+
+        v_sqlStmt := '
+        INSERT INTO ' || C_LILAM_ALERTS_TABLE || '(
+            process_id, process_name, action_name, master_table_name, monitor_table_name, logging_table_name, context_name, action_count, 
+            rule_set_name, rule_id, rule_set_version, alert_severity, handler_type
+        ) VALUES (
+            :1, :2, :3, :4, :5, :6, :7, :8, :9, :10, :11, :12, :13
+        ) RETURNING alert_id into :14';
+
+        v_idx_session := v_indexSession(p_rec.process_id);
+
+        EXECUTE IMMEDIATE v_sqlStmt
+        USING p_rec.process_id, g_process_cache(p_rec.process_id).processName, p_rec.action_Name, 
+        g_sessionList(v_idx_session).tabName_master || C_SUFFIX_PROC_TABLE, g_sessionList(v_idx_session).tabName_master || C_SUFFIX_MON_TABLE,
+        g_sessionList(v_idx_session).tabName_master || C_SUFFIX_LOG_TABLE, 
+        p_rec.context_name, p_rec.action_count, g_current_rule_set_name, p_rule.rule_id, g_current_rule_set_version, 
+        p_rule.alert_severity, p_rule.alert_handler
+        RETURNING INTO v_alert_id;
+
+        v_payload := JSON_OBJECT(
+            'alert_id'         VALUE v_alert_id,
+            'process_id'       VALUE p_rec.process_id,
+            'tab_name_process' VALUE g_sessionList(v_idx_session).tabName_master || C_SUFFIX_PROC_TABLE,
+            'tab_name_monitor' VALUE g_sessionList(v_idx_session).tabName_master || C_SUFFIX_MON_TABLE,
+            'tab_name_logging' VALUE g_sessionList(v_idx_session).tabName_master || C_SUFFIX_LOG_TABLE,
+            'action_name'      VALUE p_rec.action_name,
+            'context_name'     VALUE p_rec.context_name,
+            'action_count'     VALUE p_rec.action_count,
+            'rule_set_name'    VALUE g_current_rule_set_name,
+            'rule_id'          VALUE p_rule.rule_id,
+            'rule_set_version' VALUE g_current_rule_set_version,
+            'alert_severity'   VALUE p_rule.alert_severity,
+            'timestamp'        VALUE TO_CHAR(SYSTIMESTAMP, 'YYYY-MM-DD"T"HH24:MI:SS.FF6')
+        );
+
+        -- p_rule.alert_handler wäre hier z.B. 'MAIL', 'REST', 'PROCESS'
+        v_channel_name := p_rule.alert_handler;
+        dbms_alert.signal(v_channel_name, v_payload);
+        COMMIT; -- !!!
+
+        -- 3. Zeitstempel aktualisieren
+        g_alert_history(v_history_key) := SYSTIMESTAMP;
+
+    exception
+        when others then
+        logLilamErr(sqlCode, sqlErrM, 'fire_alert');
+    END;
+    
+    ------------------------------------------------------------
+    -- Identifizieren von Regeln gegen eintreffendes Event/Trace
+    -- Zusammengefasste Version für Monitoring und Prozess
+    ------------------------------------------------------------  
+    PROCEDURE evaluateRules_internal(p_ctx t_eval_context_rec, p_trigger VARCHAR2, p_check_context BOOLEAN)
+    AS
+        v_key       VARCHAR2(200);
+        fire        BOOLEAN := FALSE;
+        l_diff_ms   PLS_INTEGER := 0;
+        l_condVal   NUMBER := 0;
+        p_monRec    t_monitor_buffer_rec; -- Hilfsvariable für fire_alert
+
+        PROCEDURE apply_rule_list(p_list t_rule_list) IS
+        BEGIN
+            IF p_list IS NULL OR p_list.COUNT = 0 THEN RETURN; END IF;
+
+            FOR i IN 1 .. p_list.COUNT LOOP
+                fire := FALSE;
+                
+                IF upper(p_list(i).trigger_type) = upper(p_trigger) THEN
+                    CASE
+                        -- =====================================================
+                        -- LOGGING OPERATOREN
+                        -- =====================================================
+                        -- ohne SEVERITY gibt's kein fire
+                        WHEN upper(p_list(i).condition_operator) = 'SEVERITY' AND upper(p_list(i).condition_value) = upper(p_ctx.context_name) THEN
+                            fire := TRUE;
+                        
+                        -- =====================================================
+                        -- GEMEINSAME OPERATOREN
+                        -- =====================================================
+                        WHEN p_list(i).condition_operator IN ('ON_START', 'ON_STOP', 'ON_UPDATE', 'ON_EVENT') THEN
+                            fire := TRUE;
+
+                        WHEN p_list(i).condition_operator = 'MAX_OCCURRENCE' THEN
+                            -- Konsolidierte Logik: Prozess nutzt stepsTodo/stepsDone, Monitor nutzt action_count
+                            IF p_ctx.steps_todo IS NOT NULL THEN
+                                IF p_ctx.steps_todo - p_ctx.steps_done > p_list(i).condition_value THEN 
+                                    fire := TRUE; 
+                                END IF;
+                            ELSE
+                                IF p_ctx.action_count > p_list(i).condition_value THEN
+                                    fire := TRUE; 
+                                END IF;
+                            END IF;
+
+                        WHEN p_list(i).condition_operator = 'PRECEDED_BY' THEN
+                            IF g_last_action_per_process.EXISTS(p_ctx.process_id) THEN
+                                DECLARE
+                                    l_actual_history_key VARCHAR2(500) := g_last_action_per_process(p_ctx.process_id).full_key;
+
+                                BEGIN
+                                    IF l_actual_history_key = p_list(i).condition_value 
+                                       OR l_actual_history_key LIKE p_list(i).condition_value || '|%' 
+                                    THEN 
+                                        NULL; 
+                                    ELSE 
+                                        fire := TRUE; 
+                                    END IF;
+                                END;
+                            ELSE 
+                                fire := TRUE; 
+                            END IF;
+                            
+                        WHEN p_list(i).condition_operator = 'PRECEDED_BY_WITHIN_SECS' THEN
+                            IF g_last_action_per_process.EXISTS(p_ctx.process_id) THEN
+                                DECLARE
+                                    l_history     t_action_history_rec := g_last_action_per_process(p_ctx.process_id);
+                                    l_pos         PLS_INTEGER; 
+                                    l_expected    VARCHAR2(100);
+                                    l_max_seconds NUMBER;
+                                    l_gap_ms      NUMBER;
+
+                                BEGIN
+                                    l_pos := instr(p_list(i).condition_value, '|', -1);
+
+                                    IF l_pos > 0 THEN
+                                        l_expected    := substr(p_list(i).condition_value, 1, l_pos - 1);
+                                        l_max_seconds := to_number(substr(p_list(i).condition_value, l_pos + 1));                            
+
+                                        IF l_history.full_key != l_expected THEN
+                                            fire := TRUE; 
+                                        ELSE
+                                            l_gap_ms := get_ms_diff(l_history.stop_time, p_ctx.start_time);
+
+                                            IF (l_gap_ms / 1000) > l_max_seconds THEN 
+                                                fire := TRUE; 
+                                            END IF;
+                                        END IF;
+                                    END IF;
+                                END;
+                            ELSE 
+                                fire := TRUE; 
+                            END IF;
+
+                        -- =====================================================
+                        -- REINE MONITOR-OPERATOREN
+                        -- =====================================================
+                        WHEN p_list(i).condition_operator = 'AVG_DEVIATION_PCT' THEN
+                            -- Vergleich der aktuellen Dauer mit dem Durchschnitt VOR dieser Messung.
+                            -- avg_time ist während des Warm-ups NULL => keine Bewertung.
+                            p_monRec.start_time      := p_ctx.start_time; 
+                            p_monRec.stop_time       := p_ctx.stop_time;
+                            p_monRec.used_time       := p_ctx.used_time;
+                            p_monRec.avg_action_time := p_ctx.avg_time;
+
+                            IF NOT validateDurationInAverage(p_monRec, extractRuleValue(p_list(i).condition_value, 1)) THEN
+                                fire := TRUE;
+                            END IF;
+
+                        WHEN p_list(i).condition_operator = 'MAX_DURATION_MS' THEN
+                            IF p_ctx.used_time > p_list(i).condition_value THEN 
+                                fire := TRUE; 
+                            END IF;
+
+                        WHEN p_list(i).condition_operator = 'MAX_GAP_SECONDS' THEN
+                            v_key := buildMonitorKey(p_ctx.process_id, p_ctx.action_name, p_ctx.context_name);
+
+                            IF g_monitor_shadows.EXISTS(v_key) THEN
+                                DECLARE
+                                    l_vorganger_zeit TIMESTAMP := coalesce(g_monitor_shadows(v_key).stop_time, g_monitor_shadows(v_key).start_time);
+                                BEGIN
+                                    l_diff_ms := get_ms_diff(l_vorganger_zeit, p_ctx.start_time);
+                                    IF (l_diff_ms / 1000) > TO_NUMBER(p_list(i).condition_value) THEN 
+                                        fire := TRUE; 
+                                    END IF;
+                                END;
+                            END IF;
+
+                        -- =====================================================
+                        -- REINE PROZESS-OPERATOREN
+                        -- =====================================================
+                        WHEN p_list(i).condition_operator = 'RUNTIME_EXCEEDED' THEN
+                            IF p_ctx.process_end IS NULL AND get_ms_diff(coalesce(p_ctx.last_update, systimestamp), systimestamp) > to_number(p_list(i).condition_value) THEN
+                                fire := TRUE;
+                            END IF;
+
+                        WHEN p_list(i).condition_operator = 'MAX_RUNTIME_EXCEEDED' THEN
+                            IF p_ctx.process_end IS NOT NULL AND get_ms_diff(p_ctx.start_time, p_ctx.process_end) > to_number(p_list(i).condition_value) THEN
+                                fire := TRUE;
+                            END IF;
+
+                        WHEN p_list(i).condition_operator = 'STEPS_LEFT_HIGH' THEN
+                            IF p_ctx.steps_todo - p_ctx.steps_done > p_list(i).condition_value THEN 
+                                fire := TRUE; 
+                            END IF;
+
+                        WHEN p_list(i).condition_operator = 'SUCCESS_RATE_LOW' THEN
+                            IF coalesce(p_ctx.steps_todo, 0) > 0 AND (p_ctx.steps_done / p_ctx.steps_todo * 100 < to_number(p_list(i).condition_value)) THEN
+                                fire := TRUE;
+                            END IF;
+
+                        WHEN p_list(i).condition_operator = 'STATUS_EQUALS' THEN
+                            IF coalesce(p_ctx.status, -1) = to_number(p_list(i).condition_value) THEN 
+                                fire := TRUE; 
+                            END IF;
+                            
+                        WHEN p_list(i).condition_operator = 'INFO_CONTAINS' THEN
+                            IF p_ctx.info IS NOT NULL AND UPPER(p_ctx.info) LIKE '%' || UPPER(p_list(i).condition_value) || '%' THEN
+                                fire := TRUE;
+                            END IF;
+                    END CASE;
+                END IF;
+                
+                -- Wenn die Regel anschlägt, mappen wir die Daten für das Alarmsystem zurück
+                IF fire THEN
+                    p_monRec.process_id   := p_ctx.process_id;
+                    p_monRec.action_name  := p_ctx.action_name;
+                    p_monRec.context_name := p_ctx.context_name;
+                    p_monRec.action_count := coalesce(p_ctx.steps_done, p_ctx.action_count);
+                    p_monRec.start_time   := p_ctx.start_time;
+                    p_monRec.stop_time    := p_ctx.stop_time;
+                    p_monRec.used_time    := p_ctx.used_time;
+                    fire_alert(p_list(i), p_monRec);
+                END IF;
+            END LOOP;
+        END;
+        
+    BEGIN
+        -- 1. Kontext-Regeln (nur für Monitore relevant)
+        IF p_check_context AND g_rules_by_context.EXISTS(p_ctx.action_name || '|' || p_ctx.context_name) THEN          
+            apply_rule_list(g_rules_by_context(p_ctx.action_name || '|' || p_ctx.context_name));
+        END IF;
+
+        -- 2. Allgemeine Action/Prozess-Regeln
+        IF g_rules_by_action.EXISTS(p_ctx.action_name) THEN
+            apply_rule_list(g_rules_by_action(p_ctx.action_name));
+        END IF;
+
+    EXCEPTION
+        WHEN OTHERS THEN
+        logLilamErr(sqlCode, sqlErrM, 'evaluateRules_internal');
+        
+    END evaluateRules_internal;
+
+    -- Hilfsfunktion zum Mappen von Monitor-Daten
+    FUNCTION mapMonitorRecToContextRec(p_monitorRec t_monitor_buffer_rec) return t_eval_context_rec
+    AS
+        l_ctx t_eval_context_rec;
+    BEGIN
+        l_ctx.process_id   := p_monitorRec.process_id;
+        l_ctx.action_name  := p_monitorRec.action_name;
+        l_ctx.context_name := p_monitorRec.context_name;
+        l_ctx.start_time   := p_monitorRec.start_time;
+        l_ctx.stop_time    := p_monitorRec.stop_time;
+        l_ctx.used_time    := p_monitorRec.used_time;
+        l_ctx.action_count := p_monitorRec.action_count;
+        l_ctx.avg_time     := p_monitorRec.baseline_avg;
+        return l_ctx;
+    END;
+
+
+    -- Hilfsfunktion zum Mappen von Process-Daten
+    FUNCTION mapProcessRecToContextRec(p_processRec t_process_rec) return t_eval_context_rec
+    AS
+        l_ctx t_eval_context_rec;
+    BEGIN
+        l_ctx.process_id   := p_processRec.id;
+        l_ctx.action_name  := p_processRec.processName;
+        l_ctx.context_name := NULL;
+        l_ctx.start_time   := p_processRec.processStart;
+        l_ctx.process_end  := p_processRec.processEnd;
+        l_ctx.last_update  := p_processRec.lastUpdate;
+        l_ctx.steps_todo   := p_processRec.stepsTodo;
+        l_ctx.steps_done   := p_processRec.stepsDone;
+        l_ctx.status       := p_processRec.status;
+        l_ctx.info         := p_processRec.info;
+        l_ctx.action_count := NULL;
+
+        return l_ctx;
+    END;
+    
+    
+    -- Methode dient dem Mapping für die zentrale evaluate Methode
+    PROCEDURE evaluateRules(p_monitorRec t_monitor_buffer_rec, p_trigger VARCHAR2)
+    AS
+    BEGIN
+        evaluateRules_internal(mapMonitorRecToContextRec(p_monitorRec), p_trigger, p_check_context => TRUE);
+        -- Historien-Zustand für den Monitor wegschreiben
+        g_last_action_per_process(p_monitorRec.process_id).full_key  := p_monitorRec.action_name || p_monitorRec.context_name;
+        g_last_action_per_process(p_monitorRec.process_id).stop_time := coalesce(p_monitorRec.stop_time, p_monitorRec.start_time);
+        
+    EXCEPTION
+    WHEN OTHERS THEN
+        logLilamErr(sqlCode, sqlErrM, 'evaluateRules'); 
+
+    END evaluateRules;
+
+    -- Methode dient dem Mapping für die zentrale evaluate Methode
+    PROCEDURE evaluateRules(p_processRec t_process_rec, p_trigger VARCHAR2)
+    AS
+    BEGIN
+        evaluateRules_internal(mapProcessRecToContextRec(p_processRec), p_trigger, p_check_context => FALSE);
+    END evaluateRules;
+
+    --------------------------------------------------------------------------
+    -- Avoid throttling 
+    --------------------------------------------------------------------------
+    function waitForResponse(
+        p_processId   in number,
+        p_request       in varchar2, -- Wird für die Zuordnung/Verzweigung im Server benötigt
+        p_payload       IN varchar2, 
+        p_timeoutSec    IN PLS_INTEGER
+--        p_pipeName   in varchar2 default null
+    ) return varchar2
+    as
+        l_msgReceive    JSON_OBJ_LILAM;
+        l_status        PLS_INTEGER;
+        l_statusReceive PLS_INTEGER;
+        l_clientChannel varchar2(50);
+        l_groupName     varchar2(50);
+        l_serverPipe    varchar2(100);
+        l_slotIdx PLS_INTEGER;
+
+        l_jsonHeader    JSON_OBJ_LILAM;
+        l_jsonPayload   JSON_OBJ_LILAM;
+        l_jsonMain      JSON_OBJ_LILAM;
+    begin
+        l_clientChannel := getClientPipe;
+        l_groupName := jsonString(p_payload, 'group_name');
+
+        jsonPut(l_jsonHeader, 'msg_type', 'API_CALL');
+        jsonPut(l_jsonHeader, 'request', p_request);
+        jsonPut(l_jsonHeader, 'response', l_clientChannel);
+
+        l_jsonPayload := p_payLoad;
+        jsonPut(l_jsonMain, 'header', l_jsonHeader);
+        jsonPut(l_jsonMain, 'payload', l_jsonPayload);
+
+        l_serverPipe := getServerPipeForSession(p_processId, l_groupName);
+
+        DBMS_PIPE.PACK_MESSAGE(l_jsonMain);
+        if p_request = 'NEW_SESSION' then
+            -- NEW_SESSION über die Steuer-Pipe: überholt die Datennachrichten anderer Clients in der
+            -- Daten-Pipe (vorher unter Last regelmäßig > 3 s Wartezeit und Timeout).
+            l_status := DBMS_PIPE.SEND_MESSAGE(ctlPipe(l_serverPipe), timeout => 3);
+            sendPing(l_serverPipe);
+        else
+            l_status := DBMS_PIPE.SEND_MESSAGE(l_serverPipe, timeout => 3);
+        end if;
+        l_statusReceive := DBMS_PIPE.RECEIVE_MESSAGE(l_clientChannel, timeout => p_timeoutSec);
+        if l_statusReceive = 0 THEN
+            DBMS_PIPE.UNPACK_MESSAGE(l_msgReceive);
+        end if ;
+
+        DBMS_PIPE.PURGE(l_clientChannel);
+        l_status := DBMS_PIPE.REMOVE_PIPE(l_clientChannel);
+
+        if l_statusReceive = 1 THEN RETURN 'TIMEOUT'; end if ;
+        return l_msgReceive;
+
+    exception
+        when others then
+        logLilamErr(sqlCode, sqlErrM, 'waitForResponse');
+        begin
+            l_status := DBMS_PIPE.REMOVE_PIPE(l_clientChannel);
+            return 'ERROR: ' || TXT_COMM_ERR;
+        exception
+            when others then
+            logLilamErr(sqlCode, sqlErrM, 'waitForResponse', 'DBMS_PIPE.REMOVE_PIPE');
+            return 'ERROR: ' || TXT_COMM_ERR;
+        end;
+    end;
+
+    ---------------------------------------------------------------
+    -- Aktive Server markieren
+    ---------------------------------------------------------------
+    function isServerPipeActive(p_pipeName varchar2) return boolean
+    as
+        l_counter PLS_INTEGER;
+        l_sqlStmt varchar2(200);
+    begin
+        l_sqlStmt := '
+            SELECT count(*) FROM ' || C_LILAM_SERVER_REGISTRY || ' 
+            WHERE is_active = 1
+            AND last_activity > SYSTIMESTAMP - INTERVAL ''' ||C_MAX_REGISTRY_HEARTBEAT_AGE_SEC || ''' SECOND
+            AND upper(pipe_name) = :1';
+
+        execute immediate l_sqlStmt into l_counter using upper(p_pipeName);
+        if l_counter >= 1 then return TRUE; end if;
+        if l_counter = 0  then return FALSE; end if;
+        
+    exception
+        when others then
+            logLilamErr(sqlCode, sqlErrM, 'isServerPipeActive', 'EXECUTE IMMEDIATE');
+            return false;
+    end;
+
+    ---------------------------------------------------------------
+
+    function getServerPipeAvailable(p_groupName varchar2) return varchar2
+    as
+        l_clientChannel  varchar2(50);
+        l_sqlStmt   varchar2(1000);
+        l_serverPipeName varchar2(50);
+    begin
+        l_clientChannel := getClientPipe;
+
+        l_sqlStmt := '
+        SELECT pipe_name 
+        FROM ' || C_LILAM_SERVER_REGISTRY || ' 
+        WHERE is_active = 1 
+          AND last_activity > SYSTIMESTAMP - INTERVAL ''' || C_MAX_REGISTRY_HEARTBEAT_AGE_SEC || ''' SECOND ';
+
+        if p_groupName is not null then
+            l_sqlStmt := l_sqlStmt || ' AND upper(group_name) = ''' || upper(p_groupName) || '''';
+        end if;
+
+        -- Reihenfolge der Auswahl: wenigste Nachrichten im letzten Intervall, dann wenigste offene Prozesse,
+        -- bei Gleichstand der am laengsten untaetige Server (aeltester Registry-Eintrag; ein beschaeftigter
+        -- Server aktualisiert seinen Eintrag oefter, ein ruhender seltener)
+        -- Dispatcher sind nie Ziel der Serverauswahl: weder für Clients ohne Dispatcher-Einstellung
+        -- (sonst unnötiger Umweg über den Dispatcher) noch für einen Dispatcher selbst bei der Wahl
+        -- eines Workers (er würde sich die Nachricht sonst endlos selbst zuschicken)
+        l_sqlStmt := l_sqlStmt || ' AND nvl(is_dispatcher, 0) = 0';
+
+        l_sqlStmt := l_sqlStmt || '
+        ORDER BY processing ASC, current_processes ASC, last_activity ASC 
+        FETCH FIRST 1 ROW ONLY';
+
+        execute immediate l_sqlStmt into l_serverPipeName;
+        return l_serverPipeName;
+
+    exception
+        when NO_DATA_FOUND then
+            return null;
+        when others then
+            logLilamErr(sqlCode, sqlErrM, 'getServerPipeAvailable', 'EXECUTE IMMEDIATE');
+            return null;
+    end;
+    
+    ---------------------------------------------------------------
+
+    procedure send_sync_signal(p_processId number)
+    as
+        l_response varchar2(1000);
+    begin
+        -- process_id im Payload: Ein Dispatcher braucht sie, um die Anfrage an den Worker des Prozesses
+        -- weiterzuleiten. Vorher ('{}') verwarf der Dispatcher die Anfrage, und der Client wartete
+        -- jedes Mal den vollen Timeout ab (Lasttest über Dispatcher: 5,3 ms statt 0,2 ms je Aufruf).
+        l_response := waitForResponse(p_processId, 'UNFREEZE_REQUEST', '{"process_id":' || jNum(p_processId) || '}', 10);
+
+    exception
+        when others then
+            logLilamErr(sqlCode, sqlErrM, 'send_sync_signal', 'waitForResponse');
+    end;
+
+    --------------------------------------------------------------------------
+    -- Auf die Bremse treten, wenn Client zu schnell sendet
+    --------------------------------------------------------------------------
+    PROCEDURE stabilizeInLowPerfEnvironments(p_processId number)
+    IS
+        -- PERFORMANCE: SYSTIMESTAMP wird nur noch gelesen, wenn die Zeit gebraucht wird
+        -- (beim ersten Aufruf und alle msg_limit Nachrichten), nicht bei jedem Aufruf
+        l_now TIMESTAMP;
+        l_new_throttle t_throttle_stat;
+    BEGIN
+        -- Prozess ohne Wert vom Server (sollte nicht vorkommen): Standard C_SERVER_PERF_MID
+        if NOT g_local_throttle_cache.EXISTS(p_processId) THEN
+            l_new_throttle.msg_limit := C_SERVER_PERF_MID;
+            g_local_throttle_cache(p_processId) := l_new_throttle;
+        end if ;
+
+        -- 0 = keine Drosselung (Server mit p_perfServer => 0 gestartet)
+        if g_local_throttle_cache(p_processId).msg_limit > 0 THEN 
+            -- Counter hochzählen
+            g_local_throttle_cache(p_processId).msg_count := g_local_throttle_cache(p_processId).msg_count + 1;
+
+            -- Grenze des Zeitfensters erreicht?
+            if g_local_throttle_cache(p_processId).msg_count >= g_local_throttle_cache(p_processId).msg_limit THEN        
+                l_now := SYSTIMESTAMP;
+                -- Wenn zu schnell gefeuert wurde
+                if get_ms_diff(g_local_throttle_cache(p_processId).last_check, l_now) < C_THROTTLE_INTERVAL_NO THEN
+                    -- Erzwinge Synchronisation (Warten auf Server-Antwort)
+                    -- Das verschafft dem Remote-Server die nötige "Atempause"
+                    send_sync_signal(p_processId);
+                end if ;
+
+                -- Reset für das nächste Fenster
+                g_local_throttle_cache(p_processId).msg_count := 0;
+                g_local_throttle_cache(p_processId).last_check := l_now;
+            end if ;
+        end if ;
+    END;
+
+    --------------------------------------------------------------------------
+    -- Nachricht an Server Fire&Forget
+    --------------------------------------------------------------------------
+    procedure sendNoWait(
+        p_processId     in number,
+        p_request       in varchar2, -- Wird für die Zuordnung/Verzweigung im Server benötigt
+        p_payload       IN varchar2, 
+        p_timeoutSec    IN PLS_INTEGER
+    )
+    as        
+        l_pipeName      VARCHAR2(100);
+        l_status        PLS_INTEGER;
+        l_jsonMain      JSON_OBJ_LILAM;   -- (unbenutzte Variablen l_now/l_retryInterval entfernt: sparte ein SYSTIMESTAMP je Aufruf)
+    begin
+        stabilizeInLowPerfEnvironments(p_processId);
+
+        -- PERFORMANCE: Nachricht in einem Schritt verketten statt über jsonPut (siehe jStr/jNum/jTs).
+        -- p_request ist immer eine interne Konstante und muss nicht maskiert werden.
+        l_jsonMain := '{"header":{"msg_type":"API_CALL","request":"' || p_request || '"}'
+                   || case when p_payload is not null then ',"payload":' || p_payload end
+                   || '}';
+
+        l_pipeName := getServerPipeForSession(p_processId, null);
+        DBMS_PIPE.PACK_MESSAGE(l_jsonMain);
+        for i in 1 .. 3 loop
+            l_status := DBMS_PIPE.SEND_MESSAGE(l_pipeName, timeout => p_timeoutSec);
+            if l_status = 0 THEN
+                exit;
+            end if ;
+            if l_status = 2 then
+                DBMS_PIPE.RESET_BUFFER;
+                DBMS_PIPE.PACK_MESSAGE(l_jsonMain);   -- vorher l_msg (nie befüllt): Wiederholung sendete leere Nachricht
+            end if;
+            dbms_session.sleep(0.3);
+        end loop;
+
+        if l_status != 0 AND p_processId != g_serverProcessId then
+            -- Neuanmeldung an alternativem Server
+            DBMS_PIPE.RESET_BUFFER;
+            RAISE_APPLICATION_ERROR(-20006, 'LILAM: Client kann keine Nachrichten an Server senden:  ' || sqlErrM);
+        end if;
+
+    exception
+        when others then
+            logLilamErr(sqlCode, sqlErrM, 'sendNoWait');
+    end;
+
+    --------------------------------------------------------------------------    
+    -- global exception handling
+    function should_raise_error(p_processId number) return boolean
+    as
+    begin
+        -- Die Logik ist hier zentral gekapselt
+        if p_processId is not null and v_indexSession.EXISTS(p_processId) 
+           and g_sessionList(v_indexSession(p_processId)).log_level >= logLevelDebug 
+        then
+            return true;
+        end if ;
+        return false;
+    exception
+        when others then
+            logLilamErr(sqlCode, sqlErrM, 'should_raise_error');
+            error(p_processId, 'Check "should raise error" failed: ' || sqlErrM);
+            return false;
+    end;  
+
+    --------------------------------------------------------------------------
+
+    -- run execute immediate with exception handling
+    procedure run_sql(p_sqlStmt varchar2)
+    as
+    begin
+        execute immediate p_sqlStmt;
+
+    exception
+        when OTHERS then
+            logLilamErr(sqlCode, sqlErrM, 'run_sql', 'EXECUTE IMMEDIATE');
+    end;
+
+    --------------------------------------------------------------------------
+
+    -- Checks if a database sequence exists
+    function objectExists(p_objectName varchar2, p_objectType varchar2) return boolean
+    as
+        sqlStatement varchar2(200);
+        objectCount number;
+    begin
+        sqlStatement := '
+        select count(*)
+        from user_objects
+        where upper(object_name) = upper(:PH_OBJECT_NAME)
+        and   upper(object_type) = upper(:PH_OBJECT_TYPE)';
+
+        execute immediate sqlStatement into objectCount using upper(p_objectName), upper(p_objectType);
+
+        if objectCount > 0 then
+            return true;
+        else
+            return false;
+        end if ;
+        
+    exception
+        when others then
+            logLilamErr(sqlCode, sqlErrM, 'objectExists');
+            return false;
+    end;
+
+    --------------------------------------------------------------------------
+
+    function replaceNameTable(p_sqlStatement varchar2, p_placeHolder varchar2, p_tableSuffix varchar2, p_tableName varchar2) return varchar2
+    as
+    begin
+        return replace(p_sqlStatement, p_placeHolder, p_tableName || p_tableSuffix);
+    end;
+    
+    --------------------------------------------------------------------------
+
+    procedure createDispatchTable
+    as
+        l_sql varchar2(1000);
+    begin
+        if not objectExists(C_LILAM_PROCESS_ROUTE, 'TABLE') then
+            l_sql := '
+                CREATE TABLE ' || C_LILAM_PROCESS_ROUTE || '(
+                    process_id  NUMBER(19,0) PRIMARY KEY,
+                    pipe_name   VARCHAR2(50) NOT NULL,
+                    created     TIMESTAMP(6) DEFAULT SYSTIMESTAMP
+                )';
+            execute immediate l_sql;
+        end if;
+    EXCEPTION
+        WHEN OTHERS THEN
+            dbms_output.enable(10000);
+            dbms_output.put_line('LILAM INTERNAL ERROR in Procedure createDispatchTable: ' || substr(sqlErrM, 1, 1000) || chr(13) || chr(10) || l_sql);
+    end;
+
+    --------------------------------------------------------------------------
+
+    procedure createInternalLogTable
+    as
+        l_sql varchar2(1000);
+    begin
+        if not objectExists(C_LILAM_LOG_TABLE, 'TABLE') then
+            l_sql := '
+                create table ' || C_LILAM_LOG_TABLE || '(
+                    id              number generated always as identity,
+                    log_timestamp   timestamp(6) default systimestamp not null,            
+                    error_code      number,
+                    error_message   varchar2(4000),
+                    error_stack     varchar2(4000),
+                    error_backtrace varchar2(4000),
+                    call_stack      varchar2(4000),
+                    module_name     varchar2(200),
+                    log_operation   varchar2(200)
+                )';
+            execute immediate l_sql;
+        end if;
+        
+    EXCEPTION
+        WHEN OTHERS THEN
+            dbms_output.enable(10000);
+            dbms_output.put_line('LILAM INTERNAL ERROR in Procedure createInternalLogTable: ' || substr(sqlErrM, 1, 1000) || chr(13) || chr(10) || l_sql);
+    end;
+
+    -- Creates LOG tables and the sequence for the process IDs if tables or sequence don't exist
+    -- For naming rules of the tables see package description
+    --------------------------------------------------------------------------
+    -- Legt einen Index an, falls er noch nicht existiert
+    --------------------------------------------------------------------------
+    procedure createIndexIfMissing(p_indexName varchar2, p_tableName varchar2, p_columns varchar2)
+    as
+        l_indexName varchar2(128) := upper(trim(p_indexName));
+    begin
+        if not objectExists(l_indexName, 'INDEX') then
+            run_sql('CREATE INDEX ' || l_indexName || ' ON ' || upper(trim(p_tableName)) || ' (' || p_columns || ')');
+        end if;
+    end;
+
+    --------------------------------------------------------------------------
+
+    procedure createLogTables(p_TabNameMaster varchar2)
+    as
+        sqlStmt varchar2(4000);
+        l_master constant varchar2(100) := upper(trim(p_TabNameMaster));
+        l_regCols number;
+    begin
+        -- Pro Session und Master-Tabelle nur einmal pruefen (spart je NEW_SESSION rund ein Dutzend Dictionary-Abfragen)
+        if g_checked_masters.EXISTS(l_master) then
+            return;
+        end if;
+
+        if not objectExists('SEQ_LILAM_LOG', 'SEQUENCE') then
+            sqlStmt := 'CREATE SEQUENCE SEQ_LILAM_LOG MINVALUE 0 MAXVALUE 9999999999999999999999999999 INCREMENT BY 1 START WITH 1 CACHE 10 NOORDER  NOCYCLE  NOKEEP  NOSCALE  GLOBAL';
+            execute immediate sqlStmt;
+        end if ;
+
+        if not objectExists(p_TabNameMaster || C_SUFFIX_PROC_TABLE, 'TABLE') then
+            -- Master table
+            sqlStmt := '
+            create table ' || C_PARAM_MASTER_TABLE || ' ( 
+                id               NUMBER(19,0),
+                process_name     VARCHAR2(100),
+                log_level        NUMBER,
+                process_start    TIMESTAMP(6) DEFAULT SYSTIMESTAMP,
+                process_end      TIMESTAMP(6),
+                last_update      TIMESTAMP(6),
+                steps_todo       NUMBER,
+                steps_done       NUMBER,
+                status           NUMBER(2,0),
+                info             VARCHAR2(2000),
+                process_immortal NUMBER(1,0) DEFAULT 0,
+                server_pipe      VARCHAR2(100),
+                tab_name_master  VARCHAR2(100),
+                scope_name       VARCHAR2(100)
+            )';
+            sqlStmt := replaceNameTable(sqlStmt, C_PARAM_MASTER_TABLE, C_SUFFIX_PROC_TABLE, p_TabNameMaster);
+            run_sql(sqlStmt);
+        end if ;
+
+        if not objectExists(p_TabNameMaster || C_SUFFIX_LOG_TABLE, 'TABLE') then
+            -- Details table
+            sqlStmt := '
+            create table ' || C_PARAM_LOG_TABLE || ' (
+                "PROCESS_ID"        number(19,0),
+                "NO"                number(19,0),
+                "INFO"              varchar2(2000),
+                "LOG_LEVEL"         number,
+                "LOG_LEVEL_C"       varchar2(10),
+                "SESSION_TIME"      timestamp(6) DEFAULT SYSTIMESTAMP,
+                "SESSION_USER"      varchar2(50),
+                "HOST_NAME"         varchar2(50),
+                "CALLER"            varchar2(255),
+                "ERR_STACK"         varchar2(4000),
+                "ERR_BACKTRACE"     varchar2(4000),
+                "ERR_CALLSTACK"     varchar2(4000)
+            )';
+            sqlStmt := replaceNameTable(sqlStmt, C_PARAM_LOG_TABLE, C_SUFFIX_LOG_TABLE, p_TabNameMaster);
+            run_sql(sqlStmt);
+        end if ;
+
+        if not objectExists(p_TabNameMaster || C_SUFFIX_MON_TABLE, 'TABLE') then
+            -- Details table
+            sqlStmt := '
+            create table ' || C_PARAM_MON_TABLE || ' (
+                "PROCESS_ID"    number(19,0),
+                "MON_TYPE"      number DEFAULT 0,
+                "START_TIME"    timestamp(6)  DEFAULT SYSTIMESTAMP,
+                "STOP_TIME"     timestamp(6),
+                "SESSION_USER"  varchar2(50),
+                "HOST_NAME"     varchar2(50),
+                "ACTION"        VARCHAR2(100),
+                "CONTEXT"  VARCHAR2(100),
+                "USED_MILLIS"   NUMBER(19,0), -- Millis als Zahl für einfache Auswertung
+                "AVG_MILLIS"    NUMBER(19,0),
+                "ACTION_COUNT"    NUMBER(19,0)
+            )';
+            sqlStmt := replaceNameTable(sqlStmt, C_PARAM_MON_TABLE, C_SUFFIX_MON_TABLE, p_TabNameMaster);
+            run_sql(sqlStmt);
+        end if ;
+
+        if not objectExists(C_LILAM_SERVER_REGISTRY, 'TABLE') then
+            sqlStmt := '
+            CREATE TABLE ' || C_LILAM_SERVER_REGISTRY || ' (
+                pipe_name      VARCHAR2(50) PRIMARY KEY,
+                group_name     VARCHAR2(50),
+                last_activity  TIMESTAMP(3),
+                current_processes   NUMBER,
+                is_active      NUMBER(1),
+                status         VARCHAR2(20),
+                processing     NUMBER,
+                rule_set_name  VARCHAR2(30),
+                set_in_use     NUMBER DEFAULT 0,
+                avg_log_lat    NUMBER DEFAULT 0,
+                max_log_lat    NUMBER DEFAULT 0,
+                avg_mon_lat    NUMBER DEFAULT 0,
+                max_mon_lat    NUMBER DEFAULT 0,
+                is_dispatcher  NUMBER(1) DEFAULT 0
+            )';
+            run_sql(sqlStmt);
+        else
+            -- Bestehende Registry um die Kennzeichnung der Dispatcher ergänzen
+            select count(*) into l_regCols from user_tab_columns
+             where table_name = upper(C_LILAM_SERVER_REGISTRY) and column_name = 'IS_DISPATCHER';
+            if l_regCols = 0 then
+                run_sql('ALTER TABLE ' || C_LILAM_SERVER_REGISTRY || ' ADD is_dispatcher NUMBER(1) DEFAULT 0');
+            end if;
+        end if;
+
+        if not objectExists(C_LILAM_RULES_TABLE, 'TABLE') then
+            sqlStmt := '
+            CREATE TABLE ' || C_LILAM_RULES_TABLE || ' (
+                rule_set       CLOB CONSTRAINT ensure_json_rules CHECK (rule_set IS JSON),
+                set_name       VARCHAR2(30),
+                version        NUMBER,
+                created        TIMESTAMP,
+                author         VARCHAR2(50)
+            )';
+            run_sql(sqlStmt);
+        end if;
+
+
+        if not objectExists(C_LILAM_ALERTS_TABLE, 'TABLE') then
+            sqlStmt := '
+            CREATE TABLE ' || C_LILAM_ALERTS_TABLE || ' (
+                alert_id           NUMBER GENERATED BY DEFAULT AS IDENTITY,
+                process_id         NUMBER(19,0) NOT NULL,
+                process_name       VARCHAR2(50),
+                master_table_name  VARCHAR2(50), 
+                monitor_table_name VARCHAR2(50), 
+                logging_table_name VARCHAR2(50), 
+                action_name        VARCHAR2(100) NOT NULL,
+                context_name       VARCHAR2(100),
+                group_name         VARCHAR2(100),
+                action_count       NUMBER NOT NULL,
+                rule_set_name      VARCHAR2(50),
+                rule_id            VARCHAR2(50) NOT NULL,
+                rule_set_version   NUMBER NOT NULL,
+                alert_severity     VARCHAR2(30),
+                handler_type       VARCHAR2(50),              
+                status             VARCHAR2(50) DEFAULT ''PENDING'',
+                error_message      CLOB,
+                created_at         TIMESTAMP DEFAULT SYSTIMESTAMP,
+                processed_at       TIMESTAMP,
+
+                CONSTRAINT pk_lila_alerts PRIMARY KEY (alert_id)
+            )';
+            run_sql(sqlStmt);
+        end if;
+
+        -- Baseline Scopes: feste Identität einer Anwendung über Prozesse hinweg
+        if not objectExists(C_LILAM_SCOPES_TABLE, 'TABLE') then
+            sqlStmt := '
+            CREATE TABLE ' || C_LILAM_SCOPES_TABLE || ' (
+                scope_id    NUMBER GENERATED BY DEFAULT AS IDENTITY,
+                scope_name  VARCHAR2(100) NOT NULL,
+                created     TIMESTAMP DEFAULT SYSTIMESTAMP,
+                CONSTRAINT pk_lilam_scopes PRIMARY KEY (scope_id),
+                CONSTRAINT uq_lilam_scope_name UNIQUE (scope_name)
+            )';
+            run_sql(sqlStmt);
+        end if;
+
+        -- Baselines: aktueller Durchschnitt je Scope/Action/Context (kein Verlauf, der liegt in _MON)
+        if not objectExists(C_LILAM_BASELINES_TABLE, 'TABLE') then
+            sqlStmt := '
+            CREATE TABLE ' || C_LILAM_BASELINES_TABLE || ' (
+                scope_id      NUMBER(19,0)  NOT NULL,
+                action_name   VARCHAR2(100) NOT NULL,
+                context_name  VARCHAR2(100) DEFAULT ''' || C_BASELINE_NULL_CONTEXT || ''' NOT NULL,
+                avg_ms        NUMBER,
+                action_count  NUMBER(19,0)  DEFAULT 0 NOT NULL,
+                last_update   TIMESTAMP(6),
+                CONSTRAINT pk_lilam_baselines PRIMARY KEY (scope_id, action_name, context_name)
+            ) ORGANIZATION INDEX';
+            run_sql(sqlStmt);
+        end if;
+
+        -- Indizes der Master-Tabellen: Namen werden aus dem Master-Namen gebildet,
+        -- damit jede Master-Tabelle (LILAM, LILAM_SERVER, eigene Namen) ihre eigenen Indizes erhält
+        createIndexIfMissing(p_TabNameMaster || C_SUFFIX_PROC_TABLE || '_IX_ID',      p_TabNameMaster || C_SUFFIX_PROC_TABLE, 'id');
+        createIndexIfMissing(p_TabNameMaster || C_SUFFIX_PROC_TABLE || '_IX_CLEANUP', p_TabNameMaster || C_SUFFIX_PROC_TABLE, 'process_name, process_end');
+        createIndexIfMissing(p_TabNameMaster || C_SUFFIX_LOG_TABLE  || '_IX_PID',     p_TabNameMaster || C_SUFFIX_LOG_TABLE,  'process_id');
+        createIndexIfMissing(p_TabNameMaster || C_SUFFIX_LOG_TABLE  || '_IX_INFO',    p_TabNameMaster || C_SUFFIX_LOG_TABLE,  'info');
+        createIndexIfMissing(p_TabNameMaster || C_SUFFIX_MON_TABLE  || '_IX_PID',     p_TabNameMaster || C_SUFFIX_MON_TABLE,  'process_id');
+
+       if not objectExists('idx_lilam_registry_group', 'INDEX') then
+            sqlStmt := '
+            CREATE INDEX idx_lilam_registry_group 
+            ON C_LILAM_SERVER_REGISTRY (group_name, is_active, current_processes)';
+            sqlStmt := replace(sqlStmt, 'C_LILAM_SERVER_REGISTRY', C_LILAM_SERVER_REGISTRY);
+            run_sql(sqlStmt);
+        end if ;
+
+        if not objectExists('idx_lilam_rules', 'INDEX') then
+            sqlStmt := '
+            CREATE INDEX idx_lilam_rules 
+            ON C_LILAM_RULES_TABLE (set_name, version)';
+            sqlStmt := replace(sqlStmt, 'C_LILAM_RULES_TABLE', C_LILAM_RULES_TABLE);
+            run_sql(sqlStmt);
+        end if ;
+
+        g_checked_masters(l_master) := TRUE;
+
+    exception      
+        when others then
+            logLilamErr(sqlCode, sqlErrM, 'createLogTables');
+     end;
+
+    --------------------------------------------------------------------------
+    -- Deletes log entries based on their age (in days) and the process name.
+    -- Matching of process name is not case sensitive.
+    -- Doesn't work if the Master-Tablename of the process changed in the meantime.
+    procedure deleteOldLogs(p_processId number, p_processName varchar2, p_daysToKeep number)
+    as
+        pragma autonomous_transaction;
+        sqlStatement varchar2(500);
+        t_rc SYS_REFCURSOR;
+        sessionRec t_session_rec;
+        processIdToDelete number(19,0);
+    begin
+        
+        if p_daysToKeep is null then
+            return;
+        end if ;
+        
+        -- 1. eine aktive Session über die ID suchen; darin steckt der Name
+        --    der Master-Tabelle
+        -- 2. im vorgefertigten SQL den Namen der Master-Tabelle ersetzen
+        -- 3. alle veralteten IDs aus der Master-Tabelle suchen
+        -- 4. im Loop die Daten aus den Log-, Monitor- und Mastertabellen löschen
+
+        -- 1.
+        sessionRec := getSessionRecord(p_processId);
+        if sessionRec.process_id is null then
+            return; 
+        end if ;
+
+        -- basic sql for iteration through (old) sessions
+        sqlStatement := '
+        select id from ' || C_PARAM_MASTER_TABLE || '
+        where process_end <= sysdate - :PH_DAYS_TO_KEEP
+        and upper(process_name) = upper(:PH_PROCESS_NAME)
+        and process_immortal = 0';
+        
+        -- 2.
+        sqlStatement := replaceNameTable(sqlStatement, C_PARAM_MASTER_TABLE, C_SUFFIX_PROC_TABLE, sessionRec.tabName_master);
+
+        -- 3., 4.
+        -- for all process IDs
+        open t_rc for sqlStatement using p_daysToKeep, p_processName;
+        loop
+            fetch t_rc into processIdToDelete;
+            EXIT WHEN t_rc%NOTFOUND;
+
+            -- delete Logs and Monitor-entries first (integrity)
+            sqlStatement := 'delete from ' || C_PARAM_LOG_TABLE || ' where process_id = :1';
+            sqlStatement := replaceNameTable(sqlStatement, C_PARAM_LOG_TABLE, C_SUFFIX_LOG_TABLE, sessionRec.tabName_master);
+            execute immediate sqlStatement USING processIdToDelete;
+
+            sqlStatement := 'delete from ' || C_PARAM_MON_TABLE || ' where process_id = :1';
+            sqlStatement := replaceNameTable(sqlStatement, C_PARAM_MON_TABLE, C_SUFFIX_MON_TABLE, sessionRec.tabName_master);
+            execute immediate sqlStatement USING processIdToDelete;
+
+            -- delete master
+            sqlStatement := 'delete from ' || C_PARAM_MASTER_TABLE || ' where id = :1';
+            sqlStatement := replaceNameTable(sqlStatement, C_PARAM_MASTER_TABLE, C_SUFFIX_PROC_TABLE, sessionRec.tabName_master);
+            execute immediate sqlStatement USING processIdToDelete;
+        end loop;
+        close t_rc;
+        commit;
+
+    exception
+        when others then
+        begin
+            if t_rc%isopen then 
+                close t_rc;
+            end if ;
+            rollback; -- Auch im Fehlerfall die Transaktion beenden
+        exception
+            when others then
+            logLilamErr(sqlCode, sqlErrM, 'deleteOldLogs', 'close t_rc');
+        end;            
+        logLilamErr(sqlCode, sqlErrM, 'deleteOldLogs');
+
+    end;
+
+    --------------------------------------------------------------------------
+
+    function readProcessRecord(p_processId number) return t_process_rec
+    as
+        sessionRec t_session_rec;
+        processRec t_process_rec;
+        sqlStatement varchar2(1000);
+    begin
+        sqlStatement := '
+        select
+            id,
+            process_name,
+            log_level,
+            process_start,
+            process_end,
+            last_update,
+            steps_todo,
+            steps_done,
+            status,
+            info,
+            process_immortal,
+            tab_name_master
+        from ' || C_PARAM_MASTER_TABLE || '
+        where id = :PH_PROCESS_ID';
+
+        sessionRec := getSessionRecord(p_processId);
+        if sessionRec.process_id is not null then
+            sqlStatement := replaceNameTable(sqlStatement, C_PARAM_MASTER_TABLE, C_SUFFIX_PROC_TABLE, sessionRec.tabname_Master);
+            execute immediate sqlStatement into processRec USING p_processId;
+        end if ;
+        return processRec;
+
+    exception
+        when others then
+            logLilamErr(sqlCode, sqlErrM, 'readProcessRecord');
+            if should_raise_error(p_processId) then
+                error(p_processId, 'Reading process record failed: ' || sqlErrM);
+            end if ;
+            return null;
+    end;
+
+    --------------------------------------------------------------------------
+    -- Flush monitor data to detail table
+    --------------------------------------------------------------------------
+    --------------------------------------------------------------------------
+    -- PERFORMANCE: Gebündelter Flush in SYNC_ALL_DIRTY
+    --
+    -- Vorher schrieb SYNC_ALL_DIRTY jeden fälligen Prozess einzeln: je Tabelle (_LOG, _MON, _PROC)
+    -- eine eigene autonome Transaktion mit eigenem Commit. Bei 200 offenen Prozessen waren das
+    -- je Durchlauf bis zu 600 Schreibvorgänge und 600 Commits; der Server las währenddessen
+    -- keine Nachrichten aus der Pipe.
+    --
+    -- Jetzt: Während SYNC_ALL_DIRTY ist g_batch_mode gesetzt. persist_log_data,
+    -- persist_monitor_data und persist_process_record schreiben dann nicht selbst, sondern
+    -- hängen ihre Zeilen an einen Sammelpuffer je Zieltabelle an. flushBatch schreibt am Ende
+    -- des Durchlaufs alles mit einem FORALL je Tabelle und EINEM Commit.
+    --
+    -- Was und wann geschrieben wird, bleibt unverändert (gleiche Fälligkeitsprüfung je Prozess).
+    -- CLOSE_SESSION schreibt weiterhin sofort und nur den eigenen Prozess (kein Batch-Modus).
+    --------------------------------------------------------------------------
+    -- (Typen und Sammelpuffer siehe Deklarationsteil: t_log_batch_rec, g_batch_mode ...)
+
+    procedure appendLogBatch(
+        p_processId number, p_target_table varchar2,
+        p_seqs sys.odcinumberlist, p_levels sys.odcinumberlist, p_levelsC sys.odcivarchar2list,
+        p_texts sys.odcivarchar2list, p_times t_timestamp_list_t, p_callers sys.odcivarchar2list,
+        p_stacks sys.odcivarchar2list, p_backtraces sys.odcivarchar2list, p_callstacks sys.odcivarchar2list)
+    as
+        l_n     pls_integer;
+        l_empty t_log_batch_rec;   -- Record mit leeren Listen (Defaults)
+    begin
+        if not g_log_batches.EXISTS(p_target_table) then
+            g_log_batches(p_target_table) := l_empty;
+        end if;
+        l_n := g_log_batches(p_target_table).pids.COUNT;
+        g_log_batches(p_target_table).pids.EXTEND(p_levels.COUNT);
+        g_log_batches(p_target_table).seqs.EXTEND(p_levels.COUNT);
+        g_log_batches(p_target_table).levels.EXTEND(p_levels.COUNT);
+        g_log_batches(p_target_table).levelsC.EXTEND(p_levels.COUNT);
+        g_log_batches(p_target_table).texts.EXTEND(p_levels.COUNT);
+        g_log_batches(p_target_table).times.EXTEND(p_levels.COUNT);
+        g_log_batches(p_target_table).callers.EXTEND(p_levels.COUNT);
+        g_log_batches(p_target_table).stacks.EXTEND(p_levels.COUNT);
+        g_log_batches(p_target_table).backtraces.EXTEND(p_levels.COUNT);
+        g_log_batches(p_target_table).callstacks.EXTEND(p_levels.COUNT);
+        for i in 1 .. p_levels.COUNT loop
+            g_log_batches(p_target_table).pids(l_n + i)       := p_processId;
+            g_log_batches(p_target_table).seqs(l_n + i)       := p_seqs(i);
+            g_log_batches(p_target_table).levels(l_n + i)     := p_levels(i);
+            g_log_batches(p_target_table).levelsC(l_n + i)    := p_levelsC(i);
+            g_log_batches(p_target_table).texts(l_n + i)      := p_texts(i);
+            g_log_batches(p_target_table).times(l_n + i)      := p_times(i);
+            g_log_batches(p_target_table).callers(l_n + i)    := p_callers(i);
+            g_log_batches(p_target_table).stacks(l_n + i)     := p_stacks(i);
+            g_log_batches(p_target_table).backtraces(l_n + i) := p_backtraces(i);
+            g_log_batches(p_target_table).callstacks(l_n + i) := p_callstacks(i);
+        end loop;
+    end;
+
+    procedure appendMonBatch(
+        p_processId number, p_target_table varchar2,
+        p_actions sys.odcivarchar2list, p_contexts sys.odcivarchar2list, p_mon_types sys.odcinumberlist,
+        p_action_count sys.odcinumberlist, p_used sys.odcinumberlist, p_avgs sys.odcinumberlist,
+        p_timesStart t_timestamp_list_t, p_timesStop t_timestamp_list_t)
+    as
+        l_n     pls_integer;
+        l_empty t_mon_batch_rec;
+    begin
+        if not g_mon_batches.EXISTS(p_target_table) then
+            g_mon_batches(p_target_table) := l_empty;
+        end if;
+        l_n := g_mon_batches(p_target_table).pids.COUNT;
+        g_mon_batches(p_target_table).pids.EXTEND(p_actions.COUNT);
+        g_mon_batches(p_target_table).actions.EXTEND(p_actions.COUNT);
+        g_mon_batches(p_target_table).contexts.EXTEND(p_actions.COUNT);
+        g_mon_batches(p_target_table).mon_types.EXTEND(p_actions.COUNT);
+        g_mon_batches(p_target_table).action_count.EXTEND(p_actions.COUNT);
+        g_mon_batches(p_target_table).used.EXTEND(p_actions.COUNT);
+        g_mon_batches(p_target_table).avgs.EXTEND(p_actions.COUNT);
+        g_mon_batches(p_target_table).timesStart.EXTEND(p_actions.COUNT);
+        g_mon_batches(p_target_table).timesStop.EXTEND(p_actions.COUNT);
+        for i in 1 .. p_actions.COUNT loop
+            g_mon_batches(p_target_table).pids(l_n + i)         := p_processId;
+            g_mon_batches(p_target_table).actions(l_n + i)      := p_actions(i);
+            g_mon_batches(p_target_table).contexts(l_n + i)     := p_contexts(i);
+            g_mon_batches(p_target_table).mon_types(l_n + i)    := p_mon_types(i);
+            g_mon_batches(p_target_table).action_count(l_n + i) := p_action_count(i);
+            g_mon_batches(p_target_table).used(l_n + i)         := p_used(i);
+            g_mon_batches(p_target_table).avgs(l_n + i)         := p_avgs(i);
+            g_mon_batches(p_target_table).timesStart(l_n + i)   := p_timesStart(i);
+            g_mon_batches(p_target_table).timesStop(l_n + i)    := p_timesStop(i);
+        end loop;
+    end;
+
+    procedure appendProcBatch(p_process_rec t_process_rec)
+    as
+        l_key   varchar2(150) := p_process_rec.tabNameMaster;
+        l_n     pls_integer;
+        l_empty t_proc_batch_rec;
+    begin
+        if not g_proc_batches.EXISTS(l_key) then
+            g_proc_batches(l_key) := l_empty;
+        end if;
+        g_proc_batches(l_key).ids.EXTEND;       l_n := g_proc_batches(l_key).ids.COUNT;
+        g_proc_batches(l_key).status.EXTEND;    g_proc_batches(l_key).procEnd.EXTEND;
+        g_proc_batches(l_key).stepsTodo.EXTEND; g_proc_batches(l_key).stepsDone.EXTEND;
+        g_proc_batches(l_key).info.EXTEND;      g_proc_batches(l_key).immortal.EXTEND;
+        g_proc_batches(l_key).ids(l_n)       := p_process_rec.id;
+        g_proc_batches(l_key).status(l_n)    := p_process_rec.status;
+        g_proc_batches(l_key).procEnd(l_n)   := p_process_rec.processEnd;
+        g_proc_batches(l_key).stepsTodo(l_n) := p_process_rec.stepsTodo;
+        g_proc_batches(l_key).stepsDone(l_n) := p_process_rec.stepsDone;
+        g_proc_batches(l_key).info(l_n)      := p_process_rec.info;
+        g_proc_batches(l_key).immortal(l_n)  := p_process_rec.procImmortal;
+    end;
+
+    --------------------------------------------------------------------------
+
+    procedure persist_log_data(
+        p_processId    number,
+        p_target_table varchar2,
+        p_seqs         sys.odcinumberlist,
+        p_levels       sys.odcinumberlist,
+        p_levelsC      sys.odcivarchar2list,
+        p_texts        sys.odcivarchar2list,
+        p_times        t_timestamp_list_t,
+        p_callers      sys.odcivarchar2list,
+        p_stacks       sys.odcivarchar2list,
+        p_backtraces   sys.odcivarchar2list,
+        p_callstacks   sys.odcivarchar2list
+    )    
+    as
+        pragma autonomous_transaction;
+        v_safe_table varchar2(150);
+    begin
+        if g_diag_skip_persist then return; end if;
+        -- PERFORMANCE: im gebündelten Flush nur sammeln, flushBatch schreibt (siehe g_batch_mode)
+        if g_batch_mode then
+            if p_levels.count > 0 then
+                appendLogBatch(p_processId, p_target_table, p_seqs, p_levels, p_levelsC, p_texts, p_times,
+                               p_callers, p_stacks, p_backtraces, p_callstacks);
+            end if;
+            return;
+        end if;
+
+        if p_levels.count > 0 then            
+            -- Sicherheit: Tabellenname validieren
+            v_safe_table := safeTableName(p_target_table);
+            -- Bulk-Insert über alle gesammelten Log-Einträge
+            forall i in 1 .. p_levels.count
+                execute immediate 
+                    'insert into ' || v_safe_table || ' 
+                    (PROCESS_ID, LOG_LEVEL, LOG_LEVEL_C, INFO, SESSION_TIME, NO, CALLER, ERR_STACK, ERR_BACKTRACE, ERR_CALLSTACK, SESSION_USER, HOST_NAME)
+                    values (:1, :2, :3, :4, :5, :6, :7, :8, :9, :10, :11, :12)'
+                USING p_processId, p_levels(i), p_levelsC(i), p_texts(i), p_times(i), p_seqs(i), p_callers(i), p_stacks(i), p_backtraces(i), p_callstacks(i),
+                SYS_CONTEXT('USERENV','SESSION_USER'), SYS_CONTEXT('USERENV','HOST');
+            commit;
+        end if;
+
+    exception
+        when others then
+            if sqlcode = -24381 then
+                -- FORALL ... SAVE EXCEPTIONS: erfolgreiche Zeilen behalten, nur fehlerhafte protokollieren
+                for i in 1 .. sql%bulk_exceptions.count loop
+                    logLilamErr(-sql%bulk_exceptions(i).error_code, sqlerrm(-sql%bulk_exceptions(i).error_code),
+                                'persist_log_data', 'row ' || sql%bulk_exceptions(i).error_index || ' skipped');
+                end loop;
+                commit;
+            else
+                rollback;
+                -- Tabelle fehlt: beim naechsten NEW_SESSION erneut pruefen und anlegen
+                if sqlcode = -942 then g_checked_masters.DELETE; g_safe_tables.DELETE; end if;
+                logLilamErr(sqlCode, sqlErrM, 'persist_log_data');
+            end if;
+
+    end;
+
+    --------------------------------------------------------------------------
+
+    -- initilizes writing to table
+    -- decouples internal memory from autonomous transaction
+    procedure flushLogs(p_processId number)
+    as
+        v_key          constant varchar2(100) := to_char(p_processId);
+        v_targetTable  varchar2(150);
+        v_idx_session  pls_integer;
+
+        -- Bulk-Listen für den Datentransfer (Schema-Level Typen)
+        v_levels       sys.odcinumberlist   := sys.odcinumberlist();
+        v_levelsC      sys.odcivarchar2list := sys.odcivarchar2List();
+        v_texts        sys.odcivarchar2list := sys.odcivarchar2list();
+        v_times        t_timestamp_list_t   := t_timestamp_list_t(); 
+        v_seqs         sys.odcinumberlist   := sys.odcinumberlist();
+        v_callers      sys.odcivarchar2list := sys.odcivarchar2List();
+        v_stacks       sys.odcivarchar2list := sys.odcivarchar2list();
+        v_backtraces   sys.odcivarchar2list := sys.odcivarchar2list();
+        v_callstacks   sys.odcivarchar2list := sys.odcivarchar2list();
+
+        v_latency      number;
+    begin
+        -- 1. Prüfen, ob Daten für diesen Prozess im Cache sind
+        if not g_log_groups.EXISTS(v_key) or g_log_groups(v_key).COUNT = 0 then
+            return;
+        end if ;
+
+        -- calc latency
+        v_latency  := get_ms_diff(g_firstLogTimeStamp, systimestamp);
+        g_avgLatencyLogs := round((g_avgLatencyLogs + v_latency) / g_logLatencyCounter, 2);
+        if v_latency > g_maxLatencyLogs then g_maxLatencyLogs := v_latency; end if;
+
+        -- 2. Ziel-Tabelle aus der Session-Liste ermitteln
+        v_idx_session := v_indexSession(p_processId);
+        v_targetTable := g_sessionList(v_idx_session).tabName_master || C_SUFFIX_LOG_TABLE;
+
+        -- 3. Daten aus der hierarchischen Map in flache Listen sammeln
+        for i in 1 .. g_log_groups(v_key).COUNT loop
+            v_levels.EXTEND;     v_levels(v_levels.LAST)     := g_log_groups(v_key)(i).log_level;
+            v_levelsC.EXTEND;    v_levelsC(v_levelsC.LAST)   := logLevelToEnum(g_log_groups(v_key)(i).log_level);
+            v_texts.EXTEND;      v_texts(v_texts.LAST)       := substrb(g_log_groups(v_key)(i).log_text, 1, 4000);
+            v_times.EXTEND;      v_times(v_times.LAST)       := g_log_groups(v_key)(i).log_time;
+            v_seqs.EXTEND;       v_seqs(v_seqs.LAST)         := g_log_groups(v_key)(i).serial_no;
+
+            v_callers.EXTEND;     v_callers(v_callers.LAST)     := substrb(g_log_groups(v_key)(i).caller, 1, 200);
+            -- Error-Stacks (begrenzt auf 4000 Byte für sys.odcivarchar2list)
+            v_stacks.EXTEND;     v_stacks(v_stacks.LAST)     := substrb(g_log_groups(v_key)(i).err_stack, 1, 4000);
+            v_backtraces.EXTEND; v_backtraces(v_backtraces.LAST) := substrb(g_log_groups(v_key)(i).err_backtrace, 1, 4000);
+            v_callstacks.EXTEND; v_callstacks(v_callstacks.LAST) := substrb(g_log_groups(v_key)(i).err_callstack, 1, 4000);
+        end loop;
+
+        -- 4. Übergabe an die autonome Bulk-Persistierung
+        persist_log_data(
+            p_processId    => p_processId,
+            p_target_table => v_targetTable,
+            p_levels       => v_levels,
+            p_levelsC      => v_levelsC,
+            p_texts        => v_texts,
+            p_times        => v_times,
+            p_callers      => v_callers,
+            p_seqs         => v_seqs,
+            p_stacks       => v_stacks,
+            p_backtraces   => v_backtraces,
+            p_callstacks   => v_callstacks
+        );
+
+        -- 5. Cache für diesen Prozess leeren
+        g_log_groups(v_key).DELETE;
+
+    exception
+        when others then
+            logLilamErr(sqlCode, sqlErrM, 'flushLogs');
+
+    end;
+
+    --------------------------------------------------------------------------
+
+    procedure write_to_log_buffer(
+        p_processId number, 
+        p_level number,
+        p_text varchar2,
+        p_logTime timestamp,
+        p_caller varchar2,
+        p_errStack varchar2,
+        p_errBacktrace varchar2,
+        p_errCallstack varchar2
+    ) 
+    is
+        v_idx PLS_INTEGER;
+        v_key varchar2(100) := to_char(p_processId);
+        v_new_log t_log_buffer_rec;
+    begin
+        -- if there is no old value, this one will be the oldest when flush will be done
+        if g_firstLogTimeStamp is null then 
+            g_logLatencyCounter := g_logLatencyCounter + 1;
+            g_firstLogTimeStamp := p_logTime;
+        end if;
+
+        v_idx := v_indexSession(p_processId);
+        g_sessionList(v_idx).serial_no := coalesce(g_sessionList(v_idx).serial_no, 0) + 1;
+        v_new_log.serial_no := g_sessionList(v_idx).serial_no;
+
+        -- 1. Gruppe initialisieren
+        if not g_log_groups.EXISTS(v_key) then
+            g_log_groups(v_key) := t_log_history_tab();
+        end if ;
+
+        -- 2. Record befüllen
+        v_new_log.process_id    := p_processId; -- Jetzt vorhanden
+        v_new_log.log_level     := p_level;
+        v_new_log.log_text      := p_text;
+        v_new_log.log_time      := p_logTime;
+        v_new_log.serial_no     := g_sessionList(v_indexSession(p_processId)).serial_no;
+        v_new_log.caller        := p_caller;
+        v_new_log.err_stack     := p_errStack;
+        v_new_log.err_backtrace := p_errBacktrace;
+        v_new_log.err_callstack := p_errCallstack;
+
+        -- 3. In den Cache hängen
+        g_log_groups(v_key).EXTEND;
+        g_log_groups(v_key)(g_log_groups(v_key).LAST) := v_new_log;
+
+        g_sessionList(v_idx).log_dirty_count := coalesce(g_sessionList(v_idx).log_dirty_count, 0) + 1;
+        -- ID in die Dirty-Queue werfen
+        g_dirty_queue(p_processId) := TRUE;
+    end;
+
+
+    /*
+        Methods dedicated to the g_monitorList
+    */
+    --------------------------------------------------------------------------
+    -- Write monitor data to detail table
+    --------------------------------------------------------------------------
+    procedure persist_monitor_data(
+        p_processId    number,
+        p_target_table varchar2,
+        p_actions      sys.odcivarchar2list,
+        p_contexts     sys.odcivarchar2list,
+        p_mon_types    sys.odcinumberlist,
+        p_action_count sys.odcinumberlist,
+        p_used         sys.odcinumberlist,
+        p_avgs         sys.odcinumberlist,
+        p_timesStart   t_timestamp_list_t,
+        p_timesStop    t_timestamp_list_t
+    )
+    as
+        pragma autonomous_transaction;
+        v_user varchar2(128) := SYS_CONTEXT('USERENV','SESSION_USER');
+        v_host varchar2(128) := SYS_CONTEXT('USERENV','HOST');
+        v_safe_table varchar2(150);
+    begin
+        -- PERFORMANCE: im gebündelten Flush nur sammeln, flushBatch schreibt (siehe g_batch_mode)
+        if g_batch_mode then
+            if p_actions.count > 0 then
+                appendMonBatch(p_processId, p_target_table, p_actions, p_contexts, p_mon_types,
+                               p_action_count, p_used, p_avgs, p_timesStart, p_timesStop);
+            end if;
+            return;
+        end if;
+
+        if p_actions.count > 0 then
+            -- Sicherheit: Tabellenname validieren
+            v_safe_table := safeTableName(p_target_table);
+            forall i in 1 .. p_actions.count
+                execute immediate
+                'insert into ' || v_safe_table || ' 
+                (PROCESS_ID, ACTION, CONTEXT, MON_TYPE, ACTION_COUNT, USED_MILLIS, AVG_MILLIS, START_TIME, STOP_TIME, SESSION_USER, HOST_NAME)
+                values (:1, :2, :3, :4, :5, :6, :7, :8, :9, :10, :11)'
+                using p_processId, p_actions(i), p_contexts(i), p_mon_types(i), p_action_count(i), p_used(i), p_avgs(i), p_timesStart(i),
+                      p_timesStop(i), v_user, v_host;
+            commit;
+        end if ;
+    exception
+        when others then
+            if sqlcode = -24381 then
+                -- FORALL ... SAVE EXCEPTIONS: erfolgreiche Zeilen behalten, nur fehlerhafte protokollieren
+                for i in 1 .. sql%bulk_exceptions.count loop
+                    logLilamErr(-sql%bulk_exceptions(i).error_code, sqlerrm(-sql%bulk_exceptions(i).error_code),
+                                'persist_monitor_data', 'row ' || sql%bulk_exceptions(i).error_index || ' skipped');
+                end loop;
+                commit;
+            else
+                rollback;
+                -- Tabelle fehlt: beim naechsten NEW_SESSION erneut pruefen und anlegen
+                if sqlcode = -942 then g_checked_masters.DELETE; g_safe_tables.DELETE; end if;
+                logLilamErr(sqlCode, sqlErrM, 'persist_monitor_data');
+            end if;
+
+    end;
+
+    --------------------------------------------------------------------
+    -- Abgleich der Baselines (PGA) mit LILAM_BASELINES per Delta-Merge:
+    -- Jede Session schreibt nur ihre eigene Veränderung seit dem letzten
+    -- Abgleich (avg - base_avg, count - base_count) und übernimmt danach
+    -- den Gesamtstand aus der DB. Ein Schreiber => exakter EWMA,
+    -- mehrere parallele Schreiber => gute Näherung ohne verlorene Updates.
+    -- Unbenutzte, saubere Einträge werden aus dem PGA entfernt.
+    --------------------------------------------------------------------
+    PROCEDURE syncBaselines(p_force BOOLEAN DEFAULT FALSE)
+    AS
+        pragma autonomous_transaction;
+        l_now        CONSTANT TIMESTAMP(6) := SYSTIMESTAMP;
+        l_key        VARCHAR2(250);
+        l_next       VARCHAR2(250);
+        l_dbKey      VARCHAR2(250);
+        l_rec        t_baseline_rec;
+        l_dbAvg      NUMBER;
+        l_dbCnt      NUMBER;
+
+        -- Delta-Updates für Einträge, die in der DB existieren
+        l_upd_keys   sys.odcivarchar2list := sys.odcivarchar2list();
+        l_upd_scope  sys.odcinumberlist   := sys.odcinumberlist();
+        l_upd_action sys.odcivarchar2list := sys.odcivarchar2list();
+        l_upd_ctx    sys.odcivarchar2list := sys.odcivarchar2list();
+        l_upd_dAvg   sys.odcinumberlist   := sys.odcinumberlist();
+        l_upd_dCnt   sys.odcinumberlist   := sys.odcinumberlist();
+        l_upd_avg    sys.odcinumberlist   := sys.odcinumberlist();
+
+        -- Rückgabe der neuen DB-Werte
+        l_ret_scope  sys.odcinumberlist   := sys.odcinumberlist();
+        l_ret_action sys.odcivarchar2list := sys.odcivarchar2list();
+        l_ret_ctx    sys.odcivarchar2list := sys.odcivarchar2list();
+        l_ret_avg    sys.odcinumberlist   := sys.odcinumberlist();
+        l_ret_cnt    sys.odcinumberlist   := sys.odcinumberlist();
+
+        -- Neue (oder in der DB nicht mehr vorhandene) Einträge
+        l_ins_keys   sys.odcivarchar2list := sys.odcivarchar2list();
+        l_ins_avg    sys.odcinumberlist   := sys.odcinumberlist();
+        l_ins_cnt    sys.odcinumberlist   := sys.odcinumberlist();
+
+        TYPE t_key_lookup IS TABLE OF VARCHAR2(250) INDEX BY VARCHAR2(250);
+        l_lookup     t_key_lookup;
+
+        FUNCTION dbKey(p_scopeId NUMBER, p_action VARCHAR2, p_dbContext VARCHAR2) RETURN VARCHAR2 IS
+        BEGIN
+            RETURN p_scopeId || '|' || p_action || '|' || p_dbContext;
+        END;
+
+        PROCEDURE takeOver(p_key VARCHAR2, p_avg NUMBER, p_cnt NUMBER) IS
+        BEGIN
+            g_baselines(p_key).avg_ms       := p_avg;
+            g_baselines(p_key).base_avg     := p_avg;
+            g_baselines(p_key).action_count := p_cnt;
+            g_baselines(p_key).base_count   := p_cnt;
+            g_baselines(p_key).in_db        := TRUE;
+            g_baselines(p_key).dirty        := FALSE;
+        END;
+    BEGIN
+        IF g_baselines.COUNT = 0 THEN
+            RETURN;
+        END IF;
+
+        IF NOT p_force AND g_last_baseline_sync IS NOT NULL
+           AND get_ms_diff(g_last_baseline_sync, l_now) < C_BASELINE_SYNC_INTERVAL_MS THEN
+            RETURN;
+        END IF;
+        g_last_baseline_sync := l_now;
+
+        -- 1. Dirty-Einträge einsammeln, unbenutzte saubere Einträge entfernen
+        l_key := g_baselines.FIRST;
+        WHILE l_key IS NOT NULL LOOP
+            l_next := g_baselines.NEXT(l_key);
+            l_rec  := g_baselines(l_key);
+
+            IF l_rec.dirty THEN
+                IF l_rec.in_db AND l_rec.base_avg IS NOT NULL THEN
+                    l_upd_keys.EXTEND;   l_upd_keys(l_upd_keys.LAST)     := l_key;
+                    l_upd_scope.EXTEND;  l_upd_scope(l_upd_scope.LAST)   := l_rec.scope_id;
+                    l_upd_action.EXTEND; l_upd_action(l_upd_action.LAST) := l_rec.action_name;
+                    l_upd_ctx.EXTEND;    l_upd_ctx(l_upd_ctx.LAST)       := nvl(l_rec.context_name, C_BASELINE_NULL_CONTEXT);
+                    l_upd_dAvg.EXTEND;   l_upd_dAvg(l_upd_dAvg.LAST)     := l_rec.avg_ms - l_rec.base_avg;
+                    l_upd_dCnt.EXTEND;   l_upd_dCnt(l_upd_dCnt.LAST)     := l_rec.action_count - l_rec.base_count;
+                    l_upd_avg.EXTEND;    l_upd_avg(l_upd_avg.LAST)       := l_rec.avg_ms;
+                    l_lookup(dbKey(l_rec.scope_id, l_rec.action_name, nvl(l_rec.context_name, C_BASELINE_NULL_CONTEXT))) := l_key;
+                ELSE
+                    l_ins_keys.EXTEND;   l_ins_keys(l_ins_keys.LAST)     := l_key;
+                END IF;
+            ELSIF l_rec.last_touch IS NULL
+               OR (CAST(l_now AS DATE) - CAST(l_rec.last_touch AS DATE)) * 86400 > C_BASELINE_IDLE_EVICT_SEC THEN
+                g_baselines.DELETE(l_key);
+            END IF;
+
+            l_key := l_next;
+        END LOOP;
+
+        IF l_upd_keys.COUNT = 0 AND l_ins_keys.COUNT = 0 THEN
+            RETURN;
+        END IF;
+
+        -- 2. Delta-Merge als Bulk-Update
+        --    Ein negatives Ergebnis (extrem gegenläufige parallele Schreiber) wird durch den eigenen Wert ersetzt.
+        IF l_upd_keys.COUNT > 0 THEN
+            FORALL i IN 1 .. l_upd_keys.COUNT
+                EXECUTE IMMEDIATE
+                   'update ' || C_LILAM_BASELINES_TABLE || '
+                       set avg_ms       = CASE WHEN avg_ms + :1 > 0 THEN avg_ms + :2 ELSE :3 END,
+                           action_count = action_count + :4,
+                           last_update  = SYSTIMESTAMP
+                     where scope_id = :5 and action_name = :6 and context_name = :7
+                    returning scope_id, action_name, context_name, avg_ms, action_count into :8, :9, :10, :11, :12'
+                USING l_upd_dAvg(i), l_upd_dAvg(i), l_upd_avg(i), l_upd_dCnt(i), l_upd_scope(i), l_upd_action(i), l_upd_ctx(i)
+                RETURNING BULK COLLECT INTO l_ret_scope, l_ret_action, l_ret_ctx, l_ret_avg, l_ret_cnt;
+
+            -- In der DB nicht mehr vorhanden (z.B. manuell gelöscht) => neu anlegen
+            FOR i IN 1 .. l_upd_keys.COUNT LOOP
+                IF SQL%BULK_ROWCOUNT(i) = 0 THEN
+                    l_ins_keys.EXTEND; l_ins_keys(l_ins_keys.LAST) := l_upd_keys(i);
+                END IF;
+            END LOOP;
+        END IF;
+
+        -- 3. Neue Einträge anlegen; legt eine andere Session parallel an, wird gewichtet gemittelt
+        FOR i IN 1 .. l_ins_keys.COUNT LOOP
+            l_rec := g_baselines(l_ins_keys(i));
+            BEGIN
+                EXECUTE IMMEDIATE
+                    'insert into ' || C_LILAM_BASELINES_TABLE ||
+                    ' (scope_id, action_name, context_name, avg_ms, action_count, last_update) values (:1, :2, :3, :4, :5, SYSTIMESTAMP)'
+                    USING l_rec.scope_id, l_rec.action_name, nvl(l_rec.context_name, C_BASELINE_NULL_CONTEXT),
+                          l_rec.avg_ms, l_rec.action_count - l_rec.base_count;
+                l_dbAvg := l_rec.avg_ms;
+                l_dbCnt := l_rec.action_count - l_rec.base_count;
+            EXCEPTION
+                WHEN DUP_VAL_ON_INDEX THEN
+                    EXECUTE IMMEDIATE
+                       'update ' || C_LILAM_BASELINES_TABLE || '
+                           set avg_ms       = (nvl(avg_ms, 0) * action_count + :1 * :2) / nullif(action_count + :3, 0),
+                               action_count = action_count + :4,
+                               last_update  = SYSTIMESTAMP
+                         where scope_id = :5 and action_name = :6 and context_name = :7
+                        returning avg_ms, action_count into :8, :9'
+                        USING l_rec.avg_ms, l_rec.action_count - l_rec.base_count, l_rec.action_count - l_rec.base_count,
+                              l_rec.action_count - l_rec.base_count,
+                              l_rec.scope_id, l_rec.action_name, nvl(l_rec.context_name, C_BASELINE_NULL_CONTEXT)
+                        RETURNING INTO l_dbAvg, l_dbCnt;
+            END;
+            -- Werte merken; übernommen wird erst nach erfolgreichem Commit
+            l_ins_avg.EXTEND; l_ins_avg(l_ins_avg.LAST) := l_dbAvg;
+            l_ins_cnt.EXTEND; l_ins_cnt(l_ins_cnt.LAST) := l_dbCnt;
+        END LOOP;
+
+        COMMIT;
+
+        -- 4. Gesamtstand aus der DB übernehmen (neue Basis für das nächste Delta)
+        FOR i IN 1 .. l_ret_scope.COUNT LOOP
+            l_dbKey := dbKey(l_ret_scope(i), l_ret_action(i), l_ret_ctx(i));
+            IF l_lookup.EXISTS(l_dbKey) THEN
+                takeOver(l_lookup(l_dbKey), l_ret_avg(i), l_ret_cnt(i));
+            END IF;
+        END LOOP;
+
+        FOR i IN 1 .. l_ins_keys.COUNT LOOP
+            takeOver(l_ins_keys(i), l_ins_avg(i), l_ins_cnt(i));
+        END LOOP;
+
+    EXCEPTION
+        WHEN OTHERS THEN
+            -- Einträge bleiben dirty, das Delta wird beim nächsten Abgleich erneut geschrieben
+            ROLLBACK;
+            logLilamErr(sqlCode, sqlErrM, 'syncBaselines');
+    END;
+
+    --------------------------------------------------------------------
+    -- Alle Dirty Einträge für alle Sessions wegschreiben
+    --------------------------------------------------------------------
+    PROCEDURE SYNC_ALL_DIRTY(p_force BOOLEAN DEFAULT FALSE, p_isShutdown BOOLEAN DEFAULT FALSE) 
+    IS
+        v_id      BINARY_INTEGER;
+        v_next_id BINARY_INTEGER;
+        v_idx     PLS_INTEGER;
+        v_now     CONSTANT TIMESTAMP := SYSTIMESTAMP;
+    BEGIN
+        -- ======================================================================
+        -- TEIL 0: ZEITSPERRE
+        -- Ohne Force hoechstens alle C_SYNC_ALL_INTERVAL_MS einen Durchlauf ueber alle
+        -- Prozesse. So kostet z.B. jedes INFO nur einen Zeitvergleich, unabhaengig von
+        -- der Zahl offener Prozesse. Die Flush-Schwellen (Zeit/Menge) bleiben unveraendert.
+        -- ======================================================================
+        if NOT p_force AND NOT p_isShutdown
+           AND g_last_sync_all IS NOT NULL
+           AND get_ms_diff(g_last_sync_all, v_now) < C_SYNC_ALL_INTERVAL_MS
+        then
+            return;
+        end if;
+        g_last_sync_all := v_now;
+
+        -- ======================================================================
+        -- TEIL 1: BEARBEITUNG DER DRECKIGEN LISTE (Queue)
+        -- PERFORMANCE: Im Batch-Modus sammeln persist_* nur; flushBatch schreibt danach
+        -- alle fälligen Prozesse gemeinsam (je Tabelle ein FORALL, ein Commit).
+        -- ======================================================================
+        g_batch_mode := TRUE;
+        v_id := g_dirty_queue.FIRST;
+
+        WHILE v_id IS NOT NULL LOOP
+            v_next_id := g_dirty_queue.NEXT(v_id);
+
+            if v_indexSession.EXISTS(v_id) THEN
+                v_idx := v_indexSession(v_id);
+
+                -- Zeitstempel-Check (Cooldown-Logik)
+                -- Bei Force oder Shutdown ignorieren wir die Wartezeit
+                if NOT p_force AND NOT p_isShutdown
+                   AND g_sessionList(v_idx).last_sync_check IS NOT NULL 
+                   AND (SYSTIMESTAMP - g_sessionList(v_idx).last_sync_check) < INTERVAL '1' SECOND 
+                THEN
+                    NULL; 
+                ELSE
+                    -- Synchronisation (p_isShutdown wird durchgereicht)
+                    sync_log(v_id, p_force);
+                    sync_monitor(v_id, p_force);
+                    sync_process(v_id, p_force);
+                    g_sessionList(v_idx).last_sync_check := SYSTIMESTAMP;
+
+                    -- Überprüfung: Ist die Session jetzt "sauber"?
+                    if p_force OR p_isShutdown OR (
+                           coalesce(g_sessionList(v_idx).log_dirty_count, 0) = 0 
+                       AND coalesce(g_sessionList(v_idx).monitor_dirty_count, 0) = 0
+                       AND NOT g_sessionList(v_idx).process_is_dirty
+                    ) THEN
+                        g_dirty_queue.DELETE(v_id);
+                        g_sessionList(v_idx).last_sync_check := NULL;
+                    end if ;
+                end if ;
+            ELSE
+                g_dirty_queue.DELETE(v_id);
+            end if ;
+
+            v_id := v_next_id;
+        END LOOP;
+
+        g_batch_mode := FALSE;
+        flushBatch;
+
+        -- ======================================================================
+        -- TEIL 2: MASTER-CLEANUP BEI SHUTDOWN
+        -- Hier räumen wir die RAM-Reste (Round-Robin) aller bekannten Sessions weg
+        -- ======================================================================
+        if p_isShutdown THEN
+            v_id := v_indexSession.FIRST;
+            WHILE v_id IS NOT NULL LOOP
+                -- flushMonitor direkt aufrufen, um is_flushed=1 Einträge zu löschen.
+                -- Da p_isShutdown = TRUE, greift dort g_monitor_groups.DELETE(v_key).
+                flushMonitor(v_id);
+
+                v_id := v_indexSession.NEXT(v_id);
+            END LOOP;
+        end if ;
+
+        -- ======================================================================
+        -- TEIL 3: PROZESSÜBERGREIFENDE BASELINES (zeitgesteuert oder erzwungen)
+        -- ======================================================================
+        syncBaselines(p_force OR p_isShutdown);
+
+    EXCEPTION
+        WHEN OTHERS THEN
+            -- Batch-Modus darf nie aktiv bleiben, sonst würden auch spätere Einzel-Flushes nur gesammelt
+            g_batch_mode := FALSE;
+            logLilamErr(sqlCode, sqlErrM, 'SYNC_ALL_DIRTY');
+            flushBatch;
+    END SYNC_ALL_DIRTY;
+
+
+    --------------------------------------------------------------------------
+    -- Write monitor data to detail table
+    --------------------------------------------------------------------------
+    procedure flushMonitor(p_processId number)
+    as
+        v_id_prefix   constant varchar2(50) := LPAD(p_processId, 20, '0') || '|';
+        v_group_key   varchar2(100);
+        v_idx_session pls_integer;
+        v_targetTable varchar2(150);
+        v_keep_rec    t_monitor_buffer_rec;
+
+        v_actions     sys.odcivarchar2list := sys.odcivarchar2list();
+        v_contexts    sys.odcivarchar2list := sys.odcivarchar2list();
+        v_mon_types   sys.odcinumberlist   := sys.odcinumberlist();
+        v_action_count  sys.odcinumberlist := sys.odcinumberlist();
+        v_used        sys.odcinumberlist   := sys.odcinumberlist();
+        v_avgs        sys.odcinumberlist   := sys.odcinumberlist();
+        v_timesStart  t_timestamp_list_t   := t_timestamp_list_t();
+        v_timesStop   t_timestamp_list_t   := t_timestamp_list_t();
+
+        v_latency     number := 0;
+    begin
+        v_idx_session := v_indexSession(p_processId);
+        v_targetTable := g_sessionList(v_idx_session).tabName_master || C_SUFFIX_MON_TABLE;
+
+        -- PERFORMANCE: Die Schlüssel sind sortiert ("<process_id 20-stellig>|Aktion|Kontext").
+        -- Statt alle Puffer aller Prozesse zu durchlaufen und per LIKE zu filtern (quadratischer
+        -- Aufwand bei vielen offenen Prozessen), direkt beim ersten Schlüssel dieses Prozesses
+        -- einsteigen und abbrechen, sobald der Präfix nicht mehr passt.
+        v_group_key := g_monitor_groups.NEXT(v_id_prefix);
+        if v_group_key is not null and substr(v_group_key, 1, length(v_id_prefix)) != v_id_prefix then
+            v_group_key := null;
+        end if;
+
+        if v_group_key is not null then
+            -- calculate latency of oldest monitor entry until persistance
+            v_latency  := get_ms_diff(g_firstMonTimeStamp, systimestamp);
+            g_avgLatencyMon := round((g_avgLatencyMon + v_latency) / nvl(nullif(g_monLatencyCounter, 0), 1), 2);
+            if v_latency > g_maxLatencyMon then g_maxLatencyMon := v_latency; end if;        
+        end if;
+
+        while v_group_key is not null loop     
+            -- Ende der Schlüssel dieses Prozesses erreicht
+            exit when substr(v_group_key, 1, length(v_id_prefix)) != v_id_prefix;
+                -- 1. Alles einsammeln, was aktuell im Eimer ist
+                    for i in 1 .. g_monitor_groups(v_group_key).COUNT loop
+                        v_actions.extend;      v_actions(v_actions.last)          := g_monitor_groups(v_group_key)(i).action_name;
+                        v_contexts.extend;     v_contexts(v_contexts.last)        := g_monitor_groups(v_group_key)(i).context_name;
+                        v_mon_types.extend;    v_mon_types(v_mon_types.last)      := g_monitor_groups(v_group_key)(i).monitor_type;
+                        v_action_count.extend; v_action_count(v_action_count.last):= g_monitor_groups(v_group_key)(i).action_count;
+                        v_used.extend;         v_used(v_used.last)                := g_monitor_groups(v_group_key)(i).used_time;
+                        v_avgs.extend;         v_avgs(v_avgs.last)                := g_monitor_groups(v_group_key)(i).avg_action_time;
+                        v_timesStart.extend;   v_timesStart(v_timesStart.last)    := g_monitor_groups(v_group_key)(i).start_time;
+                        v_timesStop.extend;    v_timesStop(v_timesStop.last)      := g_monitor_groups(v_group_key)(i).stop_time;
+                    end loop;
+
+                -- 3. Radikaler Kahlschlag im RAM (SGA/PGA Hygiene)
+                g_monitor_groups(v_group_key).DELETE;
+
+            v_group_key := g_monitor_groups.NEXT(v_group_key);
+        end loop;
+
+        -- 5. Persistieren
+        if v_actions.COUNT > 0 then
+            persist_monitor_data(
+                p_processId    => p_processId,
+                p_target_table => v_targetTable,
+                p_actions      => v_actions,
+                p_contexts     => v_contexts,
+                p_mon_types    => v_mon_types,
+                p_action_count   => v_action_count,
+                p_used         => v_used,
+                p_avgs         => v_avgs,
+
+                p_timesStart   => v_timesStart,
+                p_timesStop    => v_timesStop
+            );
+            g_sessionList(v_idx_session).monitor_dirty_count := 0;
+        end if ;
+
+    exception
+        when others then
+            logLilamErr(sqlCode, sqlErrM, 'flushMonitor'); 
+            if should_raise_error(p_processId) then
+                error(p_processId, 'Could not flush monitor data: ' || sqlErrM);
+            end if ;
+    end flushMonitor;
+
+    --------------------------------------------------------------------------
+
+    procedure sync_monitor(p_processId number, p_force boolean default false)
+    as        
+        v_idx varchar2(100);
+        v_ms_since_flush NUMBER;
+        v_now constant timestamp := systimestamp;
+
+    begin
+        -- 1. Index der Session holen
+        if not v_indexSession.EXISTS(p_processId) then
+            return;
+        end if ;
+        v_idx := v_indexSession(p_processId);
+
+        -- Falls noch nie geflusht wurde (Start), setzen wir die Differenz hoch
+        if g_sessionList(v_idx).last_monitor_flush is null then
+            v_ms_since_flush := C_FLUSH_MILLIS_THRESHOLD_MS + 1;
+        else
+            v_ms_since_flush := get_ms_diff(g_sessionList(v_idx).last_monitor_flush, v_now);
+        end if ;
+        -- 4. Die "Smarte" Flush-Bedingung: Menge ODER Zeit ODER Force
+        if p_force 
+           or g_sessionList(v_idx).monitor_dirty_count >= C_FLUSH_MONITOR_THRESHOLD_NO 
+           or v_ms_since_flush >= C_FLUSH_MILLIS_THRESHOLD_MS
+        then        
+            flushMonitor(p_processId);
+            g_firstMonTimeStamp := null;
+
+            -- Reset der prozessspezifischen Steuerungsdaten
+            g_sessionList(v_idx).monitor_dirty_count := 0;
+            g_sessionList(v_idx).last_monitor_flush  := v_now;
+        end if ;
+
+    exception
+        when others then
+            logLilamErr(sqlCode, sqlErrM, 'sync_monitor'); 
+            if should_raise_error(p_processId) then
+                error(p_processId, 'Could not synchronize monitor data: ' || sqlErrM);
+            end if ;
+    end;
+
+    --------------------------------------------------------------------------
+    -- Arithmetisches Mittel (wird in der Warm-up-Phase verwendet)
+    --------------------------------------------------------------------------
+    function calculate_avg(
+        p_old_avg    number,
+        p_curr_count pls_integer,
+        p_new_value  number
+    ) return number 
+    is
+    begin
+        -- Erster Messwert: Der Durchschnitt ist der Wert selbst
+        if p_old_avg is null or p_curr_count <= 1 then
+            return p_new_value;
+        end if ;
+
+        -- Formel: ((Schnitt_alt * (n-1)) + Wert_neu) / n
+        return ((p_old_avg * (p_curr_count - 1)) + p_new_value) / p_curr_count;
+    end;
+
+    --------------------------------------------------------------------------
+    -- Calculation average time used
+    --------------------------------------------------------------------------
+    function calculate_ewma(
+        p_old_avg    number,      -- Der bisherige Durchschnitt
+        p_curr_count pls_integer, -- Laufender Zähler inkl. der aktuellen Messung
+        p_new_value  number,      -- Aktuell gemessene Dauer (ms)
+        p_warmup     pls_integer default 100, -- Schwelle für die Glättung
+        p_alpha      number      default 0.1  -- Gewichtung (0.1 = 10% neu, 90% alt)
+    ) return number is
+    begin
+        -- Fall 1: Initialisierung (Der allererste Datensatz überhaupt)
+        if p_old_avg is null or p_old_avg = 0 or p_curr_count <= 1 then
+            return p_new_value;
+        end if;
+
+        -- Fall 2: Warm-up Phase
+        -- Arithmetisches Mittel, bis genug Daten für eine stabile Glättung vorliegen.
+        -- So ist auch während des Warm-ups ein brauchbarer Durchschnitt vorhanden.
+        if p_curr_count <= coalesce(p_warmup, 0) then
+            return calculate_avg(p_old_avg, p_curr_count, p_new_value);
+        end if;
+
+        -- Fall 3: EWMA
+        -- Formel: Alt + Alpha * (Neu - Alt)
+        return p_old_avg + coalesce(p_alpha, 0.1) * (p_new_value - p_old_avg);
+    end;
+
+    --------------------------------------------------------------------------
+    -- Start Tracing remote
+    --------------------------------------------------------------------------    
+    procedure startTraceRemote(p_processId number, p_actionName varchar2, p_contextName varchar2, p_timestamp timestamp default systimestamp)
+    as
+        l_payload JSON_OBJ_LILAM; -- Puffer für den JSON-String
+    begin
+        -- PERFORMANCE: Nachricht direkt verketten statt über jsonPut (siehe jStr/jNum/jTs)
+        l_payload := '{"process_id":' || jNum(p_processId)
+                  || jStr('action_name',  p_actionName)
+                  || jStr('context_name', p_contextName)
+                  || jTs ('timestamp',    p_timestamp) || '}';
+
+        sendNoWait(p_processId, 'START_TRACE', l_payload, 0.5);
+
+    EXCEPTION
+        WHEN OTHERS THEN
+            logLilamErr(sqlCode, sqlErrM, 'startTraceRemote'); 
+    end;
+
+    --------------------------------------------------------------------------
+    -- Creating and adding/updating a trace entry in the monitor list
+    --------------------------------------------------------------------------    
+    procedure insertTraceMonitorRemote(p_processId number, p_actionName varchar2, p_contextName varchar2, p_timestamp timestamp default systimestamp)
+    as
+        l_payload JSON_OBJ_LILAM; -- Puffer für den JSON-String
+    begin
+        -- Da das über die PIPE läuft und damit nicht gewährleistet ist, dass bei
+        -- späterem Aufruf von insertMonitor im Server der Zeitpunkt 'in time' ist,
+        -- muss der Zeitpunkt vom Client bei Aufruf gesetzt werden.
+        -- Erzeugung des JSON-Objekts
+        -- PERFORMANCE: Nachricht direkt verketten statt über jsonPut (siehe jStr/jNum/jTs)
+        l_payload := '{"process_id":' || jNum(p_processId)
+                  || jStr('action_name',  p_actionName)
+                  || jStr('context_name', p_contextName)
+                  || jTs ('timestamp',    p_timestamp) || '}';
+
+        sendNoWait(p_processId, 'STOP_TRACE', l_payload, 0.5);
+
+    EXCEPTION
+        WHEN OTHERS THEN
+            logLilamErr(sqlCode, sqlErrM, 'insertTraceMonitorRemote'); 
+    end;
+
+    --------------------------------------------------------------------------
+
+    --------------------------------------------------------------------------
+    -- Creating and adding/updating a record in the monitor list
+    --------------------------------------------------------------------------    
+    procedure insertEventMonitorRemote(p_processId number, p_actionName varchar2, p_contextName varchar2, p_timestamp timestamp)
+    as
+        l_payload JSON_OBJ_LILAM; -- Puffer für den JSON-String
+    begin
+        if p_timestamp is null then raise_application_error(-2005, 'Event ohne Zeitangabe'); end if;
+
+        -- Da das über die PIPE läuft und damit nicht gewährleistet ist, dass bei
+        -- späterem Aufruf von insertMonitor im Server der Zeitpunkt 'in time' ist,
+        -- muss der Zeitpunkt vom Client bei Aufruf gesetzt werden.
+        -- Erzeugung des JSON-Objekts
+        -- PERFORMANCE: Nachricht direkt verketten statt über jsonPut (siehe jStr/jNum/jTs)
+        l_payload := '{"process_id":' || jNum(p_processId)
+                  || jStr('action_name',  p_actionName)
+                  || jStr('context_name', p_contextName)
+                  || jTs ('timestamp',    p_timestamp) || '}';
+
+        sendNoWait(p_processId, C_MARK_EVENT, l_payload, 0.5);
+
+    EXCEPTION
+        WHEN OTHERS THEN
+            logLilamErr(sqlCode, sqlErrM, 'insertEventMonitorRemote'); 
+ 
+    end;
+
+    --------------------------------------------------------------------------
+
+    function findAvgRule(p_action varchar2, p_context varchar2) return t_avg_params
+    as
+        l_ruleKey varchar2(100) := p_action || '|' || p_context;
+    begin
+        IF g_avg_params.EXISTS(l_ruleKey) THEN
+            return g_avg_params(l_ruleKey);
+        ELSIF g_avg_params.EXISTS(p_action) THEN
+            return g_avg_params(p_action);
+        end if;
+        return g_avg_params('DEFAULT');
+    end;
+
+    --------------------------------------------------------------------------
+    -- Berechnet Durchschnitt (avg_action_time) und Regel-Referenz (baseline_avg)
+    -- für eine neue Messung in p_rec (used_time muss gesetzt sein).
+    -- Mit Scope:  prozessübergreifende Baseline (g_baselines)
+    -- Ohne Scope oder bei Fehlern: prozesslokal wie bisher
+    -- baseline_avg ist der Durchschnitt VOR der Messung; während des Warm-ups NULL,
+    -- damit AVG_DEVIATION_PCT erst bei stabiler Baseline greift.
+    --------------------------------------------------------------------------
+    procedure applyBaseline(
+        p_processId   number,
+        p_prevAvg     number,        -- prozesslokaler Durchschnitt vor der Messung
+        p_prevCount   pls_integer,   -- prozesslokale Anzahl Messungen vor dieser
+        p_rec         in out nocopy t_monitor_buffer_rec
+    )
+    as
+        l_params  t_avg_params;
+        l_scopeId number;
+        l_key     varchar2(250);
+        l_oldAvg  number;
+        l_oldCnt  number;
+    begin
+        l_params  := findAvgRule(p_rec.action_name, p_rec.context_name);
+        l_scopeId := getScopeId(p_processId);
+
+        if l_scopeId is not null then
+            begin
+                l_key := buildBaselineKey(l_scopeId, p_rec.action_name, p_rec.context_name);
+                ensureBaseline(l_key, l_scopeId, p_rec.action_name, p_rec.context_name);
+
+                l_oldAvg := g_baselines(l_key).avg_ms;
+                l_oldCnt := g_baselines(l_key).action_count;
+
+                g_baselines(l_key).action_count := l_oldCnt + 1;
+                g_baselines(l_key).avg_ms       := calculate_ewma(l_oldAvg, l_oldCnt + 1, p_rec.used_time, l_params.warmup, l_params.alpha);
+                g_baselines(l_key).dirty        := TRUE;
+                g_baselines(l_key).last_touch   := SYSTIMESTAMP;
+
+                p_rec.avg_action_time := g_baselines(l_key).avg_ms;
+                p_rec.baseline_avg    := CASE WHEN l_oldCnt >= coalesce(l_params.warmup, 0) THEN l_oldAvg END;
+                return;
+            exception
+                when others then
+                    -- Scope für diese Session abschalten und prozesslokal weiterarbeiten
+                    logLilamErr(sqlCode, sqlErrM, 'applyBaseline', 'scope_id=' || l_scopeId || '; scope disabled for process ' || p_processId);
+                    setScopeId(p_processId, null);
+            end;
+        end if;
+
+        p_rec.avg_action_time := calculate_ewma(p_prevAvg, p_prevCount + 1, p_rec.used_time, l_params.warmup, l_params.alpha);
+        p_rec.baseline_avg    := CASE WHEN p_prevCount >= coalesce(l_params.warmup, 0) THEN p_prevAvg END;
+    end;
+
+    --------------------------------------------------------------------------
+
+    procedure writeEventToMonitorBuffer (p_processId number, p_actionName varchar2, p_contextName varchar2, p_timestamp timestamp)
+    as
+        -- Key-Präfix sollte idealerweise p_processId enthalten für schnelleren Flush-Zugriff
+        v_key        constant varchar2(200) := buildMonitorKey(p_processId, p_actionName, p_contextName);
+        l_new_idx    PLS_INTEGER;
+        v_idx        PLS_INTEGER;
+        l_prev       t_monitor_buffer_rec; 
+        l_rec        t_monitor_buffer_rec;
+    begin
+        if is_remote(p_processId) then
+            insertEventMonitorRemote(p_processId, p_actionName, p_contextName, p_timestamp);
+            return;
+        end if ;
+
+        -- Unbekannter Prozess (weder lokal noch über Dispatcher erreichbar): still ignorieren
+        if not v_indexSession.EXISTS(p_processId) then
+            return;
+        end if;
+
+        -- this event will be the oldest when flush happens
+        if g_firstMonTimeStamp is null then 
+            g_monLatencyCounter := g_monLatencyCounter + 1;
+            g_firstMonTimeStamp := p_timestamp; 
+        end if;
+
+        -- 0. Monitoring-Check (Log-Level Prüfung)
+        if v_indexSession.EXISTS(p_processId) and 
+           logLevelMonitor > g_sessionList(v_indexSession(p_processId)).log_level then
+            return;
+        end if ;
+
+        l_rec.process_id   := p_processId;
+        l_rec.action_name  := p_actionName;
+        l_rec.context_name := p_contextName;
+        l_rec.monitor_type := C_MON_TYPE_EVENT;
+        l_rec.start_time   := coalesce(p_timestamp, systimestamp);
+
+        -- Die nächsten Werte abhängig davon ob es einen Vorgänger gibt
+        -- Gemessen wird der Abstand zum vorherigen Event (innerhalb des Prozesses).
+        if g_monitor_shadows.EXISTS(v_key) then            -- Es gibt einen Vorgänger
+            l_prev := g_monitor_shadows(v_key);
+            l_rec.action_count := l_prev.action_count + 1;
+            l_rec.used_time    := get_ms_diff(l_prev.start_time, l_rec.start_time);
+
+            -- Anzahl gemessener Abstände vor diesem = action_count des Vorgängers - 1
+            applyBaseline(
+                p_processId => p_processId,
+                p_prevAvg   => CASE WHEN l_prev.action_count > 1 THEN l_prev.avg_action_time END,
+                p_prevCount => l_prev.action_count - 1,
+                p_rec       => l_rec
+            );
+        ELSE
+            -- Erster Eintrag der Session/Action
+            l_rec.action_count    := 1;
+            l_rec.used_time       := 0; -- Erster Marker hat keine Dauer
+            l_rec.avg_action_time := 0;
+            l_rec.baseline_avg    := NULL;
+        end if ;
+
+        if NOT g_monitor_groups.EXISTS(v_key) THEN
+            g_monitor_groups(v_key) := t_monitor_history_tab();
+        end if ;
+        g_monitor_groups(v_key).EXTEND;
+        l_new_idx := g_monitor_groups(v_key).LAST;
+        g_monitor_groups(v_key)(l_new_idx) := l_rec;
+
+        -- vor dem Überschreiben des shadow-Eintrags die Regeln prüfen
+        evaluateRules(g_monitor_groups(v_key)(l_new_idx), C_MARK_EVENT);
+        g_monitor_shadows(v_key) := g_monitor_groups(v_key)(g_monitor_groups(v_key).LAST);         
+
+        v_idx := v_indexSession(p_processId);
+        g_sessionList(v_idx).monitor_dirty_count := coalesce(g_sessionList(v_idx).monitor_dirty_count, 0) + 1;
+        g_dirty_queue(p_processId) := TRUE; 
+
+    exception
+        when others then
+            logLilamErr(sqlCode, sqlErrM, 'writeEventToMonitorBuffer'); 
+            if should_raise_error(p_processId) then
+                error(p_processId, 'Could not buffer event data: ' || sqlErrM);
+            end if ;
+    end;
+
+    --------------------------------------------------------------------------
+
+    procedure startTrace (p_processId number, p_actionName varchar2, p_contextName varchar2, p_timestamp timestamp)
+    as
+        v_key constant varchar2(200) := buildMonitorKey(p_processId, p_actionName, p_contextName);
+        v_dummyMonRec   t_monitor_buffer_rec;
+    begin
+        if is_remote(p_processId) then
+            startTraceRemote(p_processId, p_actionName, p_contextName, p_timestamp);
+            return;
+        end if ;
+
+        -- Unbekannter Prozess (weder lokal noch über Dispatcher erreichbar): still ignorieren
+        if not v_indexSession.EXISTS(p_processId) then
+            return;
+        end if;
+
+        -- Dummy nur für die Regeln
+        v_dummyMonRec.process_id := p_processId;
+        v_dummyMonRec.start_time := coalesce(p_timestamp, systimestamp);
+        v_dummyMonRec.stop_time := null;
+        v_dummyMonRec.monitor_type := C_MON_TYPE_TRACE;
+        v_dummyMonRec.action_name := p_actionName;
+        v_dummyMonRec.context_name := p_contextName;
+
+        evaluateRules(v_dummyMonRec, C_TRACE_START);
+        g_monitor_shadows(v_key) := v_dummyMonRec;
+        
+    exception
+        when others then
+            logLilamErr(sqlCode, sqlErrM, 'startTrace'); 
+    end;
+
+    --------------------------------------------------------------------------
+
+    procedure writeTraceToMonitorBuffer (p_processId number, p_actionName varchar2, p_contextName varchar2, p_timestamp timestamp)
+    as
+        -- Key-Präfix sollte idealerweise p_processId enthalten für schnelleren Flush-Zugriff
+        v_key        constant varchar2(200) := buildMonitorKey(p_processId, p_actionName, p_contextName);
+        v_used_time  number := 0;
+        v_new_avg    number := 0;
+        v_new_rec    t_monitor_buffer_rec;
+        v_first_idx  PLS_INTEGER;
+        l_new_idx    PLS_INTEGER;
+        v_idx        PLS_INTEGER;
+        l_prevAvg    number;
+        l_prevCnt    PLS_INTEGER;
+    begin
+        if is_remote(p_processId) then
+            insertTraceMonitorRemote(p_processId, p_actionName, p_contextName, p_timestamp);
+            return;
+        end if ;
+
+        -- Unbekannter Prozess (weder lokal noch über Dispatcher erreichbar): still ignorieren
+        if not v_indexSession.EXISTS(p_processId) then
+            return;
+        end if;
+
+        -- this will be the oldest entry when flush happens
+        if g_firstMonTimeStamp is null then g_firstMonTimeStamp := p_timestamp; end if;
+
+        if v_indexSession.EXISTS(p_processId) and 
+           logLevelMonitor > g_sessionList(v_indexSession(p_processId)).log_level then
+            return;
+        end if ;
+
+        -- check if open transaction exists
+        if NOT g_monitor_shadows.EXISTS(v_key) then
+            return;
+        end if;
+
+        v_new_rec           := g_monitor_shadows(v_key);
+        v_new_rec.stop_time := coalesce(p_timestamp, systimestamp);
+        v_new_rec.used_time := get_ms_diff(v_new_rec.start_time, v_new_rec.stop_time);
+
+        -- action_count bleibt prozesslokal (n-te Ausführung im Prozess; _MON und MAX_OCCURRENCE)
+        IF g_monitor_averages.EXISTS(v_key) THEN
+            l_prevAvg := g_monitor_averages(v_key).avg_action_time;
+            l_prevCnt := g_monitor_averages(v_key).action_count;
+        ELSE
+            l_prevAvg := NULL;
+            l_prevCnt := 0;
+        END IF;
+        v_new_rec.action_count := l_prevCnt + 1;
+
+        -- Durchschnitt: prozessübergreifend (Scope) oder prozesslokal
+        applyBaseline(p_processId, l_prevAvg, l_prevCnt, v_new_rec);
+
+        -- Gedächtnis für den nächsten Lauf aktualisieren
+        g_monitor_averages(v_key) := v_new_rec;
+
+        if NOT g_monitor_groups.EXISTS(v_key) THEN
+            g_monitor_groups(v_key) := t_monitor_history_tab();
+        end if ;
+        g_monitor_groups(v_key).EXTEND;
+        g_monitor_groups(v_key)(g_monitor_groups(v_key).LAST) := v_new_rec;
+
+        -- Das Event an die Regelprüfung durchreichen
+        evaluateRules(v_new_rec, C_TRACE_STOP);
+        g_monitor_shadows.delete(v_key);
+
+        v_idx := v_indexSession(p_processId);            
+        g_sessionList(v_idx).monitor_dirty_count := coalesce(g_sessionList(v_idx).monitor_dirty_count, 0) + 1;
+        g_dirty_queue(p_processId) := TRUE; 
+
+    exception
+        when others then
+            logLilamErr(sqlCode, sqlErrM, 'writeTraceToMonitorBuffer'); 
+            if should_raise_error(p_processId) then
+                error(p_processId, 'Could not buffer trace data: ' || sqlErrM);
+            end if ;
+    end;
+
+    --------------------------------------------------------------------------
+    -- Removing a record from monitor list
+    --------------------------------------------------------------------------
+    procedure removeMonitor(p_processId number, p_actionName varchar2, p_contextName varchar2)
+    as
+        v_key constant varchar2(200) := buildMonitorKey(p_processId, p_actionName, p_contextName);
+    begin
+        -- 1. Historie löschen
+        if g_monitor_groups.EXISTS(v_key) then
+            g_monitor_groups.DELETE(v_key);
+        end if ;
+    end;
+
+    --------------------------------------------------------------------------
+    -- Removing a record from monitor list
+    --------------------------------------------------------------------------
+    function getLastMonitorEntry(p_processId number, p_actionName varchar2, p_contextName varchar2) return t_monitor_buffer_rec
+    as
+        v_key    constant varchar2(200) := buildMonitorKey(p_processId, p_actionName, p_contextName);
+        v_empty  t_monitor_buffer_rec; -- Initial leerer Record als Fallback
+    begin
+        -- 1. Prüfen, ob die Gruppe (Action) im Cache existiert
+        if g_monitor_groups.EXISTS(v_key) then
+            -- 2. Prüfen, ob die Historie-Liste Einträge hat
+            if g_monitor_groups(v_key).COUNT > 0 then
+                -- Den letzten Eintrag (LAST) der verschachtelten Liste zurückgeben
+                return g_monitor_groups(v_key)(g_monitor_groups(v_key).LAST);
+            end if ;
+        end if ;
+
+        -- Falls nichts gefunden wurde, wird ein leerer Record zurückgegeben
+        return v_empty;
+
+    exception
+        when others then
+            logLilamErr(sqlCode, sqlErrM, 'getLastMonitorEntry'); 
+            if should_raise_error(p_processId) then
+                error(p_processId, 'Could not search or read last monitor entry: ' || sqlErrM);
+            end if ;
+            return v_empty;
+    end;
+
+    ----------------------------------------------------------------------
+
+    function hasMonitorEntry(p_processId number, p_actionName varchar2, p_contextName varchar2) return boolean
+    is
+        v_key constant varchar2(200) := buildMonitorKey(p_processId, p_actionName, p_contextName);
+    begin
+        if not g_monitor_groups.EXISTS(v_key) then
+            return false;
+        end if ;
+        return (g_monitor_groups(v_key).COUNT > 0);
+
+    exception
+        when others then
+            logLilamErr(sqlCode, sqlErrM, 'hasMonitorEntry'); 
+            if should_raise_error(p_processId) then
+                error(p_processId, 'Checking "monitor entry exists" failed: ' || sqlErrM);
+            end if ;
+            return false;
+    end;
+
+    --------------------------------------------------------------------------
+    -- Monitoring a step
+    --------------------------------------------------------------------------
+    PROCEDURE MARK_EVENT(p_processId NUMBER, p_actionName VARCHAR2, p_contextName VARCHAR2 default NULL, p_timestamp timestamp default NULL)
+    as
+        l_timestamp TIMESTAMP(6);
+    begin
+        l_timestamp := coalesce(p_timestamp, SYSTIMESTAMP);
+        writeEventToMonitorBuffer (p_processId, p_actionName, p_contextName, l_timestamp);     
+    end;
+    --------------------------------------------------------------------------
+
+
+    --------------------------------------------------------------------------
+    -- Monitoring a transaction
+    --------------------------------------------------------------------------
+    PROCEDURE TRACE_START(p_processId NUMBER, p_actionName VARCHAR2, p_contextName VARCHAR2 default null, p_timestamp timestamp default NULL)
+    as
+        l_timestamp TIMESTAMP(6);
+    begin
+        l_timestamp := coalesce(p_timestamp, SYSTIMESTAMP);
+        startTrace (p_processId, p_actionName, p_contextName, l_timestamp);     
+    end;
+    --------------------------------------------------------------------------
+
+    PROCEDURE TRACE_STOP(p_processId NUMBER, p_actionName VARCHAR2, p_contextName VARCHAR2 default null, p_timestamp TIMESTAMP DEFAULT NULL)
+    as
+        l_timestamp TIMESTAMP(6);
+    begin
+        l_timestamp := coalesce(p_timestamp, SYSTIMESTAMP);
+        writeTraceToMonitorBuffer(p_processId, p_actionName, p_contextName, l_timestamp);
+    end;
+
+    --------------------------------------------------------------------------
+
+    function getLastMonitorEntryRemote(p_processId number, p_actionName varchar2, p_contextName varchar2) return t_monitor_buffer_rec
+    as
+        l_response varchar2(1000);
+        l_payload  varchar2(1000);
+        v_rec t_monitor_buffer_rec;
+    begin
+        select json_object(
+            'process_id'   value p_processId,
+            'action_name'  value p_actionName,
+            'context_name' value p_contextName
+            returning varchar2
+        )
+        into l_payload from dual;  
+        l_response := waitForResponse(p_processId, 'GET_MONITOR_LAST_ENTRY', l_payload, 5);
+
+        if l_response not in ('TIMEOUT', 'THROTTLED') AND l_response not like 'ERROR%' THEN
+            l_payload := JSON_QUERY(l_response, '$.payload');
+            v_rec.action_count  := jsonNumber(l_payload, 'action_count');
+            v_rec.used_time  := jsonNumber(l_payload, 'used_time');
+            v_rec.start_time  := jsonTime(l_payload, 'start_time');
+            v_rec.stop_time  := jsonTime(l_payload, 'stop_time');
+            v_rec.avg_action_time  := jsonNumber(l_payload, 'avg_action_time');
+        end if;
+        return v_rec;
+    end;
+
+    --------------------------------------------------------------------------
+
+    FUNCTION GET_METRIC_AVG_DURATION(p_processId NUMBER, p_actionName VARCHAR2, p_contextName VARCHAR2) return NUMBER
+    as
+        v_rec t_monitor_buffer_rec;
+    begin
+        if is_remote(p_processId) then
+            v_rec := getLastMonitorEntryRemote(p_processId, p_actionName, p_contextName);
+            return v_rec.avg_action_time;
+        end if ;
+
+        v_rec := getLastMonitorEntry(p_processId, p_actionName, p_contextName);
+        RETURN coalesce(v_rec.avg_action_time, 0);
+    end;
+
+    --------------------------------------------------------------------------
+
+    FUNCTION GET_METRIC_STEPS(p_processId NUMBER, p_actionName VARCHAR2, p_contextName VARCHAR2) return NUMBER
+    as
+        v_rec t_monitor_buffer_rec;
+    begin
+        if is_remote(p_processId) then
+            v_rec := getLastMonitorEntryRemote(p_processId, p_actionName, p_contextName);
+            return v_rec.action_count;
+        end if ;
+
+        v_rec := getLastMonitorEntry(p_processId, p_actionName, p_contextName);
+        RETURN coalesce(v_rec.action_count, 0);
+    end;
+
+    --------------------------------------------------------------------------
+    /*
+        Methods dedicated to config
+    */
+
+    --------------------------------------------------------------------------
+
+
+    /*
+        Methods dedicated to the g_sessionList
+    */
+
+    -- Delivers a record of the internal list which belongs to the process id
+    -- Return value is NULL BUT! datatype RECORD cannot be validated by IS NULL.
+    -- RECORDs are always initialized.
+    -- So you have to check by something like
+    -- if getSessionRecord(my_id).process_id IS NULL ...
+    function getSessionRecord(p_processId number) return t_session_rec
+    as
+        listIndex number;
+    begin
+        if not v_indexSession.EXISTS(p_processId) THEN        
+            return null;
+        else
+            listIndex := v_indexSession(p_processId);
+            return g_sessionList(listIndex);
+        end if ;
+
+    end;
+
+    --------------------------------------------------------------------------
+
+    -- Set values of a stored record in the internal process list by a given record
+    procedure updateSessionRecord(p_sessionRecord t_session_rec)
+    as
+        listIndex number;
+    begin
+        listIndex := v_indexSession(p_sessionRecord.process_id);
+        g_sessionList(listIndex) := p_sessionRecord;
+    end;
+
+    --------------------------------------------------------------------------
+
+    -- Creating and adding a new record to the process list
+    -- and persist to config table
+    procedure insertSession (p_tabName varchar2, p_processId number, p_logLevel PLS_INTEGER)
+    as
+        v_new_idx PLS_INTEGER;
+    begin
+        if g_sessionList is null then
+                g_sessionList := t_session_tab(); 
+        end if ;
+
+        if getSessionRecord(p_processId).process_id is null then
+            -- neuer Datensatz
+            g_sessionList.extend;
+            v_new_idx := g_sessionList.last;
+        else
+            v_new_idx := v_indexSession(p_processId);
+        end if ;
+
+        g_sessionList(v_new_idx).process_id         := p_processId;
+        g_sessionList(v_new_idx).log_level          := p_logLevel;
+        g_sessionList(v_new_idx).tabName_master     := p_tabName;
+            -- Timestamp for flushing   
+        g_sessionList(v_new_idx).last_monitor_flush := systimestamp;
+        g_sessionList(v_new_idx).last_log_flush     := systimestamp;
+        g_sessionList(v_new_idx).monitor_dirty_count := 0;
+        g_sessionList(v_new_idx).log_dirty_count := 0;
+
+        v_indexSession(p_processId) := v_new_idx;
+
+    end;
+
+    --------------------------------------------------------------------------
+
+    -- Updates the status of a log entry in the main log table.
+    procedure persist_process_record(p_process_rec t_process_rec)
+    as
+        pragma autonomous_transaction;
+        sqlStatement varchar2(1000);
+    begin
+        -- PERFORMANCE: im gebündelten Flush nur sammeln, flushBatch schreibt (siehe g_batch_mode)
+        if g_batch_mode then
+            appendProcBatch(p_process_rec);
+            return;
+        end if;
+
+        sqlStatement := '
+        update ' || C_PARAM_MASTER_TABLE || '
+        set status           = :PH_STATUS,
+            last_update      = current_timestamp,
+            process_end      = :PH_PROCESS_END,
+            steps_todo  = :PH_steps_todo,
+            steps_done  = :PH_steps_done,
+            info             = :PH_INFO,
+            process_immortal = :PH_IMMORTAL
+        where id = :PH_PROCESS_ID';  
+
+        sqlStatement := replaceNameTable(sqlStatement, C_PARAM_MASTER_TABLE, C_SUFFIX_PROC_TABLE, p_process_rec.tabNameMaster);
+        execute immediate sqlStatement
+        USING   p_process_rec.status, 
+                p_process_rec.processEnd,
+                p_process_rec.stepsTodo,
+                p_process_rec.stepsDone,
+                p_process_rec.info,
+                p_process_rec.procImmortal,
+                p_process_rec.id;
+
+        commit;
+
+    exception
+        when others then
+            rollback; -- im Fehlerfall die Transaktion beenden
+            logLilamErr(sqlCode, sqlErrM, 'persist_process_record', 'EXECUTE IMMEDIATE');
+            
+    end;
+
+    --------------------------------------------------------------------------
+    -- PERFORMANCE: Schreibt die in SYNC_ALL_DIRTY gesammelten Zeilen aller Prozesse.
+    -- Je Zieltabelle ein FORALL, für alles zusammen EIN Commit (autonome Transaktion).
+    -- Ein fehlerhafter Datensatz wird über SAVE EXCEPTIONS einzeln protokolliert, die übrigen
+    -- Zeilen bleiben erhalten. Scheitert eine Anweisung insgesamt (z.B. Tabelle fehlt), wird nur
+    -- diese Anweisung zurückgerollt; die anderen Tabellen werden trotzdem geschrieben.
+    --------------------------------------------------------------------------
+    procedure flushBatch
+    as
+        pragma autonomous_transaction;
+        v_user  constant varchar2(128) := SYS_CONTEXT('USERENV','SESSION_USER');
+        v_host  constant varchar2(128) := SYS_CONTEXT('USERENV','HOST');
+        v_key   varchar2(150);
+        v_table varchar2(150);
+        v_stmt  varchar2(1000);
+
+        procedure handleErr(p_code number, p_msg varchar2, p_module varchar2) is
+        begin
+            if p_code = -24381 then
+                for i in 1 .. sql%bulk_exceptions.count loop
+                    logLilamErr(-sql%bulk_exceptions(i).error_code, sqlerrm(-sql%bulk_exceptions(i).error_code),
+                                p_module, 'row ' || sql%bulk_exceptions(i).error_index || ' skipped');
+                end loop;
+            else
+                if p_code = -942 then g_checked_masters.DELETE; g_safe_tables.DELETE; end if;
+                logLilamErr(p_code, p_msg, p_module);
+            end if;
+        end;
+    begin
+        -- Logs
+        v_key := g_log_batches.FIRST;
+        while v_key is not null loop
+            begin
+                v_table := safeTableName(v_key);
+                forall i in 1 .. g_log_batches(v_key).pids.COUNT
+                    execute immediate
+                        'insert into ' || v_table || '
+                        (PROCESS_ID, LOG_LEVEL, LOG_LEVEL_C, INFO, SESSION_TIME, NO, CALLER, ERR_STACK, ERR_BACKTRACE, ERR_CALLSTACK, SESSION_USER, HOST_NAME)
+                        values (:1, :2, :3, :4, :5, :6, :7, :8, :9, :10, :11, :12)'
+                    USING g_log_batches(v_key).pids(i), g_log_batches(v_key).levels(i), g_log_batches(v_key).levelsC(i),
+                          g_log_batches(v_key).texts(i), g_log_batches(v_key).times(i), g_log_batches(v_key).seqs(i),
+                          g_log_batches(v_key).callers(i), g_log_batches(v_key).stacks(i), g_log_batches(v_key).backtraces(i),
+                          g_log_batches(v_key).callstacks(i), v_user, v_host;
+            exception
+                when others then handleErr(sqlcode, sqlerrm, 'flushBatch/LOG');
+            end;
+            v_key := g_log_batches.NEXT(v_key);
+        end loop;
+
+        -- Monitor
+        v_key := g_mon_batches.FIRST;
+        while v_key is not null loop
+            begin
+                v_table := safeTableName(v_key);
+                forall i in 1 .. g_mon_batches(v_key).pids.COUNT
+                    execute immediate
+                        'insert into ' || v_table || '
+                        (PROCESS_ID, ACTION, CONTEXT, MON_TYPE, ACTION_COUNT, USED_MILLIS, AVG_MILLIS, START_TIME, STOP_TIME, SESSION_USER, HOST_NAME)
+                        values (:1, :2, :3, :4, :5, :6, :7, :8, :9, :10, :11)'
+                    USING g_mon_batches(v_key).pids(i), g_mon_batches(v_key).actions(i), g_mon_batches(v_key).contexts(i),
+                          g_mon_batches(v_key).mon_types(i), g_mon_batches(v_key).action_count(i), g_mon_batches(v_key).used(i),
+                          g_mon_batches(v_key).avgs(i), g_mon_batches(v_key).timesStart(i), g_mon_batches(v_key).timesStop(i),
+                          v_user, v_host;
+            exception
+                when others then handleErr(sqlcode, sqlerrm, 'flushBatch/MON');
+            end;
+            v_key := g_mon_batches.NEXT(v_key);
+        end loop;
+
+        -- Prozess-Datensätze (_PROC)
+        v_key := g_proc_batches.FIRST;
+        while v_key is not null loop
+            begin
+                v_stmt := '
+                update ' || C_PARAM_MASTER_TABLE || '
+                set status           = :1,
+                    last_update      = current_timestamp,
+                    process_end      = :2,
+                    steps_todo       = :3,
+                    steps_done       = :4,
+                    info             = :5,
+                    process_immortal = :6
+                where id = :7';
+                v_stmt := replaceNameTable(v_stmt, C_PARAM_MASTER_TABLE, C_SUFFIX_PROC_TABLE, v_key);
+                forall i in 1 .. g_proc_batches(v_key).ids.COUNT
+                    execute immediate v_stmt
+                    USING g_proc_batches(v_key).status(i), g_proc_batches(v_key).procEnd(i), g_proc_batches(v_key).stepsTodo(i),
+                          g_proc_batches(v_key).stepsDone(i), g_proc_batches(v_key).info(i), g_proc_batches(v_key).immortal(i),
+                          g_proc_batches(v_key).ids(i);
+            exception
+                when others then handleErr(sqlcode, sqlerrm, 'flushBatch/PROC');
+            end;
+            v_key := g_proc_batches.NEXT(v_key);
+        end loop;
+
+        commit;
+        g_log_batches.DELETE;
+        g_mon_batches.DELETE;
+        g_proc_batches.DELETE;
+
+    exception
+        when others then
+            rollback;
+            g_log_batches.DELETE;
+            g_mon_batches.DELETE;
+            g_proc_batches.DELETE;
+            logLilamErr(sqlCode, sqlErrM, 'flushBatch');
+    end;
+
+    -------------------------------------------------------------------
+    -- Ends an earlier started logging session by the process ID.
+    -- Important! Ignores if the process doesn't exist! No exception is thrown!
+    procedure persist_close_session(p_processId number, p_tableName varchar2, p_procStepsToDo number, p_procStepsDone number, p_processInfo varchar2, p_status PLS_INTEGER)
+    as
+        pragma autonomous_transaction;
+        sqlStatement varchar2(1000);
+        sqlCursor number := null;
+        updateCount number;
+    begin
+        sqlStatement := '
+        update ' || C_PARAM_MASTER_TABLE || '
+        set process_end = systimestamp,
+            last_update = systimestamp';
+
+        if p_procStepsDone is not null then
+            sqlStatement := sqlStatement || ', steps_done = :PH_steps_done';
+        end if ;
+        if p_procStepsToDo is not null then
+            sqlStatement := sqlStatement || ', steps_todo = :PH_STEPS_TO_DO';
+        end if ;
+        if p_processInfo is not null then
+            sqlStatement := sqlStatement || ', info = :PH_PROCESS_INFO';
+        end if ;     
+        if p_status is not null then
+            sqlStatement := sqlStatement || ', status = :PH_STATUS';
+        end if ;     
+
+        sqlStatement := sqlStatement || ' where id = :PH_PROCESS_ID'; 
+        sqlStatement := replaceNameTable(sqlStatement, C_PARAM_MASTER_TABLE, C_SUFFIX_PROC_TABLE, p_tableName);
+
+        -- due to the variable number of parameters using dbms_sql
+        sqlCursor := DBMS_SQL.OPEN_CURSOR;
+        DBMS_SQL.PARSE(sqlCursor, sqlStatement, DBMS_SQL.NATIVE);
+        DBMS_SQL.BIND_VARIABLE(sqlCursor, ':PH_PROCESS_ID', p_processId);
+
+        if p_procStepsDone is not null then
+            DBMS_SQL.BIND_VARIABLE(sqlCursor, ':PH_steps_done', p_procStepsDone);
+        end if ;
+        if p_procStepsToDo is not null then
+            DBMS_SQL.BIND_VARIABLE(sqlCursor, ':PH_STEPS_TO_DO', p_procStepsToDo);
+        end if ;
+        if p_processInfo is not null then
+            DBMS_SQL.BIND_VARIABLE(sqlCursor, ':PH_PROCESS_INFO', p_processInfo);
+        end if ;     
+        if p_status is not null then
+            DBMS_SQL.BIND_VARIABLE(sqlCursor, ':PH_STATUS', p_status);
+        end if ;     
+
+        updateCount := DBMS_SQL.EXECUTE(sqlCursor);
+        DBMS_SQL.CLOSE_CURSOR(sqlCursor);
+
+        commit;
+
+    EXCEPTION
+        WHEN OTHERS THEN
+            logLilamErr(sqlCode, sqlErrM, 'persist_close_session');
+            begin
+                if DBMS_SQL.IS_OPEN(sqlCursor) THEN
+                    DBMS_SQL.CLOSE_CURSOR(sqlCursor);
+                end if ;
+            exception
+                when others then
+                sqlCursor := null;
+            end;
+            rollback;
+            if should_raise_error(p_processId) then
+                error(p_processId, 'Could not persist process data while closing session: ' || sqlErrM);
+            end if ;
+    END;
+
+    --------------------------------------------------------------------------
+
+    procedure persist_new_session(p_processId NUMBER, p_processName VARCHAR2, p_logLevel PLS_INTEGER, p_procStepsToDo PLS_INTEGER, p_daysToKeep PLS_INTEGER, p_procImmortal PLS_INTEGER, p_tabNameMaster VARCHAR2, p_scopeName VARCHAR2)
+    as
+        pragma autonomous_transaction;
+        sqlStatement varchar2(2000);
+    begin
+        sqlStatement := '
+        insert into ' || C_PARAM_MASTER_TABLE || ' (
+            id,
+            process_name,
+            process_start,
+            last_update,
+            process_end,
+            steps_todo,
+            steps_done,
+            status,
+            log_level,
+            info,
+            process_immortal,
+            server_pipe,
+            tab_name_master,
+            scope_name
+        )
+        values (
+            :PH_PROCESS_ID, 
+            :PH_PROCESS_NAME, 
+            current_timestamp,
+            current_timestamp,
+            null,
+            :PH_STEPS_TO_DO, 
+            null,
+            null,
+            :PH_LOG_LEVEL,
+            ''START'',
+            :PH_IMMORTAL,
+            :PH_PIPE,
+            :PH_TABNAME_MASTER,
+            :PH_SCOPE_NAME
+        )';
+        sqlStatement := replaceNameTable(sqlStatement, C_PARAM_MASTER_TABLE, C_SUFFIX_PROC_TABLE, p_TabNameMaster);
+        execute immediate sqlStatement USING p_processId, p_processName, p_procStepsToDo, p_logLevel, p_procImmortal, g_serverPipeName, upper(p_tabNameMaster), p_scopeName;     
+        commit;
+
+    exception
+        when others then
+            rollback; -- Auch im Fehlerfall die Transaktion beenden
+            -- Tabelle fehlt: beim naechsten NEW_SESSION erneut pruefen und anlegen
+            if sqlcode = -942 then g_checked_masters.DELETE; g_safe_tables.DELETE; end if;
+            logLilamErr(sqlCode, sqlErrM, 'persist_new_session'); 
+            
+    end;
+
+    --------------------------------------------------------------------------
+
+    procedure sync_process(p_processId number, p_force boolean default false)
+    as
+        v_idx            PLS_INTEGER;
+        v_now            constant timestamp := systimestamp;
+        v_ms_since_flush number;
+    begin
+        -- 1. Sicherstellen, dass die Session im Server/Standalone bekannt ist
+        if not v_indexSession.EXISTS(p_processId) then
+            return;
+        end if ;
+
+        v_idx := v_indexSession(p_processId);
+
+        -- 2. Zeit seit dem letzten Master-Update berechnen
+        if g_sessionList(v_idx).last_process_flush is null then
+            v_ms_since_flush := C_FLUSH_MILLIS_THRESHOLD_MS + 1;
+        else
+            v_ms_since_flush := get_ms_diff(g_sessionList(v_idx).last_process_flush, v_now);
+        end if ;
+
+        -- 3. Die "Smarte" Flush-Bedingung
+        -- Wir flushen nur, wenn FORCE (z.B. Session-Ende), der Zeit-Threshold erreicht ist
+        -- ODER wenn dieser spezifische Prozess als "dirty" markiert wurde.
+        if p_force 
+           or (g_sessionList(v_idx).process_is_dirty AND v_ms_since_flush >= C_FLUSH_MILLIS_THRESHOLD_MS)
+           or (p_force = false AND v_ms_since_flush >= (C_FLUSH_MILLIS_THRESHOLD_MS * 10)) -- Safety Sync
+        then
+            -- Nur schreiben, wenn es auch wirklich Änderungen im Cache gibt
+            if g_process_cache.EXISTS(p_processId) then
+                persist_process_record(g_process_cache(p_processId));            
+
+                -- Reset der prozessspezifischen Steuerungsdaten
+                g_sessionList(v_idx).process_is_dirty   := FALSE;
+                g_sessionList(v_idx).last_process_flush := v_now;
+            end if ;
+        end if ;
+
+    exception
+        when others then
+            logLilamErr(sqlCode, sqlErrM, 'sync_process'); 
+            if should_raise_error(p_processId) then
+                error(p_processId, 'Could not synchronize process data: ' || sqlErrM);
+            end if ;
+    end;    
+
+    ---
+
+    procedure checkLogsBuffer(p_processId number, p_comment varchar2)
+    as
+        v_idx            pls_integer;
+    begin
+        if not v_indexSession.EXISTS(p_processId) then
+            return;
+        end if ;
+        v_idx := v_indexSession(p_processId);
+        DEBUG(g_serverProcessId, 'Check SESSION_CLOSE (' || p_comment || ') für processId ' || g_sessionList(v_idx).process_id || '. log_dirty_count = ' || g_sessionList(v_idx).log_dirty_count);
+    end;
+
+    --------------------------------------------------------------------------
+
+    /*
+        Public functions and procedures
+    */
+    procedure sync_log(p_processId number, p_force boolean default false)
+    is
+        v_idx            pls_integer;
+        v_now            constant timestamp := systimestamp;
+        v_ms_since_flush number;
+    begin
+        -- 1. Index der Session holen
+        if not v_indexSession.EXISTS(p_processId) then
+            return;
+        end if ;
+        v_idx := v_indexSession(p_processId);
+        g_sessionList(v_idx).log_dirty_count := coalesce(g_sessionList(v_idx).log_dirty_count, 0) + 1;
+        g_dirty_queue(p_processId) := TRUE;
+
+        -- (get_ms_diff ist Ihre optimierte Funktion)
+        if g_sessionList(v_idx).last_log_flush is null then
+            v_ms_since_flush := C_FLUSH_MILLIS_THRESHOLD_MS + 1;
+        else
+            v_ms_since_flush := get_ms_diff(g_sessionList(v_idx).last_log_flush, v_now);
+        end if ;
+        -- 4. Flush-Bedingung: Menge ODER Zeit ODER Force
+        if p_force 
+           or g_sessionList(v_idx).log_dirty_count >= C_FLUSH_LOG_THRESHOLD_NO 
+           or v_ms_since_flush >= C_FLUSH_MILLIS_THRESHOLD_MS
+        then            
+            -- Alle gepufferten Logs dieses Prozesses in die DB schreiben
+            flushLogs(p_processId);
+            g_firstLogTimeStamp := null;
+
+            -- Steuerungsdaten für diesen Prozess zurücksetzen
+            g_sessionList(v_idx).log_dirty_count := 0;
+            g_sessionList(v_idx).last_log_flush  := v_now;
+        end if ;
+
+    exception
+        when others then
+            logLilamErr(sqlCode, sqlErrM, 'sync_log'); 
+
+    end;
+
+    --------------------------------------------------------------------------
+
+    procedure close_sessionRemote(p_processId number, p_procStepsToDo PLS_INTEGER, p_procStepsDone PLS_INTEGER, p_processInfo varchar2, p_processStatus PLS_INTEGER)
+    as
+        l_payload JSON_OBJ_LILAM; -- Puffer für den JSON-String
+        l_serverMsg varchar2(100);
+        l_response  varchar2(1000);
+    begin
+        -- Erzeugung des JSON-Objekts
+        -- PERFORMANCE: Nachricht direkt verketten statt über jsonPut (siehe jStr/jNum/jTs)
+        l_payload := '{"process_id":' || jNum(p_processId)
+                  || jNum('steps_todo',     p_procStepsToDo)
+                  || jNum('steps_done',     p_procStepsDone)
+                  || jStr('process_info',   p_processInfo)
+                  || jNum('process_status', p_processStatus) || '}';
+
+        l_response := waitForResponse(p_processId, 'CLOSE_SESSION', l_payload, 1);
+
+        if l_response in ('TIMEOUT', 'THROTTLED') or
+           l_response like 'ERROR%' then
+           l_serverMsg := 'close_sessionRemote: ' || l_response;
+        else
+            l_serverMsg := jsonString(l_response, 'payload.server_message');
+        end if ;        
+
+    EXCEPTION
+        WHEN OTHERS THEN
+            logLilamErr(sqlCode, sqlErrM, 'close_sessionRemote'); 
+
+    end;
+
+    --------------------------------------------------------------------------
+
+    procedure procStepDoneRemote(p_processId number, p_timestamp TIMESTAMP)
+    as
+        l_payload JSON_OBJ_LILAM; -- Puffer für den JSON-String
+        l_serverMsg varchar2(100);
+    begin
+        -- Erzeugung des JSON-Objekts
+        -- PERFORMANCE: Nachricht direkt verketten statt über jsonPut (siehe jStr/jNum/jTs)
+        l_payload := '{"process_id":' || jNum(p_processId)
+                  || jTs('timestamp', p_timestamp) || '}';
+
+        sendNoWait(p_processId, 'PROC_STEP_DONE', l_payload, 0.5);
+    end;
+    --------------------------------------------------------------------------
+
+    procedure setAnyStatusRemote(p_processId number, p_status pls_integer, p_processInfo varchar2, p_procStepsToDo pls_integer, p_procStepsDone pls_integer, p_immortal pls_integer, p_timestamp TIMESTAMP)
+    as
+        l_payload JSON_OBJ_LILAM; -- Puffer für den JSON-String
+    begin
+        -- PERFORMANCE: Nachricht direkt verketten statt über jsonPut (siehe jStr/jNum/jTs)
+        l_payload := '{"process_id":' || jNum(p_processId)
+                  || jNum('steps_todo',       p_procStepsToDo)
+                  || jNum('steps_done',       p_procStepsDone)
+                  || jStr('process_info',     p_processInfo)
+                  || jNum('process_status',   p_status)
+                  || jNum('process_immortal', p_immortal)
+                  || jTs ('timestamp',        p_timestamp) || '}';
+
+        sendNoWait(p_processId, 'SET_ANY_STATUS', l_payload, 0.5);
+    end;
+
+    --------------------------------------------------------------------------
+
+    procedure log_anyRemote(p_processId number, p_level number, p_logText varchar2, p_caller varchar2, p_errStack varchar2, p_errBacktrace varchar2, p_errCallstack varchar2, p_timestamp TIMESTAMP)
+    as
+        l_payload JSON_OBJ_LILAM; -- Puffer für den JSON-String
+    begin
+        -- PERFORMANCE: Nachricht direkt verketten statt über jsonPut (siehe jStr/jNum/jTs)
+        l_payload := '{"process_id":' || jNum(p_processId)
+                  || jNum('level',         p_level)
+                  || jStr('log_text',      p_logText)
+                  || jStr('caller',        p_caller)
+                  || jStr('err_stack',     p_errStack)
+                  || jStr('err_backtr',    p_errBacktrace)
+                  || jStr('err_callstack', p_errCallstack)
+                  || jTs ('timestamp',     p_timestamp) || '}';
+
+        sendNoWait(p_processId, 'LOG_ANY', l_payload, 0.5);
+
+    EXCEPTION
+        WHEN OTHERS THEN
+            logLilamErr(sqlCode, sqlErrM, 'log_anyRemote'); 
+
+    end;
+
+    --------------------------------------------------------------------------
+
+    -- capsulation writing to log-buffer and synchronization of buffer
+    procedure log_any(
+        p_processId number, 
+        p_level number,
+        p_logText varchar2,
+        p_caller varchar2,
+        p_errStack varchar2,
+        p_errBacktrace varchar2,
+        p_errCallstack varchar2,
+        p_timestamp TIMESTAMP DEFAULT sysdate
+    )
+    as
+        l_packageName VARCHAR2(128);
+        l_aimDepth    PLS_INTEGER := NULL;
+        l_maxDepth    PLS_INTEGER;
+        l_module      VARCHAR2(255) := p_caller;
+        v_dummyMonRec   t_monitor_buffer_rec;
+        v_stack_unit  UTL_CALL_STACK.unit_qualified_name;        
+        l_logText     VARCHAR2(8000);
+    begin
+        -- Pauschal kürzen: gilt für Insession und Decoupled (vor dem Versand über die Pipe).
+        -- Zusätzlich auf die 2000 Bytes der Spalte INFO begrenzen (Mehrbyte-Zeichen, z.B. Umlaute)
+        l_logText := substr(p_logText, 1, C_MAX_LOG_TEXT_LEN);
+        while lengthb(l_logText) > 2000 loop
+            l_logText := substr(l_logText, 1, length(l_logText) - 50);
+        end loop;
+
+        -- lookup in stack - who called me?
+        if l_module is null then
+            -- Name von LILAM könnte sich theoretisch ändern
+            l_packageName := $$PLSQL_UNIT; 
+            
+            -- Maximale Tiefe des aktuellen Aufrufs ermitteln
+            l_maxDepth := UTL_CALL_STACK.dynamic_depth;
+            -- looks for first unit with other name
+            -- Loops starts with 3 due to performance
+            FOR i IN 3 .. l_maxDepth LOOP
+                v_stack_unit := UTL_CALL_STACK.subprogram(i);
+                IF upper(v_stack_unit(1)) != upper(l_packageName) and upper(v_stack_unit(1)) != '__ANONYMOUS_BLOCK' THEN
+                    l_aimDepth := i;
+                    EXIT;
+                END IF;
+            END LOOP;
+            
+            if l_aimDepth IS NOT NULL then    
+               -- Auslesen des vollqualifizierten Namens des echten Aufrufers
+               l_module := UTL_CALL_STACK.concatenate_subprogram (
+                              UTL_CALL_STACK.subprogram(l_aimDepth)
+                          );
+            else
+                l_module := 'EXTERNAL_CLIENT (' || SYS_CONTEXT('USERENV', 'CLIENT_PROGRAM_NAME') || ')';
+            end if;
+        
+        end if;
+            
+        if is_remote(p_processId) then
+            log_anyRemote(p_processId, p_level, l_logText, l_module, p_errStack, p_errBacktrace, p_errCallstack, p_timestamp);
+            return;
+        end if ;
+
+        -- Hier nur weiter, wenn nicht remote
+        if v_indexSession.EXISTS(p_processId) and p_level <= g_sessionList(v_indexSession(p_processId)).log_level then
+            write_to_log_buffer(
+                p_processId, 
+                p_level,
+                l_logText,
+                p_timestamp,
+                l_module,
+                p_errStack,
+                p_errBacktrace,
+                p_errCallstack
+            );
+        end if ;
+        
+        -- raise alert
+        v_dummyMonRec.process_id := p_processId;
+        v_dummyMonRec.start_time := coalesce(p_timestamp, systimestamp);
+        v_dummyMonRec.stop_time := null;
+        v_dummyMonRec.monitor_type := C_MON_TYPE_LOG;
+        v_dummyMonRec.action_name := 'LOGGING';
+        v_dummyMonRec.context_name := logLevelToEnum(p_level);
+        evaluateRules(v_dummyMonRec, C_LOGGING);
+
+        -- Wenn harte Fehler, muss das Logfile geschrieben werden
+        if p_level = logLevelError then
+            SYNC_ALL_DIRTY(true);
+        else
+            SYNC_ALL_DIRTY();
+        end if;
+
+    exception
+        when others then
+        logLilamErr(sqlCode, sqlErrM, 'log_any'); 
+    end;
+
+    --------------------------------------------------------------------------
+
+    /*
+        Public functions and procedures
+    */
+
+    -- Used by external Procedure to write a new log entry with log level DEBUG
+    -- Details are adjusted to the debug level
+    procedure DEBUG(p_processId number, p_logText varchar2)
+    as
+    begin
+        log_any(
+                p_processId, 
+                logLevelDebug,
+                p_logText,
+                null,
+                null,
+                null,
+                DBMS_UTILITY.FORMAT_CALL_STACK,
+                systimestamp
+            );
+    end;
+
+    --------------------------------------------------------------------------
+
+    -- Used by external Procedure to write a new log entry with log level INFO
+    -- Details are adjusted to the info level
+    procedure INFO(p_processId number, p_logText varchar2)
+    as
+    begin
+        log_any(
+            p_processId, 
+            logLevelInfo,
+            p_logText,
+            null,
+            null,
+            null,
+            null,
+            systimestamp
+        );
+    end;
+
+    --------------------------------------------------------------------------
+
+    -- Used by external Procedure to write a new log entry with log level ERROR
+    -- Details are adjusted to the error level
+    procedure ERROR(p_processId number, p_logText varchar2)
+    as
+    begin
+        g_counterError := g_counterError + 1;
+        log_any(
+            p_processId, 
+            logLevelError,
+            p_logText,
+            null,
+            DBMS_UTILITY.FORMAT_ERROR_STACK,
+            DBMS_UTILITY.FORMAT_ERROR_BACKTRACE,
+            DBMS_UTILITY.FORMAT_CALL_STACK,
+            SYSTIMESTAMP
+        );
+    end;
+
+    --------------------------------------------------------------------------
+
+    FUNCTION GET_COUNTER_WARN(p_processId NUMBER) return PLS_INTEGER
+    as
+    begin
+        return g_counterWarning;
+    end;
+    
+    --------------------------------------------------------------------------
+    
+    FUNCTION GET_COUNTER_ERROR(p_processId NUMBER) return PLS_INTEGER
+    as
+    begin
+        return g_counterError;
+    end;
+    
+    --------------------------------------------------------------------------
+
+    -- Used by external Procedure to write a new log entry with log level WARN
+    -- Details are adjusted to the warn level
+    procedure WARN(p_processId number, p_logText varchar2)
+    as
+    begin
+        g_counterWarning := g_counterWarning + 1;
+        log_any(
+            p_processId, 
+            logLevelWarn,
+            p_logText,
+            null,
+            DBMS_UTILITY.FORMAT_ERROR_STACK,
+            DBMS_UTILITY.FORMAT_ERROR_BACKTRACE,
+            DBMS_UTILITY.FORMAT_CALL_STACK,
+            SYSTIMESTAMP
+        );
+    end;
+
+    --------------------------------------------------------------------------
+
+    procedure setAnyStatus(p_processId number, p_status PLS_INTEGER, p_processInfo varchar2, p_procStepsToDo number, p_procStepsDone number, p_procImmortal PLS_INTEGER, p_timestamp TIMESTAMP)
+    as
+    begin
+
+        if is_remote(p_processId) then
+            setAnyStatusRemote(p_processId, p_status, p_processInfo, p_procStepsToDo, p_procStepsDone, p_procImmortal, p_timestamp);
+            return;
+        end if ;
+
+       if v_indexSession.EXISTS(p_processId) then
+            if p_status         is not null then g_process_cache(p_processId).status := p_status; end if ;
+            if p_processInfo    is not null then g_process_cache(p_processId).info := p_processInfo; end if ;
+            if p_procStepsToDo  is not null then g_process_cache(p_processId).stepsTodo := p_procStepsToDo; end if ;
+            if p_procStepsDone  is not null then g_process_cache(p_processId).stepsDone := p_procStepsDone; end if ;
+            if p_procImmortal   is not null then g_process_cache(p_processId).procImmortal := p_procImmortal; end if;
+
+            g_sessionList(v_indexSession(p_processId)).process_is_dirty := TRUE;
+            g_dirty_queue(p_processId) := TRUE; -- Damit SYNC_ALL_DIRTY die Session sieht
+
+            evaluateRules(g_process_cache(p_processId), C_PROCESS_UPDATE);                
+        end if ;
+
+    exception
+        when others then
+            logLilamErr(sqlCode, sqlErrM, 'setAnyStatus'); 
+            if should_raise_error(p_processId) then
+                error(p_processId, 'Could not set process status: ' || sqlErrM);
+            end if ;
+    end;
+
+    --------------------------------------------------------------------------
+
+    procedure SET_PROCESS_STATUS(p_processId number, p_status PLS_INTEGER, p_processInfo varchar2 DEFAULT NULL)
+    as
+    begin
+        setAnyStatus(p_processId, p_status, p_processInfo, null, null, null, SYSTIMESTAMP);
+    end;
+
+    --------------------------------------------------------------------------
+
+     procedure SET_PROC_STEPS_TODO(p_processId number, p_procStepsToDo number)
+     as
+     begin
+        setAnyStatus(p_processId, null, null, p_procStepsToDo, null, null, SYSTIMESTAMP);
+     end;
+
+    --------------------------------------------------------------------------
+
+    procedure SET_PROC_STEPS_DONE(p_processId number, p_procStepsDone number)
+    as
+    begin
+        setAnyStatus(p_processId, null, null, null, p_procStepsDone, null, SYSTIMESTAMP);   
+    end;
+
+    procedure SET_PROC_IMMORTAL(p_processId number, p_immortal number)
+    as
+    begin
+        setAnyStatus(p_processId, null, null, null, null, p_immortal, SYSTIMESTAMP);
+    end;
+
+    --------------------------------------------------------------------------
+
+    procedure PROC_STEP_DONE(p_processId number)
+    as
+        sqlStatement varchar2(500);
+        l_steps number;
+    begin
+        if is_remote(p_processId) then
+            procStepDoneRemote(p_processId, sysdate);
+            return;
+        end if ;
+
+       if v_indexSession.EXISTS(p_processId) then
+            l_steps := coalesce(g_process_cache(p_processId).stepsDone, 0) +1;                
+            setAnyStatus(p_processId, null, null, null, l_steps, null, sysdate);   
+        end if;
+    end;
+
+    --------------------------------------------------------------------------
+
+    function getProcessDataRemote(p_processId number) return t_process_rec
+    as
+        l_payload JSON_OBJ_LILAM; -- Puffer für den JSON-String
+        l_response varchar2(20000);
+        l_process_rec t_process_rec;
+    begin
+        -- Erzeugung des JSON-Objekts
+        select json_object(
+            'process_id'   value p_processId
+            returning varchar2
+        )
+        into l_payload from dual;            
+        l_response := waitForResponse(p_processId, 'GET_PROCESS_DATA', l_payload, 5);
+
+        if l_response in ('TIMEOUT', 'THROTTLED') or
+            l_response like 'ERROR%' then
+            return NULL;
+        else                
+            l_payload := JSON_QUERY(l_response, '$.payload');
+            l_process_rec.id                := jsonString(l_payload, 'process_id');
+            l_process_rec.processName      := jsonString(l_payload, 'process_name');
+            l_process_rec.logLevel         := jsonNumber(l_payload, 'log_level');
+            l_process_rec.processStart     := jsonTime(l_payload, 'process_start');
+            l_process_rec.processEnd       := jsonTime(l_payload, 'process_end');
+            l_process_rec.lastUpdate       := jsonTime(l_payload, 'last_update');
+            l_process_rec.info              := jsonString(l_payload, 'process_info');
+            l_process_rec.status            := jsonNumber(l_payload, 'process_status');
+            l_process_rec.stepsTodo   := jsonNumber(l_payload, 'steps_todo');
+            l_process_rec.stepsDone   := jsonNumber(l_payload, 'steps_done');
+            l_process_rec.tabNameMaster   := jsonString(l_payload, 'tabname_master');            
+        end if ; 
+
+        return l_process_rec;
+    end;
+
+    --------------------------------------------------------------------------
+
+    FUNCTION GET_PROCESS_DATA_JSON(p_processId NUMBER) return varchar2
+    as
+        l_payload       JSON_OBJ_LILAM;
+        l_process_rec   t_process_rec;    
+    begin   
+        l_process_rec := GET_PROCESS_DATA(p_processId); 
+        jsonPut(l_payload, 'process_id', l_process_rec.id);
+        jsonPut(l_payload, 'process_name', l_process_rec.processName);
+        jsonPut(l_payload, 'log_level', l_process_rec.logLevel);
+        jsonPut(l_payload, 'process_start', l_process_rec.processStart);
+        jsonPut(l_payload, 'process_end', l_process_rec.processEnd);
+        jsonPut(l_payload, 'last_update', l_process_rec.lastUpdate);
+        jsonPut(l_payload, 'process_info', l_process_rec.info); 
+        jsonPut(l_payload, 'process_status', l_process_rec.status); 
+        jsonPut(l_payload, 'steps_todo', l_process_rec.stepsTodo); 
+        jsonPut(l_payload, 'steps_done', l_process_rec.stepsDone); 
+        jsonPut(l_payload, 'tabname_master', l_process_rec.tabNameMaster);
+        
+        return l_payload;   
+    end;
+
+    --------------------------------------------------------------------------
+
+    FUNCTION GET_PROCESS_DATA(p_processId NUMBER) return t_process_rec
+    as
+        l_proc_rec t_process_rec;
+    begin
+        if is_remote(p_processId) then
+            return getProcessDataRemote(p_processId);
+        end if ;
+
+        if v_indexSession.EXISTS(p_processId) then
+            return g_process_cache(p_processId);
+        else return null;
+        end if ;
+    end;
+
+    --------------------------------------------------------------------------
+
+    FUNCTION GET_PROC_STEPS_DONE(p_processId NUMBER) return PLS_INTEGER
+    as
+    begin
+        return get_process_data(p_processId).stepsDone;
+    end;
+
+    --------------------------------------------------------------------------
+
+    FUNCTION GET_PROC_STEPS_TODO(p_processId NUMBER) return PLS_INTEGER
+    as
+    begin
+        return get_process_data(p_processId).stepsTodo;
+    end;
+
+    --------------------------------------------------------------------------
+
+    function GET_PROCESS_START(p_processId NUMBER) return timestamp
+    as
+    begin
+        return get_process_data(p_processId).processStart;
+    end;
+
+    --------------------------------------------------------------------------
+
+    function GET_PROCESS_END(p_processId NUMBER) return timestamp
+    as
+    begin
+        return get_process_data(p_processId).processEnd;
+    end;
+
+    --------------------------------------------------------------------------
+
+    function GET_PROCESS_STATUS(p_processId number) return PLS_INTEGER
+    as 
+    begin
+        return get_process_data(p_processId).status;
+    end;
+
+    --------------------------------------------------------------------------
+
+    function GET_PROCESS_INFO(p_processId number) return varchar2
+    as 
+    begin
+        return get_process_data(p_processId).info;
+    end;
+
+    --------------------------------------------------------------------------
+
+    procedure clearServerData
+    as
+    begin
+        -- offene Baseline-Deltas sichern (eigene Fehlerbehandlung)
+        syncBaselines(TRUE);
+        g_baselines.DELETE;
+        g_scope_ids.DELETE;
+        g_checked_masters.DELETE;
+        g_safe_tables.DELETE;
+        g_last_baseline_sync := NULL;
+
+        g_monitor_groups.delete;
+        g_log_groups.delete;
+        g_dirty_queue.delete;
+        v_indexSession.delete;
+        if not g_sessionList is null then
+            g_sessionList.delete;
+        end if;
+        g_remote_sessions.DELETE;
+        g_process_cache.DELETE;
+        g_monitor_shadows.DELETE;
+        g_local_throttle_cache.DELETE;    
+        g_alert_history.DELETE;
+        g_rules_by_context.DELETE;
+        g_rules_by_action.DELETE;
+        
+    exception
+        when others then
+        logLilamErr(sqlCode, sqlErrM, 'clearServerData', 'deletion of memory data'); 
+        
+    end;
+
+    --------------------------------------------------------------------------
+
+    PROCEDURE clearAllSessionData(p_processId NUMBER) 
+    IS
+        v_idx           PLS_INTEGER;
+        v_search_prefix CONSTANT VARCHAR2(50) := LPAD(p_processId, 20, '0') || '|';
+        v_key           VARCHAR2(250);
+        v_next_key      VARCHAR2(250);
+        v_msg           VARCHAR2(500);
+    BEGIN
+
+        -- A) MONITOR-DATEN & CACHES RÄUMEN
+        -- Wir nutzen den sicheren Loop (Sichern vor Löschen)
+        -- PERFORMANCE: direkt beim ersten Schlüssel dieses Prozesses einsteigen (Schlüssel sind sortiert)
+        v_key := g_monitor_groups.NEXT(v_search_prefix);
+        WHILE v_key IS NOT NULL LOOP
+            EXIT WHEN SUBSTR(v_key, 1, LENGTH(v_search_prefix)) != v_search_prefix;
+            v_next_key := g_monitor_groups.NEXT(v_key);
+            -- Historie löschen
+            g_monitor_groups.DELETE(v_key);
+            v_key := v_next_key;
+        END LOOP;
+
+        -- B) LOG-GRUPPEN RÄUMEN
+        -- Da g_log_groups ebenfalls mit der ID als Key (String) arbeitet:
+        if g_log_groups.EXISTS(TO_CHAR(p_processId)) THEN
+            g_log_groups.DELETE(TO_CHAR(p_processId));
+        end if;
+
+        -- C) DIRTY QUEUE RÄUMEN
+        if g_dirty_queue.EXISTS(p_processId) THEN
+            g_dirty_queue.DELETE(p_processId);
+        end if;
+
+        -- D) SESSION-METADATEN (MASTER-LISTE) RÄUMEN
+        if v_indexSession.EXISTS(p_processId) THEN
+            v_idx := v_indexSession(p_processId);
+            g_sessionList.DELETE(v_idx);     -- Eintrag in der Nested Table (Slot wird leer)
+            v_indexSession.DELETE(p_processId); -- Wegweiser löschen
+        end if;
+
+        -- E) PROZESS CACHE RÄUMEN
+        if g_process_cache.EXISTS(p_processId) THEN
+            g_process_cache.DELETE(p_processId);
+        end if ;
+
+        -- F) Monitor Shadows löschen
+            -- Wir starten am Anfang der Schatten-Map
+        v_key := g_monitor_shadows.FIRST;   
+        WHILE v_key IS NOT NULL LOOP
+            EXIT WHEN SUBSTR(v_key, 1, 20) > LPAD(p_processId, 20, '0');
+            if v_key LIKE v_search_prefix || '%' THEN
+                g_monitor_shadows.DELETE(v_key);
+                -- Optional: DBMS_OUTPUT.PUT_LINE('Shadow gelöscht für: ' || v_key);
+            end if ;            
+            -- Zum nächsten Key springen
+            v_key := g_monitor_shadows.NEXT(v_key);
+        END LOOP;
+
+        -- G) Durchschnittswerte löschen
+        v_key := g_monitor_averages.FIRST;
+        WHILE v_key IS NOT NULL LOOP
+            EXIT WHEN SUBSTR(v_key, 1, 20) > LPAD(p_processId, 20, '0');
+            if v_key LIKE v_search_prefix || '%' THEN
+                g_monitor_averages.DELETE(v_key);
+            end if ;            
+            v_key := g_monitor_averages.NEXT(v_key);
+        END LOOP;
+
+        -- Offene Traces (Shadows) prüfen, bevor sie gelöscht werden
+        -- Wenn offen, wird eine Warnung gelogged
+        v_key := g_monitor_shadows.FIRST;
+        WHILE v_key IS NOT NULL LOOP
+            EXIT WHEN SUBSTR(v_key, 1, 20) > LPAD(p_processId, 20, '0');
+
+            IF SUBSTR(v_key, 1, 21) = v_search_prefix THEN
+                -- HIER: Alert-Logik einbauen
+                v_msg := 'OPEN TRACE ALERT (Trace purged): Process_ID=>' || p_processId || '; Action=>' || g_monitor_shadows(v_key).action_name ||
+                '; Context=>' || g_monitor_shadows(v_key).context_name || '; Start=>' || g_monitor_shadows(v_key).start_time;                     
+                -- Log to Buffer
+                write_to_log_buffer(
+                    p_processId, 
+                    logLevelWarn,
+                    v_msg,
+                    systimestamp,
+                    'INTERNAL',
+                    null,
+                    null,
+                    null
+                );
+
+                g_monitor_shadows.DELETE(v_key);
+            END IF;
+            v_key := g_monitor_shadows.NEXT(v_key);
+        END LOOP;
+
+        -- H) Die Liste der aktiven Server zurücksetzen
+        g_client_pipes.DELETE(p_processId);
+
+        -- I) Speicher von gesendeten Nachrichten und vergangener Zeit für diesen Prozess
+        g_local_throttle_cache.DELETE(p_processId);
+
+        -- J) Abgelegte Vorgänger-Aktionen löschen
+            IF g_last_action_per_process.EXISTS(p_processId) THEN
+                g_last_action_per_process.DELETE(p_processId);
+            END IF;
+
+    EXCEPTION
+        WHEN OTHERS THEN
+        logLilamErr(sqlCode, sqlErrM, 'clearAllSessionData'); 
+
+    END;
+
+    --------------------------------------------------------------------------
+
+    -- Ends an earlier started logging session by the process ID.
+    -- Important! Ignores if the process doesn't exist! No exception is thrown!
+    procedure CLOSE_SESSION(
+        p_processId     NUMBER,
+        p_processInfo   VARCHAR2    DEFAULT NULL,
+        p_processStatus PLS_INTEGER DEFAULT NULL,
+        p_procStepsDone PLS_INTEGER DEFAULT NULL,
+        p_procStepsToDo PLS_INTEGER DEFAULT NULL)
+    as
+        v_idx PLS_INTEGER;
+    begin
+        if is_remote(p_processId) then
+            close_sessionRemote(p_processId, p_procStepsToDo, p_procStepsDone, p_processInfo, p_processStatus);
+            g_remote_sessions.delete(p_processId);
+            g_client_pipes.delete(p_processId);
+            g_local_throttle_cache.delete(p_processId);
+            return;
+        end if ;
+
+        -- Hier nur weiter, wenn lokale processId
+        if v_indexSession.EXISTS(p_processId) then
+            -- Nur die Puffer dieses Prozesses wegschreiben (nicht die aller offenen Prozesse)
+            sync_log(p_processId, true);
+            sync_monitor(p_processId, true);
+            sync_process(p_processId, true);
+            syncBaselines(true);
+
+            g_process_cache(p_processId).processEnd := systimestamp;
+
+            evaluateRules(g_process_cache(p_processId), C_PROCESS_STOP);
+
+            v_idx := v_indexSession(p_processId);
+            persist_close_session(p_processId,  g_sessionList(v_idx).tabName_master, p_procStepsToDo, p_procStepsDone, p_processInfo, p_processStatus);
+            checkLogsBuffer(p_processId, 'vor clearAllSessionData');
+            clearAllSessionData(p_processId);
+            checkLogsBuffer(p_processId, 'nach clearAllSessionData');
+
+        end if ;
+    end;
+    
+    --------------------------------------------------------------------------
+
+    FUNCTION NEW_SESSION(p_session_init t_session_init) RETURN NUMBER
+    as
+        p_processId number(19,0);   
+        v_new_rec t_process_rec;
+        l_session_init t_session_init := p_session_init;
+        l_scopeName VARCHAR2(100);
+        l_scopeId   NUMBER;
+    begin
+
+        -- leere Master-Tabelle (z.B. aus JSON ohne tabname_master) => Standard
+        l_session_init.tabNameMaster := nvl(trim(l_session_init.tabNameMaster), 'LILAM');
+        createLogTables(l_session_init.tabNameMaster);
+
+        -- New Process ID by Sequence
+        execute immediate 'select seq_lilam_log.nextVal from dual' into p_processId;
+        
+        -- default LogLevel logLevelMonitorr
+        if l_session_init.logLevel is null then l_session_init.logLevel := logLevelMonitor; end if;
+        
+        -- persist to session internal table
+        insertSession (l_session_init.tabNameMaster, p_processId, l_session_init.logLevel);
+        deleteOldLogs(p_processId, upper(trim(l_session_init.processName)), l_session_init.daysToKeep);
+
+        -- Baseline Scope (Default: Prozessname); bei Fehlern NULL => prozesslokal
+        l_scopeName := resolveScopeName(l_session_init.processName, l_session_init.baselineScope);
+        l_scopeId   := getOrCreateScopeId(l_scopeName);
+        setScopeId(p_processId, l_scopeId);
+        if l_scopeId is null then l_scopeName := null; end if;
+
+        persist_new_session(p_processId, l_session_init.processName, l_session_init.logLevel,  
+            l_session_init.stepsToDo, l_session_init.daysToKeep, l_session_init.procImmortal, l_session_init.tabNameMaster, l_scopeName);
+
+        -- copy new details data to memory
+        v_new_rec.id             := p_processId;
+        v_new_rec.tabNameMaster  := l_session_init.tabNameMaster;
+        v_new_rec.processName    := l_session_init.processName;
+        v_new_rec.processStart   := current_timestamp;
+        v_new_rec.processEnd     := null;
+        v_new_rec.lastUpdate     := null;
+        v_new_rec.stepsTodo      := l_session_init.stepsToDo;
+        v_new_rec.stepsDone      := 0;
+        v_new_rec.status         := 0;
+        v_new_rec.info           := 'START';
+
+        g_process_cache(p_processId) := v_new_rec;
+        evaluateRules(g_process_cache(p_processId), C_PROCESS_START);
+
+        return p_processId;
+    end;
+
+
+    -- Opens/starts a new logging session.
+    -- The returned process id must be stored within the calling procedure because it is the reference
+    -- which is recommended for all following actions (e.g. CLOSE_SESSION, DEBUG, SET_PROCESS_STATUS).
+    FUNCTION NEW_SESSION(
+        p_processName   VARCHAR2,
+        p_logLevel      PLS_INTEGER DEFAULT logLevelMonitor,
+        p_procStepsToDo PLS_INTEGER DEFAULT NULL,
+        p_daysToKeep    PLS_INTEGER DEFAULT NULL,
+        p_tabNameMaster VARCHAR2    DEFAULT 'LILAM',
+        p_baselineScope VARCHAR2    DEFAULT NULL) RETURN NUMBER
+    as
+        l_session_init t_session_init;
+    begin
+        l_session_init.processName   := p_processName;
+        l_session_init.logLevel      := p_logLevel;
+        l_session_init.stepsToDo     := p_procStepsToDo;
+        l_session_init.daysToKeep    := p_daysToKeep;
+        l_session_init.tabNameMaster := p_tabNameMaster;
+        l_session_init.baselineScope := p_baselineScope;
+        return new_session(l_session_init);
+    end;
+
+    --------------------------------------------------------------------------
+    
+    PROCEDURE SET_DISPATCHER_PIPE(p_pipeName varchar2, p_groupName varchar2 DEFAULT 'DEFAULT_DISPATCHER', p_processId number DEFAULT null)
+    AS
+        l_result number;
+    BEGIN
+        g_dispatcher_config(nvl(upper(p_groupName), 'DEFAULT_DISPATCHER')) := p_pipeName;
+    
+        -- Vorwärmen nur, wenn eine process_id mitgegeben wurde
+        if p_processId is not null then
+            l_result := SERVER_LINK(p_processId, p_pipeName);
+            -- bewusst kein Raise hier: SERVER_LINK (Function) fängt selbst alles ab
+            -- und loggt über logLilamErr; schlägt das Vorwärmen fehl, greift beim
+            -- nächsten echten API-Aufruf ohnehin der automatische Fallback in is_remote()
+        end if;
+    END;
+
+    --------------------------------------------------------------------------
+
+    function extractClientChannel(p_json_doc varchar2) return varchar2
+    as
+    begin
+        return JSON_VALUE(p_json_doc, '$.header.response');
+    end;        
+
+    --------------------------------------------------------------------------
+
+    function extractClientRequest(p_json_doc varchar2) return varchar2
+    as
+    begin
+        return JSON_VALUE(p_json_doc, '$.header.request');
+    end;
+
+    --------------------------------------------------------------------------
+
+    procedure doRemote_startTrace(p_message varchar2)
+    as
+        l_processId number;
+        l_actionName varchar2(100);
+        l_contextName varchar2(100);
+        l_timestamp timestamp;
+        l_monType pls_integer;
+        l_payload JSON_OBJ_LILAM;
+    begin
+        l_payload := JSON_QUERY(p_message, '$.payload');
+        l_processId := jsonNumber(l_payload, 'process_id');
+        l_actionName := jsonString(l_payload, 'action_name');
+        l_contextName := jsonString(l_payload, 'context_name');
+        l_timestamp := jsonTime(l_payload, 'timestamp');
+        l_monType := jsonNumber(l_payload, 'monitor_type');
+
+        startTrace(l_processId, l_actionName, l_contextName, l_timestamp);
+    end;
+
+    --------------------------------------------------------------------------
+
+    procedure doRemote_stopTrace(p_message varchar2)
+    as
+        l_processId number;
+        l_actionName varchar2(100);
+        l_contextName varchar2(100);
+        l_timestamp timestamp;
+        l_monType pls_integer;
+        l_payload JSON_OBJ_LILAM;
+    begin
+        l_payload := JSON_QUERY(p_message, '$.payload');
+        l_processId := jsonNumber(l_payload, 'process_id');
+        l_actionName := jsonString(l_payload, 'action_name');
+        l_contextName := jsonString(l_payload, 'context_name');
+        l_timestamp := jsonTime(l_payload, 'timestamp');
+        l_monType := jsonNumber(l_payload, 'monitor_type');
+
+        writeTraceToMonitorBuffer(l_processId, l_actionName, l_contextName, l_timestamp);
+    end;
+
+
+    --------------------------------------------------------------------------
+
+    procedure doRemote_markEvent(p_message varchar2)
+    as
+        l_processId number;
+        l_actionName varchar2(100);
+        l_contextName varchar2(100);
+        l_timestamp timestamp;
+        l_monType pls_integer;
+        l_payload JSON_OBJ_LILAM;
+    begin
+        l_payload := JSON_QUERY(p_message, '$.payload');
+        l_processId := jsonNumber(l_payload, 'process_id');
+        l_actionName := jsonString(l_payload, 'action_name');
+        l_contextName := jsonString(l_payload, 'context_name');
+        l_timestamp := jsonTime(l_payload, 'timestamp');
+        l_monType := jsonNumber(l_payload, 'monitor_type');
+
+        writeEventToMonitorBuffer(l_processId, l_actionName, l_contextName, l_timestamp);
+    end;
+
+    --------------------------------------------------------------------------
+
+    procedure doRemote_setAnyStatus(p_message varchar2)
+    as
+        l_processId     NUMBER;
+        l_status        PLS_INTEGER;
+        l_processInfo   VARCHAR2(2000);
+        l_stepsToDo     PLS_INTEGER;
+        l_procStepsDone PLS_INTEGER;
+        l_immortal      PLS_INTEGER;
+        l_payload JSON_OBJ_LILAM;
+        l_timestamp     TIMESTAMP(6);
+    begin
+        l_payload := JSON_QUERY(p_message, '$.payload');
+        l_processId     := jsonNumber(l_payload, 'process_id');
+        l_status        := jsonNumber(l_payload, 'process_status');
+        l_processInfo   := jsonString(l_payload, 'process_info');
+        l_stepsToDo     := jsonNumber(l_payload, 'steps_todo');
+        l_procStepsDone := jsonNumber(l_payload, 'steps_done');
+        l_immortal      := jsonNumber(l_payload, 'process_immortal');
+        l_timestamp     := jsonTime(l_payload, 'timestamp');
+
+        setAnyStatus(l_processId, l_status, l_processInfo, l_stepsToDo, l_procStepsDone, l_immortal, l_timestamp);
+    end;
+    --------------------------------------------------------------------------
+
+    procedure doRemote_procStepDone(p_message varchar2)
+    as
+        l_processId     NUMBER;
+        l_payload JSON_OBJ_LILAM;
+    begin
+        l_payload := JSON_QUERY(p_message, '$.payload');
+        l_processId  := jsonNumber(l_payload, 'process_id');
+
+        PROC_STEP_DONE(l_processId);
+    end;
+
+    --------------------------------------------------------------------------
+
+    procedure doRemote_reconnectProcess(p_clientChannel varchar2, p_message JSON_OBJ_LILAM)
+    as
+        l_status        PLS_INTEGER;
+        l_processId     NUMBER;
+        l_header        JSON_OBJ_LILAM;
+        l_payload       JSON_OBJ_LILAM;
+        l_response      JSON_OBJ_LILAM;
+        l_msg           JSON_OBJ_LILAM;
+    begin
+        l_payload       := JSON_QUERY(p_message, '$.payload');
+        l_processId     := jsonNumber(l_payload, 'process_id');
+
+        if v_indexSession.EXISTS(l_processId) then
+            jsonPut(l_response, 'server_code', get_serverCode(TXT_ACK_SERVER_PROC));
+            jsonPut(l_response, 'process_id', l_processId);
+            jsonPut(l_response, 'perf', g_server_perf);   -- Leistungsstufe für die Drosselung des Clients
+        else
+            jsonPut(l_response, 'server_code', get_serverCode(TXT_ERR_SERVER_PROC));
+        end if;
+
+        jsonPut(l_header, 'msg_type', 'SERVER_RESPONSE');
+        jsonPut(l_header, 'msg_name', 'RECONNECT_PROCESS_RESP');
+        jsonPut(l_msg, 'header', l_header);
+        jsonPut(l_msg, 'payload', l_response);
+
+        DBMS_PIPE.RESET_BUFFER;
+        DBMS_PIPE.PACK_MESSAGE(l_msg);        
+        l_status := DBMS_PIPE.SEND_MESSAGE(p_clientChannel, timeout => 1);
+
+    end;
+
+    --------------------------------------------------------------------------
+
+    procedure doRemote_logAny(p_message varchar2)
+    as
+        l_processId number;
+        l_level number;
+        l_logText varchar2(4000);
+        l_caller varchar2(255);
+        l_errStack varchar2(4000);
+        l_errBacktrace varchar2(4000);
+        l_errCallstack varchar2(4000);
+        l_payload JSON_OBJ_LILAM;
+        l_timestamp TIMESTAMP(6);
+    begin
+        l_payload       := JSON_QUERY(p_message, '$.payload');
+        l_processId     := jsonNumber(l_payload, 'process_id');
+        l_level         := jsonNumber(l_payload, 'level');
+        l_logText       := jsonString(l_payload, 'log_text');
+        l_caller        := jsonString(l_payload, 'caller');
+        l_errStack      := jsonString(l_payload, 'err_stack');
+        l_errBacktrace  := jsonString(l_payload, 'err_backtr');
+        l_errCallstack  := jsonString(l_payload, 'err_callstack');
+        l_timestamp     := jsonTime(l_payload, 'timestamp');
+
+        log_any(l_processId, l_level, l_logText, l_caller, l_errStack, l_errBacktrace, l_errCallstack, l_timestamp);
+    end;
+
+    --------------------------------------------------------------------------
+    
+    procedure unregisterProcessRoute(p_processId number)
+    as
+        pragma autonomous_transaction;
+    begin
+        execute immediate 'delete from ' || C_LILAM_PROCESS_ROUTE || ' where process_id = :1'
+        using p_processId;
+        commit;
+    exception
+        when others then
+            logLilamErr(sqlCode, sqlErrM, 'unregisterProcessRoute');
+    end;
+
+    --------------------------------------------------------------------------
+
+    procedure doRemote_closeSession(p_clientChannel varchar2, p_message VARCHAR2)
+    as
+        l_processId     number; 
+        l_procStepsToDo PLS_INTEGER; 
+        l_procStepsDone PLS_INTEGER; 
+        l_processInfo   varchar2(2000);
+        l_status        PLS_INTEGER;
+        l_payload       JSON_OBJ_LILAM;
+    begin
+        l_payload     := JSON_QUERY(p_message, '$.payload');
+        l_processId   := jsonString(l_payload, 'process_id');
+        l_procStepsToDo   := jsonNumber(l_payload, 'steps_todo');
+        l_procStepsDone   := jsonNumber(l_payload, 'steps_done');
+        l_processInfo := jsonString(l_payload, 'process_info');
+        l_status      := jsonNumber(l_payload, 'process_status');
+
+        checkLogsBuffer(l_processId, 'vor CLOSE_SESSION');
+
+        CLOSE_SESSION(p_processId => l_processId, p_processInfo => l_processInfo, p_processStatus => l_status,
+                      p_procStepsDone => l_procStepsDone, p_procStepsToDo => l_procStepsToDo);
+        unregisterProcessRoute(l_processId); 
+
+        DBMS_PIPE.RESET_BUFFER;
+        DBMS_PIPE.PACK_MESSAGE('{"process_id":' || l_processId || '}');        
+        l_status := DBMS_PIPE.SEND_MESSAGE(p_clientChannel, timeout => 1);
+
+    end;    
+
+    -------------------------------------------------------------------------- 
+
+    procedure doRemote_pingEcho(p_clientChannel varchar2, p_message VARCHAR2)
+    as
+        l_status        PLS_INTEGER;
+        l_header        JSON_OBJ_LILAM;
+        l_meta          JSON_OBJ_LILAM;
+        l_payload       JSON_OBJ_LILAM;
+        l_msg           JSON_OBJ_LILAM;
+    begin
+        jsonPut(l_header, 'msg_type', 'SERVER_RESPONSE');
+        jsonPut(l_header, 'msg_name', 'PING_ECHO');
+        jsonPut(l_meta, 'server_version', LILAM_VERSION);
+        jsonPut(l_payload, 'server_message', TXT_PING_ECHO);
+        jsonPut(l_payload, 'server_code', get_serverCode(TXT_PING_ECHO));
+
+        jsonPut(l_msg, 'header', l_header);
+        jsonPut(l_msg, 'meta', l_meta);
+        jsonPut(l_msg, 'payload', l_payload);
+
+        DBMS_PIPE.RESET_BUFFER;
+        DBMS_PIPE.PACK_MESSAGE(l_msg);        
+        l_status := DBMS_PIPE.SEND_MESSAGE(p_clientChannel, timeout => 0);
+
+    exception
+        when others then
+        logLilamErr(sqlCode, sqlErrM, 'doRemote_pingEcho'); 
+    end; 
+
+    -------------------------------------------------------------------------- 
+
+    procedure doRemote_getMonitorLastEntry(p_clientChannel varchar2, l_message varchar2)
+    as 
+        l_payload JSON_OBJ_LILAM;
+        l_header JSON_OBJ_LILAM;
+        l_meta   JSON_OBJ_LILAM;
+        l_msg    JSON_OBJ_LILAM;
+        l_processId number;
+        v_rec t_monitor_buffer_rec;
+        l_status PLS_INTEGER;
+        l_actionName varchar2(50);
+        l_contextName varchar2(50);
+
+    begin
+        l_processId := jsonNumber(l_message, 'payload.process_id');
+        l_actionName := jsonString(l_message, 'payload.action_name');
+        l_contextName := jsonString(l_message, 'payload.context_name');
+
+        v_rec := getLastMonitorEntry(l_processId, l_actionName, l_contextName);
+
+        jsonPut(l_payload, 'process_id', v_rec.process_id);
+        jsonPut(l_payload, 'action_name', v_rec.action_name);
+        jsonPut(l_payload, 'action_count', v_rec.action_count);
+        jsonPut(l_payload, 'used_time', v_rec.used_time);
+        jsonPut(l_payload, 'start_time', v_rec.start_time);
+        jsonPut(l_payload, 'stop_time', v_rec.stop_time);
+        jsonPut(l_payload, 'avg_action_time', v_rec.avg_action_time); 
+
+        jsonPut(l_header, 'msg_type', 'SERVER_RESPONSE');
+        jsonPut(l_header, 'msg_name', 'LAST_MONITOR_ENTRY');
+
+        jsonPut(l_meta, 'server_version', LILAM_VERSION);
+        jsonPut(l_meta, 'server_message', TXT_DATA_ANSWER);
+        jsonPut(l_meta, 'server_code', get_serverCode(TXT_DATA_ANSWER));
+
+        jsonPut(l_msg, 'header', l_header);
+        jsonPut(l_msg, 'meta', l_meta);
+        jsonPut(l_msg, 'payload', l_payload);
+
+        -- no payload, client waits only for unfreezing
+        DBMS_PIPE.RESET_BUFFER; -- Koffer leeren
+        DBMS_PIPE.PACK_MESSAGE(l_msg);        
+        l_status := DBMS_PIPE.SEND_MESSAGE(p_clientChannel, timeout => 0);
+
+    exception
+        when others then
+        logLilamErr(sqlCode, sqlErrM, 'doRemote_getMonitorLastEntry'); 
+    
+    end;    
+
+    -------------------------------------------------------------------------- 
+
+    procedure doRemote_getProcessData(p_clientChannel varchar2, l_message varchar2)
+    as
+        l_processId     number;
+        l_status        PLS_INTEGER;
+        l_payload       JSON_OBJ_LILAM;
+        l_header        JSON_OBJ_LILAM;
+        l_meta          JSON_OBJ_LILAM;
+        l_msg           JSON_OBJ_LILAM;
+        l_process_rec   t_process_rec;
+    begin
+        l_processId := jsonNumber(l_message, 'payload.process_id');
+        l_process_rec := GET_PROCESS_DATA(l_processId); 
+        jsonPut(l_payload, 'process_id', l_process_rec.id);
+        jsonPut(l_payload, 'process_name', l_process_rec.processName);
+        jsonPut(l_payload, 'log_level', l_process_rec.logLevel);
+        jsonPut(l_payload, 'process_start', l_process_rec.processStart);
+        jsonPut(l_payload, 'process_end', l_process_rec.processEnd);
+        jsonPut(l_payload, 'last_update', l_process_rec.lastUpdate);
+        jsonPut(l_payload, 'process_info', l_process_rec.info); 
+        jsonPut(l_payload, 'process_status', l_process_rec.status); 
+        jsonPut(l_payload, 'steps_todo', l_process_rec.stepsTodo); 
+        jsonPut(l_payload, 'steps_done', l_process_rec.stepsDone); 
+        jsonPut(l_payload, 'tabname_master', l_process_rec.tabNameMaster);
+
+        jsonPut(l_header, 'msg_type', 'SERVER_RESPONSE');
+        jsonPut(l_header, 'msg_name', 'PROCESS_DATA');
+        jsonPut(l_meta, 'server_version', LILAM_VERSION);
+        jsonPut(l_meta, 'server_message', TXT_DATA_ANSWER);
+        jsonPut(l_meta, 'server_code', get_serverCode(TXT_DATA_ANSWER));
+
+        jsonPut(l_msg, 'header', l_header);
+        jsonPut(l_msg, 'meta', l_meta);
+        jsonPut(l_msg, 'payload', l_payload);
+
+        -- no payload, client waits only for unfreezing
+        DBMS_PIPE.RESET_BUFFER; -- Koffer leeren
+        DBMS_PIPE.PACK_MESSAGE(l_msg);        
+        l_status := DBMS_PIPE.SEND_MESSAGE(p_clientChannel, timeout => 0);
+
+    exception
+        when others then
+            logLilamErr(sqlCode, sqlErrM, 'doRemote_getProcessData'); 
+            error(l_processId, 'Could not send process data to client: ' || sqlErrM);
+    end;    
+
+    -------------------------------------------------------------------------- 
+
+    procedure doRemote_unfreezeClient(p_clientChannel varchar2, p_message VARCHAR2, p_shutdown BOOLEAN DEFAULT FALSE)
+    as
+        l_payload JSON_OBJ_LILAM;
+        l_status  PLS_INTEGER;
+        l_header  JSON_OBJ_LILAM;
+        l_meta    JSON_OBJ_LILAM;
+        l_msg     JSON_OBJ_LILAM;
+    begin
+        jsonPut(l_header, 'msg_type', 'SERVER_RESPONSE');
+        jsonPut(l_header, 'msg_name', 'UNFREEZE_CLIENT');
+        jsonPut(l_meta, 'server_version', LILAM_VERSION);
+        if p_shutdown then
+            jsonPut(l_payload, 'server_message', TXT_ACK_SHUTDOWN);
+            jsonPut(l_payload, 'server_code', get_serverCode(TXT_ACK_SHUTDOWN));
+        else
+            jsonPut(l_payload, 'server_message', TXT_ACK_OK);
+            jsonPut(l_payload, 'server_code', get_serverCode(TXT_ACK_OK));
+        end if;
+        jsonPut(l_msg, 'header', l_header);
+        jsonPut(l_msg, 'meta', l_meta);
+        jsonPut(l_msg, 'payload', l_payload);
+
+        -- no payload, client waits only for unfreezing
+        DBMS_PIPE.RESET_BUFFER; -- Koffer leeren
+        DBMS_PIPE.PACK_MESSAGE(l_msg);        
+        l_status := DBMS_PIPE.SEND_MESSAGE(p_clientChannel, timeout => 0);
+
+    exception
+        when others then
+            logLilamErr(sqlCode, sqlErrM, 'doRemote_unfreezeClient'); 
+            error(p_clientChannel, 'Could not send unlock signal to client: ' || sqlErrM);
+    end;    
+
+    --------------------------------------------------------------------------
+    
+    procedure registerProcessRoute(p_processId number, p_pipeName varchar2)
+    as
+        pragma autonomous_transaction;
+    begin
+        createDispatchTable;
+        execute immediate 'insert into ' || C_LILAM_PROCESS_ROUTE || '(process_id, pipe_name) values (:1, :2)'
+        using p_processId, p_pipeName;
+        commit;
+    exception
+        when others then
+            logLilamErr(sqlCode, sqlErrM, 'registerProcessRoute');
+    end;
+
+    --------------------------------------------------------------------------
+
+    procedure doRemote_newSession(p_clientChannel varchar2, p_message VARCHAR2)
+    as
+        l_processId number;
+        l_payload JSON_OBJ_LILAM;
+        l_session_init t_session_init;
+        l_status PLS_INTEGER;
+    begin
+        l_payload := JSON_QUERY(p_message, '$.payload');
+
+        -- Verfallszeit des Clients prüfen (mit 500 ms Sicherheitsabstand). Ist sie überschritten, hat der
+        -- Client bereits aufgegeben: keinen Prozess anlegen, keine Route, keine Antwort (der Rückkanal
+        -- existiert nicht mehr; eine Antwort würde dort nur eine verwaiste Pipe erzeugen).
+        if jsonTime(l_payload, 'expires_utc') - INTERVAL '0.5' SECOND < sys_extract_utc(systimestamp) then
+            logLilamErr(NUM_ERR_SESSION_TIMEOUT, 'NEW_SESSION verworfen, Client wartet nicht mehr: '
+                        || jsonString(l_payload, 'process_name'), 'doRemote_newSession', 'EXPIRED');
+            return;
+        end if;
+
+        l_session_init.processName := jsonString(l_payload, 'process_name');
+        l_session_init.logLevel    := jsonNumber(l_payload, 'log_level');
+        l_session_init.stepsToDo   := jsonNumber(l_payload, 'steps_todo');
+        l_session_init.daysToKeep  := jsonNumber(l_payload, 'days_to_keep');
+        l_session_init.tabNameMaster := jsonString(l_payload, 'tabname_master');
+        l_session_init.baselineScope := jsonString(l_payload, 'baseline_scope');
+
+        l_processId := NEW_SESSION(l_session_init);
+        registerProcessRoute(l_processId, g_serverPipeName); 
+        touchServerRegistry;   -- Registry sofort aktuell halten (Lastverteilung bei schnellen NEW_SESSION)
+
+        DBMS_PIPE.RESET_BUFFER;
+        -- perf: Leistungsstufe dieses Servers; der Client richtet seine Drosselung danach aus
+        DBMS_PIPE.PACK_MESSAGE('{"process_id":' || l_processId || ',"perf":' || g_server_perf || '}');        
+        l_status := DBMS_PIPE.SEND_MESSAGE(p_clientChannel, timeout => 1);
+    end;    
+
+    -------------------------------------------------------------------------- 
+
+    PROCEDURE SERVER_UPDATE_RULES(p_processId NUMBER, p_ruleSetName VARCHAR2, p_ruleSetVersion PLS_INTEGER)
+    as
+        l_message    JSON_OBJ_LILAM;
+        l_serverCode PLS_INTEGER;
+        l_slotIdx    PLS_INTEGER;
+    begin
+        jsonPut(l_message, 'rule_set_name', p_ruleSetName);
+        jsonPut(l_message, 'rule_set_version', p_ruleSetVersion);
+        sendNoWait(p_processId, 'UPDATE_RULE', l_message, C_TIMEOUT_NEW_SESSION_SEC);               
+    end;
+
+    -------------------------------------------------------------------------- 
+
+    procedure SERVER_SHUTDOWN(p_processId number, p_pipeName varchar2, p_password varchar2)
+    as
+        l_response JSON_OBJ_LILAM;
+        l_message  JSON_OBJ_LILAM;
+        l_payload  JSON_OBJ_LILAM;
+        l_serverCode PLS_INTEGER;
+        l_slotIdx    PLS_INTEGER;
+    begin
+        jsonPut(l_message, 'pipe_name', p_pipeName);
+        jsonPut(l_message, 'shutdown_password', p_password);
+        l_response := waitForResponse(
+            p_processId     => p_processId,
+            p_request       => 'SERVER_SHUTDOWN',
+            p_payload       => l_message,
+            p_timeoutSec    => 5
+        );
+        l_payload := JSON_QUERY(l_response, '$.payload');
+        l_serverCode := jsonNumber(l_payload, 'server_code');
+
+        if l_serverCode = NUM_ACK_SHUTDOWN then
+            null;
+        end if ;
+
+    EXCEPTION
+        WHEN OTHERS THEN
+        logLilamErr(sqlCode, sqlErrM, 'SERVER_SHUTDOWN'); 
+
+    end;
+
+    -------------------------------------------------------------------------- 
+
+    procedure SERVER_SEND_ANY_MSG(p_processId number, p_message varchar2)
+    as
+        l_response JSON_OBJ_LILAM;
+    begin
+        l_response := waitForResponse(
+            p_processId     => p_processId,
+            p_request       => 'ANY_MSG',
+            p_payload       => p_message,
+            p_timeoutSec    => 5
+        );
+    end;
+
+    --------------------------------------------------------------------------
+
+    FUNCTION GET_SERVER_PIPE(p_processId NUMBER) RETURN VARCHAR2
+    as
+    begin
+        -- Ungültige ID (z.B. NUM_ERR_SESSION_TIMEOUT aus SERVER_NEW_SESSION): kein Server, keine Exception
+        if p_processId is null or p_processId < 0 then
+            return null;
+        end if;
+        return getServerPipeForSession(p_processId, null);
+    end;
+
+    --------------------------------------------------------------------------
+
+    FUNCTION SERVER_NEW_SESSION(
+        p_processName   VARCHAR2,
+        p_groupName     VARCHAR2    DEFAULT NULL,
+        p_logLevel      PLS_INTEGER DEFAULT logLevelMonitor,
+        p_procStepsToDo PLS_INTEGER DEFAULT NULL,
+        p_daysToKeep    PLS_INTEGER DEFAULT NULL,
+        p_tabNameMaster VARCHAR2    DEFAULT 'LILAM',
+        p_baselineScope VARCHAR2    DEFAULT NULL) RETURN NUMBER
+    as
+        l_payload JSON_OBJ_LILAM;
+    begin
+        jsonPut(l_payload, 'process_name',   p_processName);
+        jsonPut(l_payload, 'group_name',     p_groupName);
+        jsonPut(l_payload, 'log_level',      p_logLevel);
+        jsonPut(l_payload, 'steps_todo',     p_procStepsToDo);
+        jsonPut(l_payload, 'days_to_keep',   p_daysToKeep);
+        jsonPut(l_payload, 'tabname_master', p_tabNameMaster);
+        jsonPut(l_payload, 'baseline_scope', p_baselineScope);
+
+        return server_new_session_json(l_payload);
+    end;
+
+    --------------------------------------------------------------------------
+
+    FUNCTION SERVER_NEW_SESSION_JSON(p_jsonObject JSON_OBJ_LILAM) RETURN NUMBER
+    as
+        l_ProcessId number(19,0) := -500;   
+        l_response  varchar2(100);        
+        l_payload   JSON_OBJ_LILAM := p_jsonObject;
+    begin                        
+        -- Verfallszeit: Bis dahin wartet der Client auf die Antwort. Kommt der Server erst danach
+        -- an die Nachricht (z.B. volle Pipe), legt er keinen Prozess an (siehe doRemote_newSession).
+        -- So entstehen keine verwaisten, nie geschlossenen Prozesse.
+        -- In UTC, da Client- und Server-Session unterschiedliche Zeitzonen haben können.
+        jsonPut(l_payload, 'expires_utc', sys_extract_utc(systimestamp) + numtodsinterval(C_TIMEOUT_NEW_SESSION_SEC, 'SECOND'));
+
+        -- zunächst mal schauen, welche Server bereitstehen
+        l_response := waitForResponse(null, 'NEW_SESSION', l_payload, C_TIMEOUT_NEW_SESSION_SEC);
+
+        CASE
+            WHEN l_response = 'TIMEOUT' THEN
+                l_ProcessId := NUM_ERR_SESSION_TIMEOUT;
+            WHEN l_response = 'THROTTLED' THEN
+                l_ProcessId := NUM_ERR_SESSION_THROTTLED;
+            WHEN l_response LIKE 'ERROR%' THEN
+                l_ProcessId := NUM_COMM_ERR;
+            else
+            -- Erfolgsfall: JSON parsen
+            l_ProcessId := nvl(jsonNumber(l_response, 'process_id'), NUM_COMM_ERR);
+        end case;
+        
+        -- Kein Prozess angelegt: keine Exception an die Anwendung (Philosophie: kein Impact).
+        -- Die Anwendung erhält die negative ID (Konstanten NUM_ERR_SESSION_* in der Spezifikation);
+        -- alle weiteren API-Aufrufe mit dieser ID werden still ignoriert. Protokoll in LILAM_LOG_INTERNAL.
+        if l_ProcessId < 0 then
+            g_client_pipes.DELETE(C_PIPE_ID_PENDING);
+            logLilamErr(l_ProcessId, 'Could not establish connection to LILAM-Server: ' || l_response,
+                        'SERVER_NEW_SESSION_JSON', 'NEW_SESSION');
+            return l_ProcessId;
+        end if;
+        
+        -- Nur valide IDs registrieren
+        if l_ProcessId > 0 THEN
+            g_client_pipes(l_ProcessId) := g_client_pipes(C_PIPE_ID_PENDING);
+            g_client_pipes.DELETE(C_PIPE_ID_PENDING);
+            g_remote_sessions(l_ProcessId) := TRUE; -- in die Liste der RemoteSessions eintragen
+            -- Drosselung nach der Leistungsstufe des Servers (fehlt der Wert: C_SERVER_PERF_MID)
+            setPerfLimit(l_ProcessId, jsonNumber(l_response, 'perf'));
+        end if ;
+        RETURN l_ProcessId;
+    end;
+
+    --------------------------------------------------------------------------
+
+    FUNCTION reconnectRemote(p_processId number, p_pipeName varchar2) RETURN NUMBER
+    AS
+        l_payload     JSON_OBJ_LILAM;
+        l_response    JSON_OBJ_LILAM;
+        l_serverCode  NUMBER;
+    BEGIN
+        jsonPut(l_payload,'process_id', p_processId);
+
+        l_response := waitForResponse(
+            p_processId     => p_processId,
+            p_request       => 'RECONNECT_PROCESS',
+            p_payload       => l_payload,
+            p_timeoutSec    => 5
+        );
+        l_response := trim(l_response);
+        if upper(l_response) in ('TIMEOUT', 'THROTTLED') or
+            upper(l_response) like 'ERROR%' then
+            return NUM_ERR_PIPE_SERVER;
+        end if;
+            
+        l_payload := JSON_QUERY(l_response, '$.payload');
+        l_serverCode := jsonNumber(l_payload, 'server_code');
+
+        if l_serverCode = NUM_ACK_SERVER_PROC then
+            -- Drosselung nach der Leistungsstufe des Servers (auch in jeder neuen APEX-Session)
+            setPerfLimit(p_processId, jsonNumber(l_payload, 'perf'));
+            return jsonNumber(l_payload, 'process_id');
+        else
+            return NUM_ERR_SERVER_PROC;
+        end if ;
+
+    EXCEPTION
+        WHEN OTHERS THEN
+        logLilamErr(sqlCode, sqlErrM, 'reconnectRemote'); 
+        return NUM_ERR_PIPE_SERVER;
+
+    END;
+
+    --------------------------------------------------------------------------
+
+    /*
+      Möglichst schnell sicherstellen, dass die Verbindung existiert oder
+      sie bei Bedarf wiederherstellen.
+      1. Wenn Prozess und Pipe bekannt: return p_processId
+      2. Wenn Pipe nicht verfügbar (REGISTRY): return NUM_ERR_PIPE_SERVER
+      3. Anfrage bei Server
+         a) wenn der den Prozess nicht kennt: return NUM_ERR_SERVER_PROC
+         b) wenn bekannt: return p_processId
+    */
+    FUNCTION SERVER_LINK(p_processId NUMBER, p_pipeName varchar2) RETURN NUMBER
+    AS
+        l_respProcId number;
+    BEGIN
+        -- wenn alles bekannt ist, ist keine weitere Aktion notwendig
+        if g_remote_sessions.EXISTS(p_processId)
+           and g_client_pipes.EXISTS(p_processId)
+           and g_client_pipes(p_processId) = p_pipeName then
+            return p_processId;
+        end if;
+
+        -- optimistisch die assoziativen Arrays füllen
+        -- das erleichtert den Testaufruf an den Server
+        g_remote_sessions(p_processId) := TRUE;
+        g_client_pipes(p_processId)    := p_pipeName;
+
+        -- wenn die Server PIPE nicht aktiv ist, direkt abbrechen
+        if not isServerPipeActive(p_pipeName) then
+            g_remote_sessions.DELETE(p_processId);
+            g_client_pipes.DELETE(p_processId);
+            return NUM_ERR_PIPE_SERVER;
+        end if;
+
+        -- Frage den Server über die PIPE, ob er die PROCESS_ID kennt
+        l_respProcId := reconnectRemote(p_processId, p_pipeName);
+        if nvl(l_respProcId, NUM_ERR_SERVER_PROC) != p_processId then
+            g_remote_sessions.DELETE(p_processId);
+            g_client_pipes.DELETE(p_processId);
+        end if;
+        return l_respProcId;
+
+    EXCEPTION
+        WHEN OTHERS THEN
+        logLilamErr(sqlCode, sqlErrM, 'SERVER_LINK'); 
+        return NUM_ERR_PIPE_SERVER;
+
+    END;
+
+    --------------------------------------------------------------------------
+    
+    PROCEDURE SERVER_LINK(p_processId NUMBER, p_pipeName varchar2)
+    AS
+        l_respProcId number;
+    BEGIN
+        -- wenn alles bekannt ist, ist keine weitere Aktion notwendig
+        if g_remote_sessions.EXISTS(p_processId)
+           and g_client_pipes.EXISTS(p_processId)
+           and g_client_pipes(p_processId) = p_pipeName then
+           return;
+        end if;
+
+        -- optimistisch die assoziativen Arrays füllen
+        -- das erleichtert den Testaufruf an den Server
+        g_remote_sessions(p_processId) := TRUE;
+        g_client_pipes(p_processId)    := p_pipeName;
+
+        -- wenn die Server PIPE nicht aktiv ist, direkt abbrechen
+        if not isServerPipeActive(p_pipeName) then
+            g_remote_sessions.DELETE(p_processId);
+            g_client_pipes.DELETE(p_processId);
+            RAISE_APPLICATION_ERROR(
+                num => -20020,
+                msg => 'NUM_ERR_PIPE_SERVER: Kommunikation mit LILAM-SERVER ' ||
+                       'ist fehlgeschlagen.'
+            );
+        end if;
+
+        -- Frage den Server über die PIPE, ob er die PROCESS_ID kennt
+        l_respProcId := reconnectRemote(p_processId, p_pipeName);
+        if nvl(l_respProcId, NUM_ERR_SERVER_PROC) != p_processId then
+            g_remote_sessions.DELETE(p_processId);
+            g_client_pipes.DELETE(p_processId);
+            
+            RAISE_APPLICATION_ERROR(
+                num => -20021,
+                msg => 'NUM_ERR_SERVER_PROC: Der Sitzungskontext zum LILAM-SERVER ' ||
+                       'konnte nicht hergestellt oder verifiziert werden.'
+            );
+        end if;
+
+    EXCEPTION
+        WHEN OTHERS THEN
+        logLilamErr(sqlCode, sqlErrM, 'SERVER_LINK'); 
+
+    END;
+
+    PROCEDURE DUMP_BUFFER_STATS AS
+        v_key VARCHAR2(100);
+        v_log_total NUMBER := 0;
+        v_mon_total NUMBER := 0;
+    BEGIN
+    dbms_output.enable();
+
+        -- 1. Logs zählen
+        v_key := g_log_groups.FIRST;
+        WHILE v_key IS NOT NULL LOOP
+            v_log_total := v_log_total + g_log_groups(v_key).COUNT;
+            v_key := g_log_groups.NEXT(v_key);
+        END LOOP;
+
+        -- 2. Monitore zählen
+        v_key := g_monitor_groups.FIRST;
+        WHILE v_key IS NOT NULL LOOP
+            DBMS_OUTPUT.PUT_LINE('Gefundener Key im Speicher: "' || v_key || '"');
+            v_mon_total := v_mon_total + g_monitor_groups(v_key).COUNT;
+            v_key := g_monitor_groups.NEXT(v_key);
+        END LOOP;
+
+        DBMS_OUTPUT.PUT_LINE('--- LILAM BUFFER DIAGNOSE ---');
+        DBMS_OUTPUT.PUT_LINE('Sessions in Queue: ' || g_dirty_queue.COUNT);
+        DBMS_OUTPUT.PUT_LINE('Gepufferte Logs:   ' || v_log_total);
+        DBMS_OUTPUT.PUT_LINE('Gepufferte Monit.: ' || v_mon_total);
+        DBMS_OUTPUT.PUT_LINE('Master-Cache:      ' || g_process_cache.COUNT);
+    END;
+
+    --------------------------------------------------------------------------
+
+    function handleServerShutdown(p_clientChannel varchar2, p_message varchar2) return boolean
+    as
+        l_status    PLS_INTEGER;
+        l_password  varchar2(50);
+        l_msgObj   JSON_OBJ_LILAM; 
+        l_header    JSON_OBJ_LILAM;
+        l_meta      JSON_OBJ_LILAM;
+        l_payload   JSON_OBJ_LILAM;
+        l_msg       JSON_OBJ_LILAM;
+    begin
+
+        l_msgObj     := JSON_QUERY(p_message, '$.payload');
+        l_password   := jsonString(l_msgObj, 'shutdown_password');
+
+        jsonPut(l_header, 'msg_type', 'SERVER_RESPONSE');
+        jsonPut(l_header, 'msg_name', 'SERVER_SHUTDOWN');
+        jsonPut(l_meta, 'server_version', LILAM_VERSION);
+
+        if l_password = g_shutdownPassword then
+            jsonPut(l_payload, 'server_message', TXT_ACK_SHUTDOWN);
+            jsonPut(l_payload, 'server_code', get_serverCode(TXT_ACK_SHUTDOWN));
+        else
+            jsonPut(l_payload, 'server_message', TXT_ACK_DECLINE);
+            jsonPut(l_payload, 'server_code', get_serverCode(TXT_ACK_DECLINE));
+        end if ;
+        jsonPut(l_msg, 'header', l_header);
+        jsonPut(l_msg, 'meta', l_meta);
+        jsonPut(l_msg, 'payload', l_payload);
+
+        DBMS_PIPE.RESET_BUFFER;
+        DBMS_PIPE.PACK_MESSAGE(l_msg);        
+        l_status := DBMS_PIPE.SEND_MESSAGE(p_clientChannel, timeout => 1);
+
+        return l_password = g_shutdownPassword;
+    end;
+
+    --------------------------------------------------------------------------
+
+    function isServerPipeRegistered(p_pipeName varchar2) return BOOLEAN
+    as
+        l_exists INTEGER;
+        l_sqlStmt varchar2(200);
+    begin
+        l_sqlStmt := '
+        SELECT COUNT(*)
+        FROM ' || C_LILAM_SERVER_REGISTRY || '
+        WHERE upper(pipe_name) = ''' || upper(p_pipeName) || '''
+        AND rownum = 1'; -- Bricht nach dem ersten Treffer ab
+        execute immediate l_sqlStmt into l_exists;
+
+        IF l_exists > 0 THEN
+            -- Server existiert
+            return true;
+        END IF;
+        return false;
+    end;
+
+    --------------------------------------------------------------------------
+
+    procedure registerServerPipe
+    as
+        pragma autonomous_transaction; 
+        l_sqlStmt varchar2(1500);
+    begin
+        if isServerPipeRegistered(g_serverPipeName) then
+            -- update existing entry
+            l_sqlStmt := '
+            update ' || C_LILAM_SERVER_REGISTRY || ' 
+            set last_activity = systimestamp,
+                is_active = 1,
+                group_name = :1,
+                current_processes = 0,
+                is_dispatcher = :2
+            where upper(pipe_name) = :3';            
+            execute immediate l_sqlStmt using g_serverGroupName, case when g_serverIsDispatcher then 1 else 0 end,
+                                              upper(g_serverPipeName);
+        else
+                -- new entry, server was not registered yet
+            l_sqlStmt := '
+            insert into ' || C_LILAM_SERVER_REGISTRY || ' (
+                pipe_name,
+                group_name,
+                last_activity,
+                is_active,
+                current_processes,
+                avg_log_lat,
+                max_log_lat,
+                avg_mon_lat,
+                max_mon_lat,
+                is_dispatcher
+            ) values (
+                :1,
+                :2,
+                SYSTIMESTAMP,
+                1,
+                0,
+                0,
+                0,
+                0,
+                0,
+                :3
+            )';
+            execute immediate l_sqlStmt using g_serverPipeName, g_serverGroupName, case when g_serverIsDispatcher then 1 else 0 end;
+        end if;
+        commit;
+
+    exception
+        when others then
+            rollback;
+            logLilamErr(sqlCode, sqlErrM, 'registerServerPipe', 'EXECUTE IMMEDIATE'); 
+    end;
+
+    --------------------------------------------------------------------------
+    
+    function resolveDispatchTarget(p_processId number) return varchar2
+    as
+        l_pipe varchar2(50);
+        l_sql varchar2(200);
+    begin
+        if g_dispatch_route_cache.EXISTS(p_processId) then
+            return g_dispatch_route_cache(p_processId);
+        end if;
+        
+        l_sql := 'select pipe_name from ' || C_LILAM_PROCESS_ROUTE || ' where process_id = :1';
+        execute immediate l_sql into l_pipe using p_processId;
+    
+        g_dispatch_route_cache(p_processId) := l_pipe;
+        return l_pipe;
+    exception
+        when NO_DATA_FOUND then return null;
+    end;
+    
+    --------------------------------------------------------------------------
+
+    PROCEDURE updateRulesInRegistry(p_ruleSetName varchar2, p_ruleSetVersion pls_integer)
+    AS
+        pragma autonomous_transaction; 
+    BEGIN
+        execute immediate 'update ' || C_LILAM_SERVER_REGISTRY || ' set rule_set_name = :1, set_in_use = :2 where upper(pipe_name) = :3'
+        using p_ruleSetName, p_ruleSetVersion, upper(g_serverPipeName);
+        commit;
+
+    EXCEPTION
+        WHEN OTHERS THEN
+            logLilamErr(sqlCode, sqlErrM, 'updateRulesInRegistry', 'EXECUTE IMMEDIATE'); 
+            if should_raise_error(g_serverProcessId) then
+                error(g_serverProcessId, 'Failed to parse JSON rules: ' || sqlErrM);
+            end if ; 
+            rollback;
+    END;
+
+    --------------------------------------------------------------------------
+
+    PROCEDURE load_rules_from_json(p_ruleSet CLOB) IS
+        l_ruleSet VARCHAR2(32000);
+    BEGIN
+        -- Zuerst die alten Regeln löschen (Reset)
+        g_rules_by_context.DELETE;
+        g_rules_by_action.DELETE;
+        g_alert_history.DELETE;
+
+        FOR r IN (
+            SELECT *
+            FROM JSON_TABLE(p_ruleSet, '$.rules[*]'
+                COLUMNS (
+                    rule_id      VARCHAR2(50) PATH '$.id',
+                    trigger_t    VARCHAR2(50) PATH '$.trigger_type',
+                    action       VARCHAR2(50) PATH '$.action',
+                    context      VARCHAR2(50) PATH '$.context',
+                    metric       VARCHAR2(50) PATH '$.condition.metric',
+                    operator     VARCHAR2(50) PATH '$.condition.operator',
+                    value        VARCHAR2(50) PATH '$.condition.value',
+                    handler      VARCHAR2(50) PATH '$.alert.handler',
+                    severity     VARCHAR2(30) PATH '$.alert.severity',
+                    throttle_sec NUMBER       PATH '$.alert.throttle_seconds'
+                )
+            )
+        ) LOOP
+            -- Record vorbereiten
+            DECLARE
+                l_new_rule t_rule_rec;
+                l_key      VARCHAR2(250);
+            BEGIN
+                l_new_rule.rule_id            := r.rule_id;
+                l_new_rule.trigger_type       := r.trigger_t;
+                l_new_rule.target_action      := r.action;
+                l_new_rule.target_context     := r.context;
+                l_new_rule.condition_metric   := r.metric;
+                l_new_rule.condition_operator := r.operator;
+                l_new_rule.condition_value    := r.value;
+                l_new_rule.alert_handler      := r.handler;
+                l_new_rule.alert_severity     := r.severity;
+                l_new_rule.throttle_seconds   := r.throttle_sec;
+
+                -- Entscheidung: Kontext-Regel oder allgemeine Action-Regel?
+                IF r.context IS NOT NULL THEN
+                    l_key := r.action || '|' || r.context;
+                    IF NOT g_rules_by_context.EXISTS(l_key) THEN
+                        g_rules_by_context(l_key) := t_rule_list();
+                    END IF;
+                    g_rules_by_context(l_key).EXTEND;
+                    g_rules_by_context(l_key)(g_rules_by_context(l_key).LAST) := l_new_rule;
+
+                    if l_new_rule.condition_operator = 'AVG_DEVIATION_PCT' then
+                        -- 'pct|warmup|alpha'; fehlende Werte => Default
+                        g_avg_params(l_key).warmup := coalesce(extractRuleValue(l_new_rule.condition_value, 2), g_avg_params('DEFAULT').warmup);
+                        g_avg_params(l_key).alpha  := coalesce(extractRuleValue(l_new_rule.condition_value, 3), g_avg_params('DEFAULT').alpha);
+                    end if;
+                ELSE
+                    l_key := r.action;
+                    IF NOT g_rules_by_action.EXISTS(l_key) THEN
+                        g_rules_by_action(l_key) := t_rule_list();
+                    END IF;
+                    g_rules_by_action(l_key).EXTEND;
+                    g_rules_by_action(l_key)(g_rules_by_action(l_key).LAST) := l_new_rule;
+
+                    if l_new_rule.condition_operator = 'AVG_DEVIATION_PCT' then
+                        -- 'pct|warmup|alpha'; fehlende Werte => Default
+                        g_avg_params(l_key).warmup := coalesce(extractRuleValue(l_new_rule.condition_value, 2), g_avg_params('DEFAULT').warmup);
+                        g_avg_params(l_key).alpha  := coalesce(extractRuleValue(l_new_rule.condition_value, 3), g_avg_params('DEFAULT').alpha);
+                    end if;
+                END IF;
+            END;
+        END LOOP;
+
+        -- Version aus dem Header extrahieren (optionaler zweiter Schritt)
+        l_ruleSet := JSON_QUERY(p_ruleSet, '$.header');
+        g_current_rule_set_name := jsonString(l_ruleSet, 'rule_set');
+        g_current_rule_set_version := jsonNumber(l_ruleSet, 'rule_set_version');
+
+    EXCEPTION
+        WHEN OTHERS THEN
+            logLilamErr(sqlCode, sqlErrM, 'load_rules_from_json'); 
+            if should_raise_error(g_serverProcessId) then
+                error(g_serverProcessId, g_serverPipeName || '=>Failed to parse JSON rules: ' || sqlErrM);
+            end if ; 
+            
+    END;
+
+    --------------------------------------------------------------------------
+
+    function existsNewServerRule(p_pipeName varchar2) return boolean
+    as
+        l_newestVersion PLS_INTEGER;
+        l_sqlStmt varchar2(200);
+    begin
+        l_sqlStmt := 'SELECT rule_version FROM ' || C_LILAM_SERVER_REGISTRY || ' WHERE upper(pipe_name) = :1';
+        execute immediate l_sqlStmt into l_newestVersion USING upper(p_pipeName);
+        if coalesce(l_newestVersion, 0) > g_current_rule_set_version then 
+            return TRUE;
+        else
+            return FALSE;
+        end if;
+
+    exception
+        when NO_DATA_FOUND then
+            return false;
+    end;
+
+    --------------------------------------------------------------------------
+
+    procedure readServerRules(p_ruleSetName varchar2, p_ruleSetVersion Number)
+    as
+        l_sqlStmt varchar2(200);
+        l_serverRuleSet CLOB;
+    begin
+        l_sqlStmt := 'SELECT rule_set FROM ' || C_LILAM_RULES_TABLE || ' where set_name = :1 and version = :2';
+        execute immediate l_sqlStmt into l_serverRuleSet using p_ruleSetName, p_ruleSetVersion; 
+        load_rules_from_json(l_serverRuleSet);
+
+    exception
+        when NO_DATA_FOUND then
+            error(g_serverProcessId, g_serverPipeName || '=>Could not find server rule: ' || p_ruleSetName || '; version: ' || p_ruleSetVersion);
+        when others then
+            logLilamErr(sqlCode, sqlErrM, 'readServerRules'); 
+            if should_raise_error(g_serverProcessId) then
+                error(g_serverProcessId, g_serverPipeName || '=>Could not read server rule: ' || p_ruleSetName || '; version: ' || p_ruleSetVersion || '; ' || sqlErrM);
+            end if ;
+    end;
+
+    --------------------------------------------------------------------------
+
+    procedure loadServerRules
+    as
+        l_sqlStmt varchar2(200);
+        l_ruleSetName varchar2(30);
+        l_ruleSetVersion PLS_INTEGER;
+    begin
+        l_sqlStmt := 'SELECT rule_set_name, set_in_use FROM ' || C_LILAM_SERVER_REGISTRY || ' WHERE upper(pipe_name) = ''' || upper(g_serverPipeName) || '''';
+        execute immediate l_sqlStmt into l_ruleSetName,  l_ruleSetVersion;
+        if l_ruleSetName is not null then
+            readServerRules(l_ruleSetName, l_ruleSetVersion);
+        end if;
+
+
+    exception
+        when NO_DATA_FOUND then
+            null; -- in der Registry smüssen für den Server keine Rules hinterlegt sein
+        when others then
+            logLilamErr(sqlCode, sqlErrM, 'loadServerRules'); 
+            if should_raise_error(g_serverProcessId) then
+                error(g_serverProcessId, 'Could not load server ruleset: ' || sqlErrM);
+            end if ;
+    END;
+
+    --------------------------------------------------------------------------
+
+    procedure updateServerRules(l_message varchar2)
+    as
+        l_payload  VARCHAR2(100);
+        l_ruleSetName varchar2(30);
+        l_ruleSetVersion PLS_INTEGER;
+    begin
+        l_payload     := JSON_QUERY(l_message, '$.payload');
+        l_ruleSetName := jsonString(l_payload, 'rule_set_name');
+        l_ruleSetVersion := jsonNumber(l_payload, 'rule_set_version');
+
+        updateRulesInRegistry(l_ruleSetName, l_ruleSetVersion);
+        readServerRules(l_ruleSetName, l_ruleSetVersion);
+    end;
+
+    --------------------------------------------------------------------------
+
+    --------------------------------------------------------------------------
+    -- Nach jedem NEW_SESSION sofort offene Prozesse und Zeitpunkt in der Registry nachziehen.
+    -- Sonst sehen schnell aufeinanderfolgende NEW_SESSION (z.B. 20 in 0,5 s) noch die Werte der
+    -- letzten periodischen Aktualisierung und landen alle beim selben Server. Mit der Auswahl
+    -- "aeltester Eintrag zuerst" geht die naechste Anfrage dadurch an einen anderen Server.
+    --------------------------------------------------------------------------
+    procedure touchServerRegistry as
+        pragma autonomous_transaction;
+    begin
+        execute immediate 'UPDATE ' || C_LILAM_SERVER_REGISTRY || '
+                              SET last_activity = SYSTIMESTAMP, current_processes = :1
+                            WHERE upper(pipe_name) = :2'
+            using greatest(v_indexSession.COUNT - 1, 0), upper(g_serverPipeName);
+        commit;
+    exception
+        when others then
+            rollback;
+            logLilamErr(sqlCode, sqlErrM, 'touchServerRegistry');
+    end;
+
+    --------------------------------------------------------------------------
+
+    procedure updateServerRegistry(p_ready BOOLEAN, p_eventCounter PLS_INTEGER) as
+        pragma autonomous_transaction; 
+        l_sqlStmt varchar2(500);
+        l_booleanAsInt NUMBER(1) := 1;
+        l_status    varchar2(20);
+    begin
+
+        case p_ready
+            when true then l_booleanAsInt := 1;
+            when false then l_booleanAsInt := 0;
+        end case;
+
+        case
+            when p_eventCounter > 0 then
+                if p_ready then
+                    l_status := 'PROCESSING';
+                    DBMS_APPLICATION_INFO.SET_ACTION('PROCESSING');
+                    DBMS_APPLICATION_INFO.SET_CLIENT_INFO('Bulk Load:' || p_eventCounter);
+                else
+                    l_status := 'SHUTDOWN';
+                    DBMS_APPLICATION_INFO.SET_ACTION('SHUTDOWN');
+                    DBMS_APPLICATION_INFO.SET_CLIENT_INFO('Time:' || systimestamp);
+                end if;
+
+            when p_eventCounter = 0 then
+                if p_ready then
+                    l_status := 'PENDING';
+                    DBMS_APPLICATION_INFO.SET_ACTION('PENDING');
+                    DBMS_APPLICATION_INFO.SET_CLIENT_INFO('Time:' || systimestamp);
+                else
+                    l_status := 'STOPPED';
+                    DBMS_APPLICATION_INFO.SET_MODULE(NULL, NULL);
+                    DBMS_APPLICATION_INFO.SET_CLIENT_INFO(NULL);
+                end if;
+
+            when p_eventCounter < 0 then
+                if p_ready then
+                    l_status := 'UNKNOWN';
+                    DBMS_APPLICATION_INFO.SET_ACTION('UNKNOWN');
+                    DBMS_APPLICATION_INFO.SET_CLIENT_INFO('Time:' || systimestamp);
+                else
+                    l_status := 'ERROR';
+                    DBMS_APPLICATION_INFO.SET_ACTION('ERROR');
+                    DBMS_APPLICATION_INFO.SET_CLIENT_INFO('Exception; Server stopped!');
+                end if;
+        end case;
+
+        l_sqlStmt := '
+        UPDATE ' || C_LILAM_SERVER_REGISTRY || '
+        SET last_activity = SYSTIMESTAMP, 
+            is_active = :1,
+            current_processes = :2,  -- Anzahl offener Prozesse (vorher Spalte current_load = pipe_size aus v$db_pipes, siehe unten)
+            status = :3,
+            processing = :4,
+            avg_log_lat = :5,
+            max_log_lat = :6,
+            avg_mon_lat = :7,
+            max_mon_lat = :8
+        WHERE upper(pipe_name) = :9';
+        -- CURRENT_PROCESSES = Anzahl der offenen Prozesse dieses Servers (ohne den Server-Prozess selbst).
+        -- Vorher: pipe_size aus v$db_pipes. Das war ungeeignet und teuer:
+        --   * pipe_size ist ein Höchststand des belegten Speichers und sinkt nach dem Abarbeiten nicht wieder
+        --   * v$db_pipes durchsucht den gesamten Library Cache (ca. 120-190 ms je Abfrage, Server blockiert)
+        --   * erforderte einen zusätzlichen Grant auf V_$DB_PIPES
+        execute immediate l_sqlStmt USING l_booleanAsInt, greatest(v_indexSession.COUNT - 1, 0), l_status, p_eventCounter, 
+            g_avgLatencyLogs, g_maxLatencyLogs, g_avgLatencyMon, g_maxLatencyMon, upper(g_serverPipeName);
+        COMMIT; -- Muss autonom sein!
+
+    exception
+        when others then
+            rollback;
+            logLilamErr(sqlCode, sqlErrM, 'updateServerRegistry'); 
+            if should_raise_error(g_serverProcessId) then
+                error(g_serverProcessId, 'Could not update server registry: ' || sqlErrM);
+            end if ;
+    END;
+
+    --------------------------------------------------------------------------
+
+    function receiveMessage(l_pipeName IN varchar2, p_cur_timeout IN OUT NUMBER) return varchar2
+    as
+        l_status    PLS_INTEGER;
+        l_message   VARCHAR2(32767);
+        c_max_timeout CONSTANT NUMBER := C_SERVER_TIMEOUT_MAX_WAIT_SEC; -- Maximum für den Eco-Mode
+        c_min_timeout CONSTANT NUMBER := C_SERVER_TIMEOUT_WAIT_FOR_MSG_SEC;
+    begin
+        l_status := DBMS_PIPE.RECEIVE_MESSAGE(l_pipeName, timeout => p_cur_timeout); --=> C_SERVER_TIMEOUT_WAIT_FOR_MSG_SEC);
+
+        if l_status = 0 THEN
+            p_cur_timeout := C_SERVER_TIMEOUT_WAIT_FOR_MSG_SEC;
+
+            begin   
+                DBMS_PIPE.UNPACK_MESSAGE(l_message);
+                return l_message;
+
+                EXCEPTION
+                    WHEN OTHERS THEN
+                        if should_raise_error(g_serverProcessId) then
+                            ERROR(g_serverProcessId, g_serverPipeName || '=>Receiving message per pipe; ' || SQLERRM);
+                        end if;
+                END; 
+        else
+             p_cur_timeout := LEAST(p_cur_timeout + C_SERVER_TIMEOUT_WAIT_FOR_MSG_SEC, c_max_timeout);
+            return null;
+        end if;
+        
+        EXCEPTION
+            WHEN OTHERS THEN
+            logLilamErr(sqlCode, sqlErrM, 'receiveMessage'); 
+            return null;
+    end;
+
+    --------------------------------------------------------------------------
+
+    procedure preparePipe(p_pipeName varchar2)
+    as
+        l_dummyRes PLS_INTEGER;
+    begin
+        DBMS_PIPE.RESET_BUFFER;
+        DBMS_PIPE.PURGE(p_pipeName);
+        l_dummyRes := DBMS_PIPE.REMOVE_PIPE(upper(p_pipeName));
+        DBMS_PIPE.PURGE(ctlPipe(p_pipeName));
+        l_dummyRes := DBMS_PIPE.REMOVE_PIPE(ctlPipe(p_pipeName));
+        l_dummyRes := DBMS_PIPE.CREATE_PIPE(pipename => upper(p_pipeName), maxpipesize => C_MAX_SERVER_PIPE_SIZE, private => false);
+        -- Steuer-Pipe für NEW_SESSION (siehe C_CTL_PIPE_SUFFIX)
+        l_dummyRes := DBMS_PIPE.CREATE_PIPE(pipename => ctlPipe(p_pipeName), maxpipesize => C_MAX_CTL_PIPE_SIZE, private => false);
+    end;
+
+    --------------------------------------------------------------------------
+
+    function processRequest(p_request varchar2, p_message varchar2, p_clientChannel varchar2, p_drain BOOLEAN DEFAULT FALSE, p_forceDrain BOOLEAN DEFAULT FALSE) return boolean
+    as
+        l_targetPipe varchar2(100);
+        l_processId  number (19,0);
+        l_status PLS_INTEGER;        
+    begin
+        -- Dispatcher-Modus: alles weiterleiten, nichts selbst verarbeiten
+        -- Ausnahme: SERVER_SHUTDOWN gilt dem Dispatcher selbst (sonst ist er nicht stoppbar)
+        if g_serverIsDispatcher and p_request not in ('SERVER_SHUTDOWN', 'SERVER_PING') then
+            if p_request in ('NEW_SESSION', 'SERVER_NEW_SESSION') then
+                -- Noch keine process_id vorhanden; Auswahl rein lastbasiert
+                l_targetPipe := getServerPipeAvailable(g_serverGroupName);
+            else
+                l_processId := jsonNumber(JSON_QUERY(p_message, '$.payload'), 'process_id');
+                l_targetPipe := resolveDispatchTarget(l_processId); -- Cache, sonst DB-Fallback
+            end if;
+    
+            if l_targetPipe is null then
+                -- Kein Worker verfügbar bzw. keine Route für die process_id.
+                -- Synchrone Anfragen (mit Rückkanal) sofort mit Fehler beantworten, statt sie zu verwerfen:
+                -- sonst wartet der Client den vollen Timeout ab (z.B. Reconnect mit veralteter ID: 5 s je Aufruf).
+                if p_clientChannel is not null then
+                    DBMS_PIPE.RESET_BUFFER;
+                    DBMS_PIPE.PACK_MESSAGE('{"header":{"msg_type":"SERVER_RESPONSE","msg_name":"NO_TARGET"},"payload":{"server_code":'
+                        || case when p_request in ('NEW_SESSION', 'SERVER_NEW_SESSION') then NUM_ERR_NO_SERVER else NUM_ERR_SERVER_PROC end
+                        || ',"server_message":"'
+                        || case when p_request in ('NEW_SESSION', 'SERVER_NEW_SESSION') then TXT_ERR_NO_SERVER else TXT_ERR_SERVER_PROC end
+                        || '"}}');
+                    l_status := DBMS_PIPE.SEND_MESSAGE(p_clientChannel, timeout => 0);
+                end if;
+                return false;
+            end if;
+    
+            -- unverändert weiterreichen, inkl. des ursprünglichen Client-Rückkanals im Header
+            DBMS_PIPE.RESET_BUFFER;
+            DBMS_PIPE.PACK_MESSAGE(p_message);        
+            if p_request in ('NEW_SESSION', 'SERVER_NEW_SESSION') then
+                -- NEW_SESSION an die Steuer-Pipe des Workers, danach Weckruf in dessen Daten-Pipe
+                l_status := DBMS_PIPE.SEND_MESSAGE(ctlPipe(l_targetPipe), timeout => 1);
+                sendPing(l_targetPipe);
+            else
+                l_status := DBMS_PIPE.SEND_MESSAGE(l_targetPipe, timeout => 1);
+            end if;
+            return false;
+        end if;
+
+        CASE p_request
+            WHEN 'SERVER_SHUTDOWN' then
+                if handleServerShutdown(p_clientChannel, p_message) then 
+                    -- nur wenn gültiges Passwort geschickt wurde
+--                        l_shutdownSignal := TRUE;
+                    INFO(g_serverProcessId, g_serverPipeName || '=> Shutdown by remote request');
+                    return true; -- Abbruchsignal
+                end if ;
+
+            WHEN 'UPDATE_RULE' then
+                updateServerRules(p_message);
+
+            WHEN 'SERVER_PING' then
+            null;
+
+            WHEN 'NEW_SESSION' THEN
+                if not p_drain then
+                    INFO(g_serverProcessId, g_serverPipeName || '=> New remote session ordered');
+                    doRemote_newSession(p_clientChannel, p_message);
+                end if;
+
+            WHEN 'CLOSE_SESSION' THEN
+                INFO(g_serverProcessId, g_serverPipeName || '=> Remote session closed');
+                doRemote_closeSession(p_clientChannel, p_message);
+
+            WHEN 'LOG_ANY' then
+                doRemote_logAny(p_message);
+
+            WHEN 'SET_ANY_STATUS' then
+                doRemote_setAnyStatus(p_message);
+
+            WHEN 'PROC_STEP_DONE' then
+                doRemote_procStepDone(p_message);
+
+            WHEN 'RECONNECT_PROCESS' then
+                doRemote_reconnectProcess(p_clientChannel, p_message);
+
+            WHEN 'GET_PROCESS_DATA' then
+                doRemote_getProcessData(p_clientChannel, p_message);
+
+            WHEN C_MARK_EVENT then
+                doRemote_markEvent(p_message);
+
+            WHEN 'START_TRACE' then
+                doRemote_startTrace(p_message);
+
+            WHEN 'STOP_TRACE' then
+                doRemote_stopTrace(p_message);
+
+            WHEN 'GET_MONITOR_LAST_ENTRY' then
+                doRemote_getMonitorLastEntry(p_clientChannel, p_message);
+
+            WHEN 'UNFREEZE_REQUEST' then
+                if not p_forceDrain then
+                    doRemote_unfreezeClient(p_clientChannel, p_message, p_drain);
+                end if;
+
+            ELSE 
+                -- Unbekanntes Tag loggen
+                warn(g_serverProcessId, g_serverPipeName || '=> Received unknown request: ' || p_request);
+        END CASE;
+
+        return false; -- kein Abbruchsignal
+    end;
+
+    --------------------------------------------------------------------------
+
+    procedure START_SERVER(p_pipeName varchar2, p_groupName varchar2, p_password varchar2, p_isDispatcher PLS_INTEGER DEFAULT 0,
+                           p_perfServer PLS_INTEGER DEFAULT NULL)
+    as
+        v_key            VARCHAR2(100); 
+        l_clientChannel  varchar2(50);
+        l_message        JSON_OBJ_LILAM;
+        l_status         PLS_INTEGER;
+        l_request        VARCHAR2(500);
+        l_dummyRes       PLS_INTEGER;
+        l_shutdownSignal BOOLEAN := FALSE;
+        l_lastHeartbeat  TIMESTAMP := sysTimestamp;
+        l_lastSync       TIMESTAMP := sysTimestamp;  
+        l_loopCounter    PLS_INTEGER := 0;
+        l_msgCnt         PLS_INTEGER := 0;
+        l_serverTimeout  NUMBER := C_SERVER_TIMEOUT_WAIT_FOR_MSG_SEC;
+        l_ctlPipe        VARCHAR2(150);
+    begin
+        g_serverIsDispatcher := CASE nvl(p_isDispatcher, 0) WHEN 1 THEN TRUE ELSE FALSE END;
+        g_server_perf := normPerf(p_perfServer);   -- wird den Clients bei NEW_SESSION/RECONNECT mitgeteilt
+        g_shutdownPassword := p_password;
+        g_serverPipeName := p_pipeName; --l_pipe;
+        g_serverGroupName := p_groupName;
+        g_serverProcessId := new_session(p_processName => 'LILAM_SERVER', p_logLevel => logLevelMonitor, p_tabNameMaster => 'LILAM_SERVER');
+        SET_PROCESS_STATUS(g_serverProcessId, 1, 'RUNNING');
+
+        registerServerPipe;
+        preparePipe(g_serverPipeName);
+        l_ctlPipe := ctlPipe(g_serverPipeName);
+        loadServerRules;
+        updateServerRegistry(TRUE, 0);
+        DBMS_APPLICATION_INFO.SET_MODULE(
+            module_name => 'LILAM_SERVER ' || g_serverPipeName, 
+            action_name => 'STARTUP'
+        );
+
+        LOOP
+            -- Zuerst die Steuer-Pipe (NEW_SESSION), ohne zu warten. Ist sie leer, kostet das wenige µs.
+            LOOP
+                l_status := DBMS_PIPE.RECEIVE_MESSAGE(l_ctlPipe, timeout => 0);
+                EXIT WHEN l_status != 0;
+                -- mitzaehlen: PROCESSING in der Registry ist das erste Kriterium der Serverauswahl
+                l_msgCnt := l_msgCnt + 1;
+                BEGIN
+                    DBMS_PIPE.UNPACK_MESSAGE(l_message);
+                    l_clientChannel := extractClientChannel(l_message);
+                    l_request := extractClientRequest(l_message);
+                    l_shutdownSignal := processRequest(l_request, l_message, l_clientChannel);
+                EXCEPTION
+                    WHEN OTHERS THEN
+                        logLilamErr(sqlCode, sqlErrM, 'START_SERVER', 'CTL_PIPE');
+                END;
+            END LOOP;
+
+            -- Warten auf die nächste Nachricht (Timeout in Sekunden)
+            l_message := receiveMessage(g_serverPipeName, l_serverTimeout); 
+            if l_message is not null THEN
+                l_msgCnt := l_msgCnt + 1;
+            BEGIN 
+                l_clientChannel := extractClientChannel(l_message);
+                l_request := extractClientRequest(l_message);
+                l_shutdownSignal := processRequest(l_request, l_message, l_clientChannel);
+                EXCEPTION
+                    WHEN OTHERS THEN
+                        -- WICHTIG: Fehler loggen, aber die Schleife NICHT verlassen!
+                        if should_raise_error(g_serverProcessId) then
+                            ERROR(g_serverProcessId, g_serverPipeName || '=>Internal START_SERVER; Critical Error while processing command: ' || SQLERRM);
+                        end if;
+                END; 
+            end if;
+
+            if l_message is null or l_loopCounter > C_SERVER_MAX_LOOPS_IN_TIME_NO then
+                if get_ms_diff(l_lastSync, sysTimestamp) >= C_SERVER_SYNC_INTERVAL_MS  THEN
+                    -- Housekeeping
+                    updateServerRegistry(TRUE, l_msgCnt);
+                    SYNC_ALL_DIRTY;
+                    l_lastSync := sysTimestamp;
+                    l_loopCounter := 0;
+                    l_msgCnt := 0;
+                end if;
+
+                -- Timeout erreicht. Passiert, wenn innerhalb eines Intervalls kein Signal kam.
+                if get_ms_diff(l_lastHeartbeat, sysTimestamp) >= C_SERVER_HEARTBEAT_INTERVAL_MS then
+                    INFO(g_serverProcessId, g_serverPipeName || 'HEARTBEAT ' || g_serverPipeName);
+                    l_lastHeartbeat := sysTimestamp;
+                end if ;
+            end if ;
+
+            EXIT when l_shutdownSignal;
+            l_loopCounter := l_loopCounter + 1;
+        END LOOP;
+        -- Ab jetzt ist der Server nicht mehr erreichbar
+        updateServerRegistry(FALSE, l_msgCnt);
+        SET_PROCESS_STATUS(g_serverProcessId, 0, 'STOPPED');
+
+        -- +++ NEU: DRAIN-PHASE +++
+        -- Wir leeren die Pipe, falls während des Shutdowns noch Nachrichten reinkamen.
+        LOOP
+            l_status := DBMS_PIPE.RECEIVE_MESSAGE(g_serverPipeName, timeout => 0.1);
+            EXIT WHEN l_status != 0; -- Pipe ist leer (1) oder Fehler/Interrupt (!=0)
+
+            DBMS_PIPE.UNPACK_MESSAGE(l_message);
+            l_clientChannel := extractClientChannel(l_message);
+            l_request := extractClientRequest(l_message);
+
+            -- Im Drain verarbeiten wir nur noch Log-Daten, keine neuen Sessions/Shutdowns
+                l_shutdownSignal := processRequest(l_request, l_message, l_clientChannel, TRUE);
+
+        END LOOP;
+
+        DBMS_OUTPUT.ENABLE();
+
+        -- es könnten noch dirty buffered Einträge existieren
+        sync_all_dirty(true, true);
+
+        if g_serverProcessId != -1 THEN
+            DBMS_OUTPUT.PUT_LINE('Finaler Cleanup für Server-ID: ' || g_serverProcessId);
+            clearServerData;
+            clearAllSessionData(g_serverProcessId);
+        end if ;
+
+        DBMS_PIPE.PURGE(g_serverPipeName); 
+        l_dummyRes := DBMS_PIPE.REMOVE_PIPE(g_serverPipeName);
+        DBMS_PIPE.PURGE(ctlPipe(g_serverPipeName));
+        l_dummyRes := DBMS_PIPE.REMOVE_PIPE(ctlPipe(g_serverPipeName));
+        g_remote_sessions.DELETE;
+
+        -- abschließende Analyse der Buffer-Zustände
+        DUMP_BUFFER_STATS;
+
+        close_session(g_serverProcessId);
+        updateServerRegistry(FALSE, 0);
+
+    EXCEPTION
+
+    WHEN OTHERS THEN
+        logLilamErr(sqlCode, sqlErrM, 'START_SERVER', 'MAIN CODE');
+        if should_raise_error(g_serverProcessId) then
+            ERROR(g_serverProcessId, g_serverPipeName || '=>Internal START_SERVER; Critical Error: ' || SQLERRM);
+        end if;
+        
+        -- error handling step by step ensuring to close max. number of pipes
+        begin
+            DBMS_PIPE.PURGE(g_serverPipeName); 
+            l_dummyRes := DBMS_PIPE.REMOVE_PIPE(g_serverPipeName);
+        exception
+            when others then
+                logLilamErr(sqlCode, sqlErrM, 'START_SERVER', 'DBMS_PIPE.PURGE');
+        end;
+        
+        begin
+            DBMS_PIPE.PURGE(ctlPipe(g_serverPipeName));
+            l_dummyRes := DBMS_PIPE.REMOVE_PIPE(ctlPipe(g_serverPipeName));
+        exception
+            when others then
+                logLilamErr(sqlCode, sqlErrM, 'START_SERVER', 'DBMS_PIPE.PURGE');
+        end;
+        
+        -- the next procedures use their own error handling
+        clearServerData;
+        clearAllSessionData(g_serverProcessId);
+        updateServerRegistry(FALSE, -1);
+
+    end;
+
+    --------------------------------------------------------------------------
+
+PROCEDURE CALL_BY_JSON(
+    p_callObject  IN  JSON_OBJ_LILAM,
+    p_respObject  OUT JSON_OBJ_LILAM
+)
+AS
+    l_InObject      JSON_OBJ_LILAM := p_callObject;
+    l_jsonHeaderIn  JSON_OBJ_LILAM;   -- Header aus der Anfrage
+    l_jsonParams    JSON_OBJ_LILAM;   -- Params aus der Anfrage (jetzt tatsächlich befüllt)
+    l_jsonHeader    JSON_OBJ_LILAM;   -- Header der Antwort
+    l_jsonPayload   JSON_OBJ_LILAM;   -- Payload der Antwort
+    l_api_call      VARCHAR2(30);
+    l_proc_id       NUMBER;
+    p_session_init  t_session_init;
+BEGIN
+    if not p_callObject IS JSON then
+        RAISE_APPLICATION_ERROR(-20005, 'In-Parameter is invalid JSON-Format');
+    end if;
+
+    -- Header und Params aus der Anfrage extrahieren
+    l_jsonHeaderIn := jsonObject(l_InObject, 'header');
+    l_api_call     := jsonString(l_jsonHeaderIn, 'api_call');
+    l_jsonParams   := jsonObject(l_InObject, 'params');
+
+    -- Antwort-Grundgerüst; 'status' wird bewusst NUR EINMAL gesetzt,
+    -- entweder unten im jeweiligen Zweig oder im ELSE-Fallback
+    jsonPut(l_jsonHeader, 'header', l_jsonHeaderIn);
+    jsonPut(l_jsonPayload, 'returns', 'NO_VALUE');
+    jsonPut(l_jsonPayload, 'value', 'NULL');
+
+    case l_api_call
+        when 'SERVER_NEW_SESSION' THEN
+            begin
+                l_proc_id := SERVER_NEW_SESSION_JSON(l_jsonParams);
+                jsonPut(l_jsonHeader, 'status', 'SUCCESS');
+                jsonPut(l_jsonPayload, 'returns', 'PROCESS_ID');
+                jsonPut(l_jsonPayload, 'value', l_proc_id);
+
+            exception
+                when others then
+                    logLilamErr(sqlCode, sqlErrM, 'CALL_BY_JSON', 'SERVER_NEW_SESSION');
+                    jsonPut(l_jsonHeader, 'status', 'ERROR');
+                    jsonPut(l_jsonPayload, 'returns', 'ERR_NO');
+                    jsonPut(l_jsonPayload, 'value', SQLCODE);
+            end;
+
+        when 'NEW_SESSION' THEN
+            p_session_init.processName   := jsonString(l_jsonParams, 'process_name');
+            p_session_init.logLevel      := jsonNumber(l_jsonParams, 'log_level');
+            p_session_init.stepsToDo     := jsonNumber(l_jsonParams, 'steps_todo');
+            p_session_init.daysToKeep    := jsonNumber(l_jsonParams, 'days_to_keep');
+            p_session_init.procImmortal  := jsonNumber(l_jsonParams, 'process_immortal');
+            p_session_init.tabNameMaster := jsonString(l_jsonParams, 'tabname_master');
+            p_session_init.baselineScope := jsonString(l_jsonParams, 'baseline_scope');
+
+            l_proc_id := NEW_SESSION(p_session_init);
+            jsonPut(l_jsonHeader, 'status', 'SUCCESS');
+            jsonPut(l_jsonPayload, 'returns', 'PROCESS_ID');
+            jsonPut(l_jsonPayload, 'value', l_proc_id);
+
+        when 'SERVER_SHUTDOWN' then
+            SERVER_SHUTDOWN(
+                jsonNumber(l_jsonParams, 'process_id'),
+                jsonString(l_jsonParams, 'pipe_name'),   -- korrigiert: war 'process_name'
+                jsonString(l_jsonParams, 'password')
+            );
+            jsonPut(l_jsonHeader, 'status', 'SUCCESS');
+
+        when 'CLOSE_SESSION' THEN
+            CLOSE_SESSION(jsonNumber(l_jsonParams, 'process_id'));
+            jsonPut(l_jsonHeader, 'status', 'SUCCESS');
+
+        when 'SET_PROCESS_STATUS' THEN
+            SET_PROCESS_STATUS(jsonNumber(l_jsonParams, 'process_id'), jsonNumber(l_jsonParams, 'process_status'), jsonString(l_jsonParams, 'process_info'));
+            jsonPut(l_jsonHeader, 'status', 'SUCCESS');
+
+        when 'SET_STEP_TODO' THEN
+            SET_PROC_STEPS_TODO(jsonNumber(l_jsonParams, 'process_id'), jsonNumber(l_jsonParams, 'steps_todo'));
+            jsonPut(l_jsonHeader, 'status', 'SUCCESS');
+
+        when 'SET_STEPS_DONE' THEN
+            SET_PROC_STEPS_DONE(jsonNumber(l_jsonParams, 'process_id'), jsonNumber(l_jsonParams, 'steps_done'));
+            jsonPut(l_jsonHeader, 'status', 'SUCCESS');
+
+        when 'PROC_STEP_DONE' THEN
+            PROC_STEP_DONE(jsonNumber(l_jsonParams, 'process_id'));
+            jsonPut(l_jsonHeader, 'status', 'SUCCESS');
+
+        when 'SET_PROC_IMMORTAL' THEN
+            SET_PROC_IMMORTAL(jsonNumber(l_jsonParams, 'process_id'), jsonNumber(l_jsonParams, 'process_immortal'));
+            jsonPut(l_jsonHeader, 'status', 'SUCCESS');
+
+        when 'INFO' THEN
+            INFO(jsonNumber(l_jsonParams, 'process_id'), jsonString(l_jsonParams, 'process_info'));
+            jsonPut(l_jsonHeader, 'status', 'SUCCESS');
+
+        when 'DEBUG' THEN
+            DEBUG(jsonNumber(l_jsonParams, 'process_id'), jsonString(l_jsonParams, 'process_info'));
+            jsonPut(l_jsonHeader, 'status', 'SUCCESS');
+
+        when 'WARN' THEN
+            WARN(jsonNumber(l_jsonParams, 'process_id'), jsonString(l_jsonParams, 'process_info'));
+            jsonPut(l_jsonHeader, 'status', 'SUCCESS');
+
+        when 'ERROR' THEN
+            ERROR(jsonNumber(l_jsonParams, 'process_id'), jsonString(l_jsonParams, 'process_info'));
+            jsonPut(l_jsonHeader, 'status', 'SUCCESS');
+
+        when C_MARK_EVENT THEN
+            MARK_EVENT(jsonNumber(l_jsonParams, 'process_id'), jsonString(l_jsonParams, 'action_name'), jsonString(l_jsonParams, 'context_name'), jsonTime(l_jsonParams, 'timestamp'));
+            jsonPut(l_jsonHeader, 'status', 'SUCCESS');
+
+        when C_TRACE_START THEN
+            TRACE_START(jsonNumber(l_jsonParams, 'process_id'), jsonString(l_jsonParams, 'action_name'), jsonString(l_jsonParams, 'context_name'), jsonTime(l_jsonParams, 'timestamp'));
+            jsonPut(l_jsonHeader, 'status', 'SUCCESS');
+
+        when C_TRACE_STOP THEN
+            TRACE_STOP(jsonNumber(l_jsonParams, 'process_id'), jsonString(l_jsonParams, 'action_name'), jsonString(l_jsonParams, 'context_name'), jsonTime(l_jsonParams, 'timestamp'));
+            jsonPut(l_jsonHeader, 'status', 'SUCCESS');
+
+        ELSE
+            jsonPut(l_jsonHeader, 'status', 'ERROR');
+            jsonPut(l_jsonPayload, 'returns', 'ERR_NO');
+            jsonPut(l_jsonPayload, 'value', NUM_ERR_ILLEGAL_REQ);
+    END CASE;
+
+    jsonPut(p_respObject, 'header', l_jsonHeader);
+    jsonPut(p_respObject, 'payload', l_jsonPayload);
+
+EXCEPTION
+    WHEN OTHERS THEN
+    logLilamErr(sqlCode, sqlErrM, 'CALL_BY_JSON');
+    jsonPut(l_jsonHeader, 'status', 'ERROR');
+    jsonPut(l_jsonPayload, 'returns', 'ERR_NO');
+    jsonPut(l_jsonPayload, 'value', NUM_ERR_UNKNOWN);
+    jsonPut(p_respObject, 'header', l_jsonHeader);
+    jsonPut(p_respObject, 'payload', l_jsonPayload);
+
+END;
+    PROCEDURE CALL_BY_JSON (
+        p_callObject  IN  JSON_OBJECT_T,
+        p_respObject  OUT JSON_OBJECT_T
+    )
+    AS
+        l_callObject JSON_OBJ_LILAM;
+        l_respObject JSON_OBJ_LILAM;
+    BEGIN
+        p_respObject := JSON_OBJECT_T();
+        l_callObject := p_callObject.to_string();
+        CALL_BY_JSON(l_callObject, l_respObject);
+        p_respObject := JSON_OBJECT_T.parse(l_respObject);
+    END;
+
+    --------------------------------------------------------------------------
+
+    FUNCTION quote_literal(p_text IN VARCHAR2) RETURN VARCHAR2 IS
+    BEGIN
+        -- Verdoppelt Hochkommas und umschließt den Text mit Hochkommas
+        RETURN '''' || REPLACE(p_text, '''', '''''') || '''';
+    END quote_literal;
+
+    --------------------------------------------------------------------------
+
+    FUNCTION CREATE_SERVER(p_pipeName varchar2, p_groupName varchar2, p_password  varchar2, p_isDispatcher PLS_INTEGER DEFAULT 0,
+                           p_perfServer PLS_INTEGER DEFAULT NULL) RETURN VARCHAR2
+    AS
+        l_slot_idx PLS_INTEGER := 1; -- Beispielwert, sollte dynamisch ermittelt werden
+        l_action   VARCHAR2(2000); -- Puffer leicht erhöht für längere Strings
+    BEGIN
+        -- 1. Sicherstellen, dass kein "Leichen"-Job existiert
+        -- Wir fangen gezielt ORA-27475 (Job does not exist) ab
+        BEGIN
+            null;
+            DBMS_SCHEDULER.DROP_JOB(job_name => p_pipeName, force => TRUE);
+        EXCEPTION 
+            WHEN OTHERS THEN 
+                IF SQLCODE != -27475 THEN RAISE; END IF;
+        END;
+
+        -- 2. Den PL/SQL Block für den Scheduler zusammenbauen
+        -- Wichtig: p_groupName wurde in die Action integriert
+        l_action := 'BEGIN ' ||
+                    '  LILAM.START_SERVER(' ||
+                    '    p_pipeName  => ' || quote_literal(p_pipeName)      || ', ' ||
+                    '    p_groupName => ' || quote_literal(p_groupName) || ', ' ||
+                    '    p_password  => ' || quote_literal(p_password)  || ', ' ||
+                    '    p_isDispatcher => ' || quote_literal(p_isDispatcher) || ', ' ||
+                    '    p_perfServer => ' || normPerf(p_perfServer) ||
+                    '  ); ' ||
+                    'END;';
+
+        -- 3. Den Hintergrund-Prozess "zünden"
+        DBMS_SCHEDULER.CREATE_JOB (
+            job_name   => p_pipeName,
+            job_type   => 'PLSQL_BLOCK',
+            job_action => l_action,
+            enabled    => TRUE,
+            auto_drop  => TRUE,
+            comments   => 'LILAM Background Worker [' || p_groupName || '] auf Pipe ' || p_pipeName
+        );
+
+        RETURN 'LILAM-Server gestartet: Pipe=' || p_pipeName || ' (Gruppe=' || p_groupName || ')';
+
+    EXCEPTION
+        WHEN OTHERS THEN
+        logLilamErr(sqlCode, sqlErrM, 'CREATE_SERVER'); 
+        return 'Internal CREATE_SERVER; job_action = ' || l_action || '; Critical Error while processing command: ' || SQLERRM;
+
+    END;
+    
+    ------------------------------------------------------------------------
+
+    PROCEDURE FINAL_RESCUE
+    as
+    begin
+        SYNC_ALL_DIRTY(true, true);
+    end;
+
+    ------------------------------------------------------------------------
+
+    PROCEDURE IS_ALIVE
+    as
+        pProcessName number(19,0);
+    begin
+        pProcessName := new_session('LILAM Life Check', logLevelDebug);
+        debug(pProcessName, 'First Message of LILAM');
+        close_session(p_processId => pProcessName, p_processInfo => 'OK', p_processStatus => 1, p_procStepsDone => 1, p_procStepsToDo => 1);
+    end;
+
+    PROCEDURE DIAG_SKIP_PERSIST(p BOOLEAN) IS BEGIN g_diag_skip_persist := p; END;
+
+    FUNCTION MEM_STATS RETURN VARCHAR2 IS
+        l VARCHAR2(4000); k VARCHAR2(250); n PLS_INTEGER;
+    BEGIN
+        l := 'sessionList=' || CASE WHEN g_sessionList IS NULL THEN 'null' ELSE g_sessionList.COUNT || '/last ' || g_sessionList.LAST END
+          || ' indexSession=' || v_indexSession.COUNT || ' remote=' || g_remote_sessions.COUNT || ' unknown=' || g_unknown_pids.COUNT
+          || ' throttle=' || g_local_throttle_cache.COUNT || ' proc_cache=' || g_process_cache.COUNT;
+        n := 0; k := g_monitor_groups.FIRST; WHILE k IS NOT NULL LOOP n := n + g_monitor_groups(k).COUNT; k := g_monitor_groups.NEXT(k); END LOOP;
+        l := l || ' mon_groups=' || g_monitor_groups.COUNT || '(' || n || ')';
+        n := 0; k := g_log_groups.FIRST; WHILE k IS NOT NULL LOOP n := n + g_log_groups(k).COUNT; k := g_log_groups.NEXT(k); END LOOP;
+        l := l || ' log_groups=' || g_log_groups.COUNT || '(' || n || ')'
+          || ' mon_shadows=' || g_monitor_shadows.COUNT || ' mon_avgs=' || g_monitor_averages.COUNT || ' baselines=' || g_baselines.COUNT
+          || ' scope_ids=' || g_scope_ids.COUNT || ' checked_masters=' || g_checked_masters.COUNT || ' safe_tables=' || g_safe_tables.COUNT
+          || ' last_action=' || g_last_action_per_process.COUNT || ' dirty=' || g_dirty_queue.COUNT
+          || ' log_b=' || g_log_batches.COUNT || ' mon_b=' || g_mon_batches.COUNT || ' proc_b=' || g_proc_batches.COUNT
+          || ' rules_ctx=' || g_rules_by_context.COUNT || ' rules_act=' || g_rules_by_action.COUNT || ' avg_params=' || g_avg_params.COUNT
+          || ' alert_hist=' || g_alert_history.COUNT || ' client_pipes=' || g_client_pipes.COUNT || ' route_cache=' || g_dispatch_route_cache.COUNT
+          || ' resp_codes=' || g_response_codes.COUNT;
+        RETURN l;
+    END;
+
+    BEGIN
+        g_avg_params('DEFAULT').alpha := 0.1;
+        g_avg_params('DEFAULT').warmup := 3; 
+
+END LILAM_DIAG;
+
+/
