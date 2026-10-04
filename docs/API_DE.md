@@ -746,7 +746,6 @@ Parameter identisch zu START_SERVER.
 -- Beispiel: Server der Gruppe BATCH mit mittlerer Leistungsstufe
 dbms_output.put_line(lilam.create_server('LILAM_SRV1', 'BATCH', 'geheim', p_perfServer => lilam.C_SERVER_PERF_MID));
 ```
-Parameter identisch zu START_SERVER.
 
 ### Procedure SERVER_SHUTDOWN
 Der Client muss bereits mit dem Server verbunden sein.

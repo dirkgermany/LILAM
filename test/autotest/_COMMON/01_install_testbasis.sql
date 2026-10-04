@@ -1304,6 +1304,8 @@ create or replace package body lt as
             l_cnt    number;
             l_avg    number;
             l_mon    number;
+            l_servers number;
+            l_tol    number;
         begin
             -- B1: Default-Scope, drei Neustarts mit je 2 Traces
             for r in 1 .. 3 loop l_pid := run_app(p_mode, l_app, null, 2); end loop;
@@ -1321,10 +1323,21 @@ create or replace package body lt as
             check_that(l_run, p_tag || ' B2 _MON zaehlt prozesslokal (max. 2 je Prozess)', l_cnt = 2, l_cnt);
 
             -- B3: AVG_MILLIS des letzten Eintrags = Baseline des Scopes
+            -- Mit mehreren Servern (z. B. im Dauertest) haelt jeder Server die Baseline in seiner PGA und gleicht sie
+            -- nur alle 1,5 s ab. _MON zeigt dann den Stand eines Servers, die Tabelle den zusammengefuehrten Stand.
+            -- Deshalb gilt dort eine Toleranz von 20 % der Baseline, sonst +-1 ms.
+            l_servers := 1;
+            if p_mode != c_insession then
+                execute immediate 'select count(*) from lilam_server_registry where is_active = 1 and nvl(is_dispatcher, 0) = 0
+                                      and upper(group_name) = upper(:1) and last_activity > systimestamp - interval ''15'' second'
+                                 into l_servers using c_group;
+            end if;
+            l_tol := case when l_servers > 1 then greatest(1, 0.2 * l_avg) else 1 end;
             execute immediate 'select max(m.avg_millis) keep (dense_rank last order by m.stop_time)
                                  from lilam_mon m where m.process_id = :1 and m.action = :2' into l_mon using l_pid, c_action;
-            check_that(l_run, p_tag || ' B3 _MON.AVG_MILLIS des letzten Prozesses = Baseline', abs(nvl(l_mon, -1) - l_avg) <= 1,
-                       'MON ' || l_mon || ' / Baseline ' || round(l_avg, 1));
+            check_that(l_run, p_tag || ' B3 _MON.AVG_MILLIS des letzten Prozesses = Baseline', abs(nvl(l_mon, -1) - l_avg) <= l_tol,
+                       'MON ' || l_mon || ' / Baseline ' || round(l_avg, 1) || ' / Toleranz ' || round(l_tol, 1)
+                       || ' ms / Server ' || l_servers);
 
             -- B4: #NONE aendert die Baseline nicht
             l_pid := run_app(p_mode, l_app, '#NONE', 2);
