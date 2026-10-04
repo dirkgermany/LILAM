@@ -1,5 +1,5 @@
 # LILAM API-Referenz
-### Version: 1.7
+### Version: 2.0
 
 ---
 
@@ -96,9 +96,9 @@ Starte den Server in einer eigenen Datenbanksession. `START_SERVER` blockiert di
 ```sql
 BEGIN
   lilam.start_server(
-    'MY_FIRST_LILAM_SERVER',
-    NULL,
-    'SECURE PASSWORD'
+    p_pipeName  => 'MY_FIRST_LILAM_SERVER',
+    p_groupName => NULL,
+    p_password  => 'SECURE PASSWORD'
   );
 END;
 /
@@ -112,11 +112,8 @@ DECLARE
 BEGIN
   -- Connect to an available server
   l_processId := lilam.server_new_session(
-    'DECOUPLED_SYNC',
-    lilam.logLevelInfo,
-    0,
-    100,
-    'LILAM'
+    p_processName => 'DECOUPLED_SYNC',
+    p_logLevel    => lilam.logLevelInfo
   );
 
   lilam.info(
@@ -161,11 +158,8 @@ DECLARE
   l_serverPipe VARCHAR2(100);
 BEGIN
   l_processId := lilam.server_new_session(
-    'SHUT DOWN SERVER',
-    lilam.logLevelInfo,
-    0,
-    100,
-    'LILAM'
+    p_processName => 'SHUT DOWN SERVER',
+    p_logLevel    => lilam.logLevelInfo
   );
 
   l_serverPipe := lilam.get_server_pipe(l_processId);
@@ -237,49 +231,24 @@ Die Session-Verwaltung steuert den Lebenszyklus eines LILAM Prozesses.
 
 ### Function NEW_SESSION / SERVER_NEW_SESSION
 
-Beide Funktionen starten einen LILAM Prozess und liefern dessen Process ID zurück. Diese ID wird für nachfolgende API-Aufrufe benötigt.
+Beide Funktionen starten einen LILAM Prozess und liefern dessen Process ID zurück. Diese ID wird für alle nachfolgenden API-Aufrufe benötigt.
 
-#### Welche Variante sollte ich verwenden?
+- `NEW_SESSION` startet den Prozess im In-Session-Modus.
+- `SERVER_NEW_SESSION` startet den Prozess im entkoppelten Modus über einen LILAM Server. Die Parameter sind dieselben, ergänzt um `p_groupName` an zweiter Stelle.
+- Alternativ lassen sich alle Einstellungen in einem Record [`t_session_init`](#record-typ-t_session_init) zusammenfassen (nur `NEW_SESSION`).
 
-- Verwende die `t_session_init`-Variante, wenn Du die Initialisierungsparameter übersichtlich in einem Record zusammenfassen möchtest.
-- Verwende einen kurzen `NEW_SESSION`-Overload, wenn nur wenige Einstellungen erforderlich sind.
-- Verwende `SERVER_NEW_SESSION` für den entkoppelten Betrieb.
-- Verwende den `SERVER_NEW_SESSION`-Overload mit `p_groupName`, wenn die Serverauswahl auf eine bestimmte Gruppe eingeschränkt werden soll.
-
-#### NEW_SESSION: Basic Mode
+Jeder Parameter steht immer an derselben Position. Alle Parameter außer `p_processName` besitzen einen Default und können daher weggelassen oder per Namen übergeben werden.
 
 ```sql
 FUNCTION NEW_SESSION(
   p_processName   VARCHAR2,
   p_logLevel      PLS_INTEGER DEFAULT logLevelMonitor,
-  p_tabNameMaster VARCHAR2 DEFAULT 'LILAM'
+  p_procStepsToDo PLS_INTEGER DEFAULT NULL,
+  p_daysToKeep    PLS_INTEGER DEFAULT NULL,
+  p_tabNameMaster VARCHAR2    DEFAULT 'LILAM',
+  p_baselineScope VARCHAR2    DEFAULT NULL
 ) RETURN NUMBER
 ```
-
-#### NEW_SESSION: Retention Mode
-
-```sql
-FUNCTION NEW_SESSION(
-  p_processName   VARCHAR2,
-  p_logLevel      PLS_INTEGER,
-  p_daysToKeep    PLS_INTEGER,
-  p_tabNameMaster VARCHAR2 DEFAULT 'LILAM'
-) RETURN NUMBER
-```
-
-#### NEW_SESSION: Full Progress Mode
-
-```sql
-FUNCTION NEW_SESSION(
-  p_processName   VARCHAR2,
-  p_logLevel      PLS_INTEGER,
-  p_procStepsToDo PLS_INTEGER,
-  p_daysToKeep    PLS_INTEGER,
-  p_tabNameMaster VARCHAR2 DEFAULT 'LILAM'
-) RETURN NUMBER
-```
-
-#### NEW_SESSION: Initialisierung über einen Record
 
 ```sql
 FUNCTION NEW_SESSION(
@@ -287,47 +256,83 @@ FUNCTION NEW_SESSION(
 ) RETURN NUMBER
 ```
 
-#### SERVER_NEW_SESSION: Beliebiger verfügbarer Server
-
 ```sql
 FUNCTION SERVER_NEW_SESSION(
   p_processName   VARCHAR2,
-  p_logLevel      PLS_INTEGER,
-  p_procStepsToDo PLS_INTEGER,
-  p_daysToKeep    PLS_INTEGER,
-  p_tabNameMaster VARCHAR2
+  p_groupName     VARCHAR2    DEFAULT NULL,
+  p_logLevel      PLS_INTEGER DEFAULT logLevelMonitor,
+  p_procStepsToDo PLS_INTEGER DEFAULT NULL,
+  p_daysToKeep    PLS_INTEGER DEFAULT NULL,
+  p_tabNameMaster VARCHAR2    DEFAULT 'LILAM',
+  p_baselineScope VARCHAR2    DEFAULT NULL
 ) RETURN NUMBER
 ```
-
-#### SERVER_NEW_SESSION: Server aus einer bestimmten Gruppe
 
 ```sql
-FUNCTION SERVER_NEW_SESSION(
-  p_processName   VARCHAR2,
-  p_groupName     VARCHAR2,
-  p_logLevel      PLS_INTEGER,
-  p_procStepsToDo PLS_INTEGER,
-  p_daysToKeep    PLS_INTEGER,
-  p_tabNameMaster VARCHAR2
+FUNCTION SERVER_NEW_SESSION_JSON(
+  p_jsonObject VARCHAR2
 ) RETURN NUMBER
 ```
+
+`SERVER_NEW_SESSION_JSON` nimmt dieselben Parameter als JSON-Objekt entgegen (Schlüssel siehe Tabelle).
 
 #### Parameter
 
-| Parameter | JSON | Beschreibung |
-| --- | --- | --- |
-| `p_processName` | `process_name` | Name zur Identifikation des Prozesses |
-| `p_groupName` | `group_name` | Beschränkt die Serverauswahl auf die angegebene Gruppe |
-| `p_logLevel` | `log_level` | Legt den Detaillierungsgrad des Loggings fest |
-| `p_procStepsToDo` | `steps_todo` | Geplante Anzahl der Prozessschritte |
-| `p_daysToKeep` | `days_to_keep` | Maximales Alter passender Prozessdaten vor einer Bereinigung |
-| `p_tabNameMaster` | `tab_name_master` | Präfix für die PROC-, LOG- und MON-Tabellen |
+| Parameter | JSON | Default | Beschreibung |
+| --- | --- | --- | --- |
+| `p_processName` | `process_name` | – | Name zur Identifikation des Prozesses |
+| `p_groupName` | `group_name` | `NULL` | Nur `SERVER_NEW_SESSION`: beschränkt die Serverauswahl auf die angegebene Gruppe; `NULL` = beliebiger verfügbarer Server |
+| `p_logLevel` | `log_level` | `logLevelMonitor` | Detaillierungsgrad des Loggings, siehe [Log-Level](#log-level) |
+| `p_procStepsToDo` | `steps_todo` | `NULL` | Geplante Anzahl der Prozessschritte |
+| `p_daysToKeep` | `days_to_keep` | `NULL` | `NULL` = keine automatische Bereinigung. Sonst werden beim Start abgeschlossene Prozesse gleichen Namens, die älter als die angegebene Anzahl Tage sind, samt Logs und Metriken gelöscht (außer Prozesse mit `procImmortal = 1`) |
+| `p_tabNameMaster` | `tabname_master` | `'LILAM'` | Präfix für die PROC-, LOG- und MON-Tabellen |
+| `p_baselineScope` | `baseline_scope` | `NULL` | Bezugsrahmen für die Durchschnittswerte (EWMA) von Traces und Events: `NULL` = Prozessname, d.h. gemeinsam über alle Prozesse mit diesem Namen; `'#NONE'` = nur innerhalb des einzelnen Prozesses; sonst ein frei gewählter Name, der auch von mehreren Anwendungen geteilt werden kann |
 
 **Rückgabewert:** `NUMBER`, die Process ID.
 
+Kann `SERVER_NEW_SESSION` keinen Prozess anlegen, wirft die Funktion **keine Exception**, sondern liefert einen negativen Wert. Alle weiteren API-Aufrufe mit dieser ID werden ohne Fehler ignoriert; die Anwendung läuft weiter, nur ohne Logging und Monitoring für diesen Prozess. Die Ursache wird in `LILAM_LOG_INTERNAL` protokolliert.
+
+| Konstante | Wert | Bedeutung |
+| --- | --- | --- |
+| `NUM_ERR_SESSION_TIMEOUT` | -20110 | Der Server hat nicht rechtzeitig geantwortet |
+| `NUM_ERR_SESSION_THROTTLED` | -20120 | Der Server hat die Anfrage abgelehnt (Überlast) |
+| `NUM_COMM_ERR` | -20003 | Kommunikationsfehler, z.B. kein aktiver Server gefunden |
+
+```sql
+l_processId := lilam.server_new_session('IMPORT_CUSTOMERS', 'BATCH');
+if l_processId < 0 then
+  -- optional: eigene Reaktion, z.B. Hinweis an den Betrieb
+  null;   -- l_processId = lilam.NUM_ERR_SESSION_TIMEOUT, ...
+end if;
+```
+
+> [!NOTE]
+> Wartet der Client vergeblich auf die Antwort, legt der Server den Prozess auch später nicht mehr an. Der Client gibt dazu eine Verfallszeit mit; trifft die Anfrage erst danach beim Server ein, wird sie verworfen. So entstehen keine verwaisten, nie geschlossenen Prozesse.
+
+> [!NOTE]
+> Durch den Baseline-Scope baut auch eine Anwendung, die häufig neu gestartet wird, eine stabile Vergleichsbasis für ihre Laufzeiten auf. Die Durchschnittswerte werden in den Tabellen `LILAM_SCOPES` und `LILAM_BASELINES` gespeichert.
+
+#### Beispiele
+
+```sql
+-- nur der Name, alle übrigen Werte per Default
+l_processId := lilam.new_session('IMPORT_CUSTOMERS');
+
+-- Log-Level INFO und 500 geplante Schritte
+l_processId := lilam.new_session('IMPORT_CUSTOMERS', lilam.logLevelInfo, 500);
+
+-- einzelne Parameter per Namen
+l_processId := lilam.new_session('IMPORT_CUSTOMERS', p_daysToKeep => 30);
+l_processId := lilam.new_session('IMPORT_CUSTOMERS', p_baselineScope => '#NONE');
+
+-- entkoppelt: beliebiger verfügbarer Server bzw. Server der Gruppe BATCH
+l_processId := lilam.server_new_session('IMPORT_CUSTOMERS');
+l_processId := lilam.server_new_session('IMPORT_CUSTOMERS', 'BATCH', lilam.logLevelInfo);
+```
+
 ### Procedure CLOSE_SESSION
 
-Beendet einen LILAM Prozess. Abhängig vom verwendeten Overload können abschließende Prozessinformationen, Prozessfortschritt und Status übergeben werden.
+Beendet einen LILAM Prozess. Optional können abschließende Prozessinformationen, Status und Fortschritt übergeben werden.
 
 > [!IMPORTANT]
 > Rufe `CLOSE_SESSION` immer auf, wenn ein Prozess endet. LILAM puffert Daten aus Performancegründen. `CLOSE_SESSION` stellt sicher, dass noch vorhandene gepufferte Daten persistiert werden.
@@ -336,35 +341,28 @@ Beendet einen LILAM Prozess. Abhängig vom verwendeten Overload können abschlie
 
 ```sql
 PROCEDURE CLOSE_SESSION(
-  p_processId NUMBER
+  p_processId     NUMBER,
+  p_processInfo   VARCHAR2    DEFAULT NULL,
+  p_processStatus PLS_INTEGER DEFAULT NULL,
+  p_procStepsDone PLS_INTEGER DEFAULT NULL,
+  p_procStepsToDo PLS_INTEGER DEFAULT NULL
 )
 ```
 
-```sql
-PROCEDURE CLOSE_SESSION(
-  p_processId   NUMBER,
-  p_processInfo VARCHAR2,
-  p_status      PLS_INTEGER
-)
-```
+| Parameter | Beschreibung |
+| --- | --- |
+| `p_processId` | Process ID aus `NEW_SESSION` bzw. `SERVER_NEW_SESSION` |
+| `p_processInfo` | Abschließende Information zum Prozess |
+| `p_processStatus` | Abschließender Status |
+| `p_procStepsDone` | Anzahl erledigter Schritte |
+| `p_procStepsToDo` | Anzahl geplanter Schritte |
+
+Parameter, die `NULL` bleiben, verändern den bisherigen Wert des Prozesses nicht.
 
 ```sql
-PROCEDURE CLOSE_SESSION(
-  p_processId      NUMBER,
-  p_procStepsDone  NUMBER,
-  p_processInfo    VARCHAR2,
-  p_processStatus  PLS_INTEGER
-)
-```
-
-```sql
-PROCEDURE CLOSE_SESSION(
-  p_processId      NUMBER,
-  p_procStepsToDo  NUMBER,
-  p_procStepsDone  NUMBER,
-  p_processInfo    VARCHAR2,
-  p_processStatus  PLS_INTEGER
-)
+lilam.close_session(l_processId);
+lilam.close_session(l_processId, 'Import abgeschlossen', 1);
+lilam.close_session(l_processId, 'Import abgeschlossen', 1, 500);
 ```
 
 Beispiel für die Exception-Behandlung:
@@ -373,9 +371,9 @@ Beispiel für die Exception-Behandlung:
 EXCEPTION
   WHEN OTHERS THEN
     lilam.close_session(
-      p_processId   => l_proc_id,
-      p_processInfo => SQLERRM,
-      p_status      => -1
+      p_processId     => l_proc_id,
+      p_processInfo   => SQLERRM,
+      p_processStatus => -1
     );
     RAISE;
 ```
@@ -528,7 +526,6 @@ FUNCTION GET_PROCESS_INFO(
 Liefert den beim Prozess gespeicherten Informationstext.
 
 ### Function GET_PROCESS_DATA
-
 Verwende diese Funktion, wenn mehrere Eigenschaften eines Prozesses gleichzeitig benötigt werden.
 
 Dadurch werden mehrere einzelne Getter-Aufrufe vermieden. Die Funktion liefert einen vollständigen `t_process_rec` Record.
@@ -547,7 +544,6 @@ FUNCTION GET_PROCESS_DATA(
 ---
 
 ## Logging
-
 Die Logging APIs schreiben Meldungen entsprechend dem aktiven Log-Level in das LILAM Log.
 
 | API | Severity |
@@ -582,7 +578,7 @@ PROCEDURE DEBUG(
 ```
 
 - `p_processId` identifiziert den Prozess.
-- `p_logText` enthält die Meldung.
+- `p_logText` enthält die Meldung. Längere Texte werden auf 1.900 Zeichen gekürzt (bei Mehrbyte-Zeichen wie Umlauten ggf. weniger, maximal 2.000 Bytes).
 
 `ERROR` besitzt die höchste Priorität und wird immer gespeichert, sofern das Logging nicht vollständig mit `logLevelSilent` deaktiviert wurde.
 
@@ -660,7 +656,6 @@ FUNCTION GET_METRIC_AVG_DURATION(
 ```
 
 ### Function GET_METRIC_STEPS
-
 Liefert die Anzahl der Vorkommen der angegebenen Metrik.
 
 ```sql
@@ -674,13 +669,17 @@ FUNCTION GET_METRIC_STEPS(
 ---
 
 ## Serversteuerung
-
 Im entkoppelten Modus empfängt ein LILAM Server Client-Anfragen und übernimmt Logging und Monitoring zentral.
 
 Server werden durch ihre Pipe-Namen identifiziert und können optional Gruppen zugeordnet werden.
 
 > [!IMPORTANT]
-> Server-Pipe-Namen müssen innerhalb der Datenbankinstanz eindeutig sein.
+> Server-Pipe-Namen müssen innerhalb der Datenbankinstanz eindeutig sein. Jeder Server legt zusätzlich eine Steuer-Pipe mit der Endung `_CTL` an (z.B. `LILAM_SRV1_CTL` zu `LILAM_SRV1`); auch diese Namen dürfen nicht anderweitig verwendet werden.
+
+Ein Server nutzt zwei Pipes:
+
+- **Daten-Pipe** (`<Pipe-Name>`): alle Logs, Traces, Events, Status und Abfragen in der Reihenfolge ihres Eintreffens.
+- **Steuer-Pipe** (`<Pipe-Name>_CTL`): nur das Anlegen neuer Prozesse (`SERVER_NEW_SESSION`). Der Server fragt sie vor jeder Datennachricht ab, ohne zu warten. Dadurch muss das Anlegen eines Prozesses auch unter hoher Last nicht hinter den Nachrichten anderer Anwendungen warten. Ein kurzer Weckruf in die Daten-Pipe sorgt dafür, dass auch ein untätiger Server die Anfrage sofort bemerkt.
 
 | API | Zweck |
 | --- | --- |
@@ -689,35 +688,44 @@ Server werden durch ihre Pipe-Namen identifiziert und können optional Gruppen z
 | `SERVER_SHUTDOWN` | Beendet einen Server |
 | `GET_SERVER_PIPE` | Liefert die Server-Pipe eines verbundenen Clients |
 | `SERVER_UPDATE_RULES` | Aktiviert ein aktualisiertes Rule Set |
+| `SET_DISPATCHER_PIPE` | Konfiguriert einen Dispatcher für automatisches Routing und Reconnect |
 
 ### Procedure START_SERVER
-
 Startet einen LILAM Server.
 
 Das Passwort muss beim späteren Herunterfahren des Servers erneut angegeben werden.
 
 ```sql
 PROCEDURE START_SERVER(
-  p_pipeName  VARCHAR2,
-  p_groupName VARCHAR2,
-  p_password  VARCHAR2
+  p_pipeName     VARCHAR2,
+  p_groupName    VARCHAR2,
+  p_password     VARCHAR2,
+  p_isDispatcher PLS_INTEGER DEFAULT 0
 )
 ```
 
-### Function CREATE_SERVER
+#### Parameter
+| Parameter | Typ | Bedeutung |
+| --------- | --- | --------- |
+| p_pipeName | varchar2 | Eindeutiger Pipe-Name des Servers |
+| p_groupName | varchar2 | Optionale Gruppe für die Serverauswahl |
+| p_password | varchar2 | Passwort, das für SERVER_SHUTDOWN erneut benötigt wird |
+| p_isDispatcher | pls_integer | 1 startet den Server im Dispatcher-Modus (siehe Dispatcher-Modus), 0 (Standard) startet einen regulären Server
 
+### Function CREATE_SERVER
 Startet einen LILAM Server über `DBMS_SCHEDULER` und liefert Serverinformationen als `VARCHAR2` zurück.
 
 ```sql
 FUNCTION CREATE_SERVER(
-  p_pipeName  VARCHAR2,
-  p_groupName VARCHAR2,
-  p_password  VARCHAR2
+  p_pipeName     VARCHAR2,
+  p_groupName    VARCHAR2,
+  p_password     VARCHAR2,
+  p_isDispatcher PLS_INTEGER DEFAULT 0
 ) RETURN VARCHAR2
 ```
+Parameter identisch zu START_SERVER.
 
 ### Procedure SERVER_SHUTDOWN
-
 Der Client muss bereits mit dem Server verbunden sein.
 
 Zum Herunterfahren werden die Process ID, die Server-Pipe und das beim Serverstart angegebene Passwort benötigt.
@@ -731,7 +739,6 @@ PROCEDURE SERVER_SHUTDOWN(
 ```
 
 ### Function GET_SERVER_PIPE
-
 Liefert die Server-Pipe, die mit dem verbundenen Client-Prozess verknüpft ist.
 
 ```sql
@@ -741,7 +748,6 @@ FUNCTION GET_SERVER_PIPE(
 ```
 
 ### Procedure SERVER_UPDATE_RULES
-
 Rules werden als JSON-Objekte in `LILAM_RULES` gespeichert.
 
 Nachdem ein Rule Set eingefügt oder geändert wurde, kann `SERVER_UPDATE_RULES` über eine aktive Serververbindung aufgerufen werden, um das aktualisierte Rule Set anzuwenden.
@@ -754,6 +760,66 @@ PROCEDURE SERVER_UPDATE_RULES(
 )
 ```
 
+## Dispatcher-Modus
+Ein mit p_isDispatcher => 1 gestarteter Server (Dispatcher) verarbeitet keine Anfragen selbst, sondern leitet sie unverändert an einen passenden Server weiter.
+
+Für NEW_SESSION/SERVER_NEW_SESSION wählt der Dispatcher dabei denselben lastbasierten Mechanismus wie die reguläre Serverauswahl und reicht die Anfrage an die Steuer-Pipe des gewählten Servers weiter;
+für alle anderen Anfragen ermittelt er anhand der bereits vergebenen process_id den Server, der für den Prozess der Anwendung zuständig ist und leitet dorthin weiter.
+
+Die Antwort des zuständigen Servers geht direkt an den Client zurück, nicht über den Dispatcher.
+
+> [!TIP]
+> Ein Dispatcher ist vor allem für Anwendungen relevant, die ihre physische Datenbankverbindung nicht durchgehend halten – typischerweise Oracle-APEX-Anwendungen mit Connection Pooling.
+> Dabei kann eine Folgeseite in einer anderen physischen Session laufen als die Seite, die den Prozess ursprünglich gestartet hat.
+> Ein konfigurierter Dispatcher ermöglicht es LILAM, die Verbindung zum zuständigen Worker in diesem Fall automatisch wiederherzustellen, ohne dass die Anwendung das selbst steuern muss.
+
+Für Anwendungen mit durchgehender Datenbanksession (klassischer In-Session- oder entkoppelter Betrieb ohne Connection Pooling) ist kein Dispatcher erforderlich.
+
+### Automatisches Reconnect
+Ist ein Dispatcher konfiguriert, versucht LILAM bei jedem API-Aufruf mit einer process_id, die der aktuellen physischen Session unbekannt ist, automatisch und transparent eine Verbindung über den Dispatcher wiederherzustellen.
+Schlägt das fehl (kein Dispatcher konfiguriert, Dispatcher nicht erreichbar, oder der Prozess existiert nicht mehr), verhält sich der Aufruf wie bei jeder anderen unbekannten process_id: Er wird ohne Fehlermeldung ignoriert.
+
+Dabei gilt:
+
+- Für negative process_ids (z.B. `NUM_ERR_SESSION_TIMEOUT`) wird kein Reconnect versucht.
+- Findet der Dispatcher keinen zuständigen Server, antwortet er sofort mit einem Fehler; die Anwendung wartet nicht.
+- Ein gescheiterter Reconnect wird für die physische Session gemerkt: Kennt der Server den Prozess nicht (z.B. nach `CLOSE_SESSION`), werden weitere Aufrufe mit dieser process_id ohne erneute Anfrage ignoriert. Bei vorübergehenden Störungen (Dispatcher nicht erreichbar) wird der nächste Versuch frühestens nach 10 Sekunden unternommen.
+
+### Vorwärmen
+Der automatische Reconnect-Versuch kostet einen einmaligen Pipe-Roundtrip. Ohne Vorwärmen trägt der erste API-Aufruf nach einem Sessionwechsel diese zusätzliche Latenz.
+Wird p_processId mitgegeben, findet dieser Roundtrip bereits beim Aufruf von SET_DISPATCHER_PIPE statt – typischerweise im Seitenaufbau, bevor die Anwendung reagiert.
+
+### Procedure SET_DISPATCHER_PIPE
+Teilt LILAM mit, über welche Pipe ein Dispatcher erreichbar ist. Diese Information wird ausschließlich im Speicher der aktuellen physischen Datenbanksession gehalten.
+
+> [!IMPORTANT]
+> Da die Konfiguration nur für die aktuelle physische Session gilt, muss SET_DISPATCHER_PIPE bei jedem neuen Verbindungsaufbau erneut aufgerufen werden – bei Connection Pooling also potenziell auf jeder Seite, nicht nur einmalig beim ersten Seitenaufruf.
+
+
+```sql
+PROCEDURE SET_DISPATCHER_PIPE(
+  p_pipeName  VARCHAR2,
+  p_groupName VARCHAR2 DEFAULT 'DEFAULT_DISPATCHER',
+  p_processId NUMBER   DEFAULT NULL
+)
+```
+
+#### Parameter
+| Parameter | Typ | Besdeutung |
+| p_pipeName | varchar2 | Pipe-Name des Dispatchers |
+| p_groupName | varchar2 | Optionale Kennung, falls mehrere Dispatcher parallel genutzt werden. Automatisches Reconnect (siehe unten) verwendet ausschließlich die Standardkennung 'DEFAULT_DISPATCHER' |
+| p_processId | number | Optional. Ist bereits eine process_id bekannt, stellt LILAM die Verbindung zu dieser sofort wieder her (siehe „Vorwärmen"), statt erst beim nächsten API-Aufruf |
+
+```sql
+-- Beispiel: APEX "Before Header"-Process
+BEGIN
+  lilam.set_dispatcher_pipe(
+    p_pipeName  => 'LILAM_DISPATCHER_SALES',
+    p_processId => :G_LILAM_PROCESS_ID  -- NULL beim allerersten Seitenaufruf
+  );
+END;
+/
+```
 ---
 
 ## Anhang
@@ -798,9 +864,10 @@ TYPE t_session_init IS RECORD (
   processName   VARCHAR2(100),
   logLevel      PLS_INTEGER := logLevelMonitor,
   stepsToDo     PLS_INTEGER,
-  daysToKeep    PLS_INTEGER := 100,
+  daysToKeep    PLS_INTEGER,                    -- NULL = keine automatische Bereinigung
   procImmortal  PLS_INTEGER := 0,
-  tabNameMaster VARCHAR2(100) DEFAULT 'LILAM'
+  tabNameMaster VARCHAR2(100) DEFAULT 'LILAM',
+  baselineScope VARCHAR2(100)                   -- NULL = Prozessname, '#NONE' = nur pro Prozess
 );
 ```
 
@@ -845,7 +912,7 @@ Beispiel für `SERVER_NEW_SESSION`:
     "log_level": 3,
     "steps_todo": 100,
     "days_to_keep": 20,
-    "tab_name_master": "GATES"
+    "tabname_master": "GATES"
   }
 }
 ```
