@@ -790,6 +790,8 @@ für alle anderen Anfragen ermittelt er anhand der bereits vergebenen process_id
 
 Die Antwort des zuständigen Servers geht direkt an den Client zurück, nicht über den Dispatcher.
 
+Ein Dispatcher ist in der Server-Registry gekennzeichnet (`IS_DISPATCHER = 1`) und wird bei der Serverauswahl nie als Ziel gewählt. Worker und Dispatcher können daher in derselben Gruppe laufen: Clients ohne Dispatcher-Konfiguration erhalten immer direkt einen Worker.
+
 > [!TIP]
 > Ein Dispatcher ist vor allem für Anwendungen relevant, die ihre physische Datenbankverbindung nicht durchgehend halten – typischerweise Oracle-APEX-Anwendungen mit Connection Pooling.
 > Dabei kann eine Folgeseite in einer anderen physischen Session laufen als die Seite, die den Prozess ursprünglich gestartet hat.
