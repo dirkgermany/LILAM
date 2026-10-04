@@ -30,7 +30,6 @@ GRANT EXECUTE ON LILAM TO USER_NAME;
 -- Server-based Privileges (Decoupled Mode)
 GRANT EXECUTE ON DBMS_ALERT TO USER_NAME;   -- Allows LILAM to send alerts
 GRANT EXECUTE ON DBMS_PIPE TO USER_NAME;
-GRANT SELECT ON V_\$DB_PIPES TO USER_NAME;   -- Required for precision server routing
 
 -- Job and Network Privileges (Background & Modern Features)
 GRANT CREATE JOB TO USER_NAME;              -- Required to run LILAM servers as background jobs

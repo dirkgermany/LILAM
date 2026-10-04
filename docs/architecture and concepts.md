@@ -223,9 +223,11 @@ In this mode, LILAM functions as a **LILAM Server**, which writes status changes
 
 Two exceptions must be considered here:
 
-1. LILAM Clients that threaten to flood the channel to the LILAM Server due to an excessively high reporting rate are gently and temporarily—and barely noticeably—throttled until the LILAM Server has processed the bulk of the load (Backpressure Management). Mind you, we are talking about magnitudes in the millisecond range. This mechanism can be deactivated via an API call in high-end environments, such as powerful ODAs (default is 'active').
+1. LILAM Clients that threaten to flood the channel to the LILAM Server due to an excessively high reporting rate are gently and temporarily—and barely noticeably—throttled until the LILAM Server has processed the bulk of the load (Backpressure Management). Mind you, we are talking about magnitudes in the millisecond range. The limit is a property of the LILAM Server: it is set with `p_perfServer` when the server is started (`C_SERVER_PERF_LOW` = 500, `C_SERVER_PERF_MID` = 1500 (default), `C_SERVER_PERF_HIGH` = 2500 messages per process and second, or any other value; `0` disables the mechanism) and is passed to the client when a process is created or reconnected.
 
-2. Calls that request data packets from the LILAM Server are necessarily synchronous if the application wants to process the response itself afterwards. However, scenarios are also conceivable here in which, for example, LILAM Client 'A' requests a data packet from the LILAM Server on behalf of LILAM Client 'B'. 
+2. Creating a process (`SERVER_NEW_SESSION`) is synchronous, since the application needs the process ID. To keep this fast under load, each LILAM Server has a separate control pipe (`<pipe name>_CTL`) that it checks before every data message. Creating a process therefore never queues behind the messages of other applications.
+
+3. Calls that request data packets from the LILAM Server are necessarily synchronous if the application wants to process the response itself afterwards. However, scenarios are also conceivable here in which, for example, LILAM Client 'A' requests a data packet from the LILAM Server on behalf of LILAM Client 'B'. 
 
 This would turn LILAM Client 'A' into a producer, the LILAM Server into a dispatcher, and LILAM Client 'C' into a consumer. **A lightweight message broker pattern**
 
@@ -348,7 +350,7 @@ Events and traces share the same table structure. The `MON_TYPE` column identifi
 
 The `LILAM_SERVER_REGISTRY` table maintains the runtime state of registered LILAM servers. Unlike the process, log, and monitor tables, its name is fixed and is not derived from `tabNameMaster`.
 
-Each active LILAM server registers itself in this table and periodically updates its activity information. Clients use the registry to discover suitable servers and to select a server based on its current load.
+Each active LILAM server registers itself in this table and periodically updates its activity information. Clients use the registry to discover suitable servers and to select a server based on its current load: first the number of messages processed in the last interval (`PROCESSING`), then the number of open processes (`CURRENT_PROCESSES`).
 
 If `SERVER_NEW_SESSION` is called with a `p_groupName`, only servers registered for the requested group are considered.
 
@@ -361,7 +363,7 @@ If `SERVER_NEW_SESSION` is called with a `p_groupName`, only servers registered 
 | `PIPE_NAME` | `VARCHAR2(50)` | Unique pipe name used to identify and communicate with the LILAM server. |
 | `GROUP_NAME` | `VARCHAR2(50)` | Optional group to which the server is assigned. Used to restrict server selection when `p_groupName` is specified. |
 | `LAST_ACTIVITY` | `TIMESTAMP(3)` | Timestamp of the server's most recent heartbeat/activity. Used to determine whether the server is still available. |
-| `CURRENT_LOAD` | `NUMBER` | Current server load used by clients when selecting an available server. |
+| `CURRENT_PROCESSES` | `NUMBER` | Number of processes currently open on the server (excluding the server's own process). Second criterion for server selection. |
 | `IS_ACTIVE` | `NUMBER(1)` | Indicates whether the server is marked as active. |
 | `STATUS` | `VARCHAR2(20)` | Current status of the server. |
 | `PROCESSING` | `NUMBER` | Indicates what the server is currently processing. |

@@ -290,6 +290,25 @@ FUNCTION SERVER_NEW_SESSION_JSON(
 
 **Rückgabewert:** `NUMBER`, die Process ID.
 
+Kann `SERVER_NEW_SESSION` keinen Prozess anlegen, wirft die Funktion **keine Exception**, sondern liefert einen negativen Wert. Alle weiteren API-Aufrufe mit dieser ID werden ohne Fehler ignoriert; die Anwendung läuft weiter, nur ohne Logging und Monitoring für diesen Prozess. Die Ursache wird in `LILAM_LOG_INTERNAL` protokolliert.
+
+| Konstante | Wert | Bedeutung |
+| --- | --- | --- |
+| `NUM_ERR_SESSION_TIMEOUT` | -20110 | Der Server hat nicht rechtzeitig geantwortet |
+| `NUM_ERR_SESSION_THROTTLED` | -20120 | Der Server hat die Anfrage abgelehnt (Überlast) |
+| `NUM_COMM_ERR` | -20003 | Kommunikationsfehler, z.B. kein aktiver Server gefunden |
+
+```sql
+l_processId := lilam.server_new_session('IMPORT_CUSTOMERS', 'BATCH');
+if l_processId < 0 then
+  -- optional: eigene Reaktion, z.B. Hinweis an den Betrieb
+  null;   -- l_processId = lilam.NUM_ERR_SESSION_TIMEOUT, ...
+end if;
+```
+
+> [!NOTE]
+> Wartet der Client vergeblich auf die Antwort, legt der Server den Prozess auch später nicht mehr an. Der Client gibt dazu eine Verfallszeit mit; trifft die Anfrage erst danach beim Server ein, wird sie verworfen. So entstehen keine verwaisten, nie geschlossenen Prozesse.
+
 > [!NOTE]
 > Durch den Baseline-Scope baut auch eine Anwendung, die häufig neu gestartet wird, eine stabile Vergleichsbasis für ihre Laufzeiten auf. Die Durchschnittswerte werden in den Tabellen `LILAM_SCOPES` und `LILAM_BASELINES` gespeichert.
 
@@ -655,7 +674,12 @@ Im entkoppelten Modus empfängt ein LILAM Server Client-Anfragen und übernimmt 
 Server werden durch ihre Pipe-Namen identifiziert und können optional Gruppen zugeordnet werden.
 
 > [!IMPORTANT]
-> Server-Pipe-Namen müssen innerhalb der Datenbankinstanz eindeutig sein.
+> Server-Pipe-Namen müssen innerhalb der Datenbankinstanz eindeutig sein. Jeder Server legt zusätzlich eine Steuer-Pipe mit der Endung `_CTL` an (z.B. `LILAM_SRV1_CTL` zu `LILAM_SRV1`); auch diese Namen dürfen nicht anderweitig verwendet werden.
+
+Ein Server nutzt zwei Pipes:
+
+- **Daten-Pipe** (`<Pipe-Name>`): alle Logs, Traces, Events, Status und Abfragen in der Reihenfolge ihres Eintreffens.
+- **Steuer-Pipe** (`<Pipe-Name>_CTL`): nur das Anlegen neuer Prozesse (`SERVER_NEW_SESSION`). Der Server fragt sie vor jeder Datennachricht ab, ohne zu warten. Dadurch muss das Anlegen eines Prozesses auch unter hoher Last nicht hinter den Nachrichten anderer Anwendungen warten. Ein kurzer Weckruf in die Daten-Pipe sorgt dafür, dass auch ein untätiger Server die Anfrage sofort bemerkt.
 
 | API | Zweck |
 | --- | --- |
@@ -676,7 +700,8 @@ PROCEDURE START_SERVER(
   p_pipeName     VARCHAR2,
   p_groupName    VARCHAR2,
   p_password     VARCHAR2,
-  p_isDispatcher PLS_INTEGER DEFAULT 0
+  p_isDispatcher PLS_INTEGER DEFAULT 0,
+  p_perfServer   PLS_INTEGER DEFAULT NULL
 )
 ```
 
@@ -686,7 +711,22 @@ PROCEDURE START_SERVER(
 | p_pipeName | varchar2 | Eindeutiger Pipe-Name des Servers |
 | p_groupName | varchar2 | Optionale Gruppe für die Serverauswahl |
 | p_password | varchar2 | Passwort, das für SERVER_SHUTDOWN erneut benötigt wird |
-| p_isDispatcher | pls_integer | 1 startet den Server im Dispatcher-Modus (siehe Dispatcher-Modus), 0 (Standard) startet einen regulären Server
+| p_isDispatcher | pls_integer | 1 startet den Server im Dispatcher-Modus (siehe Dispatcher-Modus), 0 (Standard) startet einen regulären Server |
+| p_perfServer | pls_integer | Leistungsstufe des Servers, siehe [Leistungsstufe](#leistungsstufe-p_perfserver). `NULL` (Standard) = `C_SERVER_PERF_MID` |
+
+#### Leistungsstufe (p_perfServer)
+Damit ein Client den Server nicht mit Nachrichten überflutet, stimmt er sich nach einer bestimmten Anzahl Nachrichten je Prozess und Sekunde kurz mit dem Server ab und wartet, bis dieser aufgeholt hat. Diese Grenze legt `p_perfServer` fest. Der Server teilt sie dem Client bei `SERVER_NEW_SESSION` (und beim automatischen Reconnect) mit; in der Anwendung ist dafür kein eigener Aufruf nötig.
+
+| Konstante | Wert | Einsatz |
+| --- | --- | --- |
+| `C_SERVER_PERF_LOW` | 500 | leistungsschwächere Umgebungen |
+| `C_SERVER_PERF_MID` | 1500 | Standard; übliche Server |
+| `C_SERVER_PERF_HIGH` | 2500 | leistungsstarke Server |
+
+Beliebige andere Werte sind möglich. `0` schaltet die Abstimmung ab; `NULL` oder negative Werte gelten als `C_SERVER_PERF_MID`.
+
+> [!NOTE]
+> Die Grenze gilt je Prozess. Senden viele Anwendungen gleichzeitig an denselben Server, ist dessen Gesamtdurchsatz geringer als die Summe der Einzelwerte; dann eher `C_SERVER_PERF_LOW` oder `C_SERVER_PERF_MID` wählen oder weitere Server derselben Gruppe starten.
 
 ### Function CREATE_SERVER
 Startet einen LILAM Server über `DBMS_SCHEDULER` und liefert Serverinformationen als `VARCHAR2` zurück.
@@ -696,8 +736,14 @@ FUNCTION CREATE_SERVER(
   p_pipeName     VARCHAR2,
   p_groupName    VARCHAR2,
   p_password     VARCHAR2,
-  p_isDispatcher PLS_INTEGER DEFAULT 0
+  p_isDispatcher PLS_INTEGER DEFAULT 0,
+  p_perfServer   PLS_INTEGER DEFAULT NULL
 ) RETURN VARCHAR2
+```
+
+```sql
+-- Beispiel: Server der Gruppe BATCH mit mittlerer Leistungsstufe
+dbms_output.put_line(lilam.create_server('LILAM_SRV1', 'BATCH', 'geheim', p_perfServer => lilam.C_SERVER_PERF_MID));
 ```
 Parameter identisch zu START_SERVER.
 
@@ -739,7 +785,7 @@ PROCEDURE SERVER_UPDATE_RULES(
 ## Dispatcher-Modus
 Ein mit p_isDispatcher => 1 gestarteter Server (Dispatcher) verarbeitet keine Anfragen selbst, sondern leitet sie unverändert an einen passenden Server weiter.
 
-Für NEW_SESSION/SERVER_NEW_SESSION wählt der Dispatcher dabei denselben lastbasierten Mechanismus wie die reguläre Serverauswahl;
+Für NEW_SESSION/SERVER_NEW_SESSION wählt der Dispatcher dabei denselben lastbasierten Mechanismus wie die reguläre Serverauswahl und reicht die Anfrage an die Steuer-Pipe des gewählten Servers weiter;
 für alle anderen Anfragen ermittelt er anhand der bereits vergebenen process_id den Server, der für den Prozess der Anwendung zuständig ist und leitet dorthin weiter.
 
 Die Antwort des zuständigen Servers geht direkt an den Client zurück, nicht über den Dispatcher.
@@ -754,6 +800,12 @@ Für Anwendungen mit durchgehender Datenbanksession (klassischer In-Session- ode
 ### Automatisches Reconnect
 Ist ein Dispatcher konfiguriert, versucht LILAM bei jedem API-Aufruf mit einer process_id, die der aktuellen physischen Session unbekannt ist, automatisch und transparent eine Verbindung über den Dispatcher wiederherzustellen.
 Schlägt das fehl (kein Dispatcher konfiguriert, Dispatcher nicht erreichbar, oder der Prozess existiert nicht mehr), verhält sich der Aufruf wie bei jeder anderen unbekannten process_id: Er wird ohne Fehlermeldung ignoriert.
+
+Dabei gilt:
+
+- Für negative process_ids (z.B. `NUM_ERR_SESSION_TIMEOUT`) wird kein Reconnect versucht.
+- Findet der Dispatcher keinen zuständigen Server, antwortet er sofort mit einem Fehler; die Anwendung wartet nicht.
+- Ein gescheiterter Reconnect wird für die physische Session gemerkt: Kennt der Server den Prozess nicht (z.B. nach `CLOSE_SESSION`), werden weitere Aufrufe mit dieser process_id ohne erneute Anfrage ignoriert. Bei vorübergehenden Störungen (Dispatcher nicht erreichbar) wird der nächste Versuch frühestens nach 10 Sekunden unternommen.
 
 ### Vorwärmen
 Der automatische Reconnect-Versuch kostet einen einmaligen Pipe-Roundtrip. Ohne Vorwärmen trägt der erste API-Aufruf nach einem Sessionwechsel diese zusätzliche Latenz.
