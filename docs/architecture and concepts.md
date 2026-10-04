@@ -270,8 +270,11 @@ The application uses the same API in both modes. Which path a call takes depends
 flowchart LR
     subgraph INS ["In-Session (synchronous, in the application's session)"]
         direction TB
-        A1["Application<br/>NEW_SESSION"] --> B1["log_any / MARK_EVENT / TRACE_*"]
+        A1["Application<br/>NEW_SESSION (optional p_groupName)"] --> B1["log_any / MARK_EVENT / TRACE_*"]
         B1 --> C1["PGA buffer of the session<br/>(logs, metrics, process data)"]
+        B1 --> G1{"Process has<br/>a group?"}
+        G1 -- yes --> R1["Rule evaluation in the application session<br/>rule set of the group, checked for changes<br/>at most every 15 s"]
+        R1 -- "rule matches" --> AL1[("LILAM_ALERTS + DBMS_ALERT<br/>synchronous, autonomous transaction")]
         C1 --> D1{"Flush due?<br/>1500 ms, 50,000 entries,<br/>ERROR or CLOSE_SESSION"}
         D1 -- yes --> E1["SYNC_ALL_DIRTY<br/>FORALL + COMMIT<br/>(autonomous transaction)"]
         D1 -- no --> B1
@@ -284,7 +287,7 @@ flowchart LR
         B2["log_any / MARK_EVENT / TRACE_*"] -- "sendNoWait<br/>Fire and Forget via data pipe" --> S2["LILAM Server<br/>(own DB session / job)"]
         B2 -. "limit per second reached:<br/>UNFREEZE_REQUEST (backpressure)" .-> S2
         S2 --> C2["PGA buffer of the server<br/>(all its processes)"]
-        C2 --> R2["Rule evaluation<br/>Alerts"]
+        C2 --> R2["Rule evaluation in the server<br/>rule set of the server group"]
         C2 --> E2["SYNC_ALL_DIRTY<br/>housekeeping, at most every 500 ms"]
         E2 --> T2[("Tables<br/>NAME_PROC / _LOG / _MON")]
         R2 --> AL[("LILAM_ALERTS<br/>+ DBMS_ALERT")]
@@ -293,7 +296,7 @@ flowchart LR
     INS ~~~ DEC
 ```
 
-Rules are currently evaluated by LILAM Servers only: the rule set of a server group is loaded at server start (`loadServerRules`). An In-Session process records data and averages, but raises no alerts.
+Both modes use the active rule set of a group from `LILAM_RULES`. A server loads it at startup and on `SERVER_UPDATE_RULES`; an In-Session process only has rules if `NEW_SESSION` receives a group, and its alerts cost the application one commit each (see [Rules in INSESSION Mode](#rules-in-insession-mode)).
 
 ### How an API Call Finds Its Target
 Every API call with a process ID passes the same decision (`is_remote`). A reconnect is only attempted if a dispatcher is configured (`SET_DISPATCHER_PIPE`); this allows a process created in one session (e.g. an APEX request) to be continued in another.
