@@ -1097,33 +1097,17 @@ AS
     END;
 
     ------------------------------------------------------------
-    -- Alarmierung aber unter Berücksichtigung, dass Alarme nicht
-    -- in kurzer Zeit zu häufig ausgelöst werden dürfen
-    -- Hier: Events und Transaktionen
+    -- Alert schreiben und signalisieren (eigene Transaktion, Write-then-Signal).
+    -- TRUE, wenn der Alert geschrieben wurde.
     ------------------------------------------------------------
-    PROCEDURE fire_alert(p_rule t_rule_rec, p_rec t_monitor_buffer_rec) IS
+    FUNCTION persist_alert(p_rule t_rule_rec, p_rec t_monitor_buffer_rec) RETURN BOOLEAN IS
         pragma autonomous_transaction;
-        -- Throttle pro Scope (falls vorhanden), damit Neustarts die Sperrzeit nicht aufheben
-        v_scope_id      NUMBER := getScopeId(p_rec.process_id);
-        v_history_key   VARCHAR2(250) := CASE WHEN v_scope_id IS NOT NULL THEN 'S' || v_scope_id ELSE 'P' || p_rec.process_id END
-                                         || '|' || p_rule.rule_id || '|' || p_rec.action_name;
         v_idx_session   PLS_INTEGER;
-        v_last_fire     TIMESTAMP(6);
-        v_throttle_sec  NUMBER := coalesce(p_rule.throttle_seconds, 0); -- Aus dem JSON
         v_channel_name  VARCHAR2(30); -- max. length of Alert-Name
         v_payload       VARCHAR2(1000);
         v_sqlStmt       VARCHAR2(2000);
         v_alert_id      NUMBER;
     BEGIN
-        -- 1. Prüfen, ob wir dieses spezifische Problem schon mal gemeldet haben
-        IF g_alert_history.EXISTS(v_history_key) THEN
-            v_last_fire := g_alert_history(v_history_key);
-            -- Wenn die Sperrzeit noch nicht abgelaufen ist -> Abbruch
-            IF (v_last_fire + numtodsinterval(v_throttle_sec, 'SECOND')) > SYSTIMESTAMP THEN
-                RETURN; 
-            END IF;
-        END IF;
-
         v_sqlStmt := '
         INSERT INTO ' || C_LILAM_ALERTS_TABLE || '(
             process_id, process_name, action_name, master_table_name, monitor_table_name, logging_table_name, context_name, action_count, 
@@ -1163,15 +1147,49 @@ AS
         v_channel_name := p_rule.alert_handler;
         dbms_alert.signal(v_channel_name, v_payload);
         COMMIT; -- !!!
-
-        -- 3. Zeitstempel aktualisieren
-        g_alert_history(v_history_key) := SYSTIMESTAMP;
+        RETURN TRUE;
 
     exception
         when others then
         -- STABILITÄT: autonome Transaktion abschließen, sonst ORA-06519 beim Verlassen
         logLilamErr(sqlCode, sqlErrM, 'fire_alert', 'rule ' || p_rule.rule_id);
         rollback;
+        RETURN FALSE;
+    END;
+
+    ------------------------------------------------------------
+    -- Alarm unter Berücksichtigung der Drosselung (throttle_seconds).
+    -- PERFORMANCE: Die Drosselung wird hier geprüft, ohne autonome Transaktion;
+    -- nur ein tatsächlich auszulösender Alert öffnet eine.
+    ------------------------------------------------------------
+    PROCEDURE fire_alert(p_rule t_rule_rec, p_rec t_monitor_buffer_rec) IS
+        v_throttle_sec  NUMBER := coalesce(p_rule.throttle_seconds, 0);
+        v_scope_id      NUMBER;
+        v_history_key   VARCHAR2(250);
+    BEGIN
+        IF v_throttle_sec <= 0 THEN
+            -- ohne Drosselung kein Gedächtnis nötig
+            IF persist_alert(p_rule, p_rec) THEN NULL; END IF;
+            RETURN;
+        END IF;
+
+        -- Throttle pro Scope (falls vorhanden), damit Neustarts die Sperrzeit nicht aufheben
+        v_scope_id    := getScopeId(p_rec.process_id);
+        v_history_key := CASE WHEN v_scope_id IS NOT NULL THEN 'S' || v_scope_id ELSE 'P' || p_rec.process_id END
+                         || '|' || p_rule.rule_id || '|' || p_rec.action_name;
+
+        -- Sperrzeit seit dem letzten Alert noch nicht abgelaufen -> nichts tun
+        IF g_alert_history.EXISTS(v_history_key)
+           AND g_alert_history(v_history_key) + numtodsinterval(v_throttle_sec, 'SECOND') > SYSTIMESTAMP THEN
+            RETURN;
+        END IF;
+
+        IF persist_alert(p_rule, p_rec) THEN
+            g_alert_history(v_history_key) := SYSTIMESTAMP;
+        END IF;
+    exception
+        when others then
+        logLilamErr(sqlCode, sqlErrM, 'fire_alert', 'rule ' || p_rule.rule_id);
     END;
     
     ------------------------------------------------------------

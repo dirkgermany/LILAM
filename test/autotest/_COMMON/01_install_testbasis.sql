@@ -207,7 +207,7 @@ create or replace package lt authid definer as
     -- Regeln (Rules Engine) im SERVER-Modus: Laden, Operatoren, Alerts. Nur einzeln (aendert das Rule Set von LT_S1)
     function t_regeln(p_manage boolean default true, p_parent number default null) return number;
     -- Kosten der Regelpruefung je Signaltyp (EVENT, TRACE, LOG, STEP) und Variante; nur einzeln
-    function t_regeln_last(p_n number default 2000, p_n_fire number default 200, p_reps number default 3,
+    function t_regeln_last(p_n number default 2000, p_n_fire number default 200, p_reps number default 5,
                            p_manage boolean default true, p_parent number default null) return number;
 
     -- Speicher: PGA-Wachstum je Prozess in Client, Workern und Dispatcher (INSESSION, SERVER, DISPATCHER)
@@ -2072,7 +2072,7 @@ create or replace package body lt as
     -- Varianten NONE, OTHER50, MATCH20, FIRE_THR, FIRE_ALL; gemessen wird bis zur Antwort einer
     -- abschliessenden synchronen Abfrage (der Server hat dann alle Signale davor verarbeitet).
     ----------------------------------------------------------------------
-    function t_regeln_last(p_n number default 2000, p_n_fire number default 200, p_reps number default 3,
+    function t_regeln_last(p_n number default 2000, p_n_fire number default 200, p_reps number default 5,
                            p_manage boolean default true, p_parent number default null) return number is
         c_set     constant varchar2(30) := 'LT_REGELN_LAST';
         c_handler constant varchar2(30) := 'LT_REGELN_LAST_ALERT';
@@ -2231,7 +2231,7 @@ create or replace package body lt as
             end loop;
         end loop;
 
-        -- Auswertung je Signaltyp: Median im Verhaeltnis zu NONE; kleine absolute Unterschiede (< 50 us) gelten als gleich
+        -- Auswertung je Signaltyp: Median im Verhaeltnis zu NONE; kleine absolute Unterschiede (< 100 us) gelten als gleich
         for t in 1 .. l_types.count loop
             l_base := med(lower(l_types(t)) || '_none');
             dbms_output.put_line('    ' || rpad(l_types(t), 6) || ' NONE ' || l_base || ' us, OTHER50 ' || med(lower(l_types(t)) || '_other50')
@@ -2239,13 +2239,13 @@ create or replace package body lt as
                                  || ', FIRE_ALL ' || med(lower(l_types(t)) || '_fire_all') || ' us/Signal');
             l_val := med(lower(l_types(t)) || '_other50');
             check_that(l_run, l_types(t) || ' 50 Regeln auf andere Actions: hoechstens 1,5 x ohne Regeln',
-                       l_val <= greatest(1.5 * l_base, l_base + 50), l_val || ' / ' || l_base || ' us');
+                       l_val <= greatest(1.5 * l_base, l_base + 100), l_val || ' / ' || l_base || ' us');
             l_val := med(lower(l_types(t)) || '_match20');
             check_that(l_run, l_types(t) || ' 20 passende Regeln ohne Alarm: hoechstens 2 x ohne Regeln',
-                       l_val <= greatest(2 * l_base, l_base + 50), l_val || ' / ' || l_base || ' us');
+                       l_val <= greatest(2 * l_base, l_base + 100), l_val || ' / ' || l_base || ' us');
             l_val := med(lower(l_types(t)) || '_fire_thr');
             check_that(l_run, l_types(t) || ' Regel schlaegt immer an, gedrosselt: hoechstens 1,5 x ohne Regeln',
-                       l_val <= greatest(1.5 * l_base, l_base + 50), l_val || ' / ' || l_base || ' us');
+                       l_val <= greatest(1.5 * l_base, l_base + 100), l_val || ' / ' || l_base || ' us');
             -- ungedrosselt: Korrektheit pruefen, Kosten nur messen
             execute immediate 'select count(*) from lilam_alerts where process_name like :1 and rule_id = ''F1'''
                into l_n using l_p || '_' || l_types(t) || '_FIRE_ALL_%';

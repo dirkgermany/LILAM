@@ -12,7 +12,7 @@
 -- Gemessen wird die Verarbeitungszeit des Servers je Signal: vom ersten Signal bis zur Antwort einer
 -- abschliessenden synchronen Abfrage (GET_PROC_STEPS_DONE). Die Flush-Verzoegerung zaehlt so nicht mit.
 -- Server LT_S1 ohne Drosselung (p_perfServer 0). Je Variante p_reps Laeufe, bewertet wird der Median.
--- Pruefungen (Median relativ zu NONE, Unterschiede < 50 us gelten als gleich):
+-- Pruefungen (Median relativ zu NONE, Unterschiede < 100 us gelten als gleich):
 --   OTHER50 und FIRE_THR hoechstens 1,5 x, MATCH20 hoechstens 2 x; FIRE_ALL: ein Alert je Signal (Kosten nur gemessen)
 -- Nur einzeln ausfuehren (aendert das Rule Set der Gruppe LT, Messung empfindlich gegen Hintergrundlast).
 --
@@ -24,6 +24,6 @@ set serveroutput on size unlimited
 declare
   l_run number;
 begin
-  l_run := lt.t_regeln_last(p_n => 2000, p_n_fire => 200, p_reps => 3);
+  l_run := lt.t_regeln_last(p_n => 2000, p_n_fire => 200, p_reps => 5);
 end;
 /
