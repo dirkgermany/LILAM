@@ -360,9 +360,13 @@ AS
     -- Exclusive SessionId for Logging internal Errors or Warnings
     g_lilamSessionId                    NUMBER := -1; -- -1 as Flag for not initialized
     
-    -- Counter for ERROR and WARN Calls
-    g_counterError                      NUMBER := 0;
-    g_counterWarning                    NUMBER := 0;
+    -- Zähler der ERROR- und WARN-Aufrufe je Prozess (in der Session, die die Aufrufe macht)
+    TYPE t_log_counter_rec IS RECORD (
+        errors   PLS_INTEGER := 0,
+        warnings PLS_INTEGER := 0
+    );
+    TYPE t_log_counter_map IS TABLE OF t_log_counter_rec INDEX BY PLS_INTEGER;
+    g_log_counters                      t_log_counter_map;
 
     -- ALERT Registration
     g_isAlertRegistered                 BOOLEAN := false;
@@ -4207,12 +4211,34 @@ AS
 
     --------------------------------------------------------------------------
 
+    -- Zählt einen ERROR- bzw. WARN-Aufruf für den Prozess (GET_COUNTER_ERROR/GET_COUNTER_WARN)
+    procedure countLog(p_processId number, p_isError boolean)
+    as
+        l_new t_log_counter_rec;
+    begin
+        if not g_log_counters.EXISTS(p_processId) then
+            g_log_counters(p_processId) := l_new;
+        end if;
+        if p_isError then
+            g_log_counters(p_processId).errors := g_log_counters(p_processId).errors + 1;
+        else
+            g_log_counters(p_processId).warnings := g_log_counters(p_processId).warnings + 1;
+        end if;
+    exception
+        when others then
+            logLilamErr(sqlCode, sqlErrM, 'countLog');
+    end;
+
+    --------------------------------------------------------------------------
+
     -- Used by external Procedure to write a new log entry with log level ERROR
     -- Details are adjusted to the error level
     procedure ERROR(p_processId number, p_logText varchar2)
     as
     begin
-        g_counterError := g_counterError + 1;
+        if p_processId > 0 then
+            countLog(p_processId, TRUE);
+        end if;
         log_any(
             p_processId, 
             logLevelError,
@@ -4227,18 +4253,26 @@ AS
 
     --------------------------------------------------------------------------
 
+    -- Anzahl der WARN-Aufrufe für den Prozess in dieser Session; 0 für unbekannte oder geschlossene Prozesse
     FUNCTION GET_COUNTER_WARN(p_processId NUMBER) return PLS_INTEGER
     as
     begin
-        return g_counterWarning;
+        if p_processId > 0 and g_log_counters.EXISTS(p_processId) then
+            return g_log_counters(p_processId).warnings;
+        end if;
+        return 0;
     end;
-    
+
     --------------------------------------------------------------------------
-    
+
+    -- Anzahl der ERROR-Aufrufe für den Prozess in dieser Session; 0 für unbekannte oder geschlossene Prozesse
     FUNCTION GET_COUNTER_ERROR(p_processId NUMBER) return PLS_INTEGER
     as
     begin
-        return g_counterError;
+        if p_processId > 0 and g_log_counters.EXISTS(p_processId) then
+            return g_log_counters(p_processId).errors;
+        end if;
+        return 0;
     end;
     
     --------------------------------------------------------------------------
@@ -4248,7 +4282,9 @@ AS
     procedure WARN(p_processId number, p_logText varchar2)
     as
     begin
-        g_counterWarning := g_counterWarning + 1;
+        if p_processId > 0 then
+            countLog(p_processId, FALSE);
+        end if;
         log_any(
             p_processId, 
             logLevelWarn,
@@ -4501,13 +4537,50 @@ AS
 
     --------------------------------------------------------------------------
 
-    PROCEDURE clearAllSessionData(p_processId NUMBER) 
+    --------------------------------------------------------------------------
+    -- Offene Traces eines Prozesses als Warnung ins Log schreiben (vor dem letzten Flush in CLOSE_SESSION)
+    --------------------------------------------------------------------------
+    PROCEDURE warnOpenTraces(p_processId NUMBER)
+    IS
+        v_search_prefix CONSTANT VARCHAR2(50) := LPAD(p_processId, 20, '0') || '|';
+        v_key           VARCHAR2(250);
+    BEGIN
+        IF NOT v_indexSession.EXISTS(p_processId)
+           OR logLevelWarn > g_sessionList(v_indexSession(p_processId)).log_level THEN
+            RETURN;
+        END IF;
+
+        -- PERFORMANCE: direkt beim ersten Schlüssel dieses Prozesses einsteigen (Schlüssel sind sortiert)
+        v_key := g_monitor_shadows.NEXT(v_search_prefix);
+        WHILE v_key IS NOT NULL LOOP
+            EXIT WHEN SUBSTR(v_key, 1, LENGTH(v_search_prefix)) != v_search_prefix;
+            write_to_log_buffer(
+                p_processId,
+                logLevelWarn,
+                'OPEN TRACE (not stopped before CLOSE_SESSION): Action=>' || g_monitor_shadows(v_key).action_name
+                    || '; Context=>' || g_monitor_shadows(v_key).context_name
+                    || '; Start=>' || to_char(g_monitor_shadows(v_key).start_time, 'YYYY-MM-DD HH24:MI:SS.FF3'),
+                systimestamp,
+                'LILAM',
+                null,
+                null,
+                null
+            );
+            v_key := g_monitor_shadows.NEXT(v_key);
+        END LOOP;
+    EXCEPTION
+        WHEN OTHERS THEN
+            logLilamErr(sqlCode, sqlErrM, 'warnOpenTraces');
+    END;
+
+    --------------------------------------------------------------------------
+
+    PROCEDURE clearAllSessionData(p_processId NUMBER)
     IS
         v_idx           PLS_INTEGER;
         v_search_prefix CONSTANT VARCHAR2(50) := LPAD(p_processId, 20, '0') || '|';
         v_key           VARCHAR2(250);
         v_next_key      VARCHAR2(250);
-        v_msg           VARCHAR2(500);
     BEGIN
 
         -- A) MONITOR-DATEN & CACHES RÄUMEN
@@ -4568,33 +4641,6 @@ AS
             v_key := g_monitor_averages.NEXT(v_key);
         END LOOP;
 
-        -- Offene Traces (Shadows) prüfen, bevor sie gelöscht werden
-        -- Wenn offen, wird eine Warnung gelogged
-        v_key := g_monitor_shadows.FIRST;
-        WHILE v_key IS NOT NULL LOOP
-            EXIT WHEN SUBSTR(v_key, 1, 20) > LPAD(p_processId, 20, '0');
-
-            IF SUBSTR(v_key, 1, 21) = v_search_prefix THEN
-                -- HIER: Alert-Logik einbauen
-                v_msg := 'OPEN TRACE ALERT (Trace purged): Process_ID=>' || p_processId || '; Action=>' || g_monitor_shadows(v_key).action_name ||
-                '; Context=>' || g_monitor_shadows(v_key).context_name || '; Start=>' || g_monitor_shadows(v_key).start_time;                     
-                -- Log to Buffer
-                write_to_log_buffer(
-                    p_processId, 
-                    logLevelWarn,
-                    v_msg,
-                    systimestamp,
-                    'INTERNAL',
-                    null,
-                    null,
-                    null
-                );
-
-                g_monitor_shadows.DELETE(v_key);
-            END IF;
-            v_key := g_monitor_shadows.NEXT(v_key);
-        END LOOP;
-
         -- H) Die Liste der aktiven Server zurücksetzen
         g_client_pipes.DELETE(p_processId);
 
@@ -4605,6 +4651,9 @@ AS
             IF g_last_action_per_process.EXISTS(p_processId) THEN
                 g_last_action_per_process.DELETE(p_processId);
             END IF;
+
+        -- K) Zähler für ERROR/WARN
+        g_log_counters.DELETE(p_processId);
 
     EXCEPTION
         WHEN OTHERS THEN
@@ -4628,6 +4677,7 @@ AS
         if is_remote(p_processId) then
             close_sessionRemote(p_processId, p_procStepsToDo, p_procStepsDone, p_processInfo, p_processStatus);
             g_remote_sessions.delete(p_processId);
+            g_log_counters.delete(p_processId);
             g_client_pipes.delete(p_processId);
             g_local_throttle_cache.delete(p_processId);
             return;
@@ -4635,6 +4685,8 @@ AS
 
         -- Hier nur weiter, wenn lokale processId
         if v_indexSession.EXISTS(p_processId) then
+            -- offene Traces melden, solange Puffer und Shadows noch bestehen
+            warnOpenTraces(p_processId);
             -- Nur die Puffer dieses Prozesses wegschreiben (nicht die aller offenen Prozesse)
             sync_log(p_processId, true);
             sync_monitor(p_processId, true);
@@ -5219,20 +5271,6 @@ AS
     end;
 
     -------------------------------------------------------------------------- 
-
-    procedure SERVER_SEND_ANY_MSG(p_processId number, p_message varchar2)
-    as
-        l_response JSON_OBJ_LILAM;
-    begin
-        l_response := waitForResponse(
-            p_processId     => p_processId,
-            p_request       => 'ANY_MSG',
-            p_payload       => p_message,
-            p_timeoutSec    => 5
-        );
-    end;
-
-    --------------------------------------------------------------------------
 
     FUNCTION GET_SERVER_PIPE(p_processId NUMBER) RETURN VARCHAR2
     as

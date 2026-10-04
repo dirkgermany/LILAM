@@ -8,6 +8,7 @@
 - [Process](#process)
 - [Session](#session)
   - [Session Life Cycle](#session-life-cycle)
+  - [Persistence and Error Handling](#persistence-and-error-handling)
 - [Logs / Severity](#logs--severity)
 - [Log Level](#log-level)
 - [Metrics](#metrics)
@@ -81,6 +82,18 @@ A session represents the lifecycle of a logged process. A process 'lives' within
 >If a process terminates abnormally (e.g., due to an uncaught exception) without reaching CLOSE_SESSION, any data remaining in the buffer since the last automatic >flush will be lost. We strongly recommend including CLOSE_SESSION in your application’s central exception handler.
 
 Ultimately, all that is required for a complete life cycle is to call the NEW_SESSION function at the beginning of the session and the CLOSE_SESSION procedure at the end of the session.
+
+### Persistence and Error Handling
+LILAM writes buffered data in bulk: one flush collects the pending log, monitor and process data of all processes, writes each table with a single `FORALL` and commits everything together in an autonomous transaction.
+
+If a bulk insert fails (e.g., because a row violates a constraint of the application's tables), LILAM does not lose the other rows:
+1. The failed `FORALL` is rolled back (to a savepoint per table).
+2. The rows are then written one by one. A faulty row is skipped and recorded in `LILAM_LOG_INTERNAL` ("row n skipped"); all other rows are stored.
+3. If the table itself is missing (ORA-00942), the single-row run stops immediately.
+
+LILAM deliberately does not use `FORALL ... SAVE EXCEPTIONS`: with dynamic SQL, Oracle does not release the PGA memory used for the exception list on every call (about 40 bytes per row). In a long-running server this let the memory grow continuously. The fallback above gives the same result without this effect. The test FEATURES/SPEICHER checks that the memory per process stays flat.
+
+As everywhere in LILAM, such errors never reach the application: they are logged internally and processing continues.
 
 The session is more of a technical perspective on the workflows within LILAM, while the process is the view 'to the outside.' I believe these two terms—session and process—can be used almost synonymously in daily LILAM operations. It doesn't really hurt if they are mixed a bit.
 
