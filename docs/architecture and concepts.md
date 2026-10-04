@@ -350,7 +350,7 @@ Events and traces share the same table structure. The `MON_TYPE` column identifi
 
 The `LILAM_SERVER_REGISTRY` table maintains the runtime state of registered LILAM servers. Unlike the process, log, and monitor tables, its name is fixed and is not derived from `tabNameMaster`.
 
-Each active LILAM server registers itself in this table and periodically updates its activity information. Clients use the registry to discover suitable servers and to select a server based on its current load: first the number of messages processed in the last interval (`PROCESSING`), then the number of open processes (`CURRENT_PROCESSES`).
+Each active LILAM server registers itself in this table and periodically updates its activity information. Clients use the registry to discover suitable servers and to select a server based on its current load: first the number of messages processed in the last interval (`PROCESSING`), then the number of open processes (`CURRENT_PROCESSES`), and on a tie the server that has been idle longest (oldest `LAST_ACTIVITY`). A server updates its entry periodically and additionally right after each new process, so that processes created in quick succession are spread across the servers.
 
 If `SERVER_NEW_SESSION` is called with a `p_groupName`, only servers registered for the requested group are considered.
 
