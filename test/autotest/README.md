@@ -22,7 +22,7 @@ DECOUPLED/
     LASTTEST/  MASSENTEST/  PARALLELBETRIEB/  PROZESSZYKLEN/  DAUERTEST/  WAKEUP/  LASTSPITZE/
 
 FEATURES/                   Funktionstests einzelner Merkmale (modusübergreifend)
-  BASELINE_SCOPE/  LOGTEXT_GRENZEN/  DISPATCHER_APEX/  FEHLERFAELLE/  SERVERAUSWAHL/  SPEICHER/  REGELN/
+  BASELINE_SCOPE/  LOGTEXT_GRENZEN/  DISPATCHER_APEX/  FEHLERFAELLE/  SERVERAUSWAHL/  SPEICHER/  REGELN/  REGELN_LAST/
 
 DAUERTEST/                  Dauertest über alle Modi gleichzeitig (Kombination der Tests)
 ```
@@ -31,7 +31,7 @@ Jeder Testordner enthält das Skript `test_*.sql` und einen Ordner `results/` f�
 
 Die Testlogik steht im Package `LT` (`_COMMON/01_install_testbasis.sql`): je Test eine Funktion
 (`lt.t_lasttest`, `lt.t_massentest`, `lt.t_parallel`, `lt.t_zyklen`, `lt.t_wakeup`, `lt.t_lastspitze`,
-`lt.t_logtext`, `lt.t_baseline_scope`, `lt.t_speicher`, `lt.t_regeln`). Die Skripte rufen diese Funktionen mit sichtbaren, anpassbaren Parametern auf.
+`lt.t_logtext`, `lt.t_baseline_scope`, `lt.t_speicher`, `lt.t_regeln`, `lt.t_regeln_last`). Die Skripte rufen diese Funktionen mit sichtbaren, anpassbaren Parametern auf.
 So kann der Dauertest dieselben Tests wiederverwenden. FEHLERFAELLE und DISPATCHER_APEX bleiben eigenständige Skripte
 (sie stoppen bewusst Server bzw. legen Hilfstabellen an).
 
@@ -53,6 +53,7 @@ So kann der Dauertest dieselben Tests wiederverwenden. FEHLERFAELLE und DISPATCH
 | FEATURES/SERVERAUSWAHL | Dispatcher wird nie als Ziel der Serverauswahl gewählt; Last verteilt sich auf die Worker (je Worker mind. 30 %), ohne und mit Dispatcher | 2 Clients × 20 Prozesse |
 | FEATURES/SPEICHER | kein Speicherverlust: PGA-Wachstum je Prozess von Session/Client, Workern und Dispatcher (Median aus 5 Messblöcken, max. 100 Byte); Fallback beim Schreiben (fehlerhafte Zeile übersprungen und protokolliert, übrige geschrieben); INSESSION, SERVER, DISPATCHER. Benötigt `00_grants_als_sys.sql` | je Modus 2.000 + 5 × 1.000 Prozesse, ca. 7 min |
 | FEATURES/REGELN | Rules Engine im SERVER-Modus mit eigenem Rule Set `LT_REGELN`: Laden per API und nach Neustart, Ablehnung ungültiger Rule Sets, Vorgänger/Nachfolger, Abstand, Dauer, Häufigkeit, Abweichung, Prozess- und Log-Regeln, Kontext-/Action-Regel, Drosselung, Alert-Zeile und Signal. Nur einzeln (ändert das Rule Set der Gruppe LT) | ca. 20 Prozesse, 2–3 Server, ca. 1 min |
+| FEATURES/REGELN_LAST | Kosten der Regelprüfung im Server je Signaltyp (Event, Trace, Log, Prozessschritt): keine Regeln, 50 Regeln auf andere Actions, 20 passende Regeln ohne Alarm, eine anschlagende Regel gedrosselt und ungedrosselt; Median aus 3 Läufen, Grenzen relativ zu „keine Regeln“. Nur einzeln | 4 × 5 Varianten × 3 Läufe, ca. 4 min |
 
 Eine Operation besteht aus fünf API-Aufrufen: `INFO`, `TRACE_START`, `TRACE_STOP`, `MARK_EVENT`, `PROC_STEP_DONE`.
 Die Standard-Prüfung kontrolliert danach Vollständigkeit (Logs, Traces, Events, Steps), geschlossene Prozesse,

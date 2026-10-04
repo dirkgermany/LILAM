@@ -206,6 +206,9 @@ create or replace package lt authid definer as
 
     -- Regeln (Rules Engine) im SERVER-Modus: Laden, Operatoren, Alerts. Nur einzeln (aendert das Rule Set von LT_S1)
     function t_regeln(p_manage boolean default true, p_parent number default null) return number;
+    -- Kosten der Regelpruefung je Signaltyp (EVENT, TRACE, LOG, STEP) und Variante; nur einzeln
+    function t_regeln_last(p_n number default 2000, p_n_fire number default 200, p_reps number default 3,
+                           p_manage boolean default true, p_parent number default null) return number;
 
     -- Speicher: PGA-Wachstum je Prozess in Client, Workern und Dispatcher (INSESSION, SERVER, DISPATCHER)
     -- sowie Fallback beim Schreiben (fehlerhafte Zeile wird uebersprungen, die uebrigen bleiben erhalten)
@@ -2057,6 +2060,215 @@ create or replace package body lt as
     exception
         when others then
             begin dbms_alert.remove(c_handler); exception when others then null; end;
+            begin reset_rules; exception when others then null; end;
+            abort_run(l_run, p_manage, sqlerrm || ' ' || dbms_utility.format_error_backtrace);
+            if p_manage then raise; end if;
+            return l_run;
+    end;
+
+    ----------------------------------------------------------------------
+    -- REGELN_LAST: Kosten der Regelpruefung je Signaltyp im Server (LT_S1 ohne Drosselung)
+    -- Signaltypen EVENT, TRACE (Start+Stop), LOG (INFO), STEP (PROC_STEP_DONE)
+    -- Varianten NONE, OTHER50, MATCH20, FIRE_THR, FIRE_ALL; gemessen wird bis zur Antwort einer
+    -- abschliessenden synchronen Abfrage (der Server hat dann alle Signale davor verarbeitet).
+    ----------------------------------------------------------------------
+    function t_regeln_last(p_n number default 2000, p_n_fire number default 200, p_reps number default 3,
+                           p_manage boolean default true, p_parent number default null) return number is
+        c_set     constant varchar2(30) := 'LT_REGELN_LAST';
+        c_handler constant varchar2(30) := 'LT_REGELN_LAST_ALERT';
+        type t_names is table of varchar2(20);
+        l_types   t_names := t_names('EVENT', 'TRACE', 'LOG', 'STEP');
+        l_vars    t_names := t_names('NONE', 'OTHER50', 'MATCH20', 'FIRE_THR', 'FIRE_ALL');
+        l_run     number;
+        l_p       varchar2(60);
+        l_msg     varchar2(4000);
+        l_base    number;
+        l_val     number;
+        l_n       number;
+
+        function r(p_id varchar2, p_trig varchar2, p_action varchar2, p_op varchar2, p_val varchar2, p_thr number default 3600) return varchar2 is
+        begin
+            return '{"id":"' || p_id || '","trigger_type":"' || p_trig || '","action":"' || p_action
+                || '","condition":{"operator":"' || p_op || '","value":"' || p_val
+                || '"},"alert":{"handler":"' || c_handler || '","severity":"WARN","throttle_seconds":' || p_thr || '}}';
+        end;
+
+        -- Regeln einer Variante fuer einen Signaltyp (Action des Signals bzw. Prozessname bei STEP)
+        function rules_for(p_type varchar2, p_var varchar2, p_proc varchar2) return clob is
+            l     clob;
+            l_trg varchar2(30) := case p_type when 'EVENT' then 'MARK_EVENT' when 'TRACE' then 'TRACE_STOP'
+                                              when 'LOG' then 'LOGGING' else 'PROCESS_UPDATE' end;
+            l_act varchar2(100) := case p_type when 'EVENT' then 'RL_EV' when 'TRACE' then 'RL_TR'
+                                               when 'LOG' then 'LOGGING' else p_proc end;
+            l_op  varchar2(40);
+            l_v   varchar2(40);
+            l_t   varchar2(30);
+            procedure add(p_rule varchar2) is
+            begin
+                l := l || case when l is not null then ',' end || p_rule;
+            end;
+        begin
+            if p_var = 'OTHER50' then
+                -- Regeln auf andere Actions: fuer LOG gibt es nur die Action LOGGING, daher Event-Regeln
+                for i in 1 .. 50 loop
+                    add(r('O' || i, case when p_type = 'LOG' then 'MARK_EVENT' else l_trg end, 'RL_OTHER_' || i,
+                          case when p_type = 'STEP' then 'ON_UPDATE' when p_type = 'TRACE' then 'ON_STOP' else 'ON_EVENT' end, ''));
+                end loop;
+            elsif p_var = 'MATCH20' then
+                for i in 1 .. 20 loop
+                    l_t := l_trg;
+                    case p_type
+                        when 'EVENT' then
+                            l_op := case mod(i, 5) when 0 then 'MAX_DURATION_MS' when 1 then 'MAX_GAP_SECONDS' when 2 then 'MAX_OCCURRENCE'
+                                                   when 3 then 'PRECEDED_BY' else 'PRECEDED_BY_WITHIN_SECS' end;
+                            l_v  := case mod(i, 5) when 0 then '999999999' when 1 then '999999' when 2 then '999999999'
+                                                   when 3 then 'RL_EV' else 'RL_EV|999999' end;
+                        when 'TRACE' then
+                            l_t  := case when mod(i, 2) = 0 then 'TRACE_STOP' else 'TRACE_START' end;
+                            l_op := case when l_t = 'TRACE_START' then case mod(i, 4) when 1 then 'MAX_GAP_SECONDS' else 'PRECEDED_BY' end
+                                         else case mod(i, 3) when 0 then 'MAX_DURATION_MS' when 1 then 'MAX_OCCURRENCE' else 'AVG_DEVIATION_PCT' end end;
+                            l_v  := case l_op when 'MAX_GAP_SECONDS' then '999999' when 'PRECEDED_BY' then 'RL_TR'
+                                              when 'AVG_DEVIATION_PCT' then '100000|3|0.1' else '999999999' end;
+                        when 'LOG' then
+                            l_op := 'SEVERITY';
+                            l_v  := case mod(i, 4) when 0 then 'ERROR' when 1 then 'WARN' when 2 then 'DEBUG' else 'MONITOR' end;
+                        else
+                            l_op := case mod(i, 5) when 0 then 'STATUS_EQUALS' when 1 then 'INFO_CONTAINS' when 2 then 'MAX_OCCURRENCE'
+                                                   when 3 then 'RUNTIME_EXCEEDED' else 'STEPS_LEFT_HIGH' end;
+                            l_v  := case l_op when 'STATUS_EQUALS' then '999' when 'INFO_CONTAINS' then 'xyz_nie' else '999999999' end;
+                    end case;
+                    add(r('M' || i, l_t, l_act, l_op, l_v));
+                end loop;
+            elsif p_var in ('FIRE_THR', 'FIRE_ALL') then
+                add(r('F1', l_trg, l_act,
+                      case p_type when 'LOG' then 'SEVERITY' when 'TRACE' then 'ON_STOP' when 'STEP' then 'ON_UPDATE' else 'ON_EVENT' end,
+                      case when p_type = 'LOG' then 'INFO' end,
+                      case when p_var = 'FIRE_THR' then 3600 else 0 end));
+            end if;
+            return '{"header":{"rule_set":"' || c_set || '"},"rules":[' || l || ']}';
+        end;
+
+        procedure activate(p_ver number, p_rules clob) is
+        begin
+            execute immediate 'delete from lilam_rules where group_name = :1 and set_name = :2 and version = :3' using c_group, c_set, p_ver;
+            execute immediate 'insert into lilam_rules(group_name, set_name, version, is_active, created, author, rule_set)
+                               values (:1, :2, :3, 0, systimestamp, ''LT'', :4)' using c_group, c_set, p_ver, p_rules;
+            commit;
+            lilam.server_update_rules(c_group, c_set, p_ver);
+        end;
+
+        procedure signals(p_pid number, p_type varchar2, p_count number) is
+        begin
+            for i in 1 .. p_count loop
+                case p_type
+                    when 'EVENT' then lilam.mark_event(p_pid, 'RL_EV');
+                    when 'TRACE' then if mod(i, 2) = 1 then lilam.trace_start(p_pid, 'RL_TR'); else lilam.trace_stop(p_pid, 'RL_TR'); end if;
+                    when 'LOG'   then lilam.info(p_pid, 'rl ' || i);
+                    else              lilam.proc_step_done(p_pid);
+                end case;
+            end loop;
+        end;
+
+        -- eine Messung: liefert Mikrosekunden je Signal (Server-Verarbeitung), -1 bei Zeitueberschreitung
+        function measure(p_type varchar2, p_var varchar2, p_rep number, p_ver number) return number is
+            l_proc  varchar2(80) := l_p || '_' || p_type || '_' || p_var || '_' || p_rep;
+            l_pid   number;
+            l_cnt   number := case when p_var = 'FIRE_ALL' then p_n_fire else p_n end;
+            l_t0    timestamp;
+            l_ms    number;
+            l_sync  number;
+        begin
+            activate(p_ver, rules_for(p_type, p_var, l_proc));
+            l_pid := lilam.server_new_session(l_proc, c_group, lilam.logLevelInfo);
+            dbms_session.sleep(0.5);
+            -- Aufwaermen (Baseline, Caches), dann synchronisieren
+            signals(l_pid, p_type, 100);
+            l_sync := lilam.get_proc_steps_done(l_pid);
+            l_t0 := systimestamp;
+            signals(l_pid, p_type, l_cnt);
+            l_sync := lilam.get_proc_steps_done(l_pid);   -- Antwort erst nach allen Signalen davor
+            l_ms := ms_since(l_t0);
+            lilam.close_session(l_pid);
+            if l_sync is null then
+                return -1;
+            end if;
+            return round(l_ms * 1000 / l_cnt, 1);
+        end;
+
+        function med(p_name varchar2) return number is
+            l number;
+        begin
+            select median(value) into l from lt_metric where run_id = l_run and metric = p_name and value >= 0;
+            return l;
+        end;
+
+        procedure reset_rules is
+        begin
+            execute immediate 'delete from lilam_rules where set_name = :1' using c_set;
+            execute immediate 'update lilam_rules set is_active = 0 where upper(group_name) = :1 and is_active = 1' using c_group;
+            commit;
+        end;
+
+    begin
+        l_run := begin_run('REGELN_LAST', c_server, 'n=' || p_n || ' n_fire=' || p_n_fire || ' reps=' || p_reps
+                           || ', LT_S1 ohne Drosselung', p_parent);
+        l_p   := 'LT_' || l_run || '_RL';
+        if p_manage then
+            stop_all_servers;
+            reset_rules;
+            l_msg := lilam.create_server('LT_S1', c_group, c_pw, 0, p_perfServer => 0);
+            dbms_output.put_line('    ' || l_msg);
+            wait_servers_ready(sys.odcivarchar2list('LT_S1'));
+        end if;
+
+        -- Varianten je Lauf abwechselnd, damit Schwankungen alle Varianten gleich treffen
+        for rep in 1 .. p_reps loop
+            for t in 1 .. l_types.count loop
+                for v in 1 .. l_vars.count loop
+                    l_val := measure(l_types(t), l_vars(v), rep, t * 10 + v);
+                    metric(l_run, lower(l_types(t) || '_' || l_vars(v)), l_val, 'us/Signal');
+                end loop;
+            end loop;
+        end loop;
+
+        -- Auswertung je Signaltyp: Median im Verhaeltnis zu NONE; kleine absolute Unterschiede (< 50 us) gelten als gleich
+        for t in 1 .. l_types.count loop
+            l_base := med(lower(l_types(t)) || '_none');
+            dbms_output.put_line('    ' || rpad(l_types(t), 6) || ' NONE ' || l_base || ' us, OTHER50 ' || med(lower(l_types(t)) || '_other50')
+                                 || ', MATCH20 ' || med(lower(l_types(t)) || '_match20') || ', FIRE_THR ' || med(lower(l_types(t)) || '_fire_thr')
+                                 || ', FIRE_ALL ' || med(lower(l_types(t)) || '_fire_all') || ' us/Signal');
+            l_val := med(lower(l_types(t)) || '_other50');
+            check_that(l_run, l_types(t) || ' 50 Regeln auf andere Actions: hoechstens 1,5 x ohne Regeln',
+                       l_val <= greatest(1.5 * l_base, l_base + 50), l_val || ' / ' || l_base || ' us');
+            l_val := med(lower(l_types(t)) || '_match20');
+            check_that(l_run, l_types(t) || ' 20 passende Regeln ohne Alarm: hoechstens 2 x ohne Regeln',
+                       l_val <= greatest(2 * l_base, l_base + 50), l_val || ' / ' || l_base || ' us');
+            l_val := med(lower(l_types(t)) || '_fire_thr');
+            check_that(l_run, l_types(t) || ' Regel schlaegt immer an, gedrosselt: hoechstens 1,5 x ohne Regeln',
+                       l_val <= greatest(1.5 * l_base, l_base + 50), l_val || ' / ' || l_base || ' us');
+            -- ungedrosselt: Korrektheit pruefen, Kosten nur messen
+            execute immediate 'select count(*) from lilam_alerts where process_name like :1 and rule_id = ''F1'''
+               into l_n using l_p || '_' || l_types(t) || '_FIRE_ALL_%';
+            check_that(l_run, l_types(t) || ' ungedrosselt: ein Alert je Signal inkl. Aufwaermen',
+                       l_n = p_reps * (p_n_fire + 100)
+                            / case when l_types(t) = 'TRACE' then 2 else 1 end,
+                       l_n || ' Alerts');
+        end loop;
+
+        select count(*) into l_n from lt_metric where run_id = l_run and value < 0;
+        check_that(l_run, 'Alle Messungen synchronisiert (keine Zeitueberschreitung)', l_n = 0, l_n);
+
+        if p_manage then
+            stop_all_servers;
+        end if;
+        reset_rules;
+        check_that(l_run, 'Keine internen LILAM-Fehler', internal_errors_since(run_started(l_run)) = 0,
+                   internal_errors_since(run_started(l_run)));
+        end_run(l_run);
+        return l_run;
+
+    exception
+        when others then
             begin reset_rules; exception when others then null; end;
             abort_run(l_run, p_manage, sqlerrm || ' ' || dbms_utility.format_error_backtrace);
             if p_manage then raise; end if;
