@@ -1716,10 +1716,11 @@ create or replace package body lt as
                 || ',"description":"Test FEATURES/REGELN"},"rules":[' || replace(p_rules, '#P#', l_p) || ']}';
         end;
 
-        procedure ins(p_ver number, p_rules clob) is
+        procedure ins(p_ver number, p_rules clob, p_group varchar2 default c_group) is
             l_json clob := rule_set(p_ver, p_rules);
         begin
-            insert into lilam_rules(set_name, version, created, author, rule_set) values (c_set, p_ver, systimestamp, 'LT', l_json);
+            execute immediate 'insert into lilam_rules(group_name, set_name, version, is_active, created, author, rule_set)
+                               values (:1, :2, :3, 0, systimestamp, ''LT'', :4)' using p_group, c_set, p_ver, l_json;
         end;
 
         procedure put_rules is
@@ -1752,7 +1753,9 @@ create or replace package body lt as
             l := l || ',' || r('TF-01', 'TRACE_STOP',  'RG_TF', 'ON_STOP', '');
             l := l || ',' || r('TH-01', 'MARK_EVENT',  'RG_TH', 'ON_EVENT', '', null, 2);
             l := l || ',' || r('L-01',  'MARK_EVENT',  'RG_L',  'ON_EVENT', '');
-            delete from lilam_rules where set_name = c_set;
+            -- vorher: Rule Sets des Tests entfernen, Testgruppe ohne aktives Rule Set
+            execute immediate 'delete from lilam_rules where set_name = :1' using c_set;
+            execute immediate 'update lilam_rules set is_active = 0 where upper(group_name) = :1 and is_active = 1' using c_group;
             ins(1, l);
             -- Version 2: klein, ersetzt Version 1 vollstaendig
             ins(2, r('V2-01', 'MARK_EVENT', 'RG_V2', 'ON_EVENT', ''));
@@ -1760,6 +1763,8 @@ create or replace package body lt as
             ins(3, r('X3-01', 'MARK_EVENT', 'RG_V2', 'ON_EVENT', '', null, 0, null));
             ins(4, r('X4-01', 'MARK_EVENT', 'RG_V2', 'PRECEDED_BY_WITHIN_MS', 'RG_A|1000'));
             ins(5, r('X5-01', 'TRACE_STOP', 'RG_V2', 'MAX_GAP_SECONDS', '1'));
+            -- Gruppe ohne Server: Aktivieren ist kein Fehler
+            ins(1, r('E1-01', 'MARK_EVENT', 'RG_E', 'ON_EVENT', ''), 'LT_LEER');
             commit;
         end;
 
@@ -1782,23 +1787,23 @@ create or replace package body lt as
             return lilam.server_new_session(l_p || p_suffix, c_group, lilam.logLevelInfo, p_procStepsToDo => p_steps);
         end;
 
-        -- Rule Set eines Servers laut Registry, z.B. 'LT_REGELN v1'
-        function registry(p_pipe varchar2) return varchar2 is
+        -- aktives Rule Set einer Gruppe, z.B. 'LT_REGELN v1'
+        function active(p_group varchar2 default c_group) return varchar2 is
             l_name varchar2(50);
             l_ver  number;
         begin
-            execute immediate 'select rule_set_name, set_in_use from lilam_server_registry where pipe_name = :1'
-               into l_name, l_ver using p_pipe;
+            execute immediate 'select set_name, version from lilam_rules where upper(group_name) = upper(:1) and is_active = 1'
+               into l_name, l_ver using p_group;
             return l_name || ' v' || l_ver;
         exception
-            when no_data_found then return null;
+            when no_data_found then return 'keines';
         end;
 
-        -- Rule Set der Testgruppe in der Registry zuruecksetzen (sonst uebernehmen neue Server es)
-        procedure reset_registry is
+        -- Rule Sets des Tests entfernen und die Testgruppe ohne aktives Rule Set lassen
+        procedure reset_rules is
         begin
-            execute immediate 'update lilam_server_registry set rule_set_name = null, set_in_use = 0 where group_name = :1'
-               using c_group;
+            execute immediate 'delete from lilam_rules where set_name = :1' using c_set;
+            execute immediate 'update lilam_rules set is_active = 0 where upper(group_name) = :1 and is_active = 1' using c_group;
             commit;
         end;
 
@@ -1825,7 +1830,6 @@ create or replace package body lt as
         put_rules;
         if p_manage then
             stop_all_servers;
-            reset_registry;
             setup_servers(c_server, 2);
         end if;
 
@@ -1833,9 +1837,8 @@ create or replace package body lt as
         -- L1: Laden per SERVER_UPDATE_RULES fuer die ganze Gruppe
         -- ---------------------------------------------------------------
         update_rules(1);
-        check_that(l_run, 'L1 SERVER_UPDATE_RULES: Registry beider Server zeigt das Rule Set',
-                   registry('LT_S1') = c_set || ' v1' and registry('LT_S2') = c_set || ' v1',
-                   'LT_S1 ' || registry('LT_S1') || ', LT_S2 ' || registry('LT_S2'));
+        -- ob beide Server die Regeln geladen haben, zeigen die folgenden Szenarien (Prozesse verteilen sich auf beide)
+        check_that(l_run, 'L1 SERVER_UPDATE_RULES: Rule Set fuer die Gruppe aktiv', active = c_set || ' v1', active);
 
         -- Alert-Signal: diese Session lauscht auf den Handler
         dbms_alert.register(c_handler);
@@ -1972,46 +1975,51 @@ create or replace package body lt as
         dbms_alert.remove(c_handler);
 
         -- ---------------------------------------------------------------
-        -- L2: Neustart laedt die Regeln aus der Registry
+        -- L2: Neustart laedt das aktive Rule Set der Gruppe
         -- ---------------------------------------------------------------
         if p_manage then
             l_ok := stop_server('LT_S1');
             start_server('LT_S1');
             wait_servers_ready(sys.odcivarchar2list('LT_S1'));
-            check_that(l_run, 'L2 Neustart: Registry von LT_S1 unveraendert', registry('LT_S1') = c_set || ' v1', registry('LT_S1'));
             -- zwei Prozesse, damit mit hoher Wahrscheinlichkeit beide Server beteiligt sind
             l_pid := proc('_L2'); lilam.mark_event(l_pid, 'RG_L'); lilam.close_session(l_pid);
             l_pid := proc('_L2'); lilam.mark_event(l_pid, 'RG_L'); lilam.close_session(l_pid);
             expect('_L2', 'L-01', 2, 'L2 nach Neustart aktiv');
 
-            -- L2b: ein neuer Server der Gruppe uebernimmt das Rule Set der Gruppe
-            execute immediate 'delete from lilam_server_registry where pipe_name = ''LT_S3''';
-            commit;
+            -- L2b: ein neuer Server der Gruppe laedt das aktive Rule Set der Gruppe (allein laufend)
+            l_ok := stop_server('LT_S1'); l_ok := stop_server('LT_S2');
             start_server('LT_S3');
             wait_servers_ready(sys.odcivarchar2list('LT_S3'));
-            check_that(l_run, 'L2b neuer Server LT_S3 uebernimmt das Rule Set der Gruppe', registry('LT_S3') = c_set || ' v1', registry('LT_S3'));
+            l_pid := proc('_L2B'); lilam.mark_event(l_pid, 'RG_L'); lilam.close_session(l_pid);
+            expect('_L2B', 'L-01', 1, 'L2b neuer Server LT_S3 laedt das Rule Set der Gruppe');
             l_ok := stop_server('LT_S3');
             execute immediate 'delete from lilam_server_registry where pipe_name = ''LT_S3''';
             commit;
+            start_server('LT_S1'); start_server('LT_S2');
+            wait_servers_ready(sys.odcivarchar2list('LT_S1', 'LT_S2'));
         end if;
 
         -- ---------------------------------------------------------------
         -- L3: SERVER_UPDATE_RULES lehnt ungueltige/fehlende Rule Sets ab, nichts aendert sich
         -- ---------------------------------------------------------------
         l_n := rejected(c_group, 3) + rejected(c_group, 4) + rejected(c_group, 5)
-             + rejected(c_group, 9)                 -- Version 9 gibt es nicht
-             + rejected('LT_KEINE_GRUPPE', 1);      -- Gruppe ohne Server
-        check_that(l_run, 'L3 SERVER_UPDATE_RULES lehnt 5 Faelle mit NUM_ERR_RULE_SET ab', l_n = 5, l_n);
-        check_that(l_run, 'L3 Registry beider Server unveraendert',
-                   registry('LT_S1') = c_set || ' v1' and registry('LT_S2') = c_set || ' v1',
-                   'LT_S1 ' || registry('LT_S1') || ', LT_S2 ' || registry('LT_S2'));
+             + rejected(c_group, 9);                -- Version 9 gibt es nicht
+        check_that(l_run, 'L3 SERVER_UPDATE_RULES lehnt 4 Faelle mit NUM_ERR_RULE_SET ab', l_n = 4, l_n);
+        check_that(l_run, 'L3 aktives Rule Set der Gruppe unveraendert', active = c_set || ' v1', active);
         l_pid := proc('_L3'); lilam.mark_event(l_pid, 'RG_L'); lilam.close_session(l_pid);
         expect('_L3', 'L-01', 1, 'L3 Regeln aus Version 1 bleiben aktiv');
 
-        -- L3b: der Server selbst lehnt ein ungueltiges Rule Set aus der Registry beim Start ab
+        -- L3a: Gruppe ohne Server ist kein Fehler; das Rule Set wird aktiv
+        l_n := rejected('LT_LEER', 1);
+        check_that(l_run, 'L3a Gruppe ohne Server: kein Fehler, Rule Set aktiv',
+                   l_n = 0 and active('LT_LEER') = c_set || ' v1', active('LT_LEER'));
+
+        -- L3b: der Server selbst lehnt ein ungueltiges aktives Rule Set beim Start ab
         if p_manage then
             l_ok := stop_server('LT_S1');
-            execute immediate 'update lilam_server_registry set set_in_use = 3 where pipe_name = ''LT_S1''';
+            execute immediate 'update lilam_rules set is_active = 0 where group_name = :1' using c_group;
+            execute immediate 'update lilam_rules set is_active = 1 where group_name = :1 and set_name = :2 and version = 3'
+               using c_group, c_set;
             commit;
             start_server('LT_S1');
             wait_servers_ready(sys.odcivarchar2list('LT_S1'));
@@ -2025,9 +2033,7 @@ create or replace package body lt as
         -- L4: Wechsel auf Version 2 ersetzt alle Regeln auf allen Servern
         -- ---------------------------------------------------------------
         update_rules(2);
-        check_that(l_run, 'L4 Wechsel auf Version 2 in der Registry beider Server',
-                   registry('LT_S1') = c_set || ' v2' and registry('LT_S2') = c_set || ' v2',
-                   'LT_S1 ' || registry('LT_S1') || ', LT_S2 ' || registry('LT_S2'));
+        check_that(l_run, 'L4 Wechsel auf Version 2: aktives Rule Set der Gruppe', active = c_set || ' v2', active);
         for i in 1 .. 2 loop
             l_pid := proc('_L4'); lilam.mark_event(l_pid, 'RG_L'); lilam.mark_event(l_pid, 'RG_V2'); lilam.close_session(l_pid);
         end loop;
@@ -2039,8 +2045,8 @@ create or replace package body lt as
         -- ---------------------------------------------------------------
         if p_manage then
             stop_all_servers;
-            reset_registry;
         end if;
+        reset_rules;   -- sonst laden spaetere Server der Gruppe LT dieses Rule Set
         execute immediate 'select count(*) from lilam_log_internal where log_timestamp >= :1
                               and module_name != ''load_rules_from_json'''
            into l_n using run_started(l_run);
@@ -2051,6 +2057,7 @@ create or replace package body lt as
     exception
         when others then
             begin dbms_alert.remove(c_handler); exception when others then null; end;
+            begin reset_rules; exception when others then null; end;
             abort_run(l_run, p_manage, sqlerrm || ' ' || dbms_utility.format_error_backtrace);
             if p_manage then raise; end if;
             return l_run;

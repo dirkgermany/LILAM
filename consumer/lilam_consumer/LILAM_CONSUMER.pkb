@@ -22,7 +22,8 @@ CREATE OR REPLACE PACKAGE BODY LILAM_CONSUMER AS
                     alert_throttle      number   PATH '$.alert.throttle_seconds'
                 )
              ) jt
-        WHERE lr.set_name = p_alert_rec.rule_set_name
+        WHERE upper(lr.group_name) = upper(p_alert_rec.group_name)
+          AND lr.set_name = p_alert_rec.rule_set_name
           AND lr.version  = p_alert_rec.rule_set_version
           AND jt.id      = p_alert_rec.rule_id;
 

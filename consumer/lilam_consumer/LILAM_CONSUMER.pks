@@ -46,6 +46,7 @@ CREATE OR REPLACE PACKAGE LILAM_CONSUMER AS
         action_name         VARCHAR2(50),
         context_name        VARCHAR2(50),
         action_count        PLS_INTEGER,
+        group_name          VARCHAR2(100),
         rule_set_name       VARCHAR2(50),
         rule_id             VARCHAR2(50),
         rule_set_version    PLS_INTEGER,

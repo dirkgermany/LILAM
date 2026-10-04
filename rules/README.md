@@ -96,7 +96,7 @@ Rules are organized into Rule Sets, stored as JSON documents in the `LILAM_RULES
 Unknown properties (e.g. `_comment`) are ignored.
 
 ### Validation when loading
-A server checks a rule set completely before it uses it: required fields, lengths, unique ids, known trigger types and operators, operators allowed for the trigger, and the format of `condition.value`. If a single rule is invalid, the **whole** rule set is rejected and the previously loaded rules stay active. `SERVER_UPDATE_RULES` performs the same check before it changes the registry and raises an exception with the reason; a server that rejects a rule set at startup writes the reason to `LILAM_LOG_INTERNAL` and to the log of the server process.
+A server checks a rule set completely before it uses it: required fields, lengths, unique ids, known trigger types and operators, operators allowed for the trigger, and the format of `condition.value`. If a single rule is invalid, the **whole** rule set is rejected and the previously loaded rules stay active. `SERVER_UPDATE_RULES` performs the same check before it activates a rule set and raises an exception with the reason; a server that rejects a rule set at startup writes the reason to `LILAM_LOG_INTERNAL` and to the log of the server process.
 
 ### Hooks / Trigger Types
 | hook | scope | API call
@@ -133,31 +133,36 @@ A server checks a rule set completely before it uses it: required fields, length
 
 ---
 ## Table: LILAM_RULES
-This table serves as the central repository for all rule sets. Each rule set is stored as a single, versioned JSON document.
+This table serves as the central repository for all rule sets. Each rule set is stored as a versioned JSON document for a **server group**; the same rule set may be stored for several groups. Per group exactly one row is active.
 
 | Column | Type | Description |
 | :--- | :--- | :--- |
-| **SET_NAME** | `VARCHAR2(30)` | Name of the rule set. Together with `VERSION` unique. |
+| **GROUP_NAME** | `VARCHAR2(50)` | Server group the rule set belongs to. |
+| **SET_NAME** | `VARCHAR2(30)` | Name of the rule set. `GROUP_NAME`, `SET_NAME` and `VERSION` together are unique. |
 | **VERSION** | `NUMBER` | Version number to support testing, staging, and rollbacks. |
+| **IS_ACTIVE** | `NUMBER(1)` | `1` for the rule set the servers of the group use (at most one per group). |
 | **RULE_SET** | `CLOB` | The JSON document (header and rules); checked by `IS JSON`. |
 | **CREATED** | `TIMESTAMP` | When this version was created. |
 | **AUTHOR** | `VARCHAR2(50)` | The developer or architect who defined the rule set. |
 
-Alerts and the consumer refer to a rule by `SET_NAME`, `VERSION` and `rules.id`.
+Alerts and the consumer refer to a rule by `GROUP_NAME`, `SET_NAME`, `VERSION` and `rules.id`.
 
 > **Implementation Note**
-> The LILAM servers load the rule set of their group into RAM at startup (or when `SERVER_UPDATE_RULES` is called). All rule evaluations work on this cached structure, without database access. Only a firing rule writes to `LILAM_ALERTS`.
+> The LILAM servers load the active rule set of their group into RAM at startup (or when `SERVER_UPDATE_RULES` is called). All rule evaluations work on this cached structure, without database access. Only a firing rule writes to `LILAM_ALERTS`.
 
 ---
 ## Loading a Rule Set
 
-A rule set applies to a **server group**. `SERVER_UPDATE_RULES` checks the rule set, stores it in `LILAM_SERVER_REGISTRY` (`RULE_SET_NAME`, `SET_IN_USE`) for all servers of the group (dispatchers excluded) and sends it directly to every running server. Stopped servers load it at their next start; a newly registered server takes over the rule set of its group.
+`SERVER_UPDATE_RULES` checks the rule set of the group, makes it the active one and tells every running server of the group (dispatchers excluded) to reload it. A group without running servers is not an error: every server loads the active rule set of its group at startup, including newly added servers.
 
 ```sql
+INSERT INTO LILAM_RULES (group_name, set_name, version, created, author, rule_set)
+VALUES ('METRO', 'METRO_RULES', 2, systimestamp, 'Dirk', '{"rules":[ ... ]}');
+
 exec LILAM.SERVER_UPDATE_RULES(p_groupName => 'METRO', p_ruleSetName => 'METRO_RULES', p_ruleSetVersion => 2);
 ```
 
-An invalid or missing rule set, or a group without servers, raises `NUM_ERR_RULE_SET` (-20130) with the reason; nothing is changed.
+A missing or invalid rule set raises `NUM_ERR_RULE_SET` (-20130) with the reason; nothing is changed.
 
 ---
 

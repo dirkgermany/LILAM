@@ -770,7 +770,7 @@ FUNCTION GET_SERVER_PIPE(
 ```
 
 ### Procedure SERVER_UPDATE_RULES
-Rules werden als JSON-Objekte in `LILAM_RULES` gespeichert. Ein Rule Set gilt für alle Server einer Gruppe.
+Rule Sets werden als JSON-Objekte in `LILAM_RULES` gespeichert, jeweils für eine Servergruppe (`GROUP_NAME`, Name, Version). Dasselbe Rule Set kann für mehrere Gruppen eingetragen sein. Je Gruppe ist genau ein Rule Set aktiv (`IS_ACTIVE = 1`); es gilt für alle Server der Gruppe.
 
 ```sql
 PROCEDURE SERVER_UPDATE_RULES(
@@ -781,13 +781,16 @@ PROCEDURE SERVER_UPDATE_RULES(
 ```
 
 Ablauf:
-1. Das Rule Set wird in der aufrufenden Session vollständig geprüft. Fehlt es, ist eine Regel ungültig oder hat die Gruppe keinen Server, endet der Aufruf mit der Exception `NUM_ERR_RULE_SET` (-20130) und einer Begründung; es ändert sich nichts.
-2. Name und Version werden für alle Server der Gruppe in `LILAM_SERVER_REGISTRY` eingetragen (Dispatcher ausgenommen).
-3. Laufende Server erhalten die Anweisung direkt in ihre Pipe, also auch ohne laufenden Prozess und am Dispatcher vorbei. Gestoppte Server laden das Rule Set beim nächsten Start.
+1. Das Rule Set der Gruppe wird in der aufrufenden Session vollständig geprüft. Fehlt es für die Gruppe oder ist eine Regel ungültig, endet der Aufruf mit der Exception `NUM_ERR_RULE_SET` (-20130) und einer Begründung; es ändert sich nichts.
+2. Das Rule Set wird für die Gruppe aktiv, das bisher aktive inaktiv.
+3. Laufende Server der Gruppe erhalten die Anweisung zum Neuladen direkt in ihre Pipe, also auch ohne laufenden Prozess und am Dispatcher vorbei. Dispatcher werten keine Regeln aus.
 
-Ein neu registrierter Server übernimmt beim Start das Rule Set seiner Gruppe. Lädt ein Server ein Rule Set beim Start oder Neuladen nicht (z. B. weil es inzwischen geändert wurde), behält er die bisherigen Regeln und protokolliert den Grund in `LILAM_LOG_INTERNAL` und im Log des Serverprozesses.
+Eine Gruppe ohne laufende Server ist kein Fehler: Jeder Server lädt beim Start das aktive Rule Set seiner Gruppe, auch ein neu hinzukommender. Lehnt ein Server ein Rule Set beim Start ab (z. B. weil es inzwischen direkt in der Tabelle geändert wurde), behält er die bisherigen Regeln (beim Start: keine) und protokolliert den Grund in `LILAM_LOG_INTERNAL` und im Log des Serverprozesses.
 
 ```sql
+INSERT INTO LILAM_RULES (group_name, set_name, version, created, author, rule_set)
+VALUES ('METRO', 'METRO_RULES', 2, systimestamp, 'Dirk', '{"rules":[ ... ]}');
+
 exec LILAM.SERVER_UPDATE_RULES('METRO', 'METRO_RULES', 2);
 ```
 

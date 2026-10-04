@@ -1,4 +1,6 @@
 -- =====================================================================
+-- HINWEIS: gehört zur Analyse vom 04.10.2026 (Stand d2bf421, alte Signatur von SERVER_UPDATE_RULES
+--          und Rule-Spalten in der Registry). Läuft mit dem aktuellen Code nicht mehr; nur zur Nachvollziehbarkeit.
 -- Diagnose: Regeln und Alerts (Analyse 04.10.2026, kein Bestandteil der Testsuite)
 --
 -- Prueft das Verhalten der Rules Engine gegen erwartete Ergebnisse.
@@ -137,7 +139,7 @@ begin
   lt.start_server('LT_S1');
   lt.wait_servers_ready(sys.odcivarchar2list('LT_S1'));
   l_pid := lilam.server_new_session('LT_RG_A', 'LT', lilam.logLevelInfo, p_procStepsToDo => 5);
-  lilam.server_update_rules('LT', c_set, 1);
+  lilam.server_update_rules(l_pid, c_set, 1);
   wait_s(1);
   signals(l_pid);
   lilam.close_session(l_pid, p_procStepsDone => 2);
@@ -168,7 +170,7 @@ begin
   -- Phase D: Rule Set v2 mit leerer action
   l_t0 := systimestamp;
   l_pid := lilam.server_new_session('LT_RG_D', 'LT', lilam.logLevelInfo);
-  lilam.server_update_rules('LT', c_set, 2);
+  lilam.server_update_rules(l_pid, c_set, 2);
   wait_s(1);
   lilam.error(l_pid, 'Fehler fuer V2-1');
   lilam.mark_event(l_pid, 'RA_T2');

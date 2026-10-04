@@ -1,4 +1,6 @@
 -- =====================================================================
+-- HINWEIS: gehört zur Analyse vom 04.10.2026 (Stand d2bf421, alte Signatur von SERVER_UPDATE_RULES
+--          und Rule-Spalten in der Registry). Läuft mit dem aktuellen Code nicht mehr; nur zur Nachvollziehbarkeit.
 -- Diagnose: Einfluss der Regelpruefung auf die Server-Leistung (Analyse 04.10.2026)
 --
 -- Ein Client sendet N Events (bzw. N INFO-Logs) an LT_S1 (ohne Drosselung, p_perfServer 0).
@@ -103,7 +105,7 @@ begin
         l_alerts number;
       begin
         l_pid := lilam.server_new_session(l_prefix, 'LT', lilam.logLevelInfo);
-        lilam.server_update_rules('LT', c_set, v);
+        lilam.server_update_rules(l_pid, c_set, v);
         dbms_session.sleep(1);
         l_int0 := systimestamp;
         l_t0 := systimestamp;

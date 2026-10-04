@@ -120,7 +120,7 @@ A process monitors actions **'A'** and **'B'**:
 ## Rule Management & Event Response
 **Rules** define how LILAM servers react to incoming **signals**, transforming LILAM from a passive monitoring tool into an active **orchestrator**. The complete reference (properties, operators, examples) is in [Rules Engine](../rules/README.md).
 
-Rules are organized into **Rule Sets**, structured as JSON objects. The central table `LILAM_RULES` stores each rule set with its name and a **version**. Every LILAM server records the rule set and version it uses in `LILAM_SERVER_REGISTRY` and reloads it on restart.
+Rules are organized into **Rule Sets**, structured as JSON objects. The central table `LILAM_RULES` stores each rule set with its **server group**, name and **version**. Exactly one rule set per group is active (`IS_ACTIVE`). Every LILAM server loads the active rule set of its group at startup and when `SERVER_UPDATE_RULES` is called; a new server of the group therefore uses the same rules automatically.
 
 Rules are evaluated by LILAM **servers** only. In INSESSION mode no rules are loaded.
 
@@ -268,7 +268,7 @@ In addition to the process-specific tables, LILAM uses internal tables whose nam
 | Table | Purpose |
 | --- | --- |
 | `LILAM_SERVER_REGISTRY` | Maintains server registration, availability, heartbeat, load, and currently active Rule Set information. |
-| `LILAM_RULES` | Stores versioned Rule Sets used by LILAM servers. |
+| `LILAM_RULES` | Stores versioned Rule Sets per server group, one of them active per group. |
 | `LILAM_LOG_INTERNAL` | Provides independent fallback logging for internal LILAM framework errors. |
 
 > [!NOTE]
@@ -368,8 +368,6 @@ If `SERVER_NEW_SESSION` is called with a `p_groupName`, only servers registered 
 | `IS_ACTIVE` | `NUMBER(1)` | Indicates whether the server is marked as active. |
 | `STATUS` | `VARCHAR2(20)` | Current status of the server. |
 | `PROCESSING` | `NUMBER` | Indicates what the server is currently processing. |
-| `RULE_SET_NAME` | `VARCHAR2(30)` | Name of the rule set currently associated with the server. |
-| `SET_IN_USE` | `NUMBER` | Version of the rule set currently imported by the server. |
 | `IS_DISPATCHER` | `NUMBER(1)` | `1` for a dispatcher. Dispatchers are never selected as the target of a server selection, neither by clients nor by another dispatcher. |
 
 ### Rules Table
@@ -379,17 +377,21 @@ Rules define how LILAM reacts to incoming signals. They are organized into Rule 
 
 The central table `LILAM_RULES` acts as the repository for these configurations. Its name is fixed and is not derived from `tabNameMaster`.
 
-Rule Sets are stored as JSON documents and identified by their name and version. This allows different versions of the same Rule Set to be maintained and enables LILAM servers to track which Rule Set and version is currently in use.
+Rule Sets are stored as JSON documents and identified by server group, name and version. This allows different versions of the same Rule Set to be maintained, and the same Rule Set can be stored for several groups. Per group exactly one row is active; `SERVER_UPDATE_RULES` switches the active row and informs the running servers of the group.
 
 #### Table Structure
 
 | Column | Data Type | Description |
 | --- | --- | --- |
-| `RULE_SET` | `CLOB` | Contains the Rule Set as a JSON document. |
+| `RULE_SET` | `CLOB` | Contains the Rule Set as a JSON document (`IS JSON`). |
+| `GROUP_NAME` | `VARCHAR2(50)` | Server group the Rule Set belongs to (`GROUP_NAME` of the registry). |
 | `SET_NAME` | `VARCHAR2(30)` | Name identifying the Rule Set. |
 | `VERSION` | `NUMBER` | Version of the Rule Set. |
+| `IS_ACTIVE` | `NUMBER(1)` | `1` for the Rule Set the servers of the group use; at most one per group. |
 | `CREATED` | `TIMESTAMP(6)` | Timestamp at which the Rule Set was created. |
 | `AUTHOR` | `VARCHAR2(50)` | Author associated with the Rule Set. |
+
+`GROUP_NAME`, `SET_NAME` and `VERSION` together are unique. Alerts (`LILAM_ALERTS`) refer to a rule by `GROUP_NAME`, `RULE_SET_NAME`, `RULE_SET_VERSION` and `RULE_ID`.
 
 ### Internal Log Table
 **Table Category:** Fixed Internal Table

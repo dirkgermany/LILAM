@@ -2,7 +2,7 @@
 -- LILAM Test: FEATURES / REGELN
 --
 -- Prueft die Rules Engine im SERVER-Modus mit einem eigenen Rule Set LT_REGELN (Versionen 1-5):
---   L1     SERVER_UPDATE_RULES fuer die Gruppe LT: Registry von LT_S1 und LT_S2
+--   L1     SERVER_UPDATE_RULES fuer die Gruppe LT (LT_S1 und LT_S2): aktives Rule Set in LILAM_RULES
 --   VG     Vorgaenger: PRECEDED_BY (mit/ohne Kontext), PRECEDED_BY_WITHIN_SECS, bei Events und TRACE_START;
 --          Logs zaehlen nicht als Vorgaenger
 --   NF     Nachfolger "B folgt A innerhalb 1 s" (ein ganz ausbleibendes B erkennt LILAM nicht)
@@ -13,7 +13,7 @@
 --   LG     zwei SEVERITY-Regeln, viele nicht passende Logs
 --   KX/TF/TH  Kontext- und Action-Regel, Trigger-Filter, Drosselung
 --   A1/A2  Alert-Zeile in LILAM_ALERTS und DBMS_ALERT-Signal
---   L2-L4  Neustart, neuer Server uebernimmt das Rule Set der Gruppe (LT_S3), Ablehnung ungueltiger/fehlender
+--   L2-L4  Neustart, neuer Server laedt das Rule Set der Gruppe (LT_S3), Gruppe ohne Server, Ablehnung ungueltiger/fehlender
 --          Rule Sets durch die API (NUM_ERR_RULE_SET) und durch den Server beim Start, Versionswechsel
 --   zuletzt: keine weiteren internen LILAM-Fehler
 -- Der Test startet und stoppt seine Server selbst (LT_S1, LT_S2, kurz LT_S3) und setzt das Rule Set der Gruppe LT danach zurueck.

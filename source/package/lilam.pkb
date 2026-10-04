@@ -1127,10 +1127,10 @@ AS
         v_sqlStmt := '
         INSERT INTO ' || C_LILAM_ALERTS_TABLE || '(
             process_id, process_name, action_name, master_table_name, monitor_table_name, logging_table_name, context_name, action_count, 
-            rule_set_name, rule_id, rule_set_version, alert_severity, handler_type
+            rule_set_name, rule_id, rule_set_version, alert_severity, handler_type, group_name
         ) VALUES (
-            :1, :2, :3, :4, :5, :6, :7, :8, :9, :10, :11, :12, :13
-        ) RETURNING alert_id into :14';
+            :1, :2, :3, :4, :5, :6, :7, :8, :9, :10, :11, :12, :13, :14
+        ) RETURNING alert_id into :15';
 
         v_idx_session := v_indexSession(p_rec.process_id);
 
@@ -1139,7 +1139,7 @@ AS
         g_sessionList(v_idx_session).tabName_master || C_SUFFIX_PROC_TABLE, g_sessionList(v_idx_session).tabName_master || C_SUFFIX_MON_TABLE,
         g_sessionList(v_idx_session).tabName_master || C_SUFFIX_LOG_TABLE, 
         p_rec.context_name, p_rec.action_count, g_current_rule_set_name, p_rule.rule_id, g_current_rule_set_version, 
-        p_rule.alert_severity, p_rule.alert_handler
+        p_rule.alert_severity, p_rule.alert_handler, g_serverGroupName
         RETURNING INTO v_alert_id;
 
         v_payload := JSON_OBJECT(
@@ -1151,6 +1151,7 @@ AS
             'action_name'      VALUE p_rec.action_name,
             'context_name'     VALUE p_rec.context_name,
             'action_count'     VALUE p_rec.action_count,
+            'group_name'       VALUE g_serverGroupName,
             'rule_set_name'    VALUE g_current_rule_set_name,
             'rule_id'          VALUE p_rule.rule_id,
             'rule_set_version' VALUE g_current_rule_set_version,
@@ -1854,8 +1855,6 @@ AS
                 is_active      NUMBER(1),
                 status         VARCHAR2(20),
                 processing     NUMBER,
-                rule_set_name  VARCHAR2(30),
-                set_in_use     NUMBER DEFAULT 0,
                 avg_log_lat    NUMBER DEFAULT 0,
                 max_log_lat    NUMBER DEFAULT 0,
                 avg_mon_lat    NUMBER DEFAULT 0,
@@ -1876,12 +1875,21 @@ AS
             sqlStmt := '
             CREATE TABLE ' || C_LILAM_RULES_TABLE || ' (
                 rule_set       CLOB CONSTRAINT ensure_json_rules CHECK (rule_set IS JSON),
+                group_name     VARCHAR2(50),
                 set_name       VARCHAR2(30),
                 version        NUMBER,
+                is_active      NUMBER(1) DEFAULT 0,
                 created        TIMESTAMP,
                 author         VARCHAR2(50)
             )';
             run_sql(sqlStmt);
+        else
+            -- Bestehende Tabelle: Rule Sets gelten je Servergruppe, eines je Gruppe ist aktiv
+            select count(*) into l_regCols from user_tab_columns
+             where table_name = upper(C_LILAM_RULES_TABLE) and column_name = 'GROUP_NAME';
+            if l_regCols = 0 then
+                run_sql('ALTER TABLE ' || C_LILAM_RULES_TABLE || ' ADD (group_name VARCHAR2(50), is_active NUMBER(1) DEFAULT 0)');
+            end if;
         end if;
 
 
@@ -1957,12 +1965,13 @@ AS
             run_sql(sqlStmt);
         end if ;
 
-        if not objectExists('idx_lilam_rules', 'INDEX') then
-            sqlStmt := '
-            CREATE UNIQUE INDEX idx_lilam_rules 
-            ON C_LILAM_RULES_TABLE (set_name, version)';
-            sqlStmt := replace(sqlStmt, 'C_LILAM_RULES_TABLE', C_LILAM_RULES_TABLE);
-            run_sql(sqlStmt);
+        -- Rule Sets: eindeutig je Gruppe/Name/Version; je Gruppe höchstens ein aktives
+        if not objectExists('idx_lilam_rules_grp', 'INDEX') then
+            run_sql('CREATE UNIQUE INDEX idx_lilam_rules_grp ON ' || C_LILAM_RULES_TABLE || ' (group_name, set_name, version)');
+        end if ;
+        if not objectExists('idx_lilam_rules_active', 'INDEX') then
+            run_sql('CREATE UNIQUE INDEX idx_lilam_rules_active ON ' || C_LILAM_RULES_TABLE
+                    || ' (CASE WHEN is_active = 1 THEN upper(group_name) END)');
         end if ;
 
         g_checked_masters(l_master) := TRUE;
@@ -5593,24 +5602,6 @@ AS
     
     --------------------------------------------------------------------------
 
-    PROCEDURE updateRulesInRegistry(p_ruleSetName varchar2, p_ruleSetVersion pls_integer)
-    AS
-        pragma autonomous_transaction; 
-    BEGIN
-        execute immediate 'update ' || C_LILAM_SERVER_REGISTRY || ' set rule_set_name = :1, set_in_use = :2 where upper(pipe_name) = :3'
-        using p_ruleSetName, p_ruleSetVersion, upper(g_serverPipeName);
-        commit;
-
-    EXCEPTION
-        WHEN OTHERS THEN
-            logLilamErr(sqlCode, sqlErrM, 'updateRulesInRegistry', 'EXECUTE IMMEDIATE'); 
-            if should_raise_error(g_serverProcessId) then
-                error(g_serverProcessId, 'Failed to update rules in registry: ' || sqlErrM);
-            end if ; 
-            rollback;
-    END;
-
-    --------------------------------------------------------------------------
     --------------------------------------------------------------------------
     -- Zahl aus dem n-ten Teil von 'a|b|c', NLS-unabhängig ('.' als Dezimalzeichen).
     -- Ungültig oder fehlend => NULL (ohne Fehlerprotokoll; der Aufrufer meldet)
@@ -5874,120 +5865,74 @@ AS
     END;
 
     --------------------------------------------------------------------------
-
-    function readServerRules(p_ruleSetName varchar2, p_ruleSetVersion Number) return boolean
-    as
-        l_sqlStmt varchar2(200);
-        l_serverRuleSet CLOB;
-    begin
-        l_sqlStmt := 'SELECT rule_set FROM ' || C_LILAM_RULES_TABLE || ' where set_name = :1 and version = :2';
-        execute immediate l_sqlStmt into l_serverRuleSet using p_ruleSetName, p_ruleSetVersion;
-        return load_rules_from_json(l_serverRuleSet, p_ruleSetName, p_ruleSetVersion);
-
-    exception
-        when NO_DATA_FOUND then
-            logLilamErr(-20001, 'Could not find rule set: ' || p_ruleSetName || '; version: ' || p_ruleSetVersion, 'readServerRules');
-            if should_raise_error(g_serverProcessId) then
-                error(g_serverProcessId, g_serverPipeName || '=>Could not find server rule: ' || p_ruleSetName || '; version: ' || p_ruleSetVersion);
-            end if ;
-            return false;
-        when others then
-            logLilamErr(sqlCode, sqlErrM, 'readServerRules');
-            if should_raise_error(g_serverProcessId) then
-                error(g_serverProcessId, g_serverPipeName || '=>Could not read server rule: ' || p_ruleSetName || '; version: ' || p_ruleSetVersion || '; ' || sqlErrM);
-            end if ;
-            return false;
-    end;
-
+    -- Lädt das aktive Rule Set der eigenen Gruppe aus LILAM_RULES (Start und UPDATE_RULE).
+    -- Ohne aktives Rule Set hat der Server keine Regeln. Ein ungültiges Rule Set wird abgelehnt,
+    -- die bisherigen Regeln bleiben dann aktiv.
     --------------------------------------------------------------------------
-
     procedure loadServerRules
     as
-        l_sqlStmt varchar2(200);
-        l_ruleSetName varchar2(30);
-        l_ruleSetVersion PLS_INTEGER;
-        l_dummy boolean;
+        l_ruleSet        CLOB;
+        l_ruleSetName    VARCHAR2(30);
+        l_ruleSetVersion NUMBER;
+        l_empty          t_rule_map;
+        l_dummy          BOOLEAN;
     begin
-        l_sqlStmt := 'SELECT rule_set_name, set_in_use FROM ' || C_LILAM_SERVER_REGISTRY || ' WHERE upper(pipe_name) = :1';
-        execute immediate l_sqlStmt into l_ruleSetName,  l_ruleSetVersion using upper(g_serverPipeName);
+        -- Dispatcher werten keine Regeln aus
+        if g_serverIsDispatcher then
+            return;
+        end if;
 
-        -- Neuer Worker ohne eigenes Rule Set: das Rule Set der Gruppe übernehmen (SERVER_UPDATE_RULES gilt je Gruppe)
-        if l_ruleSetName is null and not g_serverIsDispatcher then
-            begin
-                execute immediate 'SELECT rule_set_name, set_in_use FROM ' || C_LILAM_SERVER_REGISTRY || '
-                                    WHERE upper(group_name) = upper(:1) AND nvl(is_dispatcher, 0) = 0
-                                      AND rule_set_name IS NOT NULL AND upper(pipe_name) != :2
-                                    ORDER BY last_activity DESC NULLS LAST FETCH FIRST 1 ROW ONLY'
-                    into l_ruleSetName, l_ruleSetVersion using g_serverGroupName, upper(g_serverPipeName);
-                if readServerRules(l_ruleSetName, l_ruleSetVersion) then
-                    updateRulesInRegistry(l_ruleSetName, l_ruleSetVersion);
-                end if;
+        begin
+            execute immediate 'SELECT rule_set, set_name, version FROM ' || C_LILAM_RULES_TABLE || '
+                                WHERE upper(group_name) = upper(:1) AND is_active = 1'
+                into l_ruleSet, l_ruleSetName, l_ruleSetVersion using g_serverGroupName;
+        exception
+            when NO_DATA_FOUND then
+                -- kein aktives Rule Set für die Gruppe: keine Regeln
+                g_rules_by_context := l_empty;
+                g_rules_by_action  := l_empty;
+                g_alert_history.DELETE;
+                g_current_rule_set_name    := NULL;
+                g_current_rule_set_version := 0;
                 return;
-            exception
-                when NO_DATA_FOUND then
-                    return; -- die Gruppe hat kein Rule Set
-            end;
-        end if;
+        end;
 
-        if l_ruleSetName is not null then
-            l_dummy := readServerRules(l_ruleSetName, l_ruleSetVersion);
-        end if;
+        l_dummy := load_rules_from_json(l_ruleSet, l_ruleSetName, l_ruleSetVersion);
 
     exception
-        when NO_DATA_FOUND then
-            null; -- in der Registry müssen für den Server keine Rules hinterlegt sein
         when others then
             logLilamErr(sqlCode, sqlErrM, 'loadServerRules');
             if should_raise_error(g_serverProcessId) then
-                error(g_serverProcessId, 'Could not load server ruleset: ' || sqlErrM);
+                error(g_serverProcessId, g_serverPipeName || '=>Could not load rule set of group ' || g_serverGroupName || ': ' || sqlErrM);
             end if ;
     END;
 
     --------------------------------------------------------------------------
-
-    procedure updateServerRules(l_message varchar2)
-    as
-        l_payload  VARCHAR2(500);
-        l_ruleSetName varchar2(30);
-        l_ruleSetVersion PLS_INTEGER;
-    begin
-        l_payload     := JSON_QUERY(l_message, '$.payload');
-        l_ruleSetName := jsonString(l_payload, 'rule_set_name');
-        l_ruleSetVersion := jsonNumber(l_payload, 'rule_set_version');
-
-        -- Registry erst nach erfolgreichem Laden ändern, sonst lädt der nächste Start ein ungültiges Rule Set
-        if readServerRules(l_ruleSetName, l_ruleSetVersion) then
-            updateRulesInRegistry(l_ruleSetName, l_ruleSetVersion);
-        end if;
-    end;
-
+    -- Rule Set für eine Servergruppe aktivieren (autonom, damit die Server es sofort sehen)
     --------------------------------------------------------------------------
-    -- Trägt das Rule Set für alle Worker der Gruppe in der Registry ein.
-    -- Liefert die Anzahl der Worker der Gruppe und die Pipes der laufenden.
-    --------------------------------------------------------------------------
-    function assignGroupRules(p_groupName varchar2, p_ruleSetName varchar2, p_ruleSetVersion pls_integer,
-                              p_activePipes out sys.odcivarchar2list) return pls_integer
+    procedure activateGroupRules(p_groupName varchar2, p_ruleSetName varchar2, p_ruleSetVersion pls_integer)
     as
         pragma autonomous_transaction;
-        l_count pls_integer;
     begin
-        execute immediate 'UPDATE ' || C_LILAM_SERVER_REGISTRY || ' SET rule_set_name = :1, set_in_use = :2
-                            WHERE upper(group_name) = upper(:3) AND nvl(is_dispatcher, 0) = 0'
-            using p_ruleSetName, p_ruleSetVersion, p_groupName;
-        l_count := SQL%ROWCOUNT;
+        -- zwei Schritte: der eindeutige Index erlaubt je Gruppe nur ein aktives Rule Set
+        execute immediate 'UPDATE ' || C_LILAM_RULES_TABLE || ' SET is_active = 0
+                            WHERE upper(group_name) = upper(:1) AND is_active = 1'
+            using p_groupName;
+        execute immediate 'UPDATE ' || C_LILAM_RULES_TABLE || ' SET is_active = 1
+                            WHERE upper(group_name) = upper(:1) AND set_name = :2 AND version = :3'
+            using p_groupName, p_ruleSetName, p_ruleSetVersion;
         commit;
-
-        execute immediate 'SELECT pipe_name FROM ' || C_LILAM_SERVER_REGISTRY || '
-                            WHERE upper(group_name) = upper(:1) AND nvl(is_dispatcher, 0) = 0 AND is_active = 1'
-            bulk collect into p_activePipes using p_groupName;
-        return l_count;
+    exception
+        when others then
+            rollback;
+            raise;
     end;
 
     --------------------------------------------------------------------------
     -- Rule Set für alle Server einer Gruppe aktivieren (Dispatcher ausgenommen).
     -- Das Rule Set wird hier geprüft; ein ungültiges oder fehlendes Rule Set ändert nichts.
-    -- Laufende Server erhalten UPDATE_RULE direkt in ihre Pipe (am Dispatcher vorbei),
-    -- gestoppte Server laden es beim nächsten Start aus der Registry.
+    -- Laufende Server erhalten UPDATE_RULE direkt in ihre Pipe (am Dispatcher vorbei);
+    -- Server, die später starten, laden das aktive Rule Set ihrer Gruppe selbst.
     --------------------------------------------------------------------------
     PROCEDURE SERVER_UPDATE_RULES(p_groupName VARCHAR2, p_ruleSetName VARCHAR2, p_ruleSetVersion PLS_INTEGER)
     AS
@@ -5997,13 +5942,13 @@ AS
         l_avg      t_avg_params_map;
         l_err      VARCHAR2(1000);
         l_pipes    sys.odcivarchar2list;
-        l_payload  JSON_OBJ_LILAM;
         l_status   PLS_INTEGER;
-        l_label    VARCHAR2(100) := 'LILAM: rule set ' || p_ruleSetName || ' v' || p_ruleSetVersion;
+        l_label    VARCHAR2(200) := 'LILAM: rule set ' || p_ruleSetName || ' v' || p_ruleSetVersion || ' (group ' || p_groupName || ')';
     BEGIN
         BEGIN
-            EXECUTE IMMEDIATE 'SELECT rule_set FROM ' || C_LILAM_RULES_TABLE || ' WHERE set_name = :1 AND version = :2'
-                INTO l_ruleSet USING p_ruleSetName, p_ruleSetVersion;
+            EXECUTE IMMEDIATE 'SELECT rule_set FROM ' || C_LILAM_RULES_TABLE || '
+                                WHERE upper(group_name) = upper(:1) AND set_name = :2 AND version = :3'
+                INTO l_ruleSet USING p_groupName, p_ruleSetName, p_ruleSetVersion;
         EXCEPTION
             WHEN NO_DATA_FOUND THEN
                 RAISE_APPLICATION_ERROR(NUM_ERR_RULE_SET, l_label || ' not found in ' || C_LILAM_RULES_TABLE);
@@ -6016,18 +5961,19 @@ AS
             RAISE_APPLICATION_ERROR(NUM_ERR_RULE_SET, l_label || ' rejected: ' || l_err);
         END IF;
 
-        IF assignGroupRules(p_groupName, p_ruleSetName, p_ruleSetVersion, l_pipes) = 0 THEN
-            RAISE_APPLICATION_ERROR(NUM_ERR_RULE_SET, l_label || ': no server registered in group ' || p_groupName);
-        END IF;
+        activateGroupRules(p_groupName, p_ruleSetName, p_ruleSetVersion);
 
-        jsonPut(l_payload, 'rule_set_name', p_ruleSetName);
-        jsonPut(l_payload, 'rule_set_version', p_ruleSetVersion);
+        -- laufende Server der Gruppe benachrichtigen; eine Gruppe ohne Server ist kein Fehler
+        EXECUTE IMMEDIATE 'SELECT pipe_name FROM ' || C_LILAM_SERVER_REGISTRY || '
+                            WHERE upper(group_name) = upper(:1) AND nvl(is_dispatcher, 0) = 0 AND is_active = 1'
+            BULK COLLECT INTO l_pipes USING p_groupName;
+
         FOR i IN 1 .. l_pipes.COUNT LOOP
             DBMS_PIPE.RESET_BUFFER;
-            DBMS_PIPE.PACK_MESSAGE('{"header":{"msg_type":"API_CALL","request":"UPDATE_RULE"},"payload":' || l_payload || '}');
+            DBMS_PIPE.PACK_MESSAGE('{"header":{"msg_type":"API_CALL","request":"UPDATE_RULE"}}');
             l_status := DBMS_PIPE.SEND_MESSAGE(l_pipes(i), timeout => 1);
             IF l_status != 0 THEN
-                -- Registry ist gesetzt: der Server lädt das Rule Set spätestens beim nächsten Start
+                -- das Rule Set ist aktiv: der Server lädt es spätestens beim nächsten Start
                 logLilamErr(l_status, l_label || ': pipe ' || l_pipes(i) || ' not reachable', 'SERVER_UPDATE_RULES');
             END IF;
         END LOOP;
@@ -6249,7 +6195,7 @@ AS
                 end if ;
 
             WHEN 'UPDATE_RULE' then
-                updateServerRules(p_message);
+                loadServerRules; -- aktives Rule Set der Gruppe neu laden
 
             WHEN 'SERVER_PING' then
             null;

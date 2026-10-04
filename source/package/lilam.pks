@@ -53,7 +53,7 @@ create or replace PACKAGE LILAM AS
     NUM_ERR_SESSION_TIMEOUT   CONSTANT PLS_INTEGER  := -20110;  -- Server hat nicht rechtzeitig geantwortet
     TXT_ERR_SESSION_THROTTLED CONSTANT VARCHAR2(30) := 'SESSION_THROTTLED';
     NUM_ERR_SESSION_THROTTLED CONSTANT PLS_INTEGER  := -20120;  -- Server hat abgelehnt (Überlast)
-    -- SERVER_UPDATE_RULES: Rule Set fehlt, ist ungültig oder die Gruppe hat keinen Server (Exception mit Begründung)
+    -- SERVER_UPDATE_RULES: Rule Set fehlt für die Gruppe oder ist ungültig (Exception mit Begründung)
     TXT_ERR_RULE_SET          CONSTANT VARCHAR2(30) := 'RULE_SET_REJECTED';
     NUM_ERR_RULE_SET          CONSTANT PLS_INTEGER  := -20130;
     -- Kommunikationsfehler beim Anlegen: NUM_COMM_ERR (-20003)

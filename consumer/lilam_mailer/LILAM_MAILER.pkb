@@ -170,6 +170,7 @@ create or replace PACKAGE BODY LILAM_MAILER AS
                             l_alert_rec.action_name         := rec.action_name;
                             l_alert_rec.context_name        := rec.context_name;
                             l_alert_rec.action_count        := rec.action_count;
+                            l_alert_rec.group_name          := rec.group_name;
                             l_alert_rec.rule_set_name       := rec.rule_set_name;
                             l_alert_rec.rule_id             := rec.rule_id;
                             l_alert_rec.rule_set_version    := rec.rule_set_version;
