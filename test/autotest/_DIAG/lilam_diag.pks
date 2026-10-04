@@ -1,4 +1,4 @@
-create or replace PACKAGE LILAM AS
+create or replace PACKAGE LILAM_DIAG AS
     /* Complete Doc and last version see https://github.com/dirkgermany/LILA/docs */
     LILAM_VERSION constant varchar2(20) := 'v2.0';
 
@@ -220,6 +220,8 @@ create or replace PACKAGE LILAM AS
     -- Check if LILAM works
     PROCEDURE IS_ALIVE;
 
-END LILAM;
+    FUNCTION MEM_STATS RETURN VARCHAR2;
+    PROCEDURE DIAG_SKIP_PERSIST(p BOOLEAN);
+END LILAM_DIAG;
 
 /

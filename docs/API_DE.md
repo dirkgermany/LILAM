@@ -700,7 +700,8 @@ PROCEDURE START_SERVER(
   p_pipeName     VARCHAR2,
   p_groupName    VARCHAR2,
   p_password     VARCHAR2,
-  p_isDispatcher PLS_INTEGER DEFAULT 0
+  p_isDispatcher PLS_INTEGER DEFAULT 0,
+  p_perfServer   PLS_INTEGER DEFAULT NULL
 )
 ```
 
@@ -710,7 +711,22 @@ PROCEDURE START_SERVER(
 | p_pipeName | varchar2 | Eindeutiger Pipe-Name des Servers |
 | p_groupName | varchar2 | Optionale Gruppe für die Serverauswahl |
 | p_password | varchar2 | Passwort, das für SERVER_SHUTDOWN erneut benötigt wird |
-| p_isDispatcher | pls_integer | 1 startet den Server im Dispatcher-Modus (siehe Dispatcher-Modus), 0 (Standard) startet einen regulären Server
+| p_isDispatcher | pls_integer | 1 startet den Server im Dispatcher-Modus (siehe Dispatcher-Modus), 0 (Standard) startet einen regulären Server |
+| p_perfServer | pls_integer | Leistungsstufe des Servers, siehe [Leistungsstufe](#leistungsstufe-p_perfserver). `NULL` (Standard) = `C_SERVER_PERF_MID` |
+
+#### Leistungsstufe (p_perfServer)
+Damit ein Client den Server nicht mit Nachrichten überflutet, stimmt er sich nach einer bestimmten Anzahl Nachrichten je Prozess und Sekunde kurz mit dem Server ab und wartet, bis dieser aufgeholt hat. Diese Grenze legt `p_perfServer` fest. Der Server teilt sie dem Client bei `SERVER_NEW_SESSION` (und beim automatischen Reconnect) mit; in der Anwendung ist dafür kein eigener Aufruf nötig.
+
+| Konstante | Wert | Einsatz |
+| --- | --- | --- |
+| `C_SERVER_PERF_LOW` | 500 | leistungsschwächere Umgebungen |
+| `C_SERVER_PERF_MID` | 1500 | Standard; übliche Server |
+| `C_SERVER_PERF_HIGH` | 2500 | leistungsstarke Server |
+
+Beliebige andere Werte sind möglich. `0` schaltet die Abstimmung ab; `NULL` oder negative Werte gelten als `C_SERVER_PERF_MID`.
+
+> [!NOTE]
+> Die Grenze gilt je Prozess. Senden viele Anwendungen gleichzeitig an denselben Server, ist dessen Gesamtdurchsatz geringer als die Summe der Einzelwerte; dann eher `C_SERVER_PERF_LOW` oder `C_SERVER_PERF_MID` wählen oder weitere Server derselben Gruppe starten.
 
 ### Function CREATE_SERVER
 Startet einen LILAM Server über `DBMS_SCHEDULER` und liefert Serverinformationen als `VARCHAR2` zurück.
@@ -720,8 +736,15 @@ FUNCTION CREATE_SERVER(
   p_pipeName     VARCHAR2,
   p_groupName    VARCHAR2,
   p_password     VARCHAR2,
-  p_isDispatcher PLS_INTEGER DEFAULT 0
+  p_isDispatcher PLS_INTEGER DEFAULT 0,
+  p_perfServer   PLS_INTEGER DEFAULT NULL
 ) RETURN VARCHAR2
+```
+Parameter identisch zu START_SERVER.
+
+```sql
+-- Beispiel: Server der Gruppe BATCH mit mittlerer Leistungsstufe
+dbms_output.put_line(lilam.create_server('LILAM_SRV1', 'BATCH', 'geheim', p_perfServer => lilam.C_SERVER_PERF_MID));
 ```
 Parameter identisch zu START_SERVER.
 
@@ -767,6 +790,8 @@ Für NEW_SESSION/SERVER_NEW_SESSION wählt der Dispatcher dabei denselben lastba
 für alle anderen Anfragen ermittelt er anhand der bereits vergebenen process_id den Server, der für den Prozess der Anwendung zuständig ist und leitet dorthin weiter.
 
 Die Antwort des zuständigen Servers geht direkt an den Client zurück, nicht über den Dispatcher.
+
+Ein Dispatcher ist in der Server-Registry gekennzeichnet (`IS_DISPATCHER = 1`) und wird bei der Serverauswahl nie als Ziel gewählt. Worker und Dispatcher können daher in derselben Gruppe laufen: Clients ohne Dispatcher-Konfiguration erhalten immer direkt einen Worker.
 
 > [!TIP]
 > Ein Dispatcher ist vor allem für Anwendungen relevant, die ihre physische Datenbankverbindung nicht durchgehend halten – typischerweise Oracle-APEX-Anwendungen mit Connection Pooling.

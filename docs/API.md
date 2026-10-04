@@ -759,11 +759,23 @@ Starts a LILAM server. The password is required again when the server is shut do
 
 ```sql
 PROCEDURE START_SERVER(
-  p_pipeName  VARCHAR2,
-  p_groupName VARCHAR2,
-  p_password  VARCHAR2
+  p_pipeName     VARCHAR2,
+  p_groupName    VARCHAR2,
+  p_password     VARCHAR2,
+  p_isDispatcher PLS_INTEGER DEFAULT 0,
+  p_perfServer   PLS_INTEGER DEFAULT NULL
 )
 ```
+
+`p_isDispatcher` = 1 starts the server as a dispatcher. `p_perfServer` sets the server's performance level: the number of messages per process and second a client may send before it briefly synchronises with the server. The server passes the value to the client with `SERVER_NEW_SESSION` (and on automatic reconnect); no extra call is needed in the application.
+
+| Constant | Value | Use |
+| --- | --- | --- |
+| `C_SERVER_PERF_LOW` | 500 | Less powerful environments |
+| `C_SERVER_PERF_MID` | 1500 | Default; typical servers |
+| `C_SERVER_PERF_HIGH` | 2500 | Powerful servers |
+
+Any other value is allowed. `0` disables the synchronisation; `NULL` or negative values mean `C_SERVER_PERF_MID`.
 
 ### Function CREATE_SERVER
 
@@ -771,9 +783,11 @@ Starts a LILAM server through `DBMS_SCHEDULER` and returns server information as
 
 ```sql
 FUNCTION CREATE_SERVER(
-  p_pipeName  VARCHAR2,
-  p_groupName VARCHAR2,
-  p_password  VARCHAR2
+  p_pipeName     VARCHAR2,
+  p_groupName    VARCHAR2,
+  p_password     VARCHAR2,
+  p_isDispatcher PLS_INTEGER DEFAULT 0,
+  p_perfServer   PLS_INTEGER DEFAULT NULL
 ) RETURN VARCHAR2
 ```
 
