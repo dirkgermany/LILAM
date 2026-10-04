@@ -395,6 +395,7 @@ AS
     procedure sync_process(p_processId number, p_force boolean default false);
     procedure flushMonitor(p_processId number);
     procedure flushBatch;
+    procedure touchServerRegistry;
     function getServerPipeAvailable(p_groupName varchar2) return varchar2;
     procedure createInternalLogTable;
     FUNCTION SERVER_LINK(p_processId NUMBER, p_pipeName varchar2) RETURN NUMBER;
@@ -1531,13 +1532,16 @@ AS
             l_sqlStmt := l_sqlStmt || ' AND upper(group_name) = ''' || upper(p_groupName) || '''';
         end if;
 
+        -- Reihenfolge der Auswahl: wenigste Nachrichten im letzten Intervall, dann wenigste offene Prozesse,
+        -- bei Gleichstand der am laengsten untaetige Server (aeltester Registry-Eintrag; ein beschaeftigter
+        -- Server aktualisiert seinen Eintrag oefter, ein ruhender seltener)
         -- Dispatcher sind nie Ziel der Serverauswahl: weder für Clients ohne Dispatcher-Einstellung
         -- (sonst unnötiger Umweg über den Dispatcher) noch für einen Dispatcher selbst bei der Wahl
         -- eines Workers (er würde sich die Nachricht sonst endlos selbst zuschicken)
         l_sqlStmt := l_sqlStmt || ' AND nvl(is_dispatcher, 0) = 0';
 
         l_sqlStmt := l_sqlStmt || '
-        ORDER BY processing ASC, current_processes ASC, last_activity DESC 
+        ORDER BY processing ASC, current_processes ASC, last_activity ASC 
         FETCH FIRST 1 ROW ONLY';
 
         execute immediate l_sqlStmt into l_serverPipeName;
@@ -5068,6 +5072,7 @@ AS
 
         l_processId := NEW_SESSION(l_session_init);
         registerProcessRoute(l_processId, g_serverPipeName); 
+        touchServerRegistry;   -- Registry sofort aktuell halten (Lastverteilung bei schnellen NEW_SESSION)
 
         DBMS_PIPE.RESET_BUFFER;
         -- perf: Leistungsstufe dieses Servers; der Client richtet seine Drosselung danach aus
@@ -5710,6 +5715,28 @@ AS
 
     --------------------------------------------------------------------------
 
+    --------------------------------------------------------------------------
+    -- Nach jedem NEW_SESSION sofort offene Prozesse und Zeitpunkt in der Registry nachziehen.
+    -- Sonst sehen schnell aufeinanderfolgende NEW_SESSION (z.B. 20 in 0,5 s) noch die Werte der
+    -- letzten periodischen Aktualisierung und landen alle beim selben Server. Mit der Auswahl
+    -- "aeltester Eintrag zuerst" geht die naechste Anfrage dadurch an einen anderen Server.
+    --------------------------------------------------------------------------
+    procedure touchServerRegistry as
+        pragma autonomous_transaction;
+    begin
+        execute immediate 'UPDATE ' || C_LILAM_SERVER_REGISTRY || '
+                              SET last_activity = SYSTIMESTAMP, current_processes = :1
+                            WHERE upper(pipe_name) = :2'
+            using greatest(v_indexSession.COUNT - 1, 0), upper(g_serverPipeName);
+        commit;
+    exception
+        when others then
+            rollback;
+            logLilamErr(sqlCode, sqlErrM, 'touchServerRegistry');
+    end;
+
+    --------------------------------------------------------------------------
+
     procedure updateServerRegistry(p_ready BOOLEAN, p_eventCounter PLS_INTEGER) as
         pragma autonomous_transaction; 
         l_sqlStmt varchar2(500);
@@ -5993,6 +6020,8 @@ AS
             LOOP
                 l_status := DBMS_PIPE.RECEIVE_MESSAGE(l_ctlPipe, timeout => 0);
                 EXIT WHEN l_status != 0;
+                -- mitzaehlen: PROCESSING in der Registry ist das erste Kriterium der Serverauswahl
+                l_msgCnt := l_msgCnt + 1;
                 BEGIN
                     DBMS_PIPE.UNPACK_MESSAGE(l_message);
                     l_clientChannel := extractClientChannel(l_message);
