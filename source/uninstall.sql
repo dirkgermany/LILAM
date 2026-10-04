@@ -48,6 +48,10 @@ begin
          where  j.job_name in (select upper(r.pipe_name) from lilam_server_registry r)'
         bulk collect into l_jobs;
 
+    if l_jobs.count = 0 then
+        dbms_output.put_line('Keine Server-Jobs gefunden.');
+    end if;
+
     -- 1. Jobs anhalten
     for i in 1 .. l_jobs.count loop
         begin
