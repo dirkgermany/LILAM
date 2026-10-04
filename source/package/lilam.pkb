@@ -30,6 +30,10 @@ AS
     C_FLUSH_MONITOR_THRESHOLD_NO       CONSTANT PLS_INTEGER := 50000; -- 50000 Max. number of dirty buffered metrics until flush
     C_SYNC_ALL_INTERVAL_MS             CONSTANT PLS_INTEGER := 500;   -- SYNC_ALL_DIRTY (ohne Force) hoechstens alle n ms
 
+    -- INSESSION: Prüfung auf ein geändertes aktives Rule Set der Gruppe hoechstens alle n ms
+    -- (ausgelöst durch API-Aufrufe; Server werden über SERVER_UPDATE_RULES benachrichtigt)
+    C_RULES_CHECK_INTERVAL_MS          CONSTANT PLS_INTEGER := 15000;
+
     ---------------------------------------------------------------
     -- Placeholders for tables
     ---------------------------------------------------------------
@@ -90,7 +94,8 @@ AS
         process_is_dirty    BOOLEAN,
         last_process_flush  TIMESTAMP(6),
         last_sync_check     TIMESTAMP(6),
-        group_name          VARCHAR2(50),
+        group_name          VARCHAR2(50),  -- Gruppe wie angegeben (Server: Servergruppe), für Alerts
+        rule_group          VARCHAR2(50),  -- upper(group_name): Schlüssel der Regeln; NULL = keine Regeln
         tabName_master      VARCHAR2(100),
         scope_id            NUMBER(19,0)  -- NULL = kein prozessübergreifender Scope
     );
@@ -307,21 +312,32 @@ AS
         cond_upper          VARCHAR2(100)  -- SEVERITY, INFO_CONTAINS: Wert in Großbuchstaben
     );
     TYPE t_rule_list IS TABLE OF t_rule_rec;
-    TYPE t_rule_map IS TABLE OF t_rule_list INDEX BY VARCHAR2(250);
+    TYPE t_rule_map IS TABLE OF t_rule_list INDEX BY VARCHAR2(300);
 
+    -- Regeln aller geladenen Gruppen. Schlüssel: GRUPPE|ACTION bzw. GRUPPE|ACTION|CONTEXT
+    -- (GRUPPE = rule_group der Session). Server: nur die eigene Gruppe; INSESSION: jede Gruppe,
+    -- die in dieser DB-Session mit NEW_SESSION angegeben wurde.
     g_rules_by_context t_rule_map;
     g_rules_by_action  t_rule_map;
 
-    -- Zusätzliche Variable für die aktuell geladene Version
-    g_current_rule_set_version NUMBER := 0;
-    g_current_rule_set_name    VARCHAR2(30);
+    -- Stand je Gruppe (Schlüssel: rule_group)
+    TYPE t_rule_group_rec IS RECORD (
+        set_name     VARCHAR2(30),      -- geladenes Rule Set (für Alerts); NULL = keine Regeln
+        set_version  NUMBER := 0,
+        seen_name    VARCHAR2(30),      -- zuletzt gesehenes aktives Rule Set, auch wenn abgelehnt
+        seen_version NUMBER,            -- (ein abgelehntes Set wird nicht bei jeder Prüfung neu geparst)
+        next_check   TIMESTAMP          -- INSESSION: nächste Prüfung auf ein geändertes aktives Rule Set
+    );
+    TYPE t_rule_group_map IS TABLE OF t_rule_group_rec INDEX BY VARCHAR2(50);
+    g_rule_groups t_rule_group_map;
 
     TYPE t_avg_params IS RECORD (
         alpha    NUMBER := 0.1,
         warmup   PLS_INTEGER := 100
     );
-    TYPE t_avg_params_map IS TABLE OF t_avg_params INDEX BY VARCHAR2(250);
-    g_avg_params t_avg_params_map;  
+    -- Schlüssel wie bei den Regeln mit Gruppe; 'DEFAULT' gilt für alle
+    TYPE t_avg_params_map IS TABLE OF t_avg_params INDEX BY VARCHAR2(300);
+    g_avg_params t_avg_params_map;
 
     TYPE t_alert_history IS TABLE OF TIMESTAMP INDEX BY VARCHAR2(250);
     g_alert_history t_alert_history;
@@ -409,6 +425,7 @@ AS
     function getServerPipeAvailable(p_groupName varchar2) return varchar2;
     procedure createInternalLogTable;
     FUNCTION SERVER_LINK(p_processId NUMBER, p_pipeName varchar2) RETURN NUMBER;
+    procedure refreshGroupRules(p_group varchar2, p_force boolean);
     ------------------------------------------------------------------------
     
     ---------------------------------------------------------------
@@ -1111,7 +1128,11 @@ AS
         v_payload       VARCHAR2(1000);
         v_sqlStmt       VARCHAR2(2000);
         v_alert_id      NUMBER;
+        v_group         t_rule_group_rec;
     BEGIN
+        v_idx_session := v_indexSession(p_rec.process_id);
+        v_group       := g_rule_groups(g_sessionList(v_idx_session).rule_group);
+
         v_sqlStmt := '
         INSERT INTO ' || C_LILAM_ALERTS_TABLE || '(
             process_id, process_name, action_name, master_table_name, monitor_table_name, logging_table_name, context_name, action_count, 
@@ -1120,14 +1141,12 @@ AS
             :1, :2, :3, :4, :5, :6, :7, :8, :9, :10, :11, :12, :13, :14
         ) RETURNING alert_id into :15';
 
-        v_idx_session := v_indexSession(p_rec.process_id);
-
         EXECUTE IMMEDIATE v_sqlStmt
         USING p_rec.process_id, g_process_cache(p_rec.process_id).processName, p_rec.action_Name, 
         g_sessionList(v_idx_session).tabName_master || C_SUFFIX_PROC_TABLE, g_sessionList(v_idx_session).tabName_master || C_SUFFIX_MON_TABLE,
         g_sessionList(v_idx_session).tabName_master || C_SUFFIX_LOG_TABLE, 
-        p_rec.context_name, p_rec.action_count, g_current_rule_set_name, p_rule.rule_id, g_current_rule_set_version, 
-        p_rule.alert_severity, p_rule.alert_handler, g_serverGroupName
+        p_rec.context_name, p_rec.action_count, v_group.set_name, p_rule.rule_id, v_group.set_version,
+        p_rule.alert_severity, p_rule.alert_handler, g_sessionList(v_idx_session).group_name
         RETURNING INTO v_alert_id;
 
         v_payload := JSON_OBJECT(
@@ -1139,10 +1158,10 @@ AS
             'action_name'      VALUE p_rec.action_name,
             'context_name'     VALUE p_rec.context_name,
             'action_count'     VALUE p_rec.action_count,
-            'group_name'       VALUE g_serverGroupName,
-            'rule_set_name'    VALUE g_current_rule_set_name,
+            'group_name'       VALUE g_sessionList(v_idx_session).group_name,
+            'rule_set_name'    VALUE v_group.set_name,
             'rule_id'          VALUE p_rule.rule_id,
-            'rule_set_version' VALUE g_current_rule_set_version,
+            'rule_set_version' VALUE v_group.set_version,
             'alert_severity'   VALUE p_rule.alert_severity,
             'timestamp'        VALUE TO_CHAR(SYSTIMESTAMP, 'YYYY-MM-DD"T"HH24:MI:SS.FF6')
         );
@@ -1177,9 +1196,11 @@ AS
             RETURN;
         END IF;
 
-        -- Throttle pro Scope (falls vorhanden), damit Neustarts die Sperrzeit nicht aufheben
+        -- Throttle pro Scope (falls vorhanden), damit Neustarts die Sperrzeit nicht aufheben.
+        -- Gruppe vorn: Rule-IDs sind nur je Rule Set eindeutig (siehe auch installGroupRules)
         v_scope_id    := getScopeId(p_rec.process_id);
-        v_history_key := CASE WHEN v_scope_id IS NOT NULL THEN 'S' || v_scope_id ELSE 'P' || p_rec.process_id END
+        v_history_key := g_sessionList(v_indexSession(p_rec.process_id)).rule_group || '|'
+                         || CASE WHEN v_scope_id IS NOT NULL THEN 'S' || v_scope_id ELSE 'P' || p_rec.process_id END
                          || '|' || p_rule.rule_id || '|' || p_rec.action_name;
 
         -- Sperrzeit seit dem letzten Alert noch nicht abgelaufen -> nichts tun
@@ -1206,6 +1227,7 @@ AS
         fire        BOOLEAN := FALSE;
         l_diff_ms   NUMBER := 0;
         p_monRec    t_monitor_buffer_rec; -- Hilfsvariable für fire_alert
+        l_group     VARCHAR2(50);
 
         -- Passt der letzte Vorgänger (Event/Trace) des Prozesses zur Regel?
         -- cond_context NULL: jeder Kontext der erwarteten Action ist zulässig.
@@ -1337,15 +1359,31 @@ AS
         END;
 
     BEGIN
+        -- Regeln der Gruppe des Prozesses; ohne Gruppe keine Regeln (PERFORMANCE: sofort zurück)
+        IF NOT v_indexSession.EXISTS(p_ctx.process_id) THEN
+            RETURN;
+        END IF;
+        l_group := g_sessionList(v_indexSession(p_ctx.process_id)).rule_group;
+        IF l_group IS NULL THEN
+            RETURN;
+        END IF;
+
+        -- INSESSION: höchstens alle C_RULES_CHECK_INTERVAL_MS auf ein geändertes aktives Rule Set prüfen
+        -- (nur ein Zeitvergleich; Server erhalten Änderungen über SERVER_UPDATE_RULES)
+        IF g_serverPipeName IS NULL
+           AND (NOT g_rule_groups.EXISTS(l_group) OR g_rule_groups(l_group).next_check <= SYSTIMESTAMP) THEN
+            refreshGroupRules(l_group, p_force => FALSE);
+        END IF;
+
         -- 1. Kontext-Regeln (nur für Monitore relevant)
         IF p_check_context AND p_ctx.context_name IS NOT NULL
-           AND g_rules_by_context.EXISTS(p_ctx.action_name || '|' || p_ctx.context_name) THEN
-            apply_rule_list(g_rules_by_context(p_ctx.action_name || '|' || p_ctx.context_name));
+           AND g_rules_by_context.EXISTS(l_group || '|' || p_ctx.action_name || '|' || p_ctx.context_name) THEN
+            apply_rule_list(g_rules_by_context(l_group || '|' || p_ctx.action_name || '|' || p_ctx.context_name));
         END IF;
 
         -- 2. Allgemeine Action/Prozess-Regeln (gelten zusätzlich, für alle Kontexte)
-        IF g_rules_by_action.EXISTS(p_ctx.action_name) THEN
-            apply_rule_list(g_rules_by_action(p_ctx.action_name));
+        IF g_rules_by_action.EXISTS(l_group || '|' || p_ctx.action_name) THEN
+            apply_rule_list(g_rules_by_action(l_group || '|' || p_ctx.action_name));
         END IF;
 
     EXCEPTION
@@ -3061,14 +3099,22 @@ AS
 
     --------------------------------------------------------------------------
 
-    function findAvgRule(p_action varchar2, p_context varchar2) return t_avg_params
+    -- Baseline-Parameter aus AVG_DEVIATION_PCT-Regeln der Gruppe des Prozesses, sonst DEFAULT
+    function findAvgRule(p_processId number, p_action varchar2, p_context varchar2) return t_avg_params
     as
-        l_ruleKey varchar2(100) := p_action || '|' || p_context;
+        l_group   varchar2(50);
+        l_ruleKey varchar2(300);
     begin
-        IF g_avg_params.EXISTS(l_ruleKey) THEN
-            return g_avg_params(l_ruleKey);
-        ELSIF g_avg_params.EXISTS(p_action) THEN
-            return g_avg_params(p_action);
+        if v_indexSession.EXISTS(p_processId) then
+            l_group := g_sessionList(v_indexSession(p_processId)).rule_group;
+        end if;
+        if l_group is not null then
+            l_ruleKey := l_group || '|' || p_action;
+            IF g_avg_params.EXISTS(l_ruleKey || '|' || p_context) THEN
+                return g_avg_params(l_ruleKey || '|' || p_context);
+            ELSIF g_avg_params.EXISTS(l_ruleKey) THEN
+                return g_avg_params(l_ruleKey);
+            end if;
         end if;
         return g_avg_params('DEFAULT');
     end;
@@ -3094,7 +3140,7 @@ AS
         l_oldAvg  number;
         l_oldCnt  number;
     begin
-        l_params  := findAvgRule(p_rec.action_name, p_rec.context_name);
+        l_params  := findAvgRule(p_processId, p_rec.action_name, p_rec.context_name);
         l_scopeId := getScopeId(p_processId);
 
         if l_scopeId is not null then
@@ -4145,7 +4191,8 @@ AS
         end if ;
         
         -- raise alert (nur für bekannte Prozesse; fire_alert braucht die Session-Daten)
-        if g_rules_by_action.EXISTS(C_LOGGING) and v_indexSession.EXISTS(p_processId) then
+        if v_indexSession.EXISTS(p_processId)
+           and g_rules_by_action.EXISTS(g_sessionList(v_indexSession(p_processId)).rule_group || '|' || C_LOGGING) then
             v_dummyMonRec.process_id := p_processId;
             v_dummyMonRec.start_time := coalesce(p_timestamp, systimestamp);
             v_dummyMonRec.stop_time := null;
@@ -4528,7 +4575,8 @@ AS
         g_alert_history.DELETE;
         g_rules_by_context.DELETE;
         g_rules_by_action.DELETE;
-        
+        g_rule_groups.DELETE;
+
     exception
         when others then
         logLilamErr(sqlCode, sqlErrM, 'clearServerData', 'deletion of memory data'); 
@@ -4720,6 +4768,7 @@ AS
         l_session_init t_session_init := p_session_init;
         l_scopeName VARCHAR2(100);
         l_scopeId   NUMBER;
+        v_idx       PLS_INTEGER;
     begin
 
         -- leere Master-Tabelle (z.B. aus JSON ohne tabname_master) => Standard
@@ -4734,6 +4783,20 @@ AS
         
         -- persist to session internal table
         insertSession (l_session_init.tabNameMaster, p_processId, l_session_init.logLevel);
+
+        -- Gruppe für die Regeln: im Server die Servergruppe (Dispatcher: keine Regeln),
+        -- INSESSION die angegebene Gruppe (NULL = keine Regeln). Das Rule Set der Gruppe lädt
+        -- die erste Regelprüfung (PROCESS_START unten), danach höchstens alle C_RULES_CHECK_INTERVAL_MS.
+        v_idx := v_indexSession(p_processId);
+        if g_serverPipeName is not null then
+            if not g_serverIsDispatcher then
+                g_sessionList(v_idx).group_name := trim(g_serverGroupName);
+            end if;
+        else
+            g_sessionList(v_idx).group_name := trim(l_session_init.groupName);
+        end if;
+        g_sessionList(v_idx).rule_group := upper(g_sessionList(v_idx).group_name);
+
         deleteOldLogs(p_processId, upper(trim(l_session_init.processName)), l_session_init.daysToKeep);
 
         -- Baseline Scope (Default: Prozessname); bei Fehlern NULL => prozesslokal
@@ -4773,7 +4836,8 @@ AS
         p_procStepsToDo PLS_INTEGER DEFAULT NULL,
         p_daysToKeep    PLS_INTEGER DEFAULT NULL,
         p_tabNameMaster VARCHAR2    DEFAULT 'LILAM',
-        p_baselineScope VARCHAR2    DEFAULT NULL) RETURN NUMBER
+        p_baselineScope VARCHAR2    DEFAULT NULL,
+        p_groupName     VARCHAR2    DEFAULT NULL) RETURN NUMBER
     as
         l_session_init t_session_init;
     begin
@@ -4783,6 +4847,7 @@ AS
         l_session_init.daysToKeep    := p_daysToKeep;
         l_session_init.tabNameMaster := p_tabNameMaster;
         l_session_init.baselineScope := p_baselineScope;
+        l_session_init.groupName     := p_groupName;
         return new_session(l_session_init);
     end;
 
@@ -5882,85 +5947,166 @@ AS
     END;
 
     --------------------------------------------------------------------------
-    -- Rule Set übernehmen. STABILITÄT: Ein ungültiges Rule Set wird vollständig abgelehnt,
-    -- die bisher geladenen Regeln bleiben dann aktiv.
+    -- Regeln einer Gruppe aus den globalen Maps entfernen (Schlüssel GRUPPE|...).
+    -- Die Maps sind klein und das geschieht nur beim Laden, daher ein Durchlauf über alle Schlüssel.
+    -- STABILITÄT: unabhängig von der Sortierung der Schlüssel (NLS_SORT).
     --------------------------------------------------------------------------
-    FUNCTION load_rules_from_json(p_ruleSet CLOB, p_ruleSetName VARCHAR2, p_ruleSetVersion NUMBER) RETURN BOOLEAN IS
+    procedure removeGroupRules(p_group varchar2)
+    as
+        l_prefix VARCHAR2(51) := p_group || '|';
+        l_len    PLS_INTEGER  := length(p_group) + 1;
+        l_key    VARCHAR2(300);
+        l_next   VARCHAR2(300);
+    begin
+        l_key := g_rules_by_context.FIRST;
+        WHILE l_key IS NOT NULL LOOP
+            l_next := g_rules_by_context.NEXT(l_key);
+            IF substr(l_key, 1, l_len) = l_prefix THEN g_rules_by_context.DELETE(l_key); END IF;
+            l_key := l_next;
+        END LOOP;
+
+        l_key := g_rules_by_action.FIRST;
+        WHILE l_key IS NOT NULL LOOP
+            l_next := g_rules_by_action.NEXT(l_key);
+            IF substr(l_key, 1, l_len) = l_prefix THEN g_rules_by_action.DELETE(l_key); END IF;
+            l_key := l_next;
+        END LOOP;
+
+        l_key := g_avg_params.FIRST;
+        WHILE l_key IS NOT NULL LOOP
+            l_next := g_avg_params.NEXT(l_key);
+            IF substr(l_key, 1, l_len) = l_prefix THEN g_avg_params.DELETE(l_key); END IF;
+            l_key := l_next;
+        END LOOP;
+
+        -- Drosselung beginnt mit dem neuen Rule Set von vorn
+        l_key := g_alert_history.FIRST;
+        WHILE l_key IS NOT NULL LOOP
+            l_next := g_alert_history.NEXT(l_key);
+            IF substr(l_key, 1, l_len) = l_prefix THEN g_alert_history.DELETE(l_key); END IF;
+            l_key := l_next;
+        END LOOP;
+    end;
+
+    --------------------------------------------------------------------------
+    -- Geprüftes Rule Set für eine Gruppe übernehmen (ersetzt die bisherigen Regeln der Gruppe)
+    --------------------------------------------------------------------------
+    procedure installGroupRules(p_group varchar2, p_byCtx t_rule_map, p_byAction t_rule_map,
+                                p_avg t_avg_params_map, p_ruleSetName varchar2, p_ruleSetVersion number)
+    as
+        l_key VARCHAR2(300);
+    begin
+        removeGroupRules(p_group);
+
+        l_key := p_byCtx.FIRST;
+        WHILE l_key IS NOT NULL LOOP
+            g_rules_by_context(p_group || '|' || l_key) := p_byCtx(l_key);
+            l_key := p_byCtx.NEXT(l_key);
+        END LOOP;
+
+        l_key := p_byAction.FIRST;
+        WHILE l_key IS NOT NULL LOOP
+            g_rules_by_action(p_group || '|' || l_key) := p_byAction(l_key);
+            l_key := p_byAction.NEXT(l_key);
+        END LOOP;
+
+        l_key := p_avg.FIRST;
+        WHILE l_key IS NOT NULL LOOP
+            g_avg_params(p_group || '|' || l_key) := p_avg(l_key);
+            l_key := p_avg.NEXT(l_key);
+        END LOOP;
+
+        -- Name/Version wie in LILAM_RULES (SET_NAME/VERSION); darüber findet der Consumer die Regel
+        g_rule_groups(p_group).set_name    := p_ruleSetName;
+        g_rule_groups(p_group).set_version := p_ruleSetVersion;
+    end;
+
+    --------------------------------------------------------------------------
+    -- Aktives Rule Set einer Gruppe aus LILAM_RULES laden, wenn es sich geändert hat.
+    -- p_force: immer neu laden (Serverstart, UPDATE_RULE).
+    -- Ohne aktives Rule Set hat die Gruppe keine Regeln. STABILITÄT: Ein ungültiges Rule Set wird
+    -- vollständig abgelehnt (einmal je Version protokolliert), die bisherigen Regeln bleiben dann aktiv.
+    -- Fehler erreichen den Aufrufer nie.
+    --------------------------------------------------------------------------
+    procedure refreshGroupRules(p_group varchar2, p_force boolean)
+    as
+        l_ruleSet  CLOB;
+        l_name     VARCHAR2(30);
+        l_version  NUMBER;
         l_byCtx    t_rule_map;
         l_byAction t_rule_map;
         l_avg      t_avg_params_map;
-        l_default  t_avg_params := g_avg_params('DEFAULT');
         l_err      VARCHAR2(1000);
-    BEGIN
-        l_err := parseRuleSet(p_ruleSet, l_byCtx, l_byAction, l_avg);
-        IF l_err IS NOT NULL THEN
-            logLilamErr(-20001, 'Rule set ' || p_ruleSetName || ' v' || p_ruleSetVersion || ' rejected: ' || l_err, 'load_rules_from_json');
-            if should_raise_error(g_serverProcessId) then
-                error(g_serverProcessId, g_serverPipeName || '=>Rule set ' || p_ruleSetName || ' v' || p_ruleSetVersion || ' rejected: ' || l_err);
-            end if;
-            RETURN FALSE;
+        l_new      t_rule_group_rec;
+    begin
+        IF p_group IS NULL THEN
+            RETURN;
         END IF;
 
-        g_rules_by_context := l_byCtx;
-        g_rules_by_action  := l_byAction;
-        g_avg_params       := l_avg;
-        g_avg_params('DEFAULT') := l_default;
-        g_alert_history.DELETE;
-        -- Name/Version wie in LILAM_RULES (SET_NAME/VERSION); darüber findet der Consumer die Regel
-        g_current_rule_set_name    := p_ruleSetName;
-        g_current_rule_set_version := p_ruleSetVersion;
-        RETURN TRUE;
+        -- STABILITÄT: zuerst den nächsten Prüfzeitpunkt setzen, damit auch bei Fehlern
+        -- höchstens eine Prüfung je Intervall stattfindet
+        IF NOT g_rule_groups.EXISTS(p_group) THEN
+            g_rule_groups(p_group) := l_new;
+        END IF;
+        g_rule_groups(p_group).next_check := SYSTIMESTAMP + numtodsinterval(C_RULES_CHECK_INTERVAL_MS / 1000, 'SECOND');
 
-    EXCEPTION
-        WHEN OTHERS THEN
-            logLilamErr(sqlCode, sqlErrM, 'load_rules_from_json');
-            if should_raise_error(g_serverProcessId) then
-                error(g_serverProcessId, g_serverPipeName || '=>Failed to load rules: ' || sqlErrM);
+        -- PERFORMANCE: Der Ausdruck entspricht dem eindeutigen Index idx_lilam_rules_active.
+        -- Der CLOB kommt nur als Locator und wird erst bei einer neuen Version gelesen.
+        BEGIN
+            EXECUTE IMMEDIATE 'SELECT rule_set, set_name, version FROM ' || C_LILAM_RULES_TABLE || '
+                                WHERE CASE WHEN is_active = 1 THEN upper(group_name) END = :1'
+                INTO l_ruleSet, l_name, l_version USING p_group;
+        EXCEPTION
+            WHEN NO_DATA_FOUND THEN
+                -- kein aktives Rule Set für die Gruppe: keine Regeln
+                IF p_force OR g_rule_groups(p_group).set_name IS NOT NULL THEN
+                    removeGroupRules(p_group);
+                END IF;
+                g_rule_groups(p_group).set_name     := NULL;
+                g_rule_groups(p_group).set_version  := 0;
+                g_rule_groups(p_group).seen_name    := NULL;
+                g_rule_groups(p_group).seen_version := NULL;
+                RETURN;
+        END;
+
+        -- unverändert (auch ein bereits abgelehntes Rule Set): nichts zu tun
+        IF NOT p_force
+           AND l_name = g_rule_groups(p_group).seen_name AND l_version = g_rule_groups(p_group).seen_version THEN
+            RETURN;
+        END IF;
+        g_rule_groups(p_group).seen_name    := l_name;
+        g_rule_groups(p_group).seen_version := l_version;
+
+        l_err := parseRuleSet(l_ruleSet, l_byCtx, l_byAction, l_avg);
+        IF l_err IS NOT NULL THEN
+            logLilamErr(NUM_ERR_RULE_SET, 'Rule set ' || l_name || ' v' || l_version || ' (group ' || p_group || ') rejected: ' || l_err, 'refreshGroupRules');
+            if g_serverPipeName is not null and should_raise_error(g_serverProcessId) then
+                error(g_serverProcessId, g_serverPipeName || '=>Rule set ' || l_name || ' v' || l_version || ' rejected: ' || l_err);
+            end if;
+            RETURN;
+        END IF;
+
+        installGroupRules(p_group, l_byCtx, l_byAction, l_avg, l_name, l_version);
+
+    exception
+        when others then
+            logLilamErr(sqlCode, sqlErrM, 'refreshGroupRules', 'group ' || p_group);
+            if g_serverPipeName is not null and should_raise_error(g_serverProcessId) then
+                error(g_serverProcessId, g_serverPipeName || '=>Could not load rule set of group ' || p_group || ': ' || sqlErrM);
             end if ;
-            RETURN FALSE;
     END;
 
     --------------------------------------------------------------------------
     -- Lädt das aktive Rule Set der eigenen Gruppe aus LILAM_RULES (Start und UPDATE_RULE).
-    -- Ohne aktives Rule Set hat der Server keine Regeln. Ein ungültiges Rule Set wird abgelehnt,
-    -- die bisherigen Regeln bleiben dann aktiv.
     --------------------------------------------------------------------------
     procedure loadServerRules
     as
-        l_ruleSet        CLOB;
-        l_ruleSetName    VARCHAR2(30);
-        l_ruleSetVersion NUMBER;
-        l_empty          t_rule_map;
-        l_dummy          BOOLEAN;
     begin
         -- Dispatcher werten keine Regeln aus
         if g_serverIsDispatcher then
             return;
         end if;
-
-        begin
-            execute immediate 'SELECT rule_set, set_name, version FROM ' || C_LILAM_RULES_TABLE || '
-                                WHERE upper(group_name) = upper(:1) AND is_active = 1'
-                into l_ruleSet, l_ruleSetName, l_ruleSetVersion using g_serverGroupName;
-        exception
-            when NO_DATA_FOUND then
-                -- kein aktives Rule Set für die Gruppe: keine Regeln
-                g_rules_by_context := l_empty;
-                g_rules_by_action  := l_empty;
-                g_alert_history.DELETE;
-                g_current_rule_set_name    := NULL;
-                g_current_rule_set_version := 0;
-                return;
-        end;
-
-        l_dummy := load_rules_from_json(l_ruleSet, l_ruleSetName, l_ruleSetVersion);
-
-    exception
-        when others then
-            logLilamErr(sqlCode, sqlErrM, 'loadServerRules');
-            if should_raise_error(g_serverProcessId) then
-                error(g_serverProcessId, g_serverPipeName || '=>Could not load rule set of group ' || g_serverGroupName || ': ' || sqlErrM);
-            end if ;
+        refreshGroupRules(upper(trim(g_serverGroupName)), p_force => TRUE);
     END;
 
     --------------------------------------------------------------------------
@@ -6527,6 +6673,7 @@ BEGIN
             p_session_init.procImmortal  := jsonNumber(l_jsonParams, 'process_immortal');
             p_session_init.tabNameMaster := jsonString(l_jsonParams, 'tabname_master');
             p_session_init.baselineScope := jsonString(l_jsonParams, 'baseline_scope');
+            p_session_init.groupName     := jsonString(l_jsonParams, 'group_name');
 
             l_proc_id := NEW_SESSION(p_session_init);
             jsonPut(l_jsonHeader, 'status', 'SUCCESS');

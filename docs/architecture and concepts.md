@@ -133,9 +133,16 @@ A process monitors actions **'A'** and **'B'**:
 ## Rule Management & Event Response
 **Rules** define how LILAM servers react to incoming **signals**, transforming LILAM from a passive monitoring tool into an active **orchestrator**. The complete reference (properties, operators, examples) is in [Rules Engine](../rules/README.md).
 
-Rules are organized into **Rule Sets**, structured as JSON objects. The central table `LILAM_RULES` stores each rule set with its **server group**, name and **version**. Exactly one rule set per group is active (`IS_ACTIVE`). Every LILAM server loads the active rule set of its group at startup and when `SERVER_UPDATE_RULES` is called; a new server of the group therefore uses the same rules automatically.
+Rules are organized into **Rule Sets**, structured as JSON objects. The central table `LILAM_RULES` stores each rule set with its **group**, name and **version**. Exactly one rule set per group is active (`IS_ACTIVE`). Every LILAM server loads the active rule set of its group at startup and when `SERVER_UPDATE_RULES` is called; a new server of the group therefore uses the same rules automatically.
 
-Rules are evaluated by LILAM **servers** only. In INSESSION mode no rules are loaded.
+### Rules in INSESSION Mode
+INSESSION processes evaluate rules too if `NEW_SESSION` receives a group (`p_groupName` or `t_session_init.groupName`); without a group they have no rules. They use the same active rule set of the group as the servers.
+
+*   **Loading:** the first rule check of a process loads the group's active rule set into the memory of the database session. Further processes of the group in that session share it. Several groups in one session are kept apart: internally every key is prefixed with the group (`GROUP|Action|Context`); the rule set itself is unchanged.
+*   **Changes:** there is no timer. At most every 15 seconds (`C_RULES_CHECK_INTERVAL_MS`) an API call checks name and version of the active rule set with one small indexed query and reloads only if they changed. Servers keep being notified by `SERVER_UPDATE_RULES`.
+*   **Invalid rule sets** are rejected, logged once per version in `LILAM_LOG_INTERNAL`, and the previous rules stay active. Errors never reach the application.
+*   **Latency:** without a match a rule check is a few lookups in associative arrays; actions without rules cost one `EXISTS`, processes without a group nothing. A fired alert is written synchronously (`LILAM_ALERTS`, `DBMS_ALERT` signal, autonomous transaction), which costs the application one commit per alert. `throttle_seconds` limits how often this happens.
+*   **Session-local state:** throttling and the predecessor for `PRECEDED_BY` live in the database session. With connection pools (e.g. APEX) the same alert can therefore fire once per pooled connection.
 
 ### Trigger and Filter
 Each rule is assigned to a **Trigger Type**, which defines the signal that starts the evaluation.
@@ -390,17 +397,17 @@ Rules define how LILAM reacts to incoming signals. They are organized into Rule 
 
 The central table `LILAM_RULES` acts as the repository for these configurations. Its name is fixed and is not derived from `tabNameMaster`.
 
-Rule Sets are stored as JSON documents and identified by server group, name and version. This allows different versions of the same Rule Set to be maintained, and the same Rule Set can be stored for several groups. Per group exactly one row is active; `SERVER_UPDATE_RULES` switches the active row and informs the running servers of the group.
+Rule Sets are stored as JSON documents and identified by group, name and version. This allows different versions of the same Rule Set to be maintained, and the same Rule Set can be stored for several groups. Per group exactly one row is active; `SERVER_UPDATE_RULES` switches the active row and informs the running servers of the group; INSESSION processes of the group pick it up themselves within 15 seconds.
 
 #### Table Structure
 
 | Column | Data Type | Description |
 | --- | --- | --- |
 | `RULE_SET` | `CLOB` | Contains the Rule Set as a JSON document (`IS JSON`). |
-| `GROUP_NAME` | `VARCHAR2(50)` | Server group the Rule Set belongs to (`GROUP_NAME` of the registry). |
+| `GROUP_NAME` | `VARCHAR2(50)` | Group the Rule Set belongs to: `GROUP_NAME` of the registry (servers) or `p_groupName` of `NEW_SESSION` (INSESSION). |
 | `SET_NAME` | `VARCHAR2(30)` | Name identifying the Rule Set. |
 | `VERSION` | `NUMBER` | Version of the Rule Set. |
-| `IS_ACTIVE` | `NUMBER(1)` | `1` for the Rule Set the servers of the group use; at most one per group. |
+| `IS_ACTIVE` | `NUMBER(1)` | `1` for the Rule Set the group uses (servers and INSESSION processes); at most one per group. |
 | `CREATED` | `TIMESTAMP(6)` | Timestamp at which the Rule Set was created. |
 | `AUTHOR` | `VARCHAR2(50)` | Author associated with the Rule Set. |
 

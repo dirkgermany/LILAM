@@ -51,7 +51,7 @@ Rules define how LILAM validates incoming signals. Each rule names the signal ty
 Rules are organized into Rule Sets, stored as JSON documents in the `LILAM_RULES` table. A rule set consists of a header and an array of rules.
 
 > [!IMPORTANT]
-> Rules are evaluated by LILAM **servers** only (decoupled mode, including the dispatcher setup). In INSESSION mode no rules are loaded and no alerts are raised.
+> Rules are evaluated by LILAM **servers** of the group (dispatchers do not evaluate rules) and by INSESSION processes started with `NEW_SESSION(..., p_groupName => ...)`. INSESSION processes without a group have no rules. See [Rules in INSESSION Mode](../docs/architecture%20and%20concepts.md#rules-in-insession-mode).
 
 ### Rule Set Structure
 | Property | Type | Required | Description
