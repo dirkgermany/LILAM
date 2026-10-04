@@ -293,6 +293,8 @@ To illustrate how LILAM works, imagine monitoring a subway system:
 ```
 ---
 ## Data
+The tables displayed below illustrate core content and, depending on the specific LILAM version, may include additional detailed information.
+
 ### Process data
 
 ```sql

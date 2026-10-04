@@ -740,6 +740,7 @@ FUNCTION CREATE_SERVER(
   p_perfServer   PLS_INTEGER DEFAULT NULL
 ) RETURN VARCHAR2
 ```
+Parameter identisch zu START_SERVER.
 
 ```sql
 -- Beispiel: Server der Gruppe BATCH mit mittlerer Leistungsstufe
