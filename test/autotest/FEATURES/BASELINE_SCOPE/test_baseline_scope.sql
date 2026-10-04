@@ -4,7 +4,7 @@
 -- Prueft den prozessuebergreifenden Durchschnitt (EWMA) ueber p_baselineScope, im INSESSION- und SERVER-Modus:
 --   B1  Default-Scope (= Prozessname): 3 Neustarts mit je 2 Traces -> 1 Scope, 6 Messungen, Mittel ca. 200 ms
 --   B2  ACTION_COUNT in _MON zaehlt je Prozess (1, 2), nicht ueber den Scope
---   B3  _MON.AVG_MILLIS des letzten Prozesses = Baseline des Scopes
+--   B3  _MON.AVG_MILLIS des letzten Prozesses = Baseline des Scopes (+-1 ms; mit mehreren Servern 20 % Toleranz)
 --   B4  Scope '#NONE': Baseline unveraendert, kein Scope '#NONE'
 --   B5  frei gewaehlter Scope: zwei Prozessnamen teilen eine Baseline, keine eigenen Scopes
 --   B6  keine internen LILAM-Fehler
