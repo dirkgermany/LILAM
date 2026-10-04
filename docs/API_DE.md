@@ -782,6 +782,13 @@ PROCEDURE SERVER_UPDATE_RULES(
 )
 ```
 
+Der Server prüft das Rule Set vollständig, bevor er es übernimmt. Ist eine Regel ungültig, lehnt er das ganze Rule Set ab, behält die bisherigen Regeln und protokolliert den Grund in `LILAM_LOG_INTERNAL` und im Log des Serverprozesses. Erst nach erfolgreichem Laden trägt er Name und Version in `LILAM_SERVER_REGISTRY` ein; nach einem Neustart lädt er sie von dort.
+
+Regeln wirken nur in Servern, nicht im INSESSION-Modus. Aufbau der Rule Sets und Operatoren: [Rules Engine](../rules/README.md).
+
+> [!WARNING]
+> Der Aufruf erreicht derzeit nur den Server, der `p_processId` **in der aufrufenden Session** bedient. Andere Server der Gruppe behalten ihre Regeln; über einen Dispatcher bleibt der Aufruf wirkungslos.
+
 ## Dispatcher-Modus
 Ein mit p_isDispatcher => 1 gestarteter Server (Dispatcher) verarbeitet keine Anfragen selbst, sondern leitet sie unverändert an einen passenden Server weiter.
 

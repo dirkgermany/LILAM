@@ -823,6 +823,13 @@ PROCEDURE SERVER_UPDATE_RULES(
 )
 ```
 
+The server checks the rule set completely before it uses it. If one rule is invalid, it rejects the whole rule set, keeps the previous rules and logs the reason to `LILAM_LOG_INTERNAL` and to the log of the server process. Only after a successful load does it store name and version in `LILAM_SERVER_REGISTRY`; after a restart it loads them from there.
+
+Rules are evaluated by servers only, not in INSESSION mode. Structure of rule sets and operators: [Rules Engine](../rules/README.md).
+
+> [!WARNING]
+> The call currently reaches only the server that serves `p_processId` **in the calling session**. Other servers of the group keep their rules; via a dispatcher the call has no effect.
+
 ---
 
 ## Appendix
