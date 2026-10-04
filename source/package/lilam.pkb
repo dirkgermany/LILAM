@@ -21,8 +21,8 @@ AS
     C_MAX_REGISTRY_HEARTBEAT_AGE_SEC   CONSTANT PLS_INTEGER  := 15;  --  Server HEARTBEAT in Registry mustn't be older
 
     -- Dedicated to Client
-    C_THROTTLE_LIMIT_NO                CONSTANT PLS_INTEGER := 1000; -- Max logs until unfreeze handshake (depends to C_THROTTLE_INTERVAL_NO)
-    C_THROTTLE_INTERVAL_NO             CONSTANT PLS_INTEGER := 1000; -- Max logs within this interval
+    -- Drosselung des Clients: Grenze je Prozess kommt vom Server (p_perfServer, siehe C_SERVER_PERF_*)
+    C_THROTTLE_INTERVAL_NO             CONSTANT PLS_INTEGER := 1000; -- Zeitfenster in ms für die Grenze
 
     -- Max Dirty Buffers and 
     C_FLUSH_MILLIS_THRESHOLD_MS        CONSTANT PLS_INTEGER := 1500;  -- 1500 Max. Millis until flush
@@ -61,7 +61,10 @@ AS
 
     -- Pipe handling
     C_PIPE_ID_PENDING               CONSTANT BINARY_INTEGER := -1; 
-    C_INTERLEAVE_PIPE_SUFFIX        CONSTANT VARCHAR2(20)   := '_INTERLEAVE';
+    -- Steuer-Pipe je Server/Dispatcher: <PIPE>_CTL. Nimmt NEW_SESSION auf, damit das Anlegen eines Prozesses
+    -- nicht hinter den Datennachrichten der Daten-Pipe warten muss (ersetzt das alte, unbenutzte '_INTERLEAVE').
+    C_CTL_PIPE_SUFFIX               CONSTANT VARCHAR2(20)   := '_CTL';
+    C_MAX_CTL_PIPE_SIZE             CONSTANT PLS_INTEGER    := 1048576;
 
     ---------------------------------------------------------------
     -- Kind of Monitor Entries
@@ -104,10 +107,15 @@ AS
     -- Index ist die Session-ID, Wert ist beliebig (hier Boolean)
     TYPE t_remote_sessions IS TABLE OF BOOLEAN INDEX BY BINARY_INTEGER;
     g_remote_sessions t_remote_sessions;
+    -- IDs, für die ein Reconnect über den Dispatcher gescheitert ist, mit Zeitpunkt des nächsten erlaubten
+    -- Versuchs. Verhindert, dass jeder Aufruf mit einer unbekannten ID erneut synchron beim Dispatcher anfragt.
+    TYPE t_unknown_pids IS TABLE OF TIMESTAMP INDEX BY BINARY_INTEGER;
+    g_unknown_pids t_unknown_pids;
 
     TYPE t_throttle_stat IS RECORD (
         msg_count  PLS_INTEGER := 0,
-        last_check TIMESTAMP    := SYSTIMESTAMP
+        last_check TIMESTAMP    := SYSTIMESTAMP,
+        msg_limit  PLS_INTEGER := 1500  -- Nachrichten je Zeitfenster; 0 = keine Drosselung (Wert vom Server)
     );
     TYPE t_throttle_tab IS TABLE OF t_throttle_stat INDEX BY BINARY_INTEGER;
     g_local_throttle_cache t_throttle_tab;
@@ -362,7 +370,7 @@ AS
     g_shutdownPassword                  varchar2(50);
     g_serverIsDispatcher                BOOLEAN                 := FALSE;
 
-    g_is_high_perf                      BOOLEAN                 := FALSE;
+    g_server_perf                       PLS_INTEGER             := C_SERVER_PERF_MID;  -- Leistungsstufe dieses Servers (p_perfServer)
     g_last_sync_all                     TIMESTAMP               := NULL;   -- letzter Durchlauf von SYNC_ALL_DIRTY
     g_last_check_time                   TIMESTAMP               := SYSTIMESTAMP;
 
@@ -488,11 +496,29 @@ AS
     END;
 
     ---------------------------------------------------------------
-    -- Switch von Low-Level auf Highspeed
+    -- Leistungsstufe normieren: NULL oder < 0 = MID (Standard), 0 = keine Drosselung, sonst der Wert selbst
     ---------------------------------------------------------------
-    PROCEDURE SET_HIGH_PERFORMANCE(p_enabled IN BOOLEAN) IS
+    FUNCTION normPerf(p_perf PLS_INTEGER) RETURN PLS_INTEGER IS
     BEGIN
-        g_is_high_perf := p_enabled;
+        IF p_perf IS NULL OR p_perf < 0 THEN
+            RETURN C_SERVER_PERF_MID;
+        END IF;
+        RETURN p_perf;
+    END;
+
+    ---------------------------------------------------------------
+    -- Grenze der Drosselung für einen Prozess setzen (Wert aus der Antwort des Servers
+    -- auf NEW_SESSION bzw. RECONNECT_PROCESS). Ersetzt SET_HIGH_PERFORMANCE / g_is_high_perf.
+    ---------------------------------------------------------------
+    PROCEDURE setPerfLimit(p_processId NUMBER, p_perf PLS_INTEGER) IS
+        l_rec t_throttle_stat;
+    BEGIN
+        IF g_local_throttle_cache.EXISTS(p_processId) THEN
+            g_local_throttle_cache(p_processId).msg_limit := normPerf(p_perf);
+        ELSE
+            l_rec.msg_limit := normPerf(p_perf);
+            g_local_throttle_cache(p_processId) := l_rec;
+        END IF;
     END;
 
     ---------------------------------------------------------------
@@ -509,16 +535,39 @@ AS
         IF v_indexSession.EXISTS(p_processId) THEN
             RETURN FALSE; -- echter lokaler In-Session-Prozess
         END IF;
+
+        -- Ungültige ID (z.B. NUM_ERR_SESSION_TIMEOUT aus SERVER_NEW_SESSION): nie ein Reconnect-Versuch
+        IF p_processId IS NULL OR p_processId <= 0 THEN
+            RETURN FALSE;
+        END IF;
     
         -- Weder lokal noch als remote bekannt: automatischer Reconnect-Versuch,
         -- aber nur, wenn ein Dispatcher konfiguriert wurde
         IF NOT g_dispatcher_config.EXISTS('DEFAULT_DISPATCHER') THEN
             RETURN FALSE;
         END IF;
+
+        -- Reconnect für diese ID kürzlich gescheitert: nicht erneut synchron anfragen
+        -- (sonst wartet jeder Aufruf mit einer veralteten ID auf den Dispatcher)
+        IF g_unknown_pids.EXISTS(p_processId) THEN
+            IF g_unknown_pids(p_processId) > systimestamp THEN
+                RETURN FALSE;
+            END IF;
+            g_unknown_pids.DELETE(p_processId);
+        END IF;
     
         l_dispatcherPipe := g_dispatcher_config('DEFAULT_DISPATCHER');
         l_result := SERVER_LINK(p_processId, l_dispatcherPipe);
-        RETURN (l_result = p_processId);
+        IF l_result = p_processId THEN
+            RETURN TRUE;
+        END IF;
+
+        -- Server kennt den Prozess nicht (endgültig): für diese Session merken.
+        -- Kein Server erreichbar / Timeout (vorübergehend): erst nach 10 s erneut versuchen.
+        g_unknown_pids(p_processId) := CASE WHEN l_result = NUM_ERR_SERVER_PROC
+                                            THEN systimestamp + INTERVAL '1' DAY
+                                            ELSE systimestamp + INTERVAL '10' SECOND END;
+        RETURN FALSE;
     
     EXCEPTION
         WHEN OTHERS THEN
@@ -776,6 +825,32 @@ AS
         TO_NUMBER(TO_CHAR(sys_extract_utc(SYSTIMESTAMP), 'SSSSSFF3')),
         'FM999999999999999'
     );
+    end;
+
+    --------------------------------------------------------------------------
+    -- Name der Steuer-Pipe zu einer Server-/Dispatcher-Pipe (nur per Konvention, keine Verwaltung)
+    --------------------------------------------------------------------------
+    function ctlPipe(p_pipeName varchar2) return varchar2
+    as
+    begin
+        return upper(p_pipeName) || C_CTL_PIPE_SUFFIX;
+    end;
+
+    --------------------------------------------------------------------------
+    -- Weckruf in die Daten-Pipe: Ein untätiger Server wartet blockierend auf seiner Daten-Pipe
+    -- (bis C_SERVER_TIMEOUT_MAX_WAIT_SEC) und würde eine Nachricht in der Steuer-Pipe sonst erst
+    -- nach Ablauf dieser Wartezeit bemerken. SERVER_PING bewirkt im Server nichts weiter.
+    --------------------------------------------------------------------------
+    procedure sendPing(p_pipeName varchar2)
+    as
+        l_status PLS_INTEGER;
+    begin
+        DBMS_PIPE.RESET_BUFFER;
+        DBMS_PIPE.PACK_MESSAGE('{"header":{"msg_type":"API_CALL","request":"SERVER_PING"}}');
+        l_status := DBMS_PIPE.SEND_MESSAGE(p_pipeName, timeout => 0);
+    exception
+        when others then
+            DBMS_PIPE.RESET_BUFFER;   -- Weckruf ist nur ein Hilfsmittel, Fehler sind unkritisch
     end;
 
     --------------------------------------------------------------------------
@@ -1380,7 +1455,14 @@ AS
         l_serverPipe := getServerPipeForSession(p_processId, l_groupName);
 
         DBMS_PIPE.PACK_MESSAGE(l_jsonMain);
-        l_status := DBMS_PIPE.SEND_MESSAGE(l_serverPipe, timeout => 3);
+        if p_request = 'NEW_SESSION' then
+            -- NEW_SESSION über die Steuer-Pipe: überholt die Datennachrichten anderer Clients in der
+            -- Daten-Pipe (vorher unter Last regelmäßig > 3 s Wartezeit und Timeout).
+            l_status := DBMS_PIPE.SEND_MESSAGE(ctlPipe(l_serverPipe), timeout => 3);
+            sendPing(l_serverPipe);
+        else
+            l_status := DBMS_PIPE.SEND_MESSAGE(l_serverPipe, timeout => 3);
+        end if;
         l_statusReceive := DBMS_PIPE.RECEIVE_MESSAGE(l_clientChannel, timeout => p_timeoutSec);
         if l_statusReceive = 0 THEN
             DBMS_PIPE.UNPACK_MESSAGE(l_msgReceive);
@@ -1476,7 +1558,10 @@ AS
     as
         l_response varchar2(1000);
     begin
-        l_response := waitForResponse(p_processId, 'UNFREEZE_REQUEST', '{}', 10);
+        -- process_id im Payload: Ein Dispatcher braucht sie, um die Anfrage an den Worker des Prozesses
+        -- weiterzuleiten. Vorher ('{}') verwarf der Dispatcher die Anfrage, und der Client wartete
+        -- jedes Mal den vollen Timeout ab (Lasttest über Dispatcher: 5,3 ms statt 0,2 ms je Aufruf).
+        l_response := waitForResponse(p_processId, 'UNFREEZE_REQUEST', '{"process_id":' || jNum(p_processId) || '}', 10);
 
     exception
         when others then
@@ -1489,25 +1574,23 @@ AS
     PROCEDURE stabilizeInLowPerfEnvironments(p_processId number)
     IS
         -- PERFORMANCE: SYSTIMESTAMP wird nur noch gelesen, wenn die Zeit gebraucht wird
-        -- (beim ersten Aufruf und alle C_THROTTLE_LIMIT_NO Nachrichten), nicht bei jedem Aufruf
+        -- (beim ersten Aufruf und alle msg_limit Nachrichten), nicht bei jedem Aufruf
         l_now TIMESTAMP;
         l_new_throttle t_throttle_stat;
     BEGIN
-        if NOT g_is_high_perf THEN 
-            -- In nicht hochperformanten Umgebungen den Client etwas einbremsen
-            if NOT g_local_throttle_cache.EXISTS(p_processId) THEN
-              l_new_throttle.msg_count := 0;
-              l_new_throttle.last_check := SYSTIMESTAMP;
+        -- Prozess ohne Wert vom Server (sollte nicht vorkommen): Standard C_SERVER_PERF_MID
+        if NOT g_local_throttle_cache.EXISTS(p_processId) THEN
+            l_new_throttle.msg_limit := C_SERVER_PERF_MID;
+            g_local_throttle_cache(p_processId) := l_new_throttle;
+        end if ;
 
-              g_local_throttle_cache(p_processId) := l_new_throttle;
-
-            end if ;
-
+        -- 0 = keine Drosselung (Server mit p_perfServer => 0 gestartet)
+        if g_local_throttle_cache(p_processId).msg_limit > 0 THEN 
             -- Counter hochzählen
             g_local_throttle_cache(p_processId).msg_count := g_local_throttle_cache(p_processId).msg_count + 1;
 
-            -- Check-Intervall erreicht?
-            if g_local_throttle_cache(p_processId).msg_count >= C_THROTTLE_LIMIT_NO THEN        
+            -- Grenze des Zeitfensters erreicht?
+            if g_local_throttle_cache(p_processId).msg_count >= g_local_throttle_cache(p_processId).msg_limit THEN        
                 l_now := SYSTIMESTAMP;
                 -- Wenn zu schnell gefeuert wurde
                 if get_ms_diff(g_local_throttle_cache(p_processId).last_check, l_now) < C_THROTTLE_INTERVAL_NO THEN
@@ -4433,6 +4516,7 @@ AS
             close_sessionRemote(p_processId, p_procStepsToDo, p_procStepsDone, p_processInfo, p_processStatus);
             g_remote_sessions.delete(p_processId);
             g_client_pipes.delete(p_processId);
+            g_local_throttle_cache.delete(p_processId);
             return;
         end if ;
 
@@ -4683,6 +4767,7 @@ AS
         if v_indexSession.EXISTS(l_processId) then
             jsonPut(l_response, 'server_code', get_serverCode(TXT_ACK_SERVER_PROC));
             jsonPut(l_response, 'process_id', l_processId);
+            jsonPut(l_response, 'perf', g_server_perf);   -- Leistungsstufe für die Drosselung des Clients
         else
             jsonPut(l_response, 'server_code', get_serverCode(TXT_ERR_SERVER_PROC));
         end if;
@@ -4956,6 +5041,16 @@ AS
         l_status PLS_INTEGER;
     begin
         l_payload := JSON_QUERY(p_message, '$.payload');
+
+        -- Verfallszeit des Clients prüfen (mit 500 ms Sicherheitsabstand). Ist sie überschritten, hat der
+        -- Client bereits aufgegeben: keinen Prozess anlegen, keine Route, keine Antwort (der Rückkanal
+        -- existiert nicht mehr; eine Antwort würde dort nur eine verwaiste Pipe erzeugen).
+        if jsonTime(l_payload, 'expires_utc') - INTERVAL '0.5' SECOND < sys_extract_utc(systimestamp) then
+            logLilamErr(NUM_ERR_SESSION_TIMEOUT, 'NEW_SESSION verworfen, Client wartet nicht mehr: '
+                        || jsonString(l_payload, 'process_name'), 'doRemote_newSession', 'EXPIRED');
+            return;
+        end if;
+
         l_session_init.processName := jsonString(l_payload, 'process_name');
         l_session_init.logLevel    := jsonNumber(l_payload, 'log_level');
         l_session_init.stepsToDo   := jsonNumber(l_payload, 'steps_todo');
@@ -4967,7 +5062,8 @@ AS
         registerProcessRoute(l_processId, g_serverPipeName); 
 
         DBMS_PIPE.RESET_BUFFER;
-        DBMS_PIPE.PACK_MESSAGE('{"process_id":' || l_processId || '}');        
+        -- perf: Leistungsstufe dieses Servers; der Client richtet seine Drosselung danach aus
+        DBMS_PIPE.PACK_MESSAGE('{"process_id":' || l_processId || ',"perf":' || g_server_perf || '}');        
         l_status := DBMS_PIPE.SEND_MESSAGE(p_clientChannel, timeout => 1);
     end;    
 
@@ -5034,6 +5130,10 @@ AS
     FUNCTION GET_SERVER_PIPE(p_processId NUMBER) RETURN VARCHAR2
     as
     begin
+        -- Ungültige ID (z.B. NUM_ERR_SESSION_TIMEOUT aus SERVER_NEW_SESSION): kein Server, keine Exception
+        if p_processId is null or p_processId < 0 then
+            return null;
+        end if;
         return getServerPipeForSession(p_processId, null);
     end;
 
@@ -5067,28 +5167,37 @@ AS
     as
         l_ProcessId number(19,0) := -500;   
         l_response  varchar2(100);        
+        l_payload   JSON_OBJ_LILAM := p_jsonObject;
     begin                        
+        -- Verfallszeit: Bis dahin wartet der Client auf die Antwort. Kommt der Server erst danach
+        -- an die Nachricht (z.B. volle Pipe), legt er keinen Prozess an (siehe doRemote_newSession).
+        -- So entstehen keine verwaisten, nie geschlossenen Prozesse.
+        -- In UTC, da Client- und Server-Session unterschiedliche Zeitzonen haben können.
+        jsonPut(l_payload, 'expires_utc', sys_extract_utc(systimestamp) + numtodsinterval(C_TIMEOUT_NEW_SESSION_SEC, 'SECOND'));
+
         -- zunächst mal schauen, welche Server bereitstehen
-        l_response := waitForResponse(null, 'NEW_SESSION', p_jsonObject, C_TIMEOUT_NEW_SESSION_SEC);
+        l_response := waitForResponse(null, 'NEW_SESSION', l_payload, C_TIMEOUT_NEW_SESSION_SEC);
 
         CASE
             WHEN l_response = 'TIMEOUT' THEN
-                l_ProcessId := -20110;
+                l_ProcessId := NUM_ERR_SESSION_TIMEOUT;
             WHEN l_response = 'THROTTLED' THEN
-                l_ProcessId := -20120;                
+                l_ProcessId := NUM_ERR_SESSION_THROTTLED;
             WHEN l_response LIKE 'ERROR%' THEN
-                l_ProcessId := -20100;
+                l_ProcessId := NUM_COMM_ERR;
             else
             -- Erfolgsfall: JSON parsen
-            l_ProcessId := jsonNumber(l_response, 'process_id');
+            l_ProcessId := nvl(jsonNumber(l_response, 'process_id'), NUM_COMM_ERR);
         end case;
         
-        -- Wenn Server nicht bereitsteht
+        -- Kein Prozess angelegt: keine Exception an die Anwendung (Philosophie: kein Impact).
+        -- Die Anwendung erhält die negative ID (Konstanten NUM_ERR_SESSION_* in der Spezifikation);
+        -- alle weiteren API-Aufrufe mit dieser ID werden still ignoriert. Protokoll in LILAM_LOG_INTERNAL.
         if l_ProcessId < 0 then
-            RAISE_APPLICATION_ERROR(
-                num => l_ProcessId,
-                msg => 'Could not establish connection to LILAM-Server: ' || l_response
-            );
+            g_client_pipes.DELETE(C_PIPE_ID_PENDING);
+            logLilamErr(l_ProcessId, 'Could not establish connection to LILAM-Server: ' || l_response,
+                        'SERVER_NEW_SESSION_JSON', 'NEW_SESSION');
+            return l_ProcessId;
         end if;
         
         -- Nur valide IDs registrieren
@@ -5096,6 +5205,8 @@ AS
             g_client_pipes(l_ProcessId) := g_client_pipes(C_PIPE_ID_PENDING);
             g_client_pipes.DELETE(C_PIPE_ID_PENDING);
             g_remote_sessions(l_ProcessId) := TRUE; -- in die Liste der RemoteSessions eintragen
+            -- Drosselung nach der Leistungsstufe des Servers (fehlt der Wert: C_SERVER_PERF_MID)
+            setPerfLimit(l_ProcessId, jsonNumber(l_response, 'perf'));
         end if ;
         RETURN l_ProcessId;
     end;
@@ -5126,6 +5237,8 @@ AS
         l_serverCode := jsonNumber(l_payload, 'server_code');
 
         if l_serverCode = NUM_ACK_SERVER_PROC then
+            -- Drosselung nach der Leistungsstufe des Servers (auch in jeder neuen APEX-Session)
+            setPerfLimit(p_processId, jsonNumber(l_payload, 'perf'));
             return jsonNumber(l_payload, 'process_id');
         else
             return NUM_ERR_SERVER_PROC;
@@ -5706,8 +5819,11 @@ AS
         DBMS_PIPE.RESET_BUFFER;
         DBMS_PIPE.PURGE(p_pipeName);
         l_dummyRes := DBMS_PIPE.REMOVE_PIPE(upper(p_pipeName));
-        l_dummyRes := DBMS_PIPE.REMOVE_PIPE(upper(p_pipeName) || C_INTERLEAVE_PIPE_SUFFIX);
+        DBMS_PIPE.PURGE(ctlPipe(p_pipeName));
+        l_dummyRes := DBMS_PIPE.REMOVE_PIPE(ctlPipe(p_pipeName));
         l_dummyRes := DBMS_PIPE.CREATE_PIPE(pipename => upper(p_pipeName), maxpipesize => C_MAX_SERVER_PIPE_SIZE, private => false);
+        -- Steuer-Pipe für NEW_SESSION (siehe C_CTL_PIPE_SUFFIX)
+        l_dummyRes := DBMS_PIPE.CREATE_PIPE(pipename => ctlPipe(p_pipeName), maxpipesize => C_MAX_CTL_PIPE_SIZE, private => false);
     end;
 
     --------------------------------------------------------------------------
@@ -5720,7 +5836,7 @@ AS
     begin
         -- Dispatcher-Modus: alles weiterleiten, nichts selbst verarbeiten
         -- Ausnahme: SERVER_SHUTDOWN gilt dem Dispatcher selbst (sonst ist er nicht stoppbar)
-        if g_serverIsDispatcher and p_request != 'SERVER_SHUTDOWN' then
+        if g_serverIsDispatcher and p_request not in ('SERVER_SHUTDOWN', 'SERVER_PING') then
             if p_request in ('NEW_SESSION', 'SERVER_NEW_SESSION') then
                 -- Noch keine process_id vorhanden; Auswahl rein lastbasiert
                 l_targetPipe := getServerPipeAvailable(g_serverGroupName);
@@ -5730,14 +5846,31 @@ AS
             end if;
     
             if l_targetPipe is null then
-                -- kein Worker verfügbar/gefunden; hier bewusst entscheiden, wie reagiert wird
+                -- Kein Worker verfügbar bzw. keine Route für die process_id.
+                -- Synchrone Anfragen (mit Rückkanal) sofort mit Fehler beantworten, statt sie zu verwerfen:
+                -- sonst wartet der Client den vollen Timeout ab (z.B. Reconnect mit veralteter ID: 5 s je Aufruf).
+                if p_clientChannel is not null then
+                    DBMS_PIPE.RESET_BUFFER;
+                    DBMS_PIPE.PACK_MESSAGE('{"header":{"msg_type":"SERVER_RESPONSE","msg_name":"NO_TARGET"},"payload":{"server_code":'
+                        || case when p_request in ('NEW_SESSION', 'SERVER_NEW_SESSION') then NUM_ERR_NO_SERVER else NUM_ERR_SERVER_PROC end
+                        || ',"server_message":"'
+                        || case when p_request in ('NEW_SESSION', 'SERVER_NEW_SESSION') then TXT_ERR_NO_SERVER else TXT_ERR_SERVER_PROC end
+                        || '"}}');
+                    l_status := DBMS_PIPE.SEND_MESSAGE(p_clientChannel, timeout => 0);
+                end if;
                 return false;
             end if;
     
             -- unverändert weiterreichen, inkl. des ursprünglichen Client-Rückkanals im Header
             DBMS_PIPE.RESET_BUFFER;
             DBMS_PIPE.PACK_MESSAGE(p_message);        
-            l_status := DBMS_PIPE.SEND_MESSAGE(l_targetPipe, timeout => 1);
+            if p_request in ('NEW_SESSION', 'SERVER_NEW_SESSION') then
+                -- NEW_SESSION an die Steuer-Pipe des Workers, danach Weckruf in dessen Daten-Pipe
+                l_status := DBMS_PIPE.SEND_MESSAGE(ctlPipe(l_targetPipe), timeout => 1);
+                sendPing(l_targetPipe);
+            else
+                l_status := DBMS_PIPE.SEND_MESSAGE(l_targetPipe, timeout => 1);
+            end if;
             return false;
         end if;
 
@@ -5808,7 +5941,8 @@ AS
 
     --------------------------------------------------------------------------
 
-    procedure START_SERVER(p_pipeName varchar2, p_groupName varchar2, p_password varchar2, p_isDispatcher PLS_INTEGER DEFAULT 0)
+    procedure START_SERVER(p_pipeName varchar2, p_groupName varchar2, p_password varchar2, p_isDispatcher PLS_INTEGER DEFAULT 0,
+                           p_perfServer PLS_INTEGER DEFAULT NULL)
     as
         v_key            VARCHAR2(100); 
         l_clientChannel  varchar2(50);
@@ -5822,8 +5956,10 @@ AS
         l_loopCounter    PLS_INTEGER := 0;
         l_msgCnt         PLS_INTEGER := 0;
         l_serverTimeout  NUMBER := C_SERVER_TIMEOUT_WAIT_FOR_MSG_SEC;
+        l_ctlPipe        VARCHAR2(150);
     begin
         g_serverIsDispatcher := CASE nvl(p_isDispatcher, 0) WHEN 1 THEN TRUE ELSE FALSE END;
+        g_server_perf := normPerf(p_perfServer);   -- wird den Clients bei NEW_SESSION/RECONNECT mitgeteilt
         g_shutdownPassword := p_password;
         g_serverPipeName := p_pipeName; --l_pipe;
         g_serverGroupName := p_groupName;
@@ -5832,6 +5968,7 @@ AS
 
         registerServerPipe;
         preparePipe(g_serverPipeName);
+        l_ctlPipe := ctlPipe(g_serverPipeName);
         loadServerRules;
         updateServerRegistry(TRUE, 0);
         DBMS_APPLICATION_INFO.SET_MODULE(
@@ -5840,6 +5977,21 @@ AS
         );
 
         LOOP
+            -- Zuerst die Steuer-Pipe (NEW_SESSION), ohne zu warten. Ist sie leer, kostet das wenige µs.
+            LOOP
+                l_status := DBMS_PIPE.RECEIVE_MESSAGE(l_ctlPipe, timeout => 0);
+                EXIT WHEN l_status != 0;
+                BEGIN
+                    DBMS_PIPE.UNPACK_MESSAGE(l_message);
+                    l_clientChannel := extractClientChannel(l_message);
+                    l_request := extractClientRequest(l_message);
+                    l_shutdownSignal := processRequest(l_request, l_message, l_clientChannel);
+                EXCEPTION
+                    WHEN OTHERS THEN
+                        logLilamErr(sqlCode, sqlErrM, 'START_SERVER', 'CTL_PIPE');
+                END;
+            END LOOP;
+
             -- Warten auf die nächste Nachricht (Timeout in Sekunden)
             l_message := receiveMessage(g_serverPipeName, l_serverTimeout); 
             if l_message is not null THEN
@@ -5909,8 +6061,8 @@ AS
 
         DBMS_PIPE.PURGE(g_serverPipeName); 
         l_dummyRes := DBMS_PIPE.REMOVE_PIPE(g_serverPipeName);
-        DBMS_PIPE.PURGE(g_serverPipeName || C_INTERLEAVE_PIPE_SUFFIX);
-        l_dummyRes := DBMS_PIPE.REMOVE_PIPE(g_serverPipeName || C_INTERLEAVE_PIPE_SUFFIX);
+        DBMS_PIPE.PURGE(ctlPipe(g_serverPipeName));
+        l_dummyRes := DBMS_PIPE.REMOVE_PIPE(ctlPipe(g_serverPipeName));
         g_remote_sessions.DELETE;
 
         -- abschließende Analyse der Buffer-Zustände
@@ -5937,8 +6089,8 @@ AS
         end;
         
         begin
-            DBMS_PIPE.PURGE(g_serverPipeName || C_INTERLEAVE_PIPE_SUFFIX);
-            l_dummyRes := DBMS_PIPE.REMOVE_PIPE(g_serverPipeName || C_INTERLEAVE_PIPE_SUFFIX);
+            DBMS_PIPE.PURGE(ctlPipe(g_serverPipeName));
+            l_dummyRes := DBMS_PIPE.REMOVE_PIPE(ctlPipe(g_serverPipeName));
         exception
             when others then
                 logLilamErr(sqlCode, sqlErrM, 'START_SERVER', 'DBMS_PIPE.PURGE');
@@ -6115,7 +6267,8 @@ END;
 
     --------------------------------------------------------------------------
 
-    FUNCTION CREATE_SERVER(p_pipeName varchar2, p_groupName varchar2, p_password  varchar2, p_isDispatcher PLS_INTEGER DEFAULT 0) RETURN VARCHAR2
+    FUNCTION CREATE_SERVER(p_pipeName varchar2, p_groupName varchar2, p_password  varchar2, p_isDispatcher PLS_INTEGER DEFAULT 0,
+                           p_perfServer PLS_INTEGER DEFAULT NULL) RETURN VARCHAR2
     AS
         l_slot_idx PLS_INTEGER := 1; -- Beispielwert, sollte dynamisch ermittelt werden
         l_action   VARCHAR2(2000); -- Puffer leicht erhöht für längere Strings
@@ -6137,7 +6290,8 @@ END;
                     '    p_pipeName  => ' || quote_literal(p_pipeName)      || ', ' ||
                     '    p_groupName => ' || quote_literal(p_groupName) || ', ' ||
                     '    p_password  => ' || quote_literal(p_password)  || ', ' ||
-                    '    p_isDispatcher => ' || quote_literal(p_isDispatcher) || 
+                    '    p_isDispatcher => ' || quote_literal(p_isDispatcher) || ', ' ||
+                    '    p_perfServer => ' || normPerf(p_perfServer) ||
                     '  ); ' ||
                     'END;';
 

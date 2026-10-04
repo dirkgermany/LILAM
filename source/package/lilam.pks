@@ -47,6 +47,20 @@ create or replace PACKAGE LILAM AS
     NUM_ACK_SERVER_PROC CONSTANT PLS_INTEGER  := 220;
     TXT_ERR_SERVER_PROC CONSTANT VARCHAR2(30) := 'PROCESS_AT_SERVER_INVALID';
     NUM_ERR_SERVER_PROC CONSTANT PLS_INTEGER  := -20021;
+    -- Rückgabewerte von SERVER_NEW_SESSION / SERVER_NEW_SESSION_JSON, wenn kein Prozess angelegt werden konnte.
+    -- Es wird keine Exception geworfen; alle weiteren API-Aufrufe mit dieser ID werden still ignoriert.
+    TXT_ERR_SESSION_TIMEOUT   CONSTANT VARCHAR2(30) := 'SESSION_TIMEOUT';
+    NUM_ERR_SESSION_TIMEOUT   CONSTANT PLS_INTEGER  := -20110;  -- Server hat nicht rechtzeitig geantwortet
+    TXT_ERR_SESSION_THROTTLED CONSTANT VARCHAR2(30) := 'SESSION_THROTTLED';
+    NUM_ERR_SESSION_THROTTLED CONSTANT PLS_INTEGER  := -20120;  -- Server hat abgelehnt (Überlast)
+    -- Kommunikationsfehler beim Anlegen: NUM_COMM_ERR (-20003)
+
+    -- Leistungsstufen eines LILAM-Servers (Parameter p_perfServer von CREATE_SERVER/START_SERVER).
+    -- Wert = Nachrichten je Sekunde und Prozess, die ein Client ohne Abstimmung mit dem Server senden darf.
+    -- Beliebige andere Werte sind erlaubt; 0 = keine Drosselung; NULL oder < 0 = C_SERVER_PERF_MID (Standard).
+    C_SERVER_PERF_LOW   CONSTANT PLS_INTEGER  := 500;
+    C_SERVER_PERF_MID   CONSTANT PLS_INTEGER  := 1500;
+    C_SERVER_PERF_HIGH  CONSTANT PLS_INTEGER  := 2500;
 
     -- SUFFIXES of the three main tables
     C_SUFFIX_PROC_TABLE  CONSTANT varchar2(6)  := '_PROC'; -- Process
@@ -181,8 +195,10 @@ create or replace PACKAGE LILAM AS
     -----------------
     -- Server control
     -----------------
-    FUNCTION  CREATE_SERVER(p_pipeName varchar2, p_groupName varchar2, p_password varchar2, p_isDispatcher PLS_INTEGER DEFAULT 0) RETURN VARCHAR2;
-    PROCEDURE START_SERVER(p_pipeName varchar2, p_groupName varchar2, p_password varchar2, p_isDispatcher PLS_INTEGER DEFAULT 0);
+    FUNCTION  CREATE_SERVER(p_pipeName varchar2, p_groupName varchar2, p_password varchar2, p_isDispatcher PLS_INTEGER DEFAULT 0,
+                            p_perfServer PLS_INTEGER DEFAULT NULL) RETURN VARCHAR2;
+    PROCEDURE START_SERVER(p_pipeName varchar2, p_groupName varchar2, p_password varchar2, p_isDispatcher PLS_INTEGER DEFAULT 0,
+                           p_perfServer PLS_INTEGER DEFAULT NULL);
     PROCEDURE SERVER_SHUTDOWN(p_processId number, p_pipeName varchar2, p_password varchar2);
     FUNCTION  GET_SERVER_PIPE(p_processId NUMBER) RETURN VARCHAR2;
     PROCEDURE SERVER_UPDATE_RULES(p_processId NUMBER, p_ruleSetName VARCHAR2, p_ruleSetVersion PLS_INTEGER);
