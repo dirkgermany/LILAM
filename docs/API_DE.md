@@ -6,20 +6,24 @@
 <details>
 <summary>📖 <b>Inhalt</b></summary>
 
-- #schnellstart
-  - #in-session-modus
-  - [Entkoppelter Server-modus
-- #grundkonzepte
-  - [Prozessfortschritt vs. Metriken](#prozessfortschritt-vs-metrikenen-und-prozeduren
-  - [Session-Verwaltung](#session-sssteuerung
+- [Schnellstart](#schnellstart)
+  - [In-Session-Modus](#in-session-modus)
+  - [Entkoppelter Server-Modus](#entkoppelter-server-modus)
+- [Grundkonzepte](#grundkonzepte)
+  - [Prozessfortschritt vs. Metriken](#prozessfortschritt-vs-metriken)
+  - [Events vs. Traces](#events-vs-traces)
+- [Funktionen und Prozeduren](#funktionen-und-prozeduren)
+  - [Session-Verwaltung](#session-verwaltung)
+  - [Prozesssteuerung](#prozesssteuerung)
   - [Logging](#logging)
-  - #metriken
-  - #serversteuerung
-- #anhang
-  - #parameterkennzeichnung
+  - [Metriken](#metriken)
+  - [Serversteuerung](#serversteuerung)
+  - [Dispatcher-Modus](#dispatcher-modus)
+- [Anhang](#anhang)
+  - [Parameterkennzeichnung](#parameterkennzeichnung-1)
   - [Log-Level](#log-level)
-  - [Record-typ-t_session_init
-  - #record-typ-t_process_rec
+  - [Record-Typ t_session_init](#record-typ-t_session_init)
+  - [Record-Typ t_process_rec](#record-typ-t_process_rec)
   - [JSON API Interface](#json-api-interface)
 
 </details>
@@ -770,17 +774,31 @@ FUNCTION GET_SERVER_PIPE(
 ```
 
 ### Procedure SERVER_UPDATE_RULES
-Rules werden als JSON-Objekte in `LILAM_RULES` gespeichert.
-
-Nachdem ein Rule Set eingefügt oder geändert wurde, kann `SERVER_UPDATE_RULES` über eine aktive Serververbindung aufgerufen werden, um das aktualisierte Rule Set anzuwenden.
+Rule Sets werden als JSON-Objekte in `LILAM_RULES` gespeichert, jeweils für eine Servergruppe (`GROUP_NAME`, Name, Version). Dasselbe Rule Set kann für mehrere Gruppen eingetragen sein. Je Gruppe ist genau ein Rule Set aktiv (`IS_ACTIVE = 1`); es gilt für alle Server der Gruppe.
 
 ```sql
 PROCEDURE SERVER_UPDATE_RULES(
-  p_processId      NUMBER,
+  p_groupName      VARCHAR2,
   p_ruleSetName    VARCHAR2,
   p_ruleSetVersion PLS_INTEGER
 )
 ```
+
+Ablauf:
+1. Das Rule Set der Gruppe wird in der aufrufenden Session vollständig geprüft. Fehlt es für die Gruppe oder ist eine Regel ungültig, endet der Aufruf mit der Exception `NUM_ERR_RULE_SET` (-20130) und einer Begründung; es ändert sich nichts.
+2. Das Rule Set wird für die Gruppe aktiv, das bisher aktive inaktiv.
+3. Laufende Server der Gruppe erhalten die Anweisung zum Neuladen direkt in ihre Pipe, also auch ohne laufenden Prozess und am Dispatcher vorbei. Dispatcher werten keine Regeln aus.
+
+Eine Gruppe ohne laufende Server ist kein Fehler: Jeder Server lädt beim Start das aktive Rule Set seiner Gruppe, auch ein neu hinzukommender. Lehnt ein Server ein Rule Set beim Start ab (z. B. weil es inzwischen direkt in der Tabelle geändert wurde), behält er die bisherigen Regeln (beim Start: keine) und protokolliert den Grund in `LILAM_LOG_INTERNAL` und im Log des Serverprozesses.
+
+```sql
+INSERT INTO LILAM_RULES (group_name, set_name, version, created, author, rule_set)
+VALUES ('METRO', 'METRO_RULES', 2, systimestamp, 'Dirk', '{"rules":[ ... ]}');
+
+exec LILAM.SERVER_UPDATE_RULES('METRO', 'METRO_RULES', 2);
+```
+
+Regeln wirken nur in Servern, nicht im INSESSION-Modus. Aufbau der Rule Sets und Operatoren: [Rules Engine](../rules/README.md).
 
 ## Dispatcher-Modus
 Ein mit p_isDispatcher => 1 gestarteter Server (Dispatcher) verarbeitet keine Anfragen selbst, sondern leitet sie unverändert an einen passenden Server weiter.
@@ -829,10 +847,11 @@ PROCEDURE SET_DISPATCHER_PIPE(
 ```
 
 #### Parameter
-| Parameter | Typ | Besdeutung |
+| Parameter | Typ | Bedeutung |
+| --------- | --- | --------- |
 | p_pipeName | varchar2 | Pipe-Name des Dispatchers |
-| p_groupName | varchar2 | Optionale Kennung, falls mehrere Dispatcher parallel genutzt werden. Automatisches Reconnect (siehe unten) verwendet ausschließlich die Standardkennung 'DEFAULT_DISPATCHER' |
-| p_processId | number | Optional. Ist bereits eine process_id bekannt, stellt LILAM die Verbindung zu dieser sofort wieder her (siehe „Vorwärmen"), statt erst beim nächsten API-Aufruf |
+| p_groupName | varchar2 | Optionale Kennung, falls mehrere Dispatcher parallel genutzt werden. [Automatisches Reconnect](#automatisches-reconnect) verwendet ausschließlich die Standardkennung 'DEFAULT_DISPATCHER' |
+| p_processId | number | Optional. Ist bereits eine process_id bekannt, stellt LILAM die Verbindung zu dieser sofort wieder her (siehe [Vorwärmen](#vorwärmen)), statt erst beim nächsten API-Aufruf |
 
 ```sql
 -- Beispiel: APEX "Before Header"-Process

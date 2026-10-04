@@ -44,7 +44,7 @@
 ## Technical Overview
 LILAM utilizes the core functionalities made available by Oracle through its PL/SQL (from version 12 onwards, tested under 19c and 26 AI). LILAM itself is a PL/SQL script that can be used by other PL/SQL scripts in various modi operandi.
 
-This means LILAM is the opposite of "black magic" or over-the-top engineering. By using less tables, indexes, a sequence, and pipes, LILAM pursues a 100% Zero-Dependency strategy. In fact, due to the communication via pipes, scenarios are conceivable in which LILAM is used in conjunction with non-PL/SQL applications. The security of session, log, and metric data is guaranteed by autonomous transactions. These are sharply separated from data in memory and from the transactions of other applications, ensuring their own COMMIT even if the application had to perform a rollback.
+This means LILAM is the opposite of "black magic" or over-the-top engineering. By using less tables, indexes, a sequence, and pipes, LILAM pursues a 100% Zero-Dependency strategy. The security of session, log, and metric data is guaranteed by autonomous transactions. These are sharply separated from data in memory and from the transactions of other applications, ensuring their own COMMIT even if the application had to perform a rollback.
 
 LILAM itself is a package consisting of the usual specification (.pks) and the body (.pkb). The code consists of a few thousand real lines of code; in version 1.3, which already featured most functionalities, it was around 3,000 LOC. The functionalities of the LILAM client and the LILAM server are entirely part of this code.
 
@@ -108,7 +108,7 @@ LILAM captures detailed process steps by measuring their **frequency** and **dur
 **TRACE:** Measures the specific duration of a work step from start to finish.
 
 ### Analysis & Outliers
-For every action, LILAM maintains a **moving average**. This average is recorded with each new entry, allowing for real-time performance tracking. If a trace significantly deviates from this baseline, LILAM evaluates your custom JSON rule-sets to automatically trigger specific **warnings** or **alerts** in the Log Table.
+For every action, LILAM maintains a **moving average**. This average is recorded with each new entry, allowing for real-time performance tracking. If a trace significantly deviates from this baseline, LILAM evaluates your custom JSON rule-sets to automatically raise **alerts** (table `LILAM_ALERTS` and a `DBMS_ALERT` signal to the consumer).
 
 **Example:**
 A process monitors actions **'A'** and **'B'**:
@@ -118,64 +118,65 @@ A process monitors actions **'A'** and **'B'**:
 
 ---
 ## Rule Management & Event Response
-**Rules** define how LILAM servers react to incoming **signals**, transforming LILAM from a passive monitoring tool into an active **orchestrator**.
+**Rules** define how LILAM servers react to incoming **signals**, transforming LILAM from a passive monitoring tool into an active **orchestrator**. The complete reference (properties, operators, examples) is in [Rules Engine](../rules/README.md).
 
-Rules are organized into **Rule Sets**, structured as flexible JSON objects. The central table `LILA_RULES` serves as the repository for these configurations, storing each JSON-based rule set alongside a **version stamp**. This versioning allows every LILAM server to track, verify, and synchronize its active logic in real-time.
+Rules are organized into **Rule Sets**, structured as JSON objects. The central table `LILAM_RULES` stores each rule set with its **server group**, name and **version**. Exactly one rule set per group is active (`IS_ACTIVE`). Every LILAM server loads the active rule set of its group at startup and when `SERVER_UPDATE_RULES` is called; a new server of the group therefore uses the same rules automatically.
+
+Rules are evaluated by LILAM **servers** only. In INSESSION mode no rules are loaded.
 
 ### Trigger and Filter
-LILAM uses a hierarchical **Filtering Mechanism** to react to signals with high efficiency. Each rule is assigned to a specific **Trigger Type**, which defines the event that initiates the evaluation.
+Each rule is assigned to a **Trigger Type**, which defines the signal that starts the evaluation.
 
 #### Trigger Types
-
-**Available Trigger Types:**
-*   **`TRACE_START`**: Fired when a time measurement (transaction) begins. Useful for pre-checks or initializing external dependencies.
-*   **`TRACE_STOP`**: Fired when a transaction is completed. Ideal for performance monitoring and execution-time analysis.
-*   **`MARK_EVENT`**: Reacts to the arrival of a point-in-time milestone (Marker).
-*   **`PROCESS_START`**: Triggered by beginning process.
-*   **`PROCESS_UPDATE`**: Triggered by status changes or progress reports (e.g., step counters).
-*   **`PROCESS_END`**: Triggered by ending a process.
+*   **`PROCESS_START`**: a process (session) starts.
+*   **`PROCESS_UPDATE`**: status changes or progress reports (e.g., step counters).
+*   **`PROCESS_STOP`**: a process is closed; the rule sees the final values passed to `CLOSE_SESSION`.
+*   **`MARK_EVENT`**: a point-in-time milestone (marker) arrives.
+*   **`TRACE_START`**: a time measurement (transaction) begins. Useful for pre-checks.
+*   **`TRACE_STOP`**: a transaction is completed. Ideal for execution-time analysis.
+*   **`LOGGING`**: a log message arrives (`ERROR`, `WARN`, `INFO`, ...).
 
 #### Filtering Mechanism
-To minimize system overhead, the LILAM server evaluates rules in a two-stage process using high-performance associative arrays in memory, following the principle of **Specific before General**:
-1.  **Context Filter (`Action|Context`):** The system first checks for a highly specific rule matching the exact combination of action and context (e.g., `STATION_EXIT` at station `Moulin Rouge`).
-2.  **Action Filter (`Action`):** If no context-specific rule is found, the system falls back to searching for a general rule assigned only to the action. This allows for defining global thresholds across all contexts.
+The server keeps the rules in associative arrays in memory and evaluates them in two steps:
+1.  **Context rules (`Action|Context`):** rules for the exact combination of action and context (e.g., `STATION_EXIT` at station `Moulin Rouge`).
+2.  **Action rules (`Action`):** rules without context apply to **all** contexts of the action and are evaluated in addition.
 
-Multiple rules can be assigned to the same trigger. LILAM processes these rule lists sequentially, enabling complex chains of reaction.
+Rules for other actions cost nothing. Multiple rules can be assigned to the same action and trigger; LILAM evaluates them one after the other. An error in one rule does not prevent the others.
 
 ### Condition & Operator Matrix
-The following metrics and operators can be defined within the JSON rule sets to trigger alerts.
-
 #### Process Metrics
-**Trigger:** PROCESS_START, PROCESS_UPDATE, PROCESS_STOP
-These rules evaluate the global state of a process stored in the Master Table.
+**Trigger:** PROCESS_START, PROCESS_UPDATE, PROCESS_STOP. These rules evaluate the state of a process (Master Table). The action of the rule is the process name.
 
 | Metric         | Operator Name (JSON)   | Technical Condition                               | Use Case                                       |
 | :------------- | :--------------------- | :------------------------------------------------ | :--------------------------------------------- |
-| **Runtime**    | `RUNTIME_EXCEEDED`     | `(SYSTIMESTAMP - PROCESS_START) > value`          | Detect hanging or "zombie" processes.          |
-| **Runtime**    | `MAX_RUNTIME_EXCEEDED` | `(PROCESS_END - PROCESS_START) > value`           | Process took too much time                     |
+| **Runtime**    | `RUNTIME_EXCEEDED`     | `(SYSTIMESTAMP - PROCESS_START) > value` ms (PROCESS_UPDATE) | Process runs too long (checked when a signal arrives). |
+| **Runtime**    | `MAX_RUNTIME_EXCEEDED` | `(PROCESS_END - PROCESS_START) > value` ms (PROCESS_STOP) | Process took too much time.            |
 | **Progress**   | `STEPS_LEFT_HIGH`      | `(STEPS_TODO - STEPS_DONE) > value`               | Check for unfinished work at process end.      |
 | **Efficiency** | `SUCCESS_RATE_LOW`     | `(STEPS_DONE / STEPS_TODO) * 100 < value`         | Monitor batch processing quality.              |
 | **Frequency**  | `MAX_OCCURRENCE`       | `STEPS_DONE > value`                              | Flood protection / infinite loop detection.    |
 | **Status**     | `STATUS_EQUALS`        | `STATUS = value`                                  | React to specific error status codes.          |
-| **Info Text**  | `INFO_CONTAINS`        | `UPPER(INFO) LIKE '%' \|\| UPPER(value) \|\| '%'` | Search for keywords like "FATAL" or "ERROR".   |
-| **Dependency** | `PRECEDED_BY`          | `value = <Event name>`                            | Validates predecessor.                         |
-| **Dependency** | `PRECEDED_BY_WITHIN_SECS` | `value = <Event name>`                         | Validates predecessor and max. delay. |
+| **Info Text**  | `INFO_CONTAINS`        | `UPPER(INFO)` contains `UPPER(value)`             | Search for keywords like "FATAL" or "ERROR".   |
+| **Trigger**    | `ON_START`, `ON_UPDATE`, `ON_STOP` | trigger fired                         | Signal start, progress or end downstream.      |
+| **Dependency** | `PRECEDED_BY`          | last event/trace of the process ≠ `value` (PROCESS_UPDATE, PROCESS_STOP) | Validates predecessor. |
+| **Dependency** | `PRECEDED_BY_WITHIN_SECS` | like `PRECEDED_BY`, plus maximum delay          | Validates predecessor and max. delay.          |
 
 #### Action & Context Metrics
-**Trigger:** TRACE_START, TRACE_STOP, MARK_EVENT
-These rules evaluate granular performance data from the Monitor Table.
+**Trigger:** TRACE_START, TRACE_STOP, MARK_EVENT. These rules evaluate the data of the Monitor Table.
 
 | Metric          | Operator Name (JSON)  | Technical Condition                             | Use Case                                      |
 | :-------------- | :-------------------- | :---------------------------------------------- | :-------------------------------------------- |
-| **Execution**   | `ON_EVENT`            | `Trigger fired`                                 | Trigger an orchestrator as soon as event hits.|
-| **Trace Start** | `ON_START`            | `Trigger fired`                                 | Pre-process data or lock resources.           |
-| **Trace End**   | `ON_STOP`             | `Trigger fired`                                 | Signal completion to downstream systems.      |
-| **Duration**    | `MAX_DURATION_MS`     | `used_time > value`                             | Absolute time limit for a specific action.    |
-| **Variance**    | `AVG_DEVIATION_PCT`   | `used_time > (avg_time * (1 + value/100))`      | Relative deviation from moving average.       |
-| **Frequency**   | `MAX_OCCURRENCE`      | `action_count > value`                          | Flood protection / infinite loop detection.   |
-| **Interval**    | `MAX_GAP_SECONDS`     | `(TIMESTAMP - LAST_TIMESTAMP) > value`          | Detect stall between two consecutive events.  |
-| **Dependency**  | `PRECEDED_BY`          | `value = <Event name>`                         | Validates predecessor.                         |
-| **Dependency**  | `PRECEDED_BY_WITHIN_SECS` | `value = <Event name>`                      | Validates predecessor and max. delay. |
+| **Execution**   | `ON_EVENT`, `ON_START`, `ON_STOP` | trigger fired                       | Trigger an orchestrator as soon as the signal hits. |
+| **Duration**    | `MAX_DURATION_MS`     | `used_time > value` (MARK_EVENT, TRACE_STOP)    | Absolute time limit for a specific action.    |
+| **Variance**    | `AVG_DEVIATION_PCT`   | `used_time > avg_time * (1 + value/100)` (MARK_EVENT, TRACE_STOP) | Relative deviation from moving average. |
+| **Frequency**   | `MAX_OCCURRENCE`      | `action_count > value` (MARK_EVENT, TRACE_STOP) | Flood protection / infinite loop detection.   |
+| **Interval**    | `MAX_GAP_SECONDS`     | time since previous event (MARK_EVENT) or end of previous trace (TRACE_START) > value | Detect stall between two signals. |
+| **Dependency**  | `PRECEDED_BY`         | last event/trace of the process ≠ `ACTION[\|CONTEXT]` | Validates predecessor.                  |
+| **Dependency**  | `PRECEDED_BY_WITHIN_SECS` | like `PRECEDED_BY`, plus maximum delay in seconds | Validates predecessor and max. delay.   |
+
+#### Logging
+**Trigger:** LOGGING. Operator `SEVERITY` with the value `ERROR`, `WARN`, `MONITOR`, `INFO` or `DEBUG` fires for log messages of exactly this level.
+
+Only events and traces count as predecessors for `PRECEDED_BY`, not log messages. Rules are evaluated when a signal arrives; there is no timer-based evaluation.
 
 ### JSON Structure
 The JSON object is divided into a header for metadata and an array of individual rules. Alert throttling is managed in seconds:
@@ -194,20 +195,20 @@ The JSON object is divided into a header for metadata and an array of individual
       "action": "STATION_EXIT",
       "context": "Moulin Rouge",
       "condition": {
-        "metric": "RUNTIME",
-        "operator": "RUNTIME_EXCEEDED",
-        "value": 300
+        "operator": "MAX_DURATION_MS",
+        "value": "300000"
       },
       "alert": {
-        "handler": "LOG_AND_MAIL",
+        "handler": "LILAM_ALERT_MAIL_LOG",
         "severity": "CRITICAL",
         "throttle_seconds": 900
       }
     }
   ]
 }
-
 ```
+
+A server checks a rule set completely before it uses it. If one rule is invalid, the whole rule set is rejected and the previously loaded rules stay active.
 
 ---
 ## Operating Modes
@@ -267,7 +268,7 @@ In addition to the process-specific tables, LILAM uses internal tables whose nam
 | Table | Purpose |
 | --- | --- |
 | `LILAM_SERVER_REGISTRY` | Maintains server registration, availability, heartbeat, load, and currently active Rule Set information. |
-| `LILAM_RULES` | Stores versioned Rule Sets used by LILAM servers. |
+| `LILAM_RULES` | Stores versioned Rule Sets per server group, one of them active per group. |
 | `LILAM_LOG_INTERNAL` | Provides independent fallback logging for internal LILAM framework errors. |
 
 > [!NOTE]
@@ -367,8 +368,6 @@ If `SERVER_NEW_SESSION` is called with a `p_groupName`, only servers registered 
 | `IS_ACTIVE` | `NUMBER(1)` | Indicates whether the server is marked as active. |
 | `STATUS` | `VARCHAR2(20)` | Current status of the server. |
 | `PROCESSING` | `NUMBER` | Indicates what the server is currently processing. |
-| `RULE_SET_NAME` | `VARCHAR2(30)` | Name of the rule set currently associated with the server. |
-| `SET_IN_USE` | `NUMBER` | Version of the rule set currently imported by the server. |
 | `IS_DISPATCHER` | `NUMBER(1)` | `1` for a dispatcher. Dispatchers are never selected as the target of a server selection, neither by clients nor by another dispatcher. |
 
 ### Rules Table
@@ -378,17 +377,21 @@ Rules define how LILAM reacts to incoming signals. They are organized into Rule 
 
 The central table `LILAM_RULES` acts as the repository for these configurations. Its name is fixed and is not derived from `tabNameMaster`.
 
-Rule Sets are stored as JSON documents and identified by their name and version. This allows different versions of the same Rule Set to be maintained and enables LILAM servers to track which Rule Set and version is currently in use.
+Rule Sets are stored as JSON documents and identified by server group, name and version. This allows different versions of the same Rule Set to be maintained, and the same Rule Set can be stored for several groups. Per group exactly one row is active; `SERVER_UPDATE_RULES` switches the active row and informs the running servers of the group.
 
 #### Table Structure
 
 | Column | Data Type | Description |
 | --- | --- | --- |
-| `RULE_SET` | `CLOB` | Contains the Rule Set as a JSON document. |
+| `RULE_SET` | `CLOB` | Contains the Rule Set as a JSON document (`IS JSON`). |
+| `GROUP_NAME` | `VARCHAR2(50)` | Server group the Rule Set belongs to (`GROUP_NAME` of the registry). |
 | `SET_NAME` | `VARCHAR2(30)` | Name identifying the Rule Set. |
 | `VERSION` | `NUMBER` | Version of the Rule Set. |
+| `IS_ACTIVE` | `NUMBER(1)` | `1` for the Rule Set the servers of the group use; at most one per group. |
 | `CREATED` | `TIMESTAMP(6)` | Timestamp at which the Rule Set was created. |
 | `AUTHOR` | `VARCHAR2(50)` | Author associated with the Rule Set. |
+
+`GROUP_NAME`, `SET_NAME` and `VERSION` together are unique. Alerts (`LILAM_ALERTS`) refer to a rule by `GROUP_NAME`, `RULE_SET_NAME`, `RULE_SET_VERSION` and `RULE_ID`.
 
 ### Internal Log Table
 **Table Category:** Fixed Internal Table

@@ -53,6 +53,9 @@ create or replace PACKAGE LILAM AS
     NUM_ERR_SESSION_TIMEOUT   CONSTANT PLS_INTEGER  := -20110;  -- Server hat nicht rechtzeitig geantwortet
     TXT_ERR_SESSION_THROTTLED CONSTANT VARCHAR2(30) := 'SESSION_THROTTLED';
     NUM_ERR_SESSION_THROTTLED CONSTANT PLS_INTEGER  := -20120;  -- Server hat abgelehnt (Überlast)
+    -- SERVER_UPDATE_RULES: Rule Set fehlt für die Gruppe oder ist ungültig (Exception mit Begründung)
+    TXT_ERR_RULE_SET          CONSTANT VARCHAR2(30) := 'RULE_SET_REJECTED';
+    NUM_ERR_RULE_SET          CONSTANT PLS_INTEGER  := -20130;
     -- Kommunikationsfehler beim Anlegen: NUM_COMM_ERR (-20003)
 
     -- Leistungsstufen eines LILAM-Servers (Parameter p_perfServer von CREATE_SERVER/START_SERVER).
@@ -201,7 +204,8 @@ create or replace PACKAGE LILAM AS
                            p_perfServer PLS_INTEGER DEFAULT NULL);
     PROCEDURE SERVER_SHUTDOWN(p_processId number, p_pipeName varchar2, p_password varchar2);
     FUNCTION  GET_SERVER_PIPE(p_processId NUMBER) RETURN VARCHAR2;
-    PROCEDURE SERVER_UPDATE_RULES(p_processId NUMBER, p_ruleSetName VARCHAR2, p_ruleSetVersion PLS_INTEGER);
+    -- Rule Set für alle Server der Gruppe aktivieren (Dispatcher ausgenommen); Fehler => Exception NUM_ERR_RULE_SET
+    PROCEDURE SERVER_UPDATE_RULES(p_groupName VARCHAR2, p_ruleSetName VARCHAR2, p_ruleSetVersion PLS_INTEGER);
     PROCEDURE SET_DISPATCHER_PIPE(p_pipeName varchar2, p_groupName varchar2 DEFAULT 'DEFAULT_DISPATCHER', p_processId number DEFAULT null);
 
     PROCEDURE SERVER_SEND_ANY_MSG(p_processId number, p_message varchar2);

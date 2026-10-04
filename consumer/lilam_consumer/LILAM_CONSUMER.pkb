@@ -19,10 +19,11 @@ CREATE OR REPLACE PACKAGE BODY LILAM_CONSUMER AS
                     condition_value     varchar2 PATH '$.condition.value',
                     alert_handler       varchar2 PATH '$.alert.handler',
                     alert_severity      varchar2 PATH '$.alert.severity',
-                    alert_throttle      number   PATH '$.alert.throttle'
+                    alert_throttle      number   PATH '$.alert.throttle_seconds'
                 )
              ) jt
-        WHERE lr.set_name = p_alert_rec.rule_set_name
+        WHERE upper(lr.group_name) = upper(p_alert_rec.group_name)
+          AND lr.set_name = p_alert_rec.rule_set_name
           AND lr.version  = p_alert_rec.rule_set_version
           AND jt.id      = p_alert_rec.rule_id;
 
@@ -59,25 +60,21 @@ CREATE OR REPLACE PACKAGE BODY LILAM_CONSUMER AS
     
     PROCEDURE updateAlert(p_alertId NUMBER)
     as
-        sqlStmt VARCHAR2(400);
     begin
         UPDATE LILAM_ALERTS SET status = 'PROCESSED', processed_at = systimestamp WHERE alert_id = p_alertId;
-        
+
         EXCEPTION
             WHEN OTHERS THEN
             declare
-                v_err_msg CLOB := SUBSTR(SQLERRM, 1, 2000); 
+                v_err_msg VARCHAR2(2000) := SUBSTR(SQLERRM, 1, 2000);
             begin
                 ROLLBACK;
-                sqlStmt := '
-                UPDATE :1 
-                SET status = ''ERROR'', 
-                    -- Jetzt die Variable statt der Funktion nutzen
-                    error_message = v_err_msg,
-                    processed_at = SYSTIMESTAMP -- Hilfreich für das Debugging
-                WHERE alert_id = p_alertId';
-                EXECUTE IMMEDIATE sqlStmt
-                USING LILAM.C_LILAM_ALERTS;
+                -- Tabellenname ist fest (LILAM.C_LILAM_ALERTS_TABLE); Binds gehen nur für Werte
+                UPDATE LILAM_ALERTS
+                   SET status = 'ERROR',
+                       error_message = v_err_msg,
+                       processed_at = SYSTIMESTAMP -- Hilfreich für das Debugging
+                 WHERE alert_id = p_alertId;
                 COMMIT;
             end;
     end;

@@ -57,17 +57,23 @@ LILAM is developed by a developer who hates over-engineered tools. Focus: 5 minu
 
 ## Quick start
 1. Execute [grants](docs/setup.md#privileges-of-your-schema-user)
-3. Copy & compile [spec](source/package/lilam.pks) and [body](source/package/lilam.pkb)
-4. Execute
+2. Copy & compile [spec](source/package/lilam.pks) and [body](source/package/lilam.pkb)
+3. Execute
     ```sql
-     l_pid := lilam.new_session('MY_PROCESS');
-     lilam.warn(l_pid, 'Hello LILAM');
-     lilam.close_session(l_pid);
+    DECLARE
+      l_pid NUMBER;
+    BEGIN
+      l_pid := lilam.new_session('MY_PROCESS');
+      lilam.warn(l_pid, 'Hello LILAM');
+      lilam.close_session(l_pid);
+    END;
+    /
     ```
-5. Query
+4. Query (the tables are created automatically on the first call)
     ```sql
-     select * from lilam.proc; -- process status
-     select * from lilam.log;  -- log details
+     select * from lilam_proc; -- process status
+     select * from lilam_log;  -- log details
+     select * from lilam_mon;  -- events and traces
     ```
 
 ## Key features
@@ -211,7 +217,7 @@ Instead of performing expensive aggregations across millions of monitor records,
 ### Core Strengths
 
 #### Scalability & Cloud Readiness
-By avoiding file system dependencies (`UTL_FILE`) and focusing on native database features, LILAM is 100% compatible with **Oracle Autonomous Database** and optimized for scalable cloud infrastructures.
+By avoiding file system dependencies (`UTL_FILE`) and focusing on native database features, LILAM is suited for scalable cloud infrastructures.
 
 #### Developer Experience (DX)
 LILAM promotes a standardized error-handling and monitoring culture within development teams. Its easy-to-use API allows for a "zero-config" start, enabling developers to implement professional observability in just a few minutes. No excessive DBA grants or infrastructure overhead required — just provide standard PL/SQL permissions, deploy the package, and start logging immediately.
@@ -226,7 +232,7 @@ LILAM categorizes data by its intended use to ensure maximum performance for sta
 ### Rule-based Observability & Orchestration
 LILAM doesn't just log data; it evaluates it. Using versioned JSON Rule-Sets, LILAM monitors process changes and business transactions in real-time.
 
-* **Versioned Logic:** Different worker instances can run different versions of the same rule-set simultaneously—perfect for side-by-side testing or phased rollouts.
+* **Versioned Logic:** Each server group runs its own rule set and version—perfect for side-by-side testing or phased rollouts in separate groups.
 * **Instant Alerts:** Violations trigger immediate alerts, which are processed by independent consumers.
 * **System Decoupling:** By separating alert generation from processing, LILAM stays lean and serves as a high-performance orchestrator for downstream application logic.
 
@@ -293,41 +299,49 @@ To illustrate how LILAM works, imagine monitoring a subway system:
 ```
 ---
 ## Data
-The tables displayed below illustrate core content and, depending on the specific LILAM version, may include additional detailed information.
+LILAM stores its data in three tables per application. Their names are derived from `p_tabNameMaster` (default `LILAM`): `LILAM_PROC`, `LILAM_LOG` and `LILAM_MON`. The tables are created automatically on the first API call.
+The tables displayed below illustrate core content and, depending on the specific LILAM version, may include additional columns. The complete structure is described in [architecture and concepts](docs/architecture%20and%20concepts.md#tables).
 
 ### Process data
-
+One row per process run; provides the current status of the process.
 ```sql
-SELECT id, status, last_update, ... FROM lilam_log WHERE process_name = ... (provides the current status of the process)
+SELECT id, process_name, process_start, process_end, last_update, steps_todo, steps_done, status, info
+FROM   lilam_proc
+WHERE  process_name = 'MY_PROCESS';
 ```
 
->| ID | PROCESS_NAME   | PROCESS_START         | PROCESS_END           | LAST_UPDATE           | STEPS_TO_DO | STEPS_DONE | STATUS | INFO
->| -- | ---------------| --------------------- | --------------------- | --------------------- | ----------- | ---------- | ------ | ------
->| 1  | my application | 12.01.26 18:17:51,... | 12.01.26 18:18:53,... | 12.01.26 18:18:53,... | 100         | 99         | 2      | ERROR
+>| ID | PROCESS_NAME | PROCESS_START         | PROCESS_END           | LAST_UPDATE           | STEPS_TODO | STEPS_DONE | STATUS | INFO
+>| -- | ------------ | --------------------- | --------------------- | --------------------- | ---------- | ---------- | ------ | ------
+>| 1  | MY_PROCESS   | 12.01.26 18:17:51,... | 12.01.26 18:18:53,... | 12.01.26 18:18:53,... | 100        | 99         | 2      | ERROR
 
 
 ### Logging data
 ```sql
-SELECT * FROM lilam_log_detail WHERE process_id = <id> AND monitoring = 0 
+SELECT process_id, no, info, log_level_c, session_time, session_user, host_name, err_stack, err_backtrace, err_callstack
+FROM   lilam_log
+WHERE  process_id = <id>
+ORDER  BY no;
 ```
-The monitoring table consists of two parts: the 'left' one is dedicated to logging, the 'right' one is dedicated to monitoring.
 
->| PROCESS_ID | NO | INFO               | LOG_LEVEL | SESSION_TIME    | SESSION_USER | HOST_NAME | ERR_STACK        | ERR_BACKTRACE    | ERR_CALLSTACK    |
->| ---------- | -- | --------------     | --------- | --------------- | ------------ | --------- | ---------------- | ---------------- | ---------------- | 
->| 1          | 1  | Start              | INFO      | 13.01.26 10:... | SCOTT        | SERVER1   | NULL             | NULL             | NULL             | 
->| 1          | 2  | Function A         | DEBUG     | 13.01.26 11:... | SCOTT        | SERVER1   | NULL             | NULL             | "--- PL/SQL ..." | 
->| 1          | 3  | Something happened | ERROR     | 13.01.26 12:... | SCOTT        | SERVER1   | "--- PL/SQL ..." | "--- PL/SQL ..." | "--- PL/SQL ..." | 
+>| PROCESS_ID | NO | INFO               | LOG_LEVEL_C | SESSION_TIME    | SESSION_USER | HOST_NAME | ERR_STACK        | ERR_BACKTRACE    | ERR_CALLSTACK    |
+>| ---------- | -- | ------------------ | ----------- | --------------- | ------------ | --------- | ---------------- | ---------------- | ---------------- |
+>| 1          | 1  | Start              | INFO        | 13.01.26 10:... | SCOTT        | SERVER1   | NULL             | NULL             | NULL             |
+>| 1          | 2  | Function A         | DEBUG       | 13.01.26 11:... | SCOTT        | SERVER1   | NULL             | NULL             | "--- PL/SQL ..." |
+>| 1          | 3  | Something happened | ERROR       | 13.01.26 12:... | SCOTT        | SERVER1   | "--- PL/SQL ..." | "--- PL/SQL ..." | "--- PL/SQL ..." |
 
 ### Monitoring data
+Events (`MON_TYPE` = 0) and traces (`MON_TYPE` = 1) share one table. `STOP_TIME` remains `NULL` for events.
 ```sql
-SELECT * FROM lilam_log_detail WHERE process_id = <id> AND monitoring = 1 
+SELECT process_id, mon_type, action, context, start_time, stop_time, used_millis, avg_millis, action_count
+FROM   lilam_mon
+WHERE  process_id = <id>;
 ```
 
->| PROCESS_ID | MON_TYPE   | ACTION     | CONTEXT          | START_TIME     | STOP_TIME       |STEPS_DONE     | USED_MILLIS | AVG_MILLIS | ACTION_COUNT
->| ---------- | ---------- | ---------- | ---------------- | -------------- | --------------- | ------------- | ----------- | ---------- | --------------
->| 1          | 0          | MY_ACTION  | MY_CONTEXT       | 13.01.26 10:.. | NULL            | NULL          | 402         |            | 0
->| 1          | 0          | MY_ACTION  | MY_CONTEXT       | 2              | NULL            | 1500          | 510         | 501        | 505
->| 1          | 1          | TRANS_ACT  | ROUTE_1          | 5              | 1000            | 1             | 490         | 500        | 499
+>| PROCESS_ID | MON_TYPE | ACTION    | CONTEXT    | START_TIME      | STOP_TIME       | USED_MILLIS | AVG_MILLIS | ACTION_COUNT |
+>| ---------- | -------- | --------- | ---------- | --------------- | --------------- | ----------- | ---------- | ------------ |
+>| 1          | 0        | MY_ACTION | MY_CONTEXT | 13.01.26 10:... | NULL            | 402         | 402        | 1            |
+>| 1          | 0        | MY_ACTION | MY_CONTEXT | 13.01.26 10:... | NULL            | 510         | 456        | 2            |
+>| 1          | 1        | TRANS_ACT | ROUTE_1    | 13.01.26 10:... | 13.01.26 10:... | 490         | 490        | 1            |
 
 ---
 ## Repository Structure
