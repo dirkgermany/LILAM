@@ -96,7 +96,7 @@ Rules are organized into Rule Sets, stored as JSON documents in the `LILAM_RULES
 Unknown properties (e.g. `_comment`) are ignored.
 
 ### Validation when loading
-A server checks a rule set completely before it uses it: required fields, lengths, unique ids, known trigger types and operators, operators allowed for the trigger, and the format of `condition.value`. If a single rule is invalid, the **whole** rule set is rejected, the previously loaded rules stay active and the registry is not changed. The reason is written to `LILAM_LOG_INTERNAL` and to the log of the server process.
+A server checks a rule set completely before it uses it: required fields, lengths, unique ids, known trigger types and operators, operators allowed for the trigger, and the format of `condition.value`. If a single rule is invalid, the **whole** rule set is rejected and the previously loaded rules stay active. `SERVER_UPDATE_RULES` performs the same check before it changes the registry and raises an exception with the reason; a server that rejects a rule set at startup writes the reason to `LILAM_LOG_INTERNAL` and to the log of the server process.
 
 ### Hooks / Trigger Types
 | hook | scope | API call
