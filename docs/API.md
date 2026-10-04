@@ -624,10 +624,10 @@ FUNCTION GET_COUNTER_ERROR(
 ) RETURN PLS_INTEGER
 ```
 
-Return the number of calls of `WARN` and `ERROR` since the start of the database session.
+Return the number of calls of `WARN` and `ERROR` for the process since it was started.
 
 > [!NOTE]
-> Counting is currently per database session across all processes; `p_processId` is not evaluated.
+> Counting takes place in the database session that calls `WARN` or `ERROR` (in decoupled mode, i.e. on the client). For unknown or already closed processes, both functions return 0.
 
 ---
 

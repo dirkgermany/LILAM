@@ -626,10 +626,10 @@ FUNCTION GET_COUNTER_ERROR(
 ) RETURN PLS_INTEGER
 ```
 
-Liefern die Anzahl der Aufrufe von `WARN` bzw. `ERROR` seit Beginn der Datenbanksession.
+Liefern die Anzahl der Aufrufe von `WARN` bzw. `ERROR` für den Prozess, seit er gestartet wurde.
 
 > [!NOTE]
-> Gezählt wird derzeit je Datenbanksession über alle Prozesse; `p_processId` wird nicht ausgewertet.
+> Gezählt wird in der Datenbanksession, die `WARN` bzw. `ERROR` aufruft (im entkoppelten Modus also beim Client). Für unbekannte oder bereits geschlossene Prozesse liefern beide Funktionen 0.
 
 ---
 
