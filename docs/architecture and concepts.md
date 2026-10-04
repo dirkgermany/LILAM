@@ -369,6 +369,7 @@ If `SERVER_NEW_SESSION` is called with a `p_groupName`, only servers registered 
 | `PROCESSING` | `NUMBER` | Indicates what the server is currently processing. |
 | `RULE_SET_NAME` | `VARCHAR2(30)` | Name of the rule set currently associated with the server. |
 | `SET_IN_USE` | `NUMBER` | Version of the rule set currently imported by the server. |
+| `IS_DISPATCHER` | `NUMBER(1)` | `1` for a dispatcher. Dispatchers are never selected as the target of a server selection, neither by clients nor by another dispatcher. |
 
 ### Rules Table
 **Table Category:** Fixed Internal Table
