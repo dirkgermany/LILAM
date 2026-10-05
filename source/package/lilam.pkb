@@ -1370,7 +1370,7 @@ AS
 
         -- INSESSION: höchstens alle C_RULES_CHECK_INTERVAL_MS auf ein geändertes aktives Rule Set prüfen
         -- (Server erhalten Änderungen über SERVER_UPDATE_RULES).
-        -- PERFORMANCE: DBMS_UTILITY.GET_TIME statt SYSTIMESTAMP (gemessen ca. 1,4 µs statt 19 µs je Aufruf).
+        -- PERFORMANCE: DBMS_UTILITY.GET_TIME statt SYSTIMESTAMP und Intervallrechnung (gemessen < 1 µs statt ca. 10–25 µs).
         -- ABS: beim Überlauf von GET_TIME gibt es höchstens eine zusätzliche Prüfung.
         IF g_serverPipeName IS NULL
            AND (NOT g_rule_groups.EXISTS(l_group)
