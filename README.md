@@ -102,8 +102,8 @@ It combines process lifecycle tracking, metrics, and rule-based reactions into a
 |-------------------------------------|-------|--------|-----|-----------|
 | Logging                             | ✅    | ✅     | ✅  | ✅        |
 | Log Levels                          | ✅    | ✅     | ✅  | ✅        |
-| Error Context (Stack, Backtrace)    | ✅    | ⚠️     | ✅  | ⚠️        |
-| Autonomous Transaction Logging      | ✅    | ✅     | ⚠️  | ❌        |
+| Error Context (Stack, Backtrace)    | ✅    | ✅     | ✅  | ⚠️        |
+| Autonomous Transaction Logging      | ✅    | ✅     | ⚠️  | ✅        |
 | Minimal Setup (Package-based)       | ✅    | ✅     | ⚠️  | ❌        |
 
 ---
