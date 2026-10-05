@@ -14,24 +14,24 @@ AS
     C_SERVER_SYNC_INTERVAL_MS          CONSTANT PLS_INTEGER := 500;
     C_SERVER_HEARTBEAT_INTERVAL_MS     CONSTANT PLS_INTEGER := 60000;
     C_SERVER_MAX_LOOPS_IN_TIME_NO      CONSTANT PLS_INTEGER := 10000; -- 1000
-    C_SERVER_TIMEOUT_WAIT_FOR_MSG_SEC  CONSTANT NUMBER      := 0.2; -- Timeout nach Sekunden Warten auf Nachricht
+    C_SERVER_TIMEOUT_WAIT_FOR_MSG_SEC  CONSTANT NUMBER      := 0.2; -- Timeout in seconds when waiting for a message
     C_SERVER_TIMEOUT_MAX_WAIT_SEC      CONSTANT NUMBER      := 5;
     C_MAX_SERVER_PIPE_SIZE             CONSTANT PLS_INTEGER := 16777216; --  16777216, 67108864
     
     C_MAX_REGISTRY_HEARTBEAT_AGE_SEC   CONSTANT PLS_INTEGER  := 15;  --  Server HEARTBEAT in Registry mustn't be older
 
     -- Dedicated to Client
-    -- Drosselung des Clients: Grenze je Prozess kommt vom Server (p_perfServer, siehe C_SERVER_PERF_*)
-    C_THROTTLE_INTERVAL_NO             CONSTANT PLS_INTEGER := 1000; -- Zeitfenster in ms für die Grenze
+    -- Client throttling: the limit per process comes from the server (p_perfServer, see C_SERVER_PERF_*)
+    C_THROTTLE_INTERVAL_NO             CONSTANT PLS_INTEGER := 1000; -- Time window in ms for the limit
 
     -- Max Dirty Buffers and 
     C_FLUSH_MILLIS_THRESHOLD_MS        CONSTANT PLS_INTEGER := 1500;  -- 1500 Max. Millis until flush
     C_FLUSH_LOG_THRESHOLD_NO           CONSTANT PLS_INTEGER := 50000; -- 50000 Max. number of dirty buffered logs until flush
     C_FLUSH_MONITOR_THRESHOLD_NO       CONSTANT PLS_INTEGER := 50000; -- 50000 Max. number of dirty buffered metrics until flush
-    C_SYNC_ALL_INTERVAL_MS             CONSTANT PLS_INTEGER := 500;   -- SYNC_ALL_DIRTY (ohne Force) hoechstens alle n ms
+    C_SYNC_ALL_INTERVAL_MS             CONSTANT PLS_INTEGER := 500;   -- SYNC_ALL_DIRTY (without force) at most every n ms
 
-    -- INSESSION: Prüfung auf ein geändertes aktives Rule Set der Gruppe hoechstens alle n ms
-    -- (ausgelöst durch API-Aufrufe; Server werden über SERVER_UPDATE_RULES benachrichtigt)
+    -- INSESSION: check for a changed active rule set of the group at most every n ms
+    -- (triggered by API calls; servers are notified via SERVER_UPDATE_RULES)
     C_RULES_CHECK_INTERVAL_MS          CONSTANT PLS_INTEGER := 15000;
 
     ---------------------------------------------------------------
@@ -50,23 +50,23 @@ AS
     -- Other general Parameters
     ---------------------------------------------------------------
     C_TIMEOUT_NEW_SESSION_SEC           CONSTANT NUMBER      := 3.0;  -- NEW_SESSION max. time waiting for server response
-    C_METRIC_ALERT_FACTOR_SEC           CONSTANT NUMBER      := 2.0;   -- Max. Ausreißer in der Dauer eines Verarbeitungsschrittes
-    C_MAX_LOG_TEXT_LEN                  CONSTANT PLS_INTEGER := 1900;  -- Logtexte werden pauschal auf diese Länge gekürzt (Spalte INFO: 2000)
+    C_METRIC_ALERT_FACTOR_SEC           CONSTANT NUMBER      := 2.0;   -- Max. outlier in the duration of a processing step
+    C_MAX_LOG_TEXT_LEN                  CONSTANT PLS_INTEGER := 1900;  -- Log texts are always truncated to this length (column INFO: 2000)
 
-    -- Baseline Scopes (prozessübergreifende Durchschnittswerte)
-    -- t_session_init.baselineScope:  NULL    => Scope = Prozessname (Default)
-    --                                '#NONE' => kein Scope, Durchschnitt nur pro Prozess
-    --                                sonst   => frei gewählter Scope-Name
+    -- Baseline scopes (cross-process averages)
+    -- t_session_init.baselineScope:  NULL    => scope = process name (default)
+    --                                '#NONE' => no scope, average per process only
+    --                                else    => freely chosen scope name
     C_SCOPE_NONE                        CONSTANT VARCHAR2(20) := '#NONE';
-    C_SCOPE_RESERVED_PREFIX             CONSTANT VARCHAR2(1)  := '#';      -- '#...' ist für LILAM reserviert
-    C_BASELINE_NULL_CONTEXT             CONSTANT VARCHAR2(1)  := '-';      -- Ersatz für NULL-Context im PK
-    C_BASELINE_SYNC_INTERVAL_MS         CONSTANT PLS_INTEGER  := 1500;     -- Abgleich PGA <-> LILAM_BASELINES
-    C_BASELINE_IDLE_EVICT_SEC           CONSTANT PLS_INTEGER  := 900;      -- Unbenutzte Baselines aus dem PGA entfernen
+    C_SCOPE_RESERVED_PREFIX             CONSTANT VARCHAR2(1)  := '#';      -- '#...' is reserved for LILAM
+    C_BASELINE_NULL_CONTEXT             CONSTANT VARCHAR2(1)  := '-';      -- Replacement for NULL context in the PK
+    C_BASELINE_SYNC_INTERVAL_MS         CONSTANT PLS_INTEGER  := 1500;     -- Sync PGA <-> LILAM_BASELINES
+    C_BASELINE_IDLE_EVICT_SEC           CONSTANT PLS_INTEGER  := 900;      -- Remove unused baselines from the PGA
 
     -- Pipe handling
     C_PIPE_ID_PENDING               CONSTANT BINARY_INTEGER := -1; 
-    -- Steuer-Pipe je Server/Dispatcher: <PIPE>_CTL. Nimmt NEW_SESSION auf, damit das Anlegen eines Prozesses
-    -- nicht hinter den Datennachrichten der Daten-Pipe warten muss (ersetzt das alte, unbenutzte '_INTERLEAVE').
+    -- Control pipe per server/dispatcher: <PIPE>_CTL. Receives NEW_SESSION so that creating a process
+    -- does not have to wait behind the data messages of the data pipe (replaces the old, unused '_INTERLEAVE').
     C_CTL_PIPE_SUFFIX               CONSTANT VARCHAR2(20)   := '_CTL';
     C_MAX_CTL_PIPE_SIZE             CONSTANT PLS_INTEGER    := 1048576;
 
@@ -87,17 +87,17 @@ AS
         serial_no           PLS_INTEGER := 0,
         log_level           PLS_INTEGER := 0,
         monitoring          PLS_INTEGER := 0,
-        last_monitor_flush  TIMESTAMP, -- Zeitpunkt des letzten Monitor-Flushes
-        last_log_flush      TIMESTAMP(6), -- Zeitpunkt des letzten Log-Flushes
+        last_monitor_flush  TIMESTAMP, -- Time of the last monitor flush
+        last_log_flush      TIMESTAMP(6), -- Time of the last log flush
         monitor_dirty_count PLS_INTEGER := 0,  -- monitor entries per process counter
         log_dirty_count     PLS_INTEGER := 0,  -- Logs per process counter
         process_is_dirty    BOOLEAN,
         last_process_flush  TIMESTAMP(6),
         last_sync_check     TIMESTAMP(6),
-        group_name          VARCHAR2(50),  -- Gruppe wie angegeben (Server: Servergruppe), für Alerts
-        rule_group          VARCHAR2(50),  -- upper(group_name): Schlüssel der Regeln; NULL = keine Regeln
+        group_name          VARCHAR2(50),  -- Group as specified (server: server group), for alerts
+        rule_group          VARCHAR2(50),  -- upper(group_name): key of the rules; NULL = no rules
         tabName_master      VARCHAR2(100),
-        scope_id            NUMBER(19,0)  -- NULL = kein prozessübergreifender Scope
+        scope_id            NUMBER(19,0)  -- NULL = no cross-process scope
     );
 
     -- Table for several processes
@@ -108,38 +108,38 @@ AS
     TYPE t_idx IS TABLE OF PLS_INTEGER INDEX BY BINARY_INTEGER;
     v_indexSession t_idx;
 
-    -- Private Liste im Speicher (PGA)
-    -- Index ist die Session-ID, Wert ist beliebig (hier Boolean)
+    -- Private list in memory (PGA)
+    -- Index is the session ID, value is arbitrary (here Boolean)
     TYPE t_remote_sessions IS TABLE OF BOOLEAN INDEX BY BINARY_INTEGER;
     g_remote_sessions t_remote_sessions;
-    -- IDs, für die ein Reconnect über den Dispatcher gescheitert ist, mit Zeitpunkt des nächsten erlaubten
-    -- Versuchs. Verhindert, dass jeder Aufruf mit einer unbekannten ID erneut synchron beim Dispatcher anfragt.
+    -- IDs for which a reconnect via the dispatcher failed, with the time of the next allowed
+    -- attempt. Prevents every call with an unknown ID from querying the dispatcher synchronously again.
     TYPE t_unknown_pids IS TABLE OF TIMESTAMP INDEX BY BINARY_INTEGER;
     g_unknown_pids t_unknown_pids;
 
     TYPE t_throttle_stat IS RECORD (
         msg_count  PLS_INTEGER := 0,
         last_check TIMESTAMP    := SYSTIMESTAMP,
-        msg_limit  PLS_INTEGER := 1500  -- Nachrichten je Zeitfenster; 0 = keine Drosselung (Wert vom Server)
+        msg_limit  PLS_INTEGER := 1500  -- Messages per time window; 0 = no throttling (value from the server)
     );
     TYPE t_throttle_tab IS TABLE OF t_throttle_stat INDEX BY BINARY_INTEGER;
     g_local_throttle_cache t_throttle_tab;
 
     ---------------------------------------------------------------
-    -- Gemeinsamer Typ für Monitoring und Process
+    -- Common type for monitoring and process
     ---------------------------------------------------------------
     TYPE t_eval_context_rec IS RECORD (
-        -- gemeinsame Daten
+        -- common data
         process_id    NUMBER(19,0),
         action_name   VARCHAR2(100),
         context_name  VARCHAR2(100),
         start_time    TIMESTAMP(6),
         stop_time     TIMESTAMP(6),
-        -- Monitoring Felder
+        -- Monitoring fields
         used_time     NUMBER,
         action_count  PLS_INTEGER,
-        avg_time      NUMBER,         -- Referenz-Durchschnitt VOR dieser Messung (NULL im Warm-up)
-        -- Prozess-spezifische Felder
+        avg_time      NUMBER,         -- Reference average BEFORE this measurement (NULL during warm-up)
+        -- Process-specific fields
         process_end   TIMESTAMP,
         last_update   TIMESTAMP,
         steps_todo    PLS_INTEGER,
@@ -162,12 +162,12 @@ AS
         action_name     VARCHAR2(100),
         context_name    VARCHAR2(100),
         monitor_type    PLS_INTEGER,
-        avg_action_time NUMBER,             -- Umbenannt
-        start_time      TIMESTAMP(6),          -- Startzeitpunkt der Aktion
-        stop_time       TIMESTAMP(6),          -- Startzeitpunkt der Aktion
-        used_time       NUMBER,             -- Dauer der letzten Ausführung (in Sek.)
-        action_count   PLS_INTEGER := 0,   -- Arbeitsschritt einer Action / Transaktion (pro Prozess)
-        baseline_avg    NUMBER              -- Durchschnitt VOR dieser Messung, Referenz für Regeln (nicht persistiert)
+        avg_action_time NUMBER,             -- Renamed
+        start_time      TIMESTAMP(6),          -- Start time of the action
+        stop_time       TIMESTAMP(6),          -- Stop time of the action
+        used_time       NUMBER,             -- Duration of the last execution (in sec.)
+        action_count   PLS_INTEGER := 0,   -- Work step of an action / transaction (per process)
+        baseline_avg    NUMBER              -- Average BEFORE this measurement, reference for rules (not persisted)
     );
     TYPE t_monitor_history_tab IS TABLE OF t_monitor_buffer_rec;    
     TYPE t_monitor_map IS TABLE OF t_monitor_history_tab INDEX BY VARCHAR2(200);
@@ -176,9 +176,9 @@ AS
     g_monitor_shadows t_monitor_shadow_map;
     g_monitor_averages t_monitor_shadow_map;
 
-    -- Prozessübergreifende Baselines (Scope)
-    -- avg_ms/action_count: aktueller Stand im PGA
-    -- base_avg/base_count: Stand beim letzten Laden/Abgleich mit LILAM_BASELINES (für Delta-Merge)
+    -- Cross-process baselines (scope)
+    -- avg_ms/action_count: current state in the PGA
+    -- base_avg/base_count: state at the last load/sync with LILAM_BASELINES (for delta merge)
     TYPE t_baseline_rec IS RECORD (
         scope_id        NUMBER(19,0),
         action_name     VARCHAR2(100),
@@ -189,24 +189,24 @@ AS
         base_count      NUMBER := 0,
         in_db           BOOLEAN := FALSE,
         dirty           BOOLEAN := FALSE,
-        last_touch_cs   NUMBER          -- letzte Nutzung (DBMS_UTILITY.GET_TIME), für das Verdrängen
+        last_touch_cs   NUMBER          -- last use (DBMS_UTILITY.GET_TIME), for eviction
     );
     TYPE t_baseline_map IS TABLE OF t_baseline_rec INDEX BY VARCHAR2(250);
     g_baselines t_baseline_map;
     g_last_baseline_sync TIMESTAMP(6);
 
-    -- Cache Scope-Name -> Scope-ID
+    -- Cache scope name -> scope ID
     TYPE t_scope_id_map IS TABLE OF NUMBER INDEX BY VARCHAR2(100);
     g_scope_ids t_scope_id_map;
 
-    -- Master-Tabellen, deren Tabellen in dieser Session bereits geprueft/angelegt wurden
+    -- Master tables whose tables have already been checked/created in this session
     TYPE t_checked_masters IS TABLE OF BOOLEAN INDEX BY VARCHAR2(100);
     g_checked_masters t_checked_masters;
-    -- PERFORMANCE: Ergebnis von DBMS_ASSERT.SQL_OBJECT_NAME je Tabellenname (kostet sonst ca. 0,4 ms je Flush)
+    -- PERFORMANCE: result of DBMS_ASSERT.SQL_OBJECT_NAME per table name (otherwise costs approx. 0.4 ms per flush)
     TYPE t_safe_tables IS TABLE OF VARCHAR2(150) INDEX BY VARCHAR2(150);
     g_safe_tables t_safe_tables;
 
-    -- Letztes Event bzw. letzter Trace je Prozess (Vorgänger für PRECEDED_BY); Logs zählen nicht
+    -- Last event or trace per process (predecessor for PRECEDED_BY); logs do not count
     TYPE t_action_history_rec IS RECORD (
         action_name  VARCHAR2(100),
         context_name VARCHAR2(100),
@@ -230,12 +230,12 @@ AS
         err_callstack   VARCHAR2(4000)
     );
 
-    -- Die Liste für den Bulk-Speicher
-    -- Die flache Liste der Log-Einträge
+    -- The list for bulk storage
+    -- The flat list of log entries
     TYPE t_log_history_tab IS TABLE OF t_log_buffer_rec;
 
-    -- Das Haupt-Objekt für Logs: 
-    -- Key ist hier die process_id (als String gewandelt für die Map)
+    -- The main object for logs: 
+    -- Key is the process_id (converted to a string for the map)
     TYPE t_log_map IS TABLE OF t_log_history_tab INDEX BY VARCHAR2(100);
     g_log_groups t_log_map;
 
@@ -245,7 +245,7 @@ AS
     -- Time precision
     TYPE t_timestamp_list_t IS TABLE OF TIMESTAMP(6);
 
-    -- PERFORMANCE: Sammelpuffer für den gebündelten Flush in SYNC_ALL_DIRTY (siehe flushBatch)
+    -- PERFORMANCE: collection buffer for the bundled flush in SYNC_ALL_DIRTY (see flushBatch)
     TYPE t_log_batch_rec IS RECORD (
         pids       sys.odcinumberlist   := sys.odcinumberlist(),
         seqs       sys.odcinumberlist   := sys.odcinumberlist(),
@@ -282,7 +282,7 @@ AS
         info       sys.odcivarchar2list := sys.odcivarchar2list(),
         immortal   sys.odcinumberlist   := sys.odcinumberlist()
     );
-    TYPE t_proc_batches IS TABLE OF t_proc_batch_rec INDEX BY VARCHAR2(150);  -- Schlüssel: Master-Tabelle
+    TYPE t_proc_batches IS TABLE OF t_proc_batch_rec INDEX BY VARCHAR2(150);  -- Key: master table
 
     g_batch_mode    BOOLEAN := FALSE;
     g_log_batches   t_log_batches;
@@ -293,7 +293,7 @@ AS
     ---------------------------------------------------------------
     -- Rules
     ---------------------------------------------------------------
-    -- Typ-Definition für die Regeldetails (aus dem JSON)
+    -- Type definition for the rule details (from the JSON)
     TYPE t_rule_rec IS RECORD (
         rule_id             VARCHAR2(50),
         trigger_type        VARCHAR2(50),  -- TRACE_STOP, MARK_EVENT
@@ -302,31 +302,31 @@ AS
         condition_metric    VARCHAR2(50),
         condition_operator  VARCHAR2(50),  -- MAX_DURATION_MS, PRECEDED_BY, etc.
         condition_value     VARCHAR2(250),
-        alert_handler       VARCHAR2(30),  -- Name des DBMS_ALERT-Signals (max. 30 Zeichen)
+        alert_handler       VARCHAR2(30),  -- Name of the DBMS_ALERT signal (max. 30 characters)
         alert_severity      VARCHAR2(30),
-        throttle_seconds    NUMBER,        -- Warten bis zum nächsten Alarm
-        -- PERFORMANCE: beim Laden aufbereitete Werte (keine Umwandlung je Signal)
-        cond_num            NUMBER,        -- Zahlenwert (NLS-unabhängig), z.B. Grenze in ms
-        cond_action         VARCHAR2(100), -- PRECEDED_BY*: erwartete Vorgänger-Action
-        cond_context        VARCHAR2(100), -- PRECEDED_BY*: erwarteter Kontext (NULL = beliebig)
-        cond_upper          VARCHAR2(100)  -- SEVERITY, INFO_CONTAINS: Wert in Großbuchstaben
+        throttle_seconds    NUMBER,        -- Wait until the next alert
+        -- PERFORMANCE: values prepared at load time (no conversion per signal)
+        cond_num            NUMBER,        -- Numeric value (NLS-independent), e.g. limit in ms
+        cond_action         VARCHAR2(100), -- PRECEDED_BY*: expected predecessor action
+        cond_context        VARCHAR2(100), -- PRECEDED_BY*: expected context (NULL = any)
+        cond_upper          VARCHAR2(100)  -- SEVERITY, INFO_CONTAINS: value in upper case
     );
     TYPE t_rule_list IS TABLE OF t_rule_rec;
     TYPE t_rule_map IS TABLE OF t_rule_list INDEX BY VARCHAR2(300);
 
-    -- Regeln aller geladenen Gruppen. Schlüssel: GRUPPE|ACTION bzw. GRUPPE|ACTION|CONTEXT
-    -- (GRUPPE = rule_group der Session). Server: nur die eigene Gruppe; INSESSION: jede Gruppe,
-    -- die in dieser DB-Session mit NEW_SESSION angegeben wurde.
+    -- Rules of all loaded groups. Key: GROUP|ACTION or GROUP|ACTION|CONTEXT
+    -- (GROUP = rule_group of the session). Server: only its own group; INSESSION: every group
+    -- that was specified with NEW_SESSION in this DB session.
     g_rules_by_context t_rule_map;
     g_rules_by_action  t_rule_map;
 
-    -- Stand je Gruppe (Schlüssel: rule_group)
+    -- State per group (key: rule_group)
     TYPE t_rule_group_rec IS RECORD (
-        set_name     VARCHAR2(30),      -- geladenes Rule Set (für Alerts); NULL = keine Regeln
+        set_name     VARCHAR2(30),      -- loaded rule set (for alerts); NULL = no rules
         set_version  NUMBER := 0,
-        seen_name    VARCHAR2(30),      -- zuletzt gesehenes aktives Rule Set, auch wenn abgelehnt
-        seen_version NUMBER,            -- (ein abgelehntes Set wird nicht bei jeder Prüfung neu geparst)
-        last_check_cs NUMBER            -- INSESSION: letzte Prüfung auf ein geändertes aktives Rule Set (DBMS_UTILITY.GET_TIME)
+        seen_name    VARCHAR2(30),      -- last seen active rule set, even if rejected
+        seen_version NUMBER,            -- (a rejected set is not parsed again on every check)
+        last_check_cs NUMBER            -- INSESSION: last check for a changed active rule set (DBMS_UTILITY.GET_TIME)
     );
     TYPE t_rule_group_map IS TABLE OF t_rule_group_rec INDEX BY VARCHAR2(50);
     g_rule_groups t_rule_group_map;
@@ -335,7 +335,7 @@ AS
         alpha    NUMBER := 0.1,
         warmup   PLS_INTEGER := 100
     );
-    -- Schlüssel wie bei den Regeln mit Gruppe; 'DEFAULT' gilt für alle
+    -- Key as for the rules with group; 'DEFAULT' applies to all
     TYPE t_avg_params_map IS TABLE OF t_avg_params INDEX BY VARCHAR2(300);
     g_avg_params t_avg_params_map;
 
@@ -359,10 +359,10 @@ AS
     C_LOGGING          CONSTANT VARCHAR2(20) := 'LOGGING';
 
     ---------------------------------------------------------------
-    -- Automatisierte Lastverteilung
+    -- Automated load balancing
     ---------------------------------------------------------------
 
-    -- Tabelle der Clients und von ihnen verwendeter Pipes
+    -- Table of the clients and the pipes they use
     TYPE t_client_pipe IS TABLE OF VARCHAR2(128) INDEX BY BINARY_INTEGER;
     g_client_pipes t_client_pipe;
     g_dispatch_route_cache t_client_pipe;
@@ -376,7 +376,7 @@ AS
     -- Exclusive SessionId for Logging internal Errors or Warnings
     g_lilamSessionId                    NUMBER := -1; -- -1 as Flag for not initialized
     
-    -- Zähler der ERROR- und WARN-Aufrufe je Prozess (in der Session, die die Aufrufe macht)
+    -- Counters of ERROR and WARN calls per process (in the session that makes the calls)
     TYPE t_log_counter_rec IS RECORD (
         errors   PLS_INTEGER := 0,
         warnings PLS_INTEGER := 0
@@ -396,8 +396,8 @@ AS
     g_shutdownPassword                  varchar2(50);
     g_serverIsDispatcher                BOOLEAN                 := FALSE;
 
-    g_server_perf                       PLS_INTEGER             := C_SERVER_PERF_MID;  -- Leistungsstufe dieses Servers (p_perfServer)
-    g_last_sync_all_cs                  NUMBER                  := NULL;   -- letzter Durchlauf von SYNC_ALL_DIRTY (DBMS_UTILITY.GET_TIME)
+    g_server_perf                       PLS_INTEGER             := C_SERVER_PERF_MID;  -- Performance level of this server (p_perfServer)
+    g_last_sync_all_cs                  NUMBER                  := NULL;   -- last run of SYNC_ALL_DIRTY (DBMS_UTILITY.GET_TIME)
     g_last_check_time                   TIMESTAMP               := SYSTIMESTAMP;
 
     -- Latencies between event generation and persistance in DB
@@ -476,7 +476,7 @@ AS
 
 
     ---------------------------------------------------------------
-    -- Antwort Codes stabil vereinheitlichen
+    -- Unify response codes consistently
     ---------------------------------------------------------------
     PROCEDURE initialize_map IS
     BEGIN
@@ -514,17 +514,17 @@ AS
 
     FUNCTION get_serverCode(p_txt VARCHAR2) RETURN PLS_INTEGER IS
     BEGIN
-        initialize_map; -- Stellt sicher, dass die Map befüllt ist
+        initialize_map; -- Ensures that the map is filled
 
         if g_response_codes.EXISTS(p_txt) THEN
             RETURN g_response_codes(p_txt);
         ELSE
-            RETURN -1; -- Oder eine Exception werfen
+            RETURN -1; -- Or raise an exception
         end if ;
     END;
 
     ---------------------------------------------------------------
-    -- Leistungsstufe normieren: NULL oder < 0 = MID (Standard), 0 = keine Drosselung, sonst der Wert selbst
+    -- Normalize performance level: NULL or < 0 = MID (default), 0 = no throttling, otherwise the value itself
     ---------------------------------------------------------------
     FUNCTION normPerf(p_perf PLS_INTEGER) RETURN PLS_INTEGER IS
     BEGIN
@@ -535,8 +535,8 @@ AS
     END;
 
     ---------------------------------------------------------------
-    -- Grenze der Drosselung für einen Prozess setzen (Wert aus der Antwort des Servers
-    -- auf NEW_SESSION bzw. RECONNECT_PROCESS). Ersetzt SET_HIGH_PERFORMANCE / g_is_high_perf.
+    -- Set the throttling limit for a process (value from the server's response
+    -- to NEW_SESSION or RECONNECT_PROCESS). Replaces SET_HIGH_PERFORMANCE / g_is_high_perf.
     ---------------------------------------------------------------
     PROCEDURE setPerfLimit(p_processId NUMBER, p_perf PLS_INTEGER) IS
         l_rec t_throttle_stat;
@@ -550,7 +550,7 @@ AS
     END;
 
     ---------------------------------------------------------------
-    -- Erkennung ob ein Prozess auf einem Server läuft
+    -- Detect whether a process runs on a server
     ---------------------------------------------------------------
     FUNCTION is_remote(p_processId IN NUMBER) RETURN BOOLEAN IS
         l_dispatcherPipe varchar2(80);
@@ -561,22 +561,22 @@ AS
         END IF;
     
         IF v_indexSession.EXISTS(p_processId) THEN
-            RETURN FALSE; -- echter lokaler In-Session-Prozess
+            RETURN FALSE; -- real local in-session process
         END IF;
 
-        -- Ungültige ID (z.B. NUM_ERR_SESSION_TIMEOUT aus SERVER_NEW_SESSION): nie ein Reconnect-Versuch
+        -- Invalid ID (e.g. NUM_ERR_SESSION_TIMEOUT from SERVER_NEW_SESSION): never a reconnect attempt
         IF p_processId IS NULL OR p_processId <= 0 THEN
             RETURN FALSE;
         END IF;
     
-        -- Weder lokal noch als remote bekannt: automatischer Reconnect-Versuch,
-        -- aber nur, wenn ein Dispatcher konfiguriert wurde
+        -- Known neither locally nor as remote: automatic reconnect attempt,
+        -- but only if a dispatcher has been configured
         IF NOT g_dispatcher_config.EXISTS('DEFAULT_DISPATCHER') THEN
             RETURN FALSE;
         END IF;
 
-        -- Reconnect für diese ID kürzlich gescheitert: nicht erneut synchron anfragen
-        -- (sonst wartet jeder Aufruf mit einer veralteten ID auf den Dispatcher)
+        -- Reconnect for this ID failed recently: do not query synchronously again
+        -- (otherwise every call with an outdated ID waits for the dispatcher)
         IF g_unknown_pids.EXISTS(p_processId) THEN
             IF g_unknown_pids(p_processId) > systimestamp THEN
                 RETURN FALSE;
@@ -590,8 +590,8 @@ AS
             RETURN TRUE;
         END IF;
 
-        -- Server kennt den Prozess nicht (endgültig): für diese Session merken.
-        -- Kein Server erreichbar / Timeout (vorübergehend): erst nach 10 s erneut versuchen.
+        -- Server does not know the process (final): remember for this session.
+        -- No server reachable / timeout (temporary): retry only after 10 s.
         g_unknown_pids(p_processId) := CASE WHEN l_result = NUM_ERR_SERVER_PROC
                                             THEN systimestamp + INTERVAL '1' DAY
                                             ELSE systimestamp + INTERVAL '10' SECOND END;
@@ -659,7 +659,7 @@ AS
 
     function jsonPutPrep(p_jsonString varchar2) return varchar2
     as
-        l_str JSON_OBJ_LILAM;  -- vorher varchar2(1000): längere Nachrichten (z.B. Logtexte) gingen still verloren
+        l_str JSON_OBJ_LILAM;  -- previously varchar2(1000): longer messages (e.g. log texts) were silently lost
     begin
         l_str := p_jsonString;
         if trim(l_str) is null then
@@ -678,26 +678,26 @@ AS
 
     ------------------------------------------------------------------------
 
-    procedure jsonPut(p_jsonString in out JSON_OBJ_LILAM, jsonKey in varchar2, valueStr in varchar2) --return varchar2
-    -- Achtung! Die If-Konstruktionen sind nicht schön aber deutlich performanter, als case
-    -- Auch das Arbeiten mit einem booleschen Wert am Anfang macht die Logik um vieles langsamer
+    procedure jsonPut(p_jsonString in out JSON_OBJ_LILAM, jsonKey in varchar2, valueStr in varchar2)
+    -- Attention! The IF constructs are not pretty but considerably faster than CASE
+    -- Working with a boolean value at the beginning also makes the logic much slower
     as
         l_str   JSON_OBJ_LILAM;
         l_value JSON_OBJ_LILAM := trim(valueStr);
     begin
-        if valueStr is null or trim(valueStr) = '' then return; end if; -- p_jsonString; end if;
+        if valueStr is null or trim(valueStr) = '' then return; end if;
 
         if substr(l_value,1,1) != '{' and substr(l_value, -1) != '}' then
-            -- Escapen!
-            l_value := REPLACE(l_value, '\', '\\'); -- ZUERST Backslash
-            l_value := REPLACE(l_value, '"', '\"'); -- DANN Anführungszeichen
-            -- Optional: Zeilenumbrüche (JSON erlaubt keine echten Linebreaks in Strings)
+            -- Escape!
+            l_value := REPLACE(l_value, '\', '\\'); -- backslash FIRST
+            l_value := REPLACE(l_value, '"', '\"'); -- THEN quotation marks
+            -- Optional: line breaks (JSON does not allow real line breaks in strings)
             l_value := REPLACE(l_value, CHR(10), '\n');
             l_value := REPLACE(l_value, CHR(13), '\r');
         end if;
 
-        -- Ergebnis ist immer ein vollständiges JSON-Objekt, auch beim ersten jsonPut
-        -- (vorher entstand bei leerem p_jsonString und Objekt-Wert nur ein Fragment ohne Klammern)
+        -- The result is always a complete JSON object, even on the first jsonPut
+        -- (previously an empty p_jsonString with an object value produced only a fragment without braces)
         l_str := jsonPutPrep(p_jsonString);
         l_str := '{' || l_str || '"' || trim(jsonKey) || '":';
         if substr(l_value, 1, 1) != '{' then
@@ -710,16 +710,15 @@ AS
             l_str := l_str || '}';
         end if;
         p_jsonString := l_str;
---            return l_str;
     end;
 
     -------------------------------------------------------------------------------------
 
-    procedure jsonPut(p_jsonString in out varchar2, jsonKey varchar2, valueNum Number) -- return varchar2
+    procedure jsonPut(p_jsonString in out varchar2, jsonKey varchar2, valueNum Number)
     as
         l_str JSON_OBJ_LILAM;
     begin
-        if valueNum is null then return; end if; -- p_jsonString; end if;
+        if valueNum is null then return; end if;
 
         l_str := jsonPutPrep(p_jsonString);
         if p_jsonString is null and substr(valueNum, 1,1) = '{' and substr(valueNum, -1) = '}' then
@@ -729,54 +728,52 @@ AS
             l_str := l_str || valueNum || '}'; 
         end if;
         p_jsonString := l_str;
---            return l_str;
     end;
 
     -------------------------------------------------------------------------------------
 
-    procedure jsonPut(p_jsonString in out JSON_OBJ_LILAM, jsonKey varchar2, valueTS timestamp) -- return varchar2
+    procedure jsonPut(p_jsonString in out JSON_OBJ_LILAM, jsonKey varchar2, valueTS timestamp)
     as
     begin
         jsonPut(p_jsonString, jsonKey, TO_CHAR(valueTS, 'YYYY-MM-DD"T"HH24:MI:SS.FF6'));
---            return jsonPut(p_jsonString, jsonKey, TO_CHAR(valueTS, 'YYYY-MM-DD"T"HH24:MI:SS.FF6'));
     end;
 
     --------------------------------------------------------------------------
-    -- PERFORMANCE: Bausteine für die direkte Verkettung von JSON-Nachrichten
+    -- PERFORMANCE: building blocks for the direct concatenation of JSON messages
     --
-    -- jsonPut zerlegt bei jedem Aufruf das bisher gebaute Objekt und kopiert es
-    -- neu. Bei 8-10 Feldern pro Nachricht war das im Decoupled-Mode der größte
-    -- Kostenblock auf Client-Seite (HPROF: 39 % bei INFO, 47 % bei MARK_EVENT).
-    -- In den häufig durchlaufenen Pfaden (Logs, Traces, Events, Steps, Status)
-    -- wird die Nachricht deshalb in EINEM Ausdruck verkettet:
+    -- jsonPut parses the object built so far on every call and copies it
+    -- again. With 8-10 fields per message this was the largest cost block
+    -- on the client side in decoupled mode (HPROF: 39 % for INFO, 47 % for MARK_EVENT).
+    -- In the frequently used paths (logs, traces, events, steps, status)
+    -- the message is therefore concatenated in ONE expression:
     --
     --     '{"process_id":' || jNum(p_processId) || jStr('action_name', p_actionName) || ... || '}'
     --
-    -- Jeder Baustein liefert ',"key":wert' oder - bei NULL - einen Leerstring.
-    -- Das erste Feld wird daher immer ohne Baustein und ohne Komma geschrieben.
-    -- Die selten genutzten Pfade (Antworten des Servers, Verwaltung) verwenden
-    -- weiterhin jsonPut.
+    -- Each building block returns ',"key":value' or - for NULL - an empty string.
+    -- The first field is therefore always written without a building block and without a comma.
+    -- The rarely used paths (server responses, administration) still
+    -- use jsonPut.
     --------------------------------------------------------------------------
 
-    -- Textwert für JSON maskieren (gleiche Regeln wie jsonPut, zusätzlich Tab)
+    -- Escape a text value for JSON (same rules as jsonPut, plus tab)
     function jEsc(p_value varchar2) return varchar2
     as
     begin
         return replace(replace(replace(replace(replace(p_value,
-                   '\', '\\'),          -- ZUERST Backslash
+                   '\', '\\'),          -- backslash FIRST
                    '"', '\"'),
                    chr(10), '\n'),
                    chr(13), '\r'),
                    chr(9), '\t');
     end;
 
-    -- Zahl unabhängig von NLS_NUMERIC_CHARACTERS (immer Dezimalpunkt, führende 0)
+    -- Number independent of NLS_NUMERIC_CHARACTERS (always decimal point, leading 0)
     function jNum(p_value number) return varchar2
     as
         l_str varchar2(64);
     begin
         if p_value = trunc(p_value) then
-            return to_char(p_value);       -- Ganzzahl: NLS spielt keine Rolle (Normalfall)
+            return to_char(p_value);       -- Integer: NLS does not matter (normal case)
         end if;
         l_str := to_char(p_value, 'TM9', 'NLS_NUMERIC_CHARACTERS=''.,''');
         if substr(l_str, 1, 1) = '.' then
@@ -787,7 +784,7 @@ AS
         return l_str;
     end;
 
-    -- ',"key":"text"' bzw. '' bei NULL
+    -- ',"key":"text"' or '' for NULL
     function jStr(p_key varchar2, p_value varchar2) return varchar2
     as
     begin
@@ -795,7 +792,7 @@ AS
         return ',"' || p_key || '":"' || jEsc(p_value) || '"';
     end;
 
-    -- ',"key":zahl' bzw. '' bei NULL
+    -- ',"key":number' or '' for NULL
     function jNum(p_key varchar2, p_value number) return varchar2
     as
     begin
@@ -803,7 +800,7 @@ AS
         return ',"' || p_key || '":' || jNum(p_value);
     end;
 
-    -- ',"key":"YYYY-MM-DDTHH24:MI:SS.FF6"' bzw. '' bei NULL
+    -- ',"key":"YYYY-MM-DDTHH24:MI:SS.FF6"' or '' for NULL
     function jTs(p_key varchar2, p_value timestamp) return varchar2
     as
     begin
@@ -812,10 +809,10 @@ AS
     end;
 
     --------------------------------------------------------------------------
-    -- PERFORMANCE: Tabellenname nur einmal je Session über DBMS_ASSERT prüfen.
-    -- DBMS_ASSERT.SQL_OBJECT_NAME löst den Namen im Data Dictionary auf und kostete
-    -- im Server-Profil 0,4 ms je Aufruf (8 % der Serverzeit im Massentest).
-    -- Der Cache wird zusammen mit g_checked_masters geleert (z.B. bei ORA-00942).
+    -- PERFORMANCE: check the table name via DBMS_ASSERT only once per session.
+    -- DBMS_ASSERT.SQL_OBJECT_NAME resolves the name in the data dictionary and cost
+    -- 0.4 ms per call in the server profile (8 % of the server time in the mass test).
+    -- The cache is cleared together with g_checked_masters (e.g. on ORA-00942).
     --------------------------------------------------------------------------
     function safeTableName(p_table varchar2) return varchar2
     as
@@ -830,12 +827,12 @@ AS
     -- Millis between two timestamps
     --------------------------------------------------------------------------
     function get_ms_diff(p_start timestamp, p_end timestamp) return number is
-        -- STABILITÄT: day(9) statt day(0), sonst ORA-01873 ab einem Tag Abstand (z.B. RUNTIME_EXCEEDED)
-        v_diff interval day(9) to second(3); -- Präzision auf ms begrenzen
+        -- STABILITY: day(9) instead of day(0), otherwise ORA-01873 from a difference of one day (e.g. RUNTIME_EXCEEDED)
+        v_diff interval day(9) to second(3); -- Limit precision to ms
     begin
         v_diff := p_end - p_start;
-        -- Wir extrahieren nur die Sekunden inklusive der Nachkommastellen (ms)
-        -- und addieren die Minuten/Stunden/Tage als Sekunden-Vielfache
+        -- We extract only the seconds including the fractional part (ms)
+        -- and add the minutes/hours/days as multiples of seconds
         return (extract(day from v_diff) * 86400000)
              + (extract(hour from v_diff) * 3600000)
              + (extract(minute from v_diff) * 60000)
@@ -857,7 +854,7 @@ AS
     end;
 
     --------------------------------------------------------------------------
-    -- Name der Steuer-Pipe zu einer Server-/Dispatcher-Pipe (nur per Konvention, keine Verwaltung)
+    -- Name of the control pipe for a server/dispatcher pipe (by convention only, no administration)
     --------------------------------------------------------------------------
     function ctlPipe(p_pipeName varchar2) return varchar2
     as
@@ -866,9 +863,9 @@ AS
     end;
 
     --------------------------------------------------------------------------
-    -- Weckruf in die Daten-Pipe: Ein untätiger Server wartet blockierend auf seiner Daten-Pipe
-    -- (bis C_SERVER_TIMEOUT_MAX_WAIT_SEC) und würde eine Nachricht in der Steuer-Pipe sonst erst
-    -- nach Ablauf dieser Wartezeit bemerken. SERVER_PING bewirkt im Server nichts weiter.
+    -- Wake-up call into the data pipe: an idle server waits blocking on its data pipe
+    -- (up to C_SERVER_TIMEOUT_MAX_WAIT_SEC) and would otherwise notice a message in the control pipe only
+    -- after this wait time has expired. SERVER_PING has no further effect in the server.
     --------------------------------------------------------------------------
     procedure sendPing(p_pipeName varchar2)
     as
@@ -879,7 +876,7 @@ AS
         l_status := DBMS_PIPE.SEND_MESSAGE(p_pipeName, timeout => 0);
     exception
         when others then
-            DBMS_PIPE.RESET_BUFFER;   -- Weckruf ist nur ein Hilfsmittel, Fehler sind unkritisch
+            DBMS_PIPE.RESET_BUFFER;   -- The wake-up call is only an aid, errors are not critical
     end;
 
     --------------------------------------------------------------------------
@@ -891,12 +888,12 @@ AS
         l_key        BINARY_INTEGER;
     begin
         l_key := coalesce(p_processId, C_PIPE_ID_PENDING);
-        -- 1. Cache-Check (PGA)
+        -- 1. Cache check (PGA)
         IF g_client_pipes.EXISTS(p_processId) THEN
             RETURN g_client_pipes(p_processId);
         END IF;
     
-        -- 2. Dispatcher hat Vorrang vor der Registry-Suche, falls konfiguriert
+        -- 2. Dispatcher takes precedence over the registry search, if configured
         IF g_dispatcher_config.EXISTS('DEFAULT_DISPATCHER') THEN
             l_serverPipe := g_dispatcher_config('DEFAULT_DISPATCHER');
         ELSE
@@ -913,19 +910,19 @@ AS
     end;
 
     --------------------------------------------------------------------------
-    -- Hilfsfunktion (intern): Erzeugt den einheitlichen Key für den Index
+    -- Helper function (internal): creates the uniform key for the index
     --------------------------------------------------------------------------
     FUNCTION buildMonitorKey(p_processId NUMBER, p_actionName VARCHAR2, p_contextName VARCHAR2) RETURN VARCHAR2 AS
     BEGIN
-        -- Format: "0000000000000000180|MEINE_AKTION|MEIN_CONTEXT"
-        -- LPAD sorgt für eine feste Länge, was das Filtern extrem beschleunigt
+        -- Format: "0000000000000000180|MY_ACTION|MY_CONTEXT"
+        -- LPAD ensures a fixed length, which speeds up filtering enormously
         RETURN LPAD(p_processId, 20, '0') || '|' || p_actionName || '|' || p_contextName;
     END;
 
     --------------------------------------------------------------------------
-    -- Baseline Scopes: prozessübergreifende Durchschnittswerte
+    -- Baseline scopes: cross-process averages
     --------------------------------------------------------------------------
-    -- Key für g_baselines; gleiches Format wie buildMonitorKey, aber mit scope_id
+    -- Key for g_baselines; same format as buildMonitorKey, but with scope_id
     FUNCTION buildBaselineKey(p_scopeId NUMBER, p_actionName VARCHAR2, p_contextName VARCHAR2) RETURN VARCHAR2 AS
     BEGIN
         RETURN LPAD(p_scopeId, 20, '0') || '|' || p_actionName || '|' || p_contextName;
@@ -951,11 +948,11 @@ AS
     END;
 
     --------------------------------------------------------------------------
-    -- Ermittelt den Scope-Namen aus t_session_init.baselineScope
-    --   NULL    => Prozessname
-    --   '#NONE' => kein Scope (NULL)
-    --   '#...'  => unbekannter reservierter Wert: protokollieren, Prozessname verwenden
-    --   sonst   => der angegebene Name
+    -- Determines the scope name from t_session_init.baselineScope
+    --   NULL    => process name
+    --   '#NONE' => no scope (NULL)
+    --   '#...'  => unknown reserved value: log it, use the process name
+    --   else    => the specified name
     --------------------------------------------------------------------------
     FUNCTION resolveScopeName(p_processName VARCHAR2, p_baselineScope VARCHAR2) RETURN VARCHAR2
     AS
@@ -982,8 +979,8 @@ AS
     END;
 
     --------------------------------------------------------------------------
-    -- Liefert die scope_id zum Namen; legt den Scope bei Bedarf an.
-    -- Fehler => NULL (Session arbeitet dann prozesslokal wie bisher)
+    -- Returns the scope_id for the name; creates the scope if necessary.
+    -- Error => NULL (the session then works process-locally as before)
     --------------------------------------------------------------------------
     FUNCTION getOrCreateScopeId(p_scopeName VARCHAR2) RETURN NUMBER
     AS
@@ -1009,7 +1006,7 @@ AS
                     COMMIT;
                 EXCEPTION
                     WHEN DUP_VAL_ON_INDEX THEN
-                        -- parallel von einer anderen Session angelegt
+                        -- created in parallel by another session
                         ROLLBACK;
                         EXECUTE IMMEDIATE l_select INTO l_scopeId USING p_scopeName;
                 END;
@@ -1026,8 +1023,8 @@ AS
     END;
 
     --------------------------------------------------------------------------
-    -- Stellt sicher, dass die Baseline im PGA liegt (Lazy Load, ein PK-Zugriff
-    -- pro Scope/Action/Context). Fehler werden an den Aufrufer durchgereicht.
+    -- Ensures that the baseline is in the PGA (lazy load, one PK access
+    -- per scope/action/context). Errors are passed on to the caller.
     --------------------------------------------------------------------------
     PROCEDURE ensureBaseline(p_key VARCHAR2, p_scopeId NUMBER, p_actionName VARCHAR2, p_contextName VARCHAR2)
     AS
@@ -1070,15 +1067,15 @@ AS
     function validateDurationInAverage(p_monitor_rec t_monitor_buffer_rec, p_metricFactor number) return BOOLEAN
     as
     begin
-        -- Wenn noch kein Trend da ist (Initialstart / Warm-up), können wir nichts validieren.
+        -- If there is no trend yet (initial start / warm-up), we cannot validate anything.
         if p_monitor_rec.avg_action_time is null or p_monitor_rec.avg_action_time = 0 
            or p_monitor_rec.used_time is null or p_metricFactor is null then
             return TRUE; 
         end if;
 
-        -- Vergleich gegen den bestehenden Trend
-        -- Da p_old_ewma während des Warm-ups dem Trend folgt, 
-        -- greift die 10% (oder X%) Hürde erst, wenn der EWMA sich stabilisiert.
+        -- Comparison against the existing trend
+        -- Since p_old_ewma follows the trend during warm-up, 
+        -- the 10% (or X%) threshold only applies once the EWMA has stabilized.
         if p_monitor_rec.used_time > p_monitor_rec.avg_action_time * (1 + p_metricFactor / 100) then
             return FALSE;
         end if;
@@ -1088,8 +1085,8 @@ AS
 
     --------------------------------------------------------------------------
 
-    -- Liefert den n-ten Wert aus 'a|b|c' (z.B. AVG_DEVIATION_PCT: 'pct|warmup|alpha').
-    -- Fehlende oder ungültige Werte => NULL (Aufrufer setzen Defaults)
+    -- Returns the n-th value from 'a|b|c' (e.g. AVG_DEVIATION_PCT: 'pct|warmup|alpha').
+    -- Missing or invalid values => NULL (callers set defaults)
     FUNCTION extractRuleValue(p_param VARCHAR2, p_position PLS_INTEGER) return number
     AS
         l_val VARCHAR2(50);
@@ -1118,8 +1115,8 @@ AS
     END;
 
     ------------------------------------------------------------
-    -- Alert schreiben und signalisieren (eigene Transaktion, Write-then-Signal).
-    -- TRUE, wenn der Alert geschrieben wurde.
+    -- Write and signal the alert (own transaction, write-then-signal).
+    -- TRUE if the alert was written.
     ------------------------------------------------------------
     FUNCTION persist_alert(p_rule t_rule_rec, p_rec t_monitor_buffer_rec) RETURN BOOLEAN IS
         pragma autonomous_transaction;
@@ -1166,7 +1163,7 @@ AS
             'timestamp'        VALUE TO_CHAR(SYSTIMESTAMP, 'YYYY-MM-DD"T"HH24:MI:SS.FF6')
         );
 
-        -- p_rule.alert_handler wäre hier z.B. 'MAIL', 'REST', 'PROCESS'
+        -- p_rule.alert_handler would be e.g. 'MAIL', 'REST', 'PROCESS' here
         v_channel_name := p_rule.alert_handler;
         dbms_alert.signal(v_channel_name, v_payload);
         COMMIT; -- !!!
@@ -1174,16 +1171,16 @@ AS
 
     exception
         when others then
-        -- STABILITÄT: autonome Transaktion abschließen, sonst ORA-06519 beim Verlassen
+        -- STABILITY: end the autonomous transaction, otherwise ORA-06519 on exit
         logLilamErr(sqlCode, sqlErrM, 'fire_alert', 'rule ' || p_rule.rule_id);
         rollback;
         RETURN FALSE;
     END;
 
     ------------------------------------------------------------
-    -- Alarm unter Berücksichtigung der Drosselung (throttle_seconds).
-    -- PERFORMANCE: Die Drosselung wird hier geprüft, ohne autonome Transaktion;
-    -- nur ein tatsächlich auszulösender Alert öffnet eine.
+    -- Alert taking throttling into account (throttle_seconds).
+    -- PERFORMANCE: throttling is checked here without an autonomous transaction;
+    -- only an alert that is actually raised opens one.
     ------------------------------------------------------------
     PROCEDURE fire_alert(p_rule t_rule_rec, p_rec t_monitor_buffer_rec) IS
         v_throttle_sec  NUMBER := coalesce(p_rule.throttle_seconds, 0);
@@ -1191,19 +1188,19 @@ AS
         v_history_key   VARCHAR2(250);
     BEGIN
         IF v_throttle_sec <= 0 THEN
-            -- ohne Drosselung kein Gedächtnis nötig
+            -- without throttling no memory is needed
             IF persist_alert(p_rule, p_rec) THEN NULL; END IF;
             RETURN;
         END IF;
 
-        -- Throttle pro Scope (falls vorhanden), damit Neustarts die Sperrzeit nicht aufheben.
-        -- Gruppe vorn: Rule-IDs sind nur je Rule Set eindeutig (siehe auch installGroupRules)
+        -- Throttle per scope (if any), so that restarts do not lift the lock period.
+        -- Group first: rule IDs are only unique per rule set (see also installGroupRules)
         v_scope_id    := getScopeId(p_rec.process_id);
         v_history_key := g_sessionList(v_indexSession(p_rec.process_id)).rule_group || '|'
                          || CASE WHEN v_scope_id IS NOT NULL THEN 'S' || v_scope_id ELSE 'P' || p_rec.process_id END
                          || '|' || p_rule.rule_id || '|' || p_rec.action_name;
 
-        -- Sperrzeit seit dem letzten Alert noch nicht abgelaufen -> nichts tun
+        -- Lock period since the last alert has not yet expired -> do nothing
         IF g_alert_history.EXISTS(v_history_key)
            AND g_alert_history(v_history_key) + numtodsinterval(v_throttle_sec, 'SECOND') > SYSTIMESTAMP THEN
             RETURN;
@@ -1218,19 +1215,19 @@ AS
     END;
     
     ------------------------------------------------------------
-    -- Identifizieren von Regeln gegen eintreffendes Event/Trace
-    -- Zusammengefasste Version für Monitoring und Prozess
+    -- Match rules against an incoming event/trace
+    -- Combined version for monitoring and process
     ------------------------------------------------------------  
     PROCEDURE evaluateRules_internal(p_ctx t_eval_context_rec, p_trigger VARCHAR2, p_check_context BOOLEAN)
     AS
         v_key       VARCHAR2(200);
         fire        BOOLEAN := FALSE;
         l_diff_ms   NUMBER := 0;
-        p_monRec    t_monitor_buffer_rec; -- Hilfsvariable für fire_alert
+        p_monRec    t_monitor_buffer_rec; -- Helper variable for fire_alert
         l_group     VARCHAR2(50);
 
-        -- Passt der letzte Vorgänger (Event/Trace) des Prozesses zur Regel?
-        -- cond_context NULL: jeder Kontext der erwarteten Action ist zulässig.
+        -- Does the last predecessor (event/trace) of the process match the rule?
+        -- cond_context NULL: any context of the expected action is allowed.
         FUNCTION predecessorMatches(p_rule t_rule_rec) RETURN BOOLEAN IS
         BEGIN
             RETURN NVL(g_last_action_per_process(p_ctx.process_id).action_name = p_rule.cond_action
@@ -1245,19 +1242,19 @@ AS
             FOR i IN 1 .. p_list.COUNT LOOP
                 fire := FALSE;
 
-                -- Trigger und Operator sind beim Laden geprüft und in Großbuchstaben abgelegt
+                -- Trigger and operator were checked at load time and stored in upper case
                 IF p_list(i).trigger_type = p_trigger THEN
-                  -- STABILITÄT: ein Fehler in einer Regel darf die übrigen Regeln nicht verhindern
+                  -- STABILITY: an error in one rule must not prevent the other rules
                   BEGIN
                     CASE p_list(i).condition_operator
                         -- =====================================================
-                        -- LOGGING OPERATOREN
+                        -- LOGGING OPERATORS
                         -- =====================================================
                         WHEN 'SEVERITY' THEN
                             fire := p_list(i).cond_upper = upper(p_ctx.context_name);
 
                         -- =====================================================
-                        -- GEMEINSAME OPERATOREN
+                        -- COMMON OPERATORS
                         -- =====================================================
                         WHEN 'ON_START' THEN fire := TRUE;
                         WHEN 'ON_STOP'  THEN fire := TRUE;
@@ -1265,7 +1262,7 @@ AS
                         WHEN 'ON_EVENT' THEN fire := TRUE;
 
                         WHEN 'MAX_OCCURRENCE' THEN
-                            -- Prozess: erledigte Schritte; Monitor: n-te Ausführung der Action im Prozess
+                            -- Process: completed steps; monitor: n-th execution of the action in the process
                             IF p_ctx.action_count IS NULL THEN
                                 fire := p_ctx.steps_done > p_list(i).cond_num;
                             ELSE
@@ -1284,11 +1281,11 @@ AS
                             END IF;
 
                         -- =====================================================
-                        -- REINE MONITOR-OPERATOREN
+                        -- MONITOR-ONLY OPERATORS
                         -- =====================================================
                         WHEN 'AVG_DEVIATION_PCT' THEN
-                            -- Vergleich der aktuellen Dauer mit dem Durchschnitt VOR dieser Messung.
-                            -- avg_time ist während des Warm-ups NULL => keine Bewertung.
+                            -- Compare the current duration with the average BEFORE this measurement.
+                            -- avg_time is NULL during warm-up => no evaluation.
                             p_monRec.start_time      := p_ctx.start_time;
                             p_monRec.stop_time       := p_ctx.stop_time;
                             p_monRec.used_time       := p_ctx.used_time;
@@ -1299,7 +1296,7 @@ AS
                             fire := p_ctx.used_time > p_list(i).cond_num;
 
                         WHEN 'MAX_GAP_SECONDS' THEN
-                            -- Events: Abstand zum vorigen Event; Traces (TRACE_START): Abstand zum Ende des vorigen Traces
+                            -- Events: distance to the previous event; traces (TRACE_START): distance to the end of the previous trace
                             v_key := buildMonitorKey(p_ctx.process_id, p_ctx.action_name, p_ctx.context_name);
                             IF p_trigger = C_MARK_EVENT AND g_monitor_shadows.EXISTS(v_key) THEN
                                 l_diff_ms := get_ms_diff(g_monitor_shadows(v_key).start_time, p_ctx.start_time);
@@ -1310,10 +1307,10 @@ AS
                             END IF;
 
                         -- =====================================================
-                        -- REINE PROZESS-OPERATOREN
+                        -- PROCESS-ONLY OPERATORS
                         -- =====================================================
                         WHEN 'RUNTIME_EXCEEDED' THEN
-                            -- laufender Prozess; geprüft wird nur, wenn ein Signal eintrifft
+                            -- running process; checked only when a signal arrives
                             fire := p_ctx.process_end IS NULL
                                 AND get_ms_diff(p_ctx.start_time, systimestamp) > p_list(i).cond_num;
 
@@ -1335,11 +1332,11 @@ AS
                             fire := instr(upper(p_ctx.info), p_list(i).cond_upper) > 0;
 
                         ELSE
-                            NULL; -- unbekannte Operatoren lehnt das Laden ab
+                            NULL; -- loading rejects unknown operators
                     END CASE;
 
-                    -- Wenn die Regel anschlägt, mappen wir die Daten für das Alarmsystem zurück
-                    -- (fire kann bei NULL-Vergleichen NULL sein => kein Alarm)
+                    -- If the rule fires, we map the data back for the alerting system
+                    -- (fire can be NULL for NULL comparisons => no alert)
                     IF fire THEN
                         p_monRec.process_id   := p_ctx.process_id;
                         p_monRec.action_name  := p_ctx.action_name;
@@ -1359,7 +1356,7 @@ AS
         END;
 
     BEGIN
-        -- Regeln der Gruppe des Prozesses; ohne Gruppe keine Regeln (PERFORMANCE: sofort zurück)
+        -- Rules of the process's group; no group, no rules (PERFORMANCE: return immediately)
         IF NOT v_indexSession.EXISTS(p_ctx.process_id) THEN
             RETURN;
         END IF;
@@ -1368,23 +1365,23 @@ AS
             RETURN;
         END IF;
 
-        -- INSESSION: höchstens alle C_RULES_CHECK_INTERVAL_MS auf ein geändertes aktives Rule Set prüfen
-        -- (Server erhalten Änderungen über SERVER_UPDATE_RULES).
-        -- PERFORMANCE: DBMS_UTILITY.GET_TIME statt SYSTIMESTAMP und Intervallrechnung (gemessen < 1 µs statt ca. 10–25 µs).
-        -- ABS: beim Überlauf von GET_TIME gibt es höchstens eine zusätzliche Prüfung.
+        -- INSESSION: check for a changed active rule set at most every C_RULES_CHECK_INTERVAL_MS
+        -- (servers receive changes via SERVER_UPDATE_RULES).
+        -- PERFORMANCE: DBMS_UTILITY.GET_TIME instead of SYSTIMESTAMP and interval arithmetic (measured < 1 µs instead of approx. 10–25 µs).
+        -- ABS: on overflow of GET_TIME there is at most one additional check.
         IF g_serverPipeName IS NULL
            AND (NOT g_rule_groups.EXISTS(l_group)
                 OR abs(dbms_utility.get_time - g_rule_groups(l_group).last_check_cs) >= C_RULES_CHECK_INTERVAL_MS / 10) THEN
             refreshGroupRules(l_group, p_force => FALSE);
         END IF;
 
-        -- 1. Kontext-Regeln (nur für Monitore relevant)
+        -- 1. Context rules (relevant for monitors only)
         IF p_check_context AND p_ctx.context_name IS NOT NULL
            AND g_rules_by_context.EXISTS(l_group || '|' || p_ctx.action_name || '|' || p_ctx.context_name) THEN
             apply_rule_list(g_rules_by_context(l_group || '|' || p_ctx.action_name || '|' || p_ctx.context_name));
         END IF;
 
-        -- 2. Allgemeine Action/Prozess-Regeln (gelten zusätzlich, für alle Kontexte)
+        -- 2. General action/process rules (apply additionally, for all contexts)
         IF g_rules_by_action.EXISTS(l_group || '|' || p_ctx.action_name) THEN
             apply_rule_list(g_rules_by_action(l_group || '|' || p_ctx.action_name));
         END IF;
@@ -1395,7 +1392,7 @@ AS
 
     END evaluateRules_internal;
 
-    -- Hilfsfunktion zum Mappen von Monitor-Daten
+    -- Helper function for mapping monitor data
     FUNCTION mapMonitorRecToContextRec(p_monitorRec t_monitor_buffer_rec) return t_eval_context_rec
     AS
         l_ctx t_eval_context_rec;
@@ -1412,7 +1409,7 @@ AS
     END;
 
 
-    -- Hilfsfunktion zum Mappen von Process-Daten
+    -- Helper function for mapping process data
     FUNCTION mapProcessRecToContextRec(p_processRec t_process_rec) return t_eval_context_rec
     AS
         l_ctx t_eval_context_rec;
@@ -1433,12 +1430,12 @@ AS
     END;
     
     
-    -- Methode dient dem Mapping für die zentrale evaluate Methode
+    -- Method used for mapping to the central evaluate method
     PROCEDURE evaluateRules(p_monitorRec t_monitor_buffer_rec, p_trigger VARCHAR2)
     AS
     BEGIN
         evaluateRules_internal(mapMonitorRecToContextRec(p_monitorRec), p_trigger, p_check_context => TRUE);
-        -- Vorgänger für PRECEDED_BY merken: nur Events und Traces, keine Logs
+        -- Remember the predecessor for PRECEDED_BY: only events and traces, no logs
         IF p_trigger != C_LOGGING THEN
             g_last_action_per_process(p_monitorRec.process_id).action_name  := p_monitorRec.action_name;
             g_last_action_per_process(p_monitorRec.process_id).context_name := p_monitorRec.context_name;
@@ -1451,7 +1448,7 @@ AS
 
     END evaluateRules;
 
-    -- Methode dient dem Mapping für die zentrale evaluate Methode
+    -- Method used for mapping to the central evaluate method
     PROCEDURE evaluateRules(p_processRec t_process_rec, p_trigger VARCHAR2)
     AS
     BEGIN
@@ -1463,10 +1460,9 @@ AS
     --------------------------------------------------------------------------
     function waitForResponse(
         p_processId   in number,
-        p_request       in varchar2, -- Wird für die Zuordnung/Verzweigung im Server benötigt
+        p_request       in varchar2, -- Needed for assignment/branching in the server
         p_payload       IN varchar2, 
         p_timeoutSec    IN PLS_INTEGER
---        p_pipeName   in varchar2 default null
     ) return varchar2
     as
         l_msgReceive    JSON_OBJ_LILAM;
@@ -1496,8 +1492,8 @@ AS
 
         DBMS_PIPE.PACK_MESSAGE(l_jsonMain);
         if p_request = 'NEW_SESSION' then
-            -- NEW_SESSION über die Steuer-Pipe: überholt die Datennachrichten anderer Clients in der
-            -- Daten-Pipe (vorher unter Last regelmäßig > 3 s Wartezeit und Timeout).
+            -- NEW_SESSION via the control pipe: overtakes the data messages of other clients in the
+            -- data pipe (previously regularly > 3 s wait time and timeout under load).
             l_status := DBMS_PIPE.SEND_MESSAGE(ctlPipe(l_serverPipe), timeout => 3);
             sendPing(l_serverPipe);
         else
@@ -1528,7 +1524,7 @@ AS
     end;
 
     ---------------------------------------------------------------
-    -- Aktive Server markieren
+    -- Mark active servers
     ---------------------------------------------------------------
     function isServerPipeActive(p_pipeName varchar2) return boolean
     as
@@ -1571,12 +1567,12 @@ AS
             l_sqlStmt := l_sqlStmt || ' AND upper(group_name) = ''' || upper(p_groupName) || '''';
         end if;
 
-        -- Reihenfolge der Auswahl: wenigste Nachrichten im letzten Intervall, dann wenigste offene Prozesse,
-        -- bei Gleichstand der am laengsten untaetige Server (aeltester Registry-Eintrag; ein beschaeftigter
-        -- Server aktualisiert seinen Eintrag oefter, ein ruhender seltener)
-        -- Dispatcher sind nie Ziel der Serverauswahl: weder für Clients ohne Dispatcher-Einstellung
-        -- (sonst unnötiger Umweg über den Dispatcher) noch für einen Dispatcher selbst bei der Wahl
-        -- eines Workers (er würde sich die Nachricht sonst endlos selbst zuschicken)
+        -- Order of selection: fewest messages in the last interval, then fewest open processes,
+        -- on a tie the server idle for the longest time (oldest registry entry; a busy
+        -- server updates its entry more often, an idle one less often)
+        -- Dispatchers are never the target of server selection: neither for clients without a dispatcher setting
+        -- (otherwise an unnecessary detour via the dispatcher) nor for a dispatcher itself when choosing
+        -- a worker (it would otherwise send the message to itself endlessly)
         l_sqlStmt := l_sqlStmt || ' AND nvl(is_dispatcher, 0) = 0';
 
         l_sqlStmt := l_sqlStmt || '
@@ -1600,9 +1596,9 @@ AS
     as
         l_response varchar2(1000);
     begin
-        -- process_id im Payload: Ein Dispatcher braucht sie, um die Anfrage an den Worker des Prozesses
-        -- weiterzuleiten. Vorher ('{}') verwarf der Dispatcher die Anfrage, und der Client wartete
-        -- jedes Mal den vollen Timeout ab (Lasttest über Dispatcher: 5,3 ms statt 0,2 ms je Aufruf).
+        -- process_id in the payload: a dispatcher needs it to forward the request to the worker of the process.
+        -- Previously ('{}') the dispatcher discarded the request, and the client waited
+        -- for the full timeout every time (load test via dispatcher: 5.3 ms instead of 0.2 ms per call).
         l_response := waitForResponse(p_processId, 'UNFREEZE_REQUEST', '{"process_id":' || jNum(p_processId) || '}', 10);
 
     exception
@@ -1611,37 +1607,37 @@ AS
     end;
 
     --------------------------------------------------------------------------
-    -- Auf die Bremse treten, wenn Client zu schnell sendet
+    -- Hit the brakes when the client sends too fast
     --------------------------------------------------------------------------
     PROCEDURE stabilizeInLowPerfEnvironments(p_processId number)
     IS
-        -- PERFORMANCE: SYSTIMESTAMP wird nur noch gelesen, wenn die Zeit gebraucht wird
-        -- (beim ersten Aufruf und alle msg_limit Nachrichten), nicht bei jedem Aufruf
+        -- PERFORMANCE: SYSTIMESTAMP is only read when the time is needed
+        -- (on the first call and every msg_limit messages), not on every call
         l_now TIMESTAMP;
         l_new_throttle t_throttle_stat;
     BEGIN
-        -- Prozess ohne Wert vom Server (sollte nicht vorkommen): Standard C_SERVER_PERF_MID
+        -- Process without a value from the server (should not happen): default C_SERVER_PERF_MID
         if NOT g_local_throttle_cache.EXISTS(p_processId) THEN
             l_new_throttle.msg_limit := C_SERVER_PERF_MID;
             g_local_throttle_cache(p_processId) := l_new_throttle;
         end if ;
 
-        -- 0 = keine Drosselung (Server mit p_perfServer => 0 gestartet)
+        -- 0 = no throttling (server started with p_perfServer => 0)
         if g_local_throttle_cache(p_processId).msg_limit > 0 THEN 
-            -- Counter hochzählen
+            -- Increment counter
             g_local_throttle_cache(p_processId).msg_count := g_local_throttle_cache(p_processId).msg_count + 1;
 
-            -- Grenze des Zeitfensters erreicht?
+            -- Limit of the time window reached?
             if g_local_throttle_cache(p_processId).msg_count >= g_local_throttle_cache(p_processId).msg_limit THEN        
                 l_now := SYSTIMESTAMP;
-                -- Wenn zu schnell gefeuert wurde
+                -- If messages were fired too fast
                 if get_ms_diff(g_local_throttle_cache(p_processId).last_check, l_now) < C_THROTTLE_INTERVAL_NO THEN
-                    -- Erzwinge Synchronisation (Warten auf Server-Antwort)
-                    -- Das verschafft dem Remote-Server die nötige "Atempause"
+                    -- Force synchronization (wait for the server response)
+                    -- This gives the remote server the necessary "breathing space"
                     send_sync_signal(p_processId);
                 end if ;
 
-                -- Reset für das nächste Fenster
+                -- Reset for the next window
                 g_local_throttle_cache(p_processId).msg_count := 0;
                 g_local_throttle_cache(p_processId).last_check := l_now;
             end if ;
@@ -1649,23 +1645,23 @@ AS
     END;
 
     --------------------------------------------------------------------------
-    -- Nachricht an Server Fire&Forget
+    -- Message to server, fire & forget
     --------------------------------------------------------------------------
     procedure sendNoWait(
         p_processId     in number,
-        p_request       in varchar2, -- Wird für die Zuordnung/Verzweigung im Server benötigt
+        p_request       in varchar2, -- Needed for assignment/branching in the server
         p_payload       IN varchar2, 
         p_timeoutSec    IN PLS_INTEGER
     )
     as        
         l_pipeName      VARCHAR2(100);
         l_status        PLS_INTEGER;
-        l_jsonMain      JSON_OBJ_LILAM;   -- (unbenutzte Variablen l_now/l_retryInterval entfernt: sparte ein SYSTIMESTAMP je Aufruf)
+        l_jsonMain      JSON_OBJ_LILAM;   -- (unused variables l_now/l_retryInterval removed: saved one SYSTIMESTAMP per call)
     begin
         stabilizeInLowPerfEnvironments(p_processId);
 
-        -- PERFORMANCE: Nachricht in einem Schritt verketten statt über jsonPut (siehe jStr/jNum/jTs).
-        -- p_request ist immer eine interne Konstante und muss nicht maskiert werden.
+        -- PERFORMANCE: concatenate the message in one step instead of via jsonPut (see jStr/jNum/jTs).
+        -- p_request is always an internal constant and does not need to be escaped.
         l_jsonMain := '{"header":{"msg_type":"API_CALL","request":"' || p_request || '"}'
                    || case when p_payload is not null then ',"payload":' || p_payload end
                    || '}';
@@ -1679,13 +1675,13 @@ AS
             end if ;
             if l_status = 2 then
                 DBMS_PIPE.RESET_BUFFER;
-                DBMS_PIPE.PACK_MESSAGE(l_jsonMain);   -- vorher l_msg (nie befüllt): Wiederholung sendete leere Nachricht
+                DBMS_PIPE.PACK_MESSAGE(l_jsonMain);   -- previously l_msg (never filled): the retry sent an empty message
             end if;
             dbms_session.sleep(0.3);
         end loop;
 
         if l_status != 0 AND p_processId != g_serverProcessId then
-            -- Neuanmeldung an alternativem Server
+            -- Re-registration with an alternative server
             DBMS_PIPE.RESET_BUFFER;
             RAISE_APPLICATION_ERROR(-20006, 'LILAM: Client kann keine Nachrichten an Server senden:  ' || sqlErrM);
         end if;
@@ -1700,7 +1696,7 @@ AS
     function should_raise_error(p_processId number) return boolean
     as
     begin
-        -- Die Logik ist hier zentral gekapselt
+        -- The logic is encapsulated centrally here
         if p_processId is not null and v_indexSession.EXISTS(p_processId) 
            and g_sessionList(v_indexSession(p_processId)).log_level >= logLevelDebug 
         then
@@ -1815,7 +1811,7 @@ AS
     -- Creates LOG tables and the sequence for the process IDs if tables or sequence don't exist
     -- For naming rules of the tables see package description
     --------------------------------------------------------------------------
-    -- Legt einen Index an, falls er noch nicht existiert
+    -- Creates an index if it does not exist yet
     --------------------------------------------------------------------------
     procedure createIndexIfMissing(p_indexName varchar2, p_tableName varchar2, p_columns varchar2)
     as
@@ -1834,7 +1830,7 @@ AS
         l_master constant varchar2(100) := upper(trim(p_TabNameMaster));
         l_regCols number;
     begin
-        -- Pro Session und Master-Tabelle nur einmal pruefen (spart je NEW_SESSION rund ein Dutzend Dictionary-Abfragen)
+        -- Check only once per session and master table (saves about a dozen dictionary queries per NEW_SESSION)
         if g_checked_masters.EXISTS(l_master) then
             return;
         end if;
@@ -1900,7 +1896,7 @@ AS
                 "HOST_NAME"     varchar2(50),
                 "ACTION"        VARCHAR2(100),
                 "CONTEXT"  VARCHAR2(100),
-                "USED_MILLIS"   NUMBER(19,0), -- Millis als Zahl für einfache Auswertung
+                "USED_MILLIS"   NUMBER(19,0), -- Millis as a number for easy evaluation
                 "AVG_MILLIS"    NUMBER(19,0),
                 "ACTION_COUNT"    NUMBER(19,0)
             )';
@@ -1926,7 +1922,7 @@ AS
             )';
             run_sql(sqlStmt);
         else
-            -- Bestehende Registry um die Kennzeichnung der Dispatcher ergänzen
+            -- Extend an existing registry with the dispatcher flag
             select count(*) into l_regCols from user_tab_columns
              where table_name = upper(C_LILAM_SERVER_REGISTRY) and column_name = 'IS_DISPATCHER';
             if l_regCols = 0 then
@@ -1947,7 +1943,7 @@ AS
             )';
             run_sql(sqlStmt);
         else
-            -- Bestehende Tabelle: Rule Sets gelten je Servergruppe, eines je Gruppe ist aktiv
+            -- Existing table: rule sets apply per server group, one per group is active
             select count(*) into l_regCols from user_tab_columns
              where table_name = upper(C_LILAM_RULES_TABLE) and column_name = 'GROUP_NAME';
             if l_regCols = 0 then
@@ -1984,7 +1980,7 @@ AS
             run_sql(sqlStmt);
         end if;
 
-        -- Baseline Scopes: feste Identität einer Anwendung über Prozesse hinweg
+        -- Baseline scopes: fixed identity of an application across processes
         if not objectExists(C_LILAM_SCOPES_TABLE, 'TABLE') then
             sqlStmt := '
             CREATE TABLE ' || C_LILAM_SCOPES_TABLE || ' (
@@ -1997,7 +1993,7 @@ AS
             run_sql(sqlStmt);
         end if;
 
-        -- Baselines: aktueller Durchschnitt je Scope/Action/Context (kein Verlauf, der liegt in _MON)
+        -- Baselines: current average per scope/action/context (no history, that is in _MON)
         if not objectExists(C_LILAM_BASELINES_TABLE, 'TABLE') then
             sqlStmt := '
             CREATE TABLE ' || C_LILAM_BASELINES_TABLE || ' (
@@ -2012,8 +2008,8 @@ AS
             run_sql(sqlStmt);
         end if;
 
-        -- Indizes der Master-Tabellen: Namen werden aus dem Master-Namen gebildet,
-        -- damit jede Master-Tabelle (LILAM, LILAM_SERVER, eigene Namen) ihre eigenen Indizes erhält
+        -- Indexes of the master tables: names are derived from the master name,
+        -- so that each master table (LILAM, LILAM_SERVER, custom names) gets its own indexes
         createIndexIfMissing(p_TabNameMaster || C_SUFFIX_PROC_TABLE || '_IX_ID',      p_TabNameMaster || C_SUFFIX_PROC_TABLE, 'id');
         createIndexIfMissing(p_TabNameMaster || C_SUFFIX_PROC_TABLE || '_IX_CLEANUP', p_TabNameMaster || C_SUFFIX_PROC_TABLE, 'process_name, process_end');
         createIndexIfMissing(p_TabNameMaster || C_SUFFIX_LOG_TABLE  || '_IX_PID',     p_TabNameMaster || C_SUFFIX_LOG_TABLE,  'process_id');
@@ -2028,7 +2024,7 @@ AS
             run_sql(sqlStmt);
         end if ;
 
-        -- Rule Sets: eindeutig je Gruppe/Name/Version; je Gruppe höchstens ein aktives
+        -- Rule sets: unique per group/name/version; at most one active per group
         if not objectExists('idx_lilam_rules_grp', 'INDEX') then
             run_sql('CREATE UNIQUE INDEX idx_lilam_rules_grp ON ' || C_LILAM_RULES_TABLE || ' (group_name, set_name, version)');
         end if ;
@@ -2061,11 +2057,11 @@ AS
             return;
         end if ;
         
-        -- 1. eine aktive Session über die ID suchen; darin steckt der Name
-        --    der Master-Tabelle
-        -- 2. im vorgefertigten SQL den Namen der Master-Tabelle ersetzen
-        -- 3. alle veralteten IDs aus der Master-Tabelle suchen
-        -- 4. im Loop die Daten aus den Log-, Monitor- und Mastertabellen löschen
+        -- 1. find an active session by ID; it contains the name
+        --    of the master table
+        -- 2. replace the name of the master table in the prepared SQL
+        -- 3. find all outdated IDs in the master table
+        -- 4. delete the data from the log, monitor and master tables in a loop
 
         -- 1.
         sessionRec := getSessionRecord(p_processId);
@@ -2113,7 +2109,7 @@ AS
             if t_rc%isopen then 
                 close t_rc;
             end if ;
-            rollback; -- Auch im Fehlerfall die Transaktion beenden
+            rollback; -- End the transaction in the error case as well
         exception
             when others then
             logLilamErr(sqlCode, sqlErrM, 'deleteOldLogs', 'close t_rc');
@@ -2167,22 +2163,22 @@ AS
     -- Flush monitor data to detail table
     --------------------------------------------------------------------------
     --------------------------------------------------------------------------
-    -- PERFORMANCE: Gebündelter Flush in SYNC_ALL_DIRTY
+    -- PERFORMANCE: bundled flush in SYNC_ALL_DIRTY
     --
-    -- Vorher schrieb SYNC_ALL_DIRTY jeden fälligen Prozess einzeln: je Tabelle (_LOG, _MON, _PROC)
-    -- eine eigene autonome Transaktion mit eigenem Commit. Bei 200 offenen Prozessen waren das
-    -- je Durchlauf bis zu 600 Schreibvorgänge und 600 Commits; der Server las währenddessen
-    -- keine Nachrichten aus der Pipe.
+    -- Previously SYNC_ALL_DIRTY wrote each due process individually: per table (_LOG, _MON, _PROC)
+    -- a separate autonomous transaction with its own commit. With 200 open processes that meant
+    -- up to 600 writes and 600 commits per run; meanwhile the server read
+    -- no messages from the pipe.
     --
-    -- Jetzt: Während SYNC_ALL_DIRTY ist g_batch_mode gesetzt. persist_log_data,
-    -- persist_monitor_data und persist_process_record schreiben dann nicht selbst, sondern
-    -- hängen ihre Zeilen an einen Sammelpuffer je Zieltabelle an. flushBatch schreibt am Ende
-    -- des Durchlaufs alles mit einem FORALL je Tabelle und EINEM Commit.
+    -- Now: g_batch_mode is set during SYNC_ALL_DIRTY. persist_log_data,
+    -- persist_monitor_data and persist_process_record then do not write themselves but
+    -- append their rows to a collection buffer per target table. At the end of the run flushBatch writes
+    -- everything with one FORALL per table and ONE commit.
     --
-    -- Was und wann geschrieben wird, bleibt unverändert (gleiche Fälligkeitsprüfung je Prozess).
-    -- CLOSE_SESSION schreibt weiterhin sofort und nur den eigenen Prozess (kein Batch-Modus).
+    -- What is written and when remains unchanged (same due check per process).
+    -- CLOSE_SESSION still writes immediately and only its own process (no batch mode).
     --------------------------------------------------------------------------
-    -- (Typen und Sammelpuffer siehe Deklarationsteil: t_log_batch_rec, g_batch_mode ...)
+    -- (types and collection buffers see declaration section: t_log_batch_rec, g_batch_mode ...)
 
     procedure appendLogBatch(
         p_processId number, p_target_table varchar2,
@@ -2191,7 +2187,7 @@ AS
         p_stacks sys.odcivarchar2list, p_backtraces sys.odcivarchar2list, p_callstacks sys.odcivarchar2list)
     as
         l_n     pls_integer;
-        l_empty t_log_batch_rec;   -- Record mit leeren Listen (Defaults)
+        l_empty t_log_batch_rec;   -- Record with empty lists (defaults)
     begin
         if not g_log_batches.EXISTS(p_target_table) then
             g_log_batches(p_target_table) := l_empty;
@@ -2279,23 +2275,23 @@ AS
     end;
 
     --------------------------------------------------------------------------
-    -- STABILITÄT: Bulk-Schreiben ohne FORALL ... SAVE EXCEPTIONS
-    -- Dynamisches FORALL mit SAVE EXCEPTIONS gibt in Oracle bei jedem Aufruf PGA nicht frei
-    -- (ca. 40 Byte je Zeile, gemessen 23.26; siehe Test FEATURES/SPEICHER). Auf einem Server,
-    -- der tagelang läuft, wächst der Speicher dadurch unbegrenzt.
-    -- Deshalb: Normalfall ein FORALL ohne SAVE EXCEPTIONS (gleich schnell). Scheitert eine Zeile,
-    -- bricht das FORALL ab; die Anweisung wird zurückgerollt (Rollback der autonomen Transaktion
-    -- bzw. bis zum Savepoint in flushBatch) und dieselben Zeilen werden einzeln geschrieben
-    -- (nur im Fehlerfall). Fehlerhafte Zeilen werden wie bisher
-    -- übersprungen und protokolliert, die übrigen bleiben erhalten.
+    -- STABILITY: bulk writing without FORALL ... SAVE EXCEPTIONS
+    -- In Oracle, dynamic FORALL with SAVE EXCEPTIONS does not release PGA on each call
+    -- (approx. 40 bytes per row, measured on 23.26; see test FEATURES/SPEICHER). On a server
+    -- that runs for days, memory therefore grows without limit.
+    -- Therefore: in the normal case one FORALL without SAVE EXCEPTIONS (equally fast). If a row fails,
+    -- the FORALL aborts; the statement is rolled back (rollback of the autonomous transaction
+    -- or to the savepoint in flushBatch) and the same rows are written individually
+    -- (only in the error case). Faulty rows are, as before,
+    -- skipped and logged, the others are kept.
     --------------------------------------------------------------------------
-    -- Protokolliert den Fehler einer Einzelzeile im Fallback.
-    -- TRUE = Fallback abbrechen (Tabelle fehlt, jede weitere Zeile würde ebenso scheitern)
+    -- Logs the error of a single row in the fallback.
+    -- TRUE = abort the fallback (table missing, every further row would fail as well)
     function rowFailed(p_code number, p_msg varchar2, p_module varchar2, p_row pls_integer) return boolean
     is
     begin
         if p_code = -942 then
-            -- Tabelle fehlt: beim naechsten NEW_SESSION erneut pruefen und anlegen
+            -- Table missing: check and create again on the next NEW_SESSION
             g_checked_masters.DELETE; g_safe_tables.DELETE;
             logLilamErr(p_code, p_msg, p_module);
             return true;
@@ -2326,7 +2322,7 @@ AS
         v_user       varchar2(128);
         v_host       varchar2(128);
     begin
-        -- PERFORMANCE: im gebündelten Flush nur sammeln, flushBatch schreibt (siehe g_batch_mode)
+        -- PERFORMANCE: in the bundled flush only collect, flushBatch writes (see g_batch_mode)
         if g_batch_mode then
             if p_levels.count > 0 then
                 appendLogBatch(p_processId, p_target_table, p_seqs, p_levels, p_levelsC, p_texts, p_times,
@@ -2336,7 +2332,7 @@ AS
         end if;
 
         if p_levels.count > 0 then            
-            -- Sicherheit: Tabellenname validieren
+            -- Security: validate the table name
             v_safe_table := safeTableName(p_target_table);
             v_user := SYS_CONTEXT('USERENV','SESSION_USER');
             v_host := SYS_CONTEXT('USERENV','HOST');
@@ -2344,14 +2340,14 @@ AS
                     (PROCESS_ID, LOG_LEVEL, LOG_LEVEL_C, INFO, SESSION_TIME, NO, CALLER, ERR_STACK, ERR_BACKTRACE, ERR_CALLSTACK, SESSION_USER, HOST_NAME)
                     values (:1, :2, :3, :4, :5, :6, :7, :8, :9, :10, :11, :12)';
             begin
-                -- Bulk-Insert über alle gesammelten Log-Einträge (STABILITÄT: ohne SAVE EXCEPTIONS, siehe rowFailed)
+                -- Bulk insert over all collected log entries (STABILITY: without SAVE EXCEPTIONS, see rowFailed)
                 forall i in 1 .. p_levels.count
                     execute immediate v_stmt
                     USING p_processId, p_levels(i), p_levelsC(i), p_texts(i), p_times(i), p_seqs(i), p_callers(i), p_stacks(i),
                           p_backtraces(i), p_callstacks(i), v_user, v_host;
             exception
                 when others then
-                    -- Fallback: einzeln schreiben, fehlerhafte Zeilen überspringen
+                    -- Fallback: write individually, skip faulty rows
                     rollback;
                     for i in 1 .. p_levels.count loop
                         begin
@@ -2370,7 +2366,7 @@ AS
     exception
         when others then
             rollback;
-            -- Tabelle fehlt: beim naechsten NEW_SESSION erneut pruefen und anlegen
+            -- Table missing: check and create again on the next NEW_SESSION
             if sqlcode = -942 then g_checked_masters.DELETE; g_safe_tables.DELETE; end if;
             logLilamErr(sqlCode, sqlErrM, 'persist_log_data');
 
@@ -2378,7 +2374,7 @@ AS
 
     --------------------------------------------------------------------------
 
-    -- initilizes writing to table
+    -- initializes writing to table
     -- decouples internal memory from autonomous transaction
     procedure flushLogs(p_processId number)
     as
@@ -2386,7 +2382,7 @@ AS
         v_targetTable  varchar2(150);
         v_idx_session  pls_integer;
 
-        -- Bulk-Listen für den Datentransfer (Schema-Level Typen)
+        -- Bulk lists for the data transfer (schema-level types)
         v_levels       sys.odcinumberlist   := sys.odcinumberlist();
         v_levelsC      sys.odcivarchar2list := sys.odcivarchar2List();
         v_texts        sys.odcivarchar2list := sys.odcivarchar2list();
@@ -2399,7 +2395,7 @@ AS
 
         v_latency      number;
     begin
-        -- 1. Prüfen, ob Daten für diesen Prozess im Cache sind
+        -- 1. Check whether there is data for this process in the cache
         if not g_log_groups.EXISTS(v_key) or g_log_groups(v_key).COUNT = 0 then
             return;
         end if ;
@@ -2409,11 +2405,11 @@ AS
         g_avgLatencyLogs := round((g_avgLatencyLogs + v_latency) / g_logLatencyCounter, 2);
         if v_latency > g_maxLatencyLogs then g_maxLatencyLogs := v_latency; end if;
 
-        -- 2. Ziel-Tabelle aus der Session-Liste ermitteln
+        -- 2. Determine the target table from the session list
         v_idx_session := v_indexSession(p_processId);
         v_targetTable := g_sessionList(v_idx_session).tabName_master || C_SUFFIX_LOG_TABLE;
 
-        -- 3. Daten aus der hierarchischen Map in flache Listen sammeln
+        -- 3. Collect data from the hierarchical map into flat lists
         for i in 1 .. g_log_groups(v_key).COUNT loop
             v_levels.EXTEND;     v_levels(v_levels.LAST)     := g_log_groups(v_key)(i).log_level;
             v_levelsC.EXTEND;    v_levelsC(v_levelsC.LAST)   := logLevelToEnum(g_log_groups(v_key)(i).log_level);
@@ -2422,13 +2418,13 @@ AS
             v_seqs.EXTEND;       v_seqs(v_seqs.LAST)         := g_log_groups(v_key)(i).serial_no;
 
             v_callers.EXTEND;     v_callers(v_callers.LAST)     := substrb(g_log_groups(v_key)(i).caller, 1, 200);
-            -- Error-Stacks (begrenzt auf 4000 Byte für sys.odcivarchar2list)
+            -- Error stacks (limited to 4000 bytes for sys.odcivarchar2list)
             v_stacks.EXTEND;     v_stacks(v_stacks.LAST)     := substrb(g_log_groups(v_key)(i).err_stack, 1, 4000);
             v_backtraces.EXTEND; v_backtraces(v_backtraces.LAST) := substrb(g_log_groups(v_key)(i).err_backtrace, 1, 4000);
             v_callstacks.EXTEND; v_callstacks(v_callstacks.LAST) := substrb(g_log_groups(v_key)(i).err_callstack, 1, 4000);
         end loop;
 
-        -- 4. Übergabe an die autonome Bulk-Persistierung
+        -- 4. Hand over to the autonomous bulk persistence
         persist_log_data(
             p_processId    => p_processId,
             p_target_table => v_targetTable,
@@ -2443,7 +2439,7 @@ AS
             p_callstacks   => v_callstacks
         );
 
-        -- 5. Cache für diesen Prozess leeren
+        -- 5. Clear the cache for this process
         g_log_groups(v_key).DELETE;
 
     exception
@@ -2479,13 +2475,13 @@ AS
         g_sessionList(v_idx).serial_no := coalesce(g_sessionList(v_idx).serial_no, 0) + 1;
         v_new_log.serial_no := g_sessionList(v_idx).serial_no;
 
-        -- 1. Gruppe initialisieren
+        -- 1. Initialize the group
         if not g_log_groups.EXISTS(v_key) then
             g_log_groups(v_key) := t_log_history_tab();
         end if ;
 
-        -- 2. Record befüllen
-        v_new_log.process_id    := p_processId; -- Jetzt vorhanden
+        -- 2. Fill the record
+        v_new_log.process_id    := p_processId; -- Now available
         v_new_log.log_level     := p_level;
         v_new_log.log_text      := p_text;
         v_new_log.log_time      := p_logTime;
@@ -2495,12 +2491,12 @@ AS
         v_new_log.err_backtrace := p_errBacktrace;
         v_new_log.err_callstack := p_errCallstack;
 
-        -- 3. In den Cache hängen
+        -- 3. Append to the cache
         g_log_groups(v_key).EXTEND;
         g_log_groups(v_key)(g_log_groups(v_key).LAST) := v_new_log;
 
         g_sessionList(v_idx).log_dirty_count := coalesce(g_sessionList(v_idx).log_dirty_count, 0) + 1;
-        -- ID in die Dirty-Queue werfen
+        -- Put the ID into the dirty queue
         g_dirty_queue(p_processId) := TRUE;
     end;
 
@@ -2530,7 +2526,7 @@ AS
         v_safe_table varchar2(150);
         v_stmt       varchar2(1000);
     begin
-        -- PERFORMANCE: im gebündelten Flush nur sammeln, flushBatch schreibt (siehe g_batch_mode)
+        -- PERFORMANCE: in the bundled flush only collect, flushBatch writes (see g_batch_mode)
         if g_batch_mode then
             if p_actions.count > 0 then
                 appendMonBatch(p_processId, p_target_table, p_actions, p_contexts, p_mon_types,
@@ -2540,20 +2536,20 @@ AS
         end if;
 
         if p_actions.count > 0 then
-            -- Sicherheit: Tabellenname validieren
+            -- Security: validate the table name
             v_safe_table := safeTableName(p_target_table);
             v_stmt := 'insert into ' || v_safe_table || '
                 (PROCESS_ID, ACTION, CONTEXT, MON_TYPE, ACTION_COUNT, USED_MILLIS, AVG_MILLIS, START_TIME, STOP_TIME, SESSION_USER, HOST_NAME)
                 values (:1, :2, :3, :4, :5, :6, :7, :8, :9, :10, :11)';
             begin
-                -- STABILITÄT: ohne SAVE EXCEPTIONS, siehe rowFailed
+                -- STABILITY: without SAVE EXCEPTIONS, see rowFailed
                 forall i in 1 .. p_actions.count
                     execute immediate v_stmt
                     using p_processId, p_actions(i), p_contexts(i), p_mon_types(i), p_action_count(i), p_used(i), p_avgs(i), p_timesStart(i),
                           p_timesStop(i), v_user, v_host;
             exception
                 when others then
-                    -- Fallback: einzeln schreiben, fehlerhafte Zeilen überspringen
+                    -- Fallback: write individually, skip faulty rows
                     rollback;
                     for i in 1 .. p_actions.count loop
                         begin
@@ -2571,19 +2567,19 @@ AS
     exception
         when others then
             rollback;
-            -- Tabelle fehlt: beim naechsten NEW_SESSION erneut pruefen und anlegen
+            -- Table missing: check and create again on the next NEW_SESSION
             if sqlcode = -942 then g_checked_masters.DELETE; g_safe_tables.DELETE; end if;
             logLilamErr(sqlCode, sqlErrM, 'persist_monitor_data');
 
     end;
 
     --------------------------------------------------------------------
-    -- Abgleich der Baselines (PGA) mit LILAM_BASELINES per Delta-Merge:
-    -- Jede Session schreibt nur ihre eigene Veränderung seit dem letzten
-    -- Abgleich (avg - base_avg, count - base_count) und übernimmt danach
-    -- den Gesamtstand aus der DB. Ein Schreiber => exakter EWMA,
-    -- mehrere parallele Schreiber => gute Näherung ohne verlorene Updates.
-    -- Unbenutzte, saubere Einträge werden aus dem PGA entfernt.
+    -- Sync the baselines (PGA) with LILAM_BASELINES via delta merge:
+    -- Each session writes only its own change since the last
+    -- sync (avg - base_avg, count - base_count) and then takes over
+    -- the overall state from the DB. One writer => exact EWMA,
+    -- several parallel writers => good approximation without lost updates.
+    -- Unused, clean entries are removed from the PGA.
     --------------------------------------------------------------------
     PROCEDURE syncBaselines(p_force BOOLEAN DEFAULT FALSE)
     AS
@@ -2597,7 +2593,7 @@ AS
         l_dbAvg      NUMBER;
         l_dbCnt      NUMBER;
 
-        -- Delta-Updates für Einträge, die in der DB existieren
+        -- Delta updates for entries that exist in the DB
         l_upd_keys   sys.odcivarchar2list := sys.odcivarchar2list();
         l_upd_scope  sys.odcinumberlist   := sys.odcinumberlist();
         l_upd_action sys.odcivarchar2list := sys.odcivarchar2list();
@@ -2606,14 +2602,14 @@ AS
         l_upd_dCnt   sys.odcinumberlist   := sys.odcinumberlist();
         l_upd_avg    sys.odcinumberlist   := sys.odcinumberlist();
 
-        -- Rückgabe der neuen DB-Werte
+        -- Return the new DB values
         l_ret_scope  sys.odcinumberlist   := sys.odcinumberlist();
         l_ret_action sys.odcivarchar2list := sys.odcivarchar2list();
         l_ret_ctx    sys.odcivarchar2list := sys.odcivarchar2list();
         l_ret_avg    sys.odcinumberlist   := sys.odcinumberlist();
         l_ret_cnt    sys.odcinumberlist   := sys.odcinumberlist();
 
-        -- Neue (oder in der DB nicht mehr vorhandene) Einträge
+        -- New entries (or entries no longer present in the DB)
         l_ins_keys   sys.odcivarchar2list := sys.odcivarchar2list();
         l_ins_avg    sys.odcinumberlist   := sys.odcinumberlist();
         l_ins_cnt    sys.odcinumberlist   := sys.odcinumberlist();
@@ -2646,7 +2642,7 @@ AS
         END IF;
         g_last_baseline_sync := l_now;
 
-        -- 1. Dirty-Einträge einsammeln, unbenutzte saubere Einträge entfernen
+        -- 1. Collect dirty entries, remove unused clean entries
         l_key := g_baselines.FIRST;
         WHILE l_key IS NOT NULL LOOP
             l_next := g_baselines.NEXT(l_key);
@@ -2677,8 +2673,8 @@ AS
             RETURN;
         END IF;
 
-        -- 2. Delta-Merge als Bulk-Update
-        --    Ein negatives Ergebnis (extrem gegenläufige parallele Schreiber) wird durch den eigenen Wert ersetzt.
+        -- 2. Delta merge as bulk update
+        --    A negative result (extremely opposing parallel writers) is replaced by the own value.
         IF l_upd_keys.COUNT > 0 THEN
             FORALL i IN 1 .. l_upd_keys.COUNT
                 EXECUTE IMMEDIATE
@@ -2691,7 +2687,7 @@ AS
                 USING l_upd_dAvg(i), l_upd_dAvg(i), l_upd_avg(i), l_upd_dCnt(i), l_upd_scope(i), l_upd_action(i), l_upd_ctx(i)
                 RETURNING BULK COLLECT INTO l_ret_scope, l_ret_action, l_ret_ctx, l_ret_avg, l_ret_cnt;
 
-            -- In der DB nicht mehr vorhanden (z.B. manuell gelöscht) => neu anlegen
+            -- No longer present in the DB (e.g. deleted manually) => create again
             FOR i IN 1 .. l_upd_keys.COUNT LOOP
                 IF SQL%BULK_ROWCOUNT(i) = 0 THEN
                     l_ins_keys.EXTEND; l_ins_keys(l_ins_keys.LAST) := l_upd_keys(i);
@@ -2699,7 +2695,7 @@ AS
             END LOOP;
         END IF;
 
-        -- 3. Neue Einträge anlegen; legt eine andere Session parallel an, wird gewichtet gemittelt
+        -- 3. Create new entries; if another session creates them in parallel, a weighted average is used
         FOR i IN 1 .. l_ins_keys.COUNT LOOP
             l_rec := g_baselines(l_ins_keys(i));
             BEGIN
@@ -2724,14 +2720,14 @@ AS
                               l_rec.scope_id, l_rec.action_name, nvl(l_rec.context_name, C_BASELINE_NULL_CONTEXT)
                         RETURNING INTO l_dbAvg, l_dbCnt;
             END;
-            -- Werte merken; übernommen wird erst nach erfolgreichem Commit
+            -- Remember values; they are taken over only after a successful commit
             l_ins_avg.EXTEND; l_ins_avg(l_ins_avg.LAST) := l_dbAvg;
             l_ins_cnt.EXTEND; l_ins_cnt(l_ins_cnt.LAST) := l_dbCnt;
         END LOOP;
 
         COMMIT;
 
-        -- 4. Gesamtstand aus der DB übernehmen (neue Basis für das nächste Delta)
+        -- 4. Take over the overall state from the DB (new base for the next delta)
         FOR i IN 1 .. l_ret_scope.COUNT LOOP
             l_dbKey := dbKey(l_ret_scope(i), l_ret_action(i), l_ret_ctx(i));
             IF l_lookup.EXISTS(l_dbKey) THEN
@@ -2745,28 +2741,28 @@ AS
 
     EXCEPTION
         WHEN OTHERS THEN
-            -- Einträge bleiben dirty, das Delta wird beim nächsten Abgleich erneut geschrieben
+            -- Entries stay dirty, the delta is written again on the next sync
             ROLLBACK;
             logLilamErr(sqlCode, sqlErrM, 'syncBaselines');
     END;
 
     --------------------------------------------------------------------
-    -- Alle Dirty Einträge für alle Sessions wegschreiben
+    -- Write all dirty entries for all sessions
     --------------------------------------------------------------------
     PROCEDURE SYNC_ALL_DIRTY(p_force BOOLEAN DEFAULT FALSE, p_isShutdown BOOLEAN DEFAULT FALSE) 
     IS
         v_id      BINARY_INTEGER;
         v_next_id BINARY_INTEGER;
         v_idx     PLS_INTEGER;
-        -- PERFORMANCE: GET_TIME (1/100 s) statt SYSTIMESTAMP und get_ms_diff: läuft bei jedem Log-Aufruf
+        -- PERFORMANCE: GET_TIME (1/100 s) instead of SYSTIMESTAMP and get_ms_diff: runs on every log call
         v_now_cs  CONSTANT NUMBER := dbms_utility.get_time;
     BEGIN
         -- ======================================================================
-        -- TEIL 0: ZEITSPERRE
-        -- Ohne Force hoechstens alle C_SYNC_ALL_INTERVAL_MS einen Durchlauf ueber alle
-        -- Prozesse. So kostet z.B. jedes INFO nur einen Zeitvergleich, unabhaengig von
-        -- der Zahl offener Prozesse. Die Flush-Schwellen (Zeit/Menge) bleiben unveraendert.
-        -- ABS: beim Überlauf von GET_TIME gibt es höchstens einen zusätzlichen Durchlauf.
+        -- PART 0: TIME LOCK
+        -- Without force, at most one run over all processes every C_SYNC_ALL_INTERVAL_MS.
+        -- This way e.g. each INFO costs only one time comparison, regardless of
+        -- the number of open processes. The flush thresholds (time/amount) remain unchanged.
+        -- ABS: on overflow of GET_TIME there is at most one additional run.
         -- ======================================================================
         if NOT p_force AND NOT p_isShutdown
            AND g_last_sync_all_cs IS NOT NULL
@@ -2777,9 +2773,9 @@ AS
         g_last_sync_all_cs := v_now_cs;
 
         -- ======================================================================
-        -- TEIL 1: BEARBEITUNG DER DRECKIGEN LISTE (Queue)
-        -- PERFORMANCE: Im Batch-Modus sammeln persist_* nur; flushBatch schreibt danach
-        -- alle fälligen Prozesse gemeinsam (je Tabelle ein FORALL, ein Commit).
+        -- PART 1: PROCESSING THE DIRTY LIST (queue)
+        -- PERFORMANCE: in batch mode persist_* only collect; flushBatch then writes
+        -- all due processes together (one FORALL per table, one commit).
         -- ======================================================================
         g_batch_mode := TRUE;
         v_id := g_dirty_queue.FIRST;
@@ -2790,21 +2786,21 @@ AS
             if v_indexSession.EXISTS(v_id) THEN
                 v_idx := v_indexSession(v_id);
 
-                -- Zeitstempel-Check (Cooldown-Logik)
-                -- Bei Force oder Shutdown ignorieren wir die Wartezeit
+                -- Timestamp check (cooldown logic)
+                -- On force or shutdown we ignore the wait time
                 if NOT p_force AND NOT p_isShutdown
                    AND g_sessionList(v_idx).last_sync_check IS NOT NULL 
                    AND (SYSTIMESTAMP - g_sessionList(v_idx).last_sync_check) < INTERVAL '1' SECOND 
                 THEN
                     NULL; 
                 ELSE
-                    -- Synchronisation (p_isShutdown wird durchgereicht)
+                    -- Synchronization (p_isShutdown is passed through)
                     sync_log(v_id, p_force);
                     sync_monitor(v_id, p_force);
                     sync_process(v_id, p_force);
                     g_sessionList(v_idx).last_sync_check := SYSTIMESTAMP;
 
-                    -- Überprüfung: Ist die Session jetzt "sauber"?
+                    -- Check: is the session "clean" now?
                     if p_force OR p_isShutdown OR (
                            coalesce(g_sessionList(v_idx).log_dirty_count, 0) = 0 
                        AND coalesce(g_sessionList(v_idx).monitor_dirty_count, 0) = 0
@@ -2825,14 +2821,14 @@ AS
         flushBatch;
 
         -- ======================================================================
-        -- TEIL 2: MASTER-CLEANUP BEI SHUTDOWN
-        -- Hier räumen wir die RAM-Reste (Round-Robin) aller bekannten Sessions weg
+        -- PART 2: MASTER CLEANUP ON SHUTDOWN
+        -- Here we clear the RAM remnants (round robin) of all known sessions
         -- ======================================================================
         if p_isShutdown THEN
             v_id := v_indexSession.FIRST;
             WHILE v_id IS NOT NULL LOOP
-                -- flushMonitor direkt aufrufen, um is_flushed=1 Einträge zu löschen.
-                -- Da p_isShutdown = TRUE, greift dort g_monitor_groups.DELETE(v_key).
+                -- Call flushMonitor directly to delete is_flushed=1 entries.
+                -- Since p_isShutdown = TRUE, g_monitor_groups.DELETE(v_key) applies there.
                 flushMonitor(v_id);
 
                 v_id := v_indexSession.NEXT(v_id);
@@ -2840,13 +2836,13 @@ AS
         end if ;
 
         -- ======================================================================
-        -- TEIL 3: PROZESSÜBERGREIFENDE BASELINES (zeitgesteuert oder erzwungen)
+        -- PART 3: CROSS-PROCESS BASELINES (time-controlled or forced)
         -- ======================================================================
         syncBaselines(p_force OR p_isShutdown);
 
     EXCEPTION
         WHEN OTHERS THEN
-            -- Batch-Modus darf nie aktiv bleiben, sonst würden auch spätere Einzel-Flushes nur gesammelt
+            -- Batch mode must never stay active, otherwise later single flushes would only be collected too
             g_batch_mode := FALSE;
             logLilamErr(sqlCode, sqlErrM, 'SYNC_ALL_DIRTY');
             flushBatch;
@@ -2878,10 +2874,10 @@ AS
         v_idx_session := v_indexSession(p_processId);
         v_targetTable := g_sessionList(v_idx_session).tabName_master || C_SUFFIX_MON_TABLE;
 
-        -- PERFORMANCE: Die Schlüssel sind sortiert ("<process_id 20-stellig>|Aktion|Kontext").
-        -- Statt alle Puffer aller Prozesse zu durchlaufen und per LIKE zu filtern (quadratischer
-        -- Aufwand bei vielen offenen Prozessen), direkt beim ersten Schlüssel dieses Prozesses
-        -- einsteigen und abbrechen, sobald der Präfix nicht mehr passt.
+        -- PERFORMANCE: the keys are sorted ("<process_id 20 digits>|action|context").
+        -- Instead of iterating over all buffers of all processes and filtering via LIKE (quadratic
+        -- effort with many open processes), start directly at the first key of this process
+        -- and stop as soon as the prefix no longer matches.
         v_group_key := g_monitor_groups.NEXT(v_id_prefix);
         if v_group_key is not null and substr(v_group_key, 1, length(v_id_prefix)) != v_id_prefix then
             v_group_key := null;
@@ -2895,9 +2891,9 @@ AS
         end if;
 
         while v_group_key is not null loop     
-            -- Ende der Schlüssel dieses Prozesses erreicht
+            -- End of the keys of this process reached
             exit when substr(v_group_key, 1, length(v_id_prefix)) != v_id_prefix;
-                -- 1. Alles einsammeln, was aktuell im Eimer ist
+                -- 1. Collect everything that is currently in the bucket
                     for i in 1 .. g_monitor_groups(v_group_key).COUNT loop
                         v_actions.extend;      v_actions(v_actions.last)          := g_monitor_groups(v_group_key)(i).action_name;
                         v_contexts.extend;     v_contexts(v_contexts.last)        := g_monitor_groups(v_group_key)(i).context_name;
@@ -2909,13 +2905,13 @@ AS
                         v_timesStop.extend;    v_timesStop(v_timesStop.last)      := g_monitor_groups(v_group_key)(i).stop_time;
                     end loop;
 
-                -- 3. Radikaler Kahlschlag im RAM (SGA/PGA Hygiene)
+                -- 3. Radical clean-up in RAM (SGA/PGA hygiene)
                 g_monitor_groups(v_group_key).DELETE;
 
             v_group_key := g_monitor_groups.NEXT(v_group_key);
         end loop;
 
-        -- 5. Persistieren
+        -- 5. Persist
         if v_actions.COUNT > 0 then
             persist_monitor_data(
                 p_processId    => p_processId,
@@ -2950,19 +2946,19 @@ AS
         v_now constant timestamp := systimestamp;
 
     begin
-        -- 1. Index der Session holen
+        -- 1. Get the index of the session
         if not v_indexSession.EXISTS(p_processId) then
             return;
         end if ;
         v_idx := v_indexSession(p_processId);
 
-        -- Falls noch nie geflusht wurde (Start), setzen wir die Differenz hoch
+        -- If it has never been flushed (start), we set the difference high
         if g_sessionList(v_idx).last_monitor_flush is null then
             v_ms_since_flush := C_FLUSH_MILLIS_THRESHOLD_MS + 1;
         else
             v_ms_since_flush := get_ms_diff(g_sessionList(v_idx).last_monitor_flush, v_now);
         end if ;
-        -- 4. Die "Smarte" Flush-Bedingung: Menge ODER Zeit ODER Force
+        -- 4. The "smart" flush condition: amount OR time OR force
         if p_force 
            or g_sessionList(v_idx).monitor_dirty_count >= C_FLUSH_MONITOR_THRESHOLD_NO 
            or v_ms_since_flush >= C_FLUSH_MILLIS_THRESHOLD_MS
@@ -2970,7 +2966,7 @@ AS
             flushMonitor(p_processId);
             g_firstMonTimeStamp := null;
 
-            -- Reset der prozessspezifischen Steuerungsdaten
+            -- Reset the process-specific control data
             g_sessionList(v_idx).monitor_dirty_count := 0;
             g_sessionList(v_idx).last_monitor_flush  := v_now;
         end if ;
@@ -2984,7 +2980,7 @@ AS
     end;
 
     --------------------------------------------------------------------------
-    -- Arithmetisches Mittel (wird in der Warm-up-Phase verwendet)
+    -- Arithmetic mean (used in the warm-up phase)
     --------------------------------------------------------------------------
     function calculate_avg(
         p_old_avg    number,
@@ -2993,12 +2989,12 @@ AS
     ) return number 
     is
     begin
-        -- Erster Messwert: Der Durchschnitt ist der Wert selbst
+        -- First measurement: the average is the value itself
         if p_old_avg is null or p_curr_count <= 1 then
             return p_new_value;
         end if ;
 
-        -- Formel: ((Schnitt_alt * (n-1)) + Wert_neu) / n
+        -- Formula: ((avg_old * (n-1)) + value_new) / n
         return ((p_old_avg * (p_curr_count - 1)) + p_new_value) / p_curr_count;
     end;
 
@@ -3006,27 +3002,27 @@ AS
     -- Calculation average time used
     --------------------------------------------------------------------------
     function calculate_ewma(
-        p_old_avg    number,      -- Der bisherige Durchschnitt
-        p_curr_count pls_integer, -- Laufender Zähler inkl. der aktuellen Messung
-        p_new_value  number,      -- Aktuell gemessene Dauer (ms)
-        p_warmup     pls_integer default 100, -- Schwelle für die Glättung
-        p_alpha      number      default 0.1  -- Gewichtung (0.1 = 10% neu, 90% alt)
+        p_old_avg    number,      -- The previous average
+        p_curr_count pls_integer, -- Running counter including the current measurement
+        p_new_value  number,      -- Currently measured duration (ms)
+        p_warmup     pls_integer default 100, -- Threshold for smoothing
+        p_alpha      number      default 0.1  -- Weighting (0.1 = 10% new, 90% old)
     ) return number is
     begin
-        -- Fall 1: Initialisierung (Der allererste Datensatz überhaupt)
+        -- Case 1: initialization (the very first record)
         if p_old_avg is null or p_old_avg = 0 or p_curr_count <= 1 then
             return p_new_value;
         end if;
 
-        -- Fall 2: Warm-up Phase
-        -- Arithmetisches Mittel, bis genug Daten für eine stabile Glättung vorliegen.
-        -- So ist auch während des Warm-ups ein brauchbarer Durchschnitt vorhanden.
+        -- Case 2: warm-up phase
+        -- Arithmetic mean until there is enough data for stable smoothing.
+        -- This way a usable average is available during warm-up as well.
         if p_curr_count <= coalesce(p_warmup, 0) then
             return calculate_avg(p_old_avg, p_curr_count, p_new_value);
         end if;
 
-        -- Fall 3: EWMA
-        -- Formel: Alt + Alpha * (Neu - Alt)
+        -- Case 3: EWMA
+        -- Formula: old + alpha * (new - old)
         return p_old_avg + coalesce(p_alpha, 0.1) * (p_new_value - p_old_avg);
     end;
 
@@ -3035,9 +3031,9 @@ AS
     --------------------------------------------------------------------------    
     procedure startTraceRemote(p_processId number, p_actionName varchar2, p_contextName varchar2, p_timestamp timestamp default systimestamp)
     as
-        l_payload JSON_OBJ_LILAM; -- Puffer für den JSON-String
+        l_payload JSON_OBJ_LILAM; -- Buffer for the JSON string
     begin
-        -- PERFORMANCE: Nachricht direkt verketten statt über jsonPut (siehe jStr/jNum/jTs)
+        -- PERFORMANCE: concatenate the message directly instead of via jsonPut (see jStr/jNum/jTs)
         l_payload := '{"process_id":' || jNum(p_processId)
                   || jStr('action_name',  p_actionName)
                   || jStr('context_name', p_contextName)
@@ -3055,13 +3051,13 @@ AS
     --------------------------------------------------------------------------    
     procedure insertTraceMonitorRemote(p_processId number, p_actionName varchar2, p_contextName varchar2, p_timestamp timestamp default systimestamp)
     as
-        l_payload JSON_OBJ_LILAM; -- Puffer für den JSON-String
+        l_payload JSON_OBJ_LILAM; -- Buffer for the JSON string
     begin
-        -- Da das über die PIPE läuft und damit nicht gewährleistet ist, dass bei
-        -- späterem Aufruf von insertMonitor im Server der Zeitpunkt 'in time' ist,
-        -- muss der Zeitpunkt vom Client bei Aufruf gesetzt werden.
-        -- Erzeugung des JSON-Objekts
-        -- PERFORMANCE: Nachricht direkt verketten statt über jsonPut (siehe jStr/jNum/jTs)
+        -- Since this runs via the PIPE and it is therefore not guaranteed that the time
+        -- is still 'in time' when insertMonitor is called later in the server,
+        -- the time must be set by the client at the time of the call.
+        -- Creating the JSON object
+        -- PERFORMANCE: concatenate the message directly instead of via jsonPut (see jStr/jNum/jTs)
         l_payload := '{"process_id":' || jNum(p_processId)
                   || jStr('action_name',  p_actionName)
                   || jStr('context_name', p_contextName)
@@ -3081,15 +3077,15 @@ AS
     --------------------------------------------------------------------------    
     procedure insertEventMonitorRemote(p_processId number, p_actionName varchar2, p_contextName varchar2, p_timestamp timestamp)
     as
-        l_payload JSON_OBJ_LILAM; -- Puffer für den JSON-String
+        l_payload JSON_OBJ_LILAM; -- Buffer for the JSON string
     begin
         if p_timestamp is null then raise_application_error(-2005, 'Event ohne Zeitangabe'); end if;
 
-        -- Da das über die PIPE läuft und damit nicht gewährleistet ist, dass bei
-        -- späterem Aufruf von insertMonitor im Server der Zeitpunkt 'in time' ist,
-        -- muss der Zeitpunkt vom Client bei Aufruf gesetzt werden.
-        -- Erzeugung des JSON-Objekts
-        -- PERFORMANCE: Nachricht direkt verketten statt über jsonPut (siehe jStr/jNum/jTs)
+        -- Since this runs via the PIPE and it is therefore not guaranteed that the time
+        -- is still 'in time' when insertMonitor is called later in the server,
+        -- the time must be set by the client at the time of the call.
+        -- Creating the JSON object
+        -- PERFORMANCE: concatenate the message directly instead of via jsonPut (see jStr/jNum/jTs)
         l_payload := '{"process_id":' || jNum(p_processId)
                   || jStr('action_name',  p_actionName)
                   || jStr('context_name', p_contextName)
@@ -3105,7 +3101,7 @@ AS
 
     --------------------------------------------------------------------------
 
-    -- Baseline-Parameter aus AVG_DEVIATION_PCT-Regeln der Gruppe des Prozesses, sonst DEFAULT
+    -- Baseline parameters from AVG_DEVIATION_PCT rules of the process's group, otherwise DEFAULT
     function findAvgRule(p_processId number, p_action varchar2, p_context varchar2) return t_avg_params
     as
         l_group   varchar2(50);
@@ -3126,17 +3122,17 @@ AS
     end;
 
     --------------------------------------------------------------------------
-    -- Berechnet Durchschnitt (avg_action_time) und Regel-Referenz (baseline_avg)
-    -- für eine neue Messung in p_rec (used_time muss gesetzt sein).
-    -- Mit Scope:  prozessübergreifende Baseline (g_baselines)
-    -- Ohne Scope oder bei Fehlern: prozesslokal wie bisher
-    -- baseline_avg ist der Durchschnitt VOR der Messung; während des Warm-ups NULL,
-    -- damit AVG_DEVIATION_PCT erst bei stabiler Baseline greift.
+    -- Calculates the average (avg_action_time) and the rule reference (baseline_avg)
+    -- for a new measurement in p_rec (used_time must be set).
+    -- With scope:  cross-process baseline (g_baselines)
+    -- Without scope or on errors: process-local as before
+    -- baseline_avg is the average BEFORE the measurement; NULL during warm-up,
+    -- so that AVG_DEVIATION_PCT only applies once the baseline is stable.
     --------------------------------------------------------------------------
     procedure applyBaseline(
         p_processId   number,
-        p_prevAvg     number,        -- prozesslokaler Durchschnitt vor der Messung
-        p_prevCount   pls_integer,   -- prozesslokale Anzahl Messungen vor dieser
+        p_prevAvg     number,        -- process-local average before the measurement
+        p_prevCount   pls_integer,   -- process-local number of measurements before this one
         p_rec         in out nocopy t_monitor_buffer_rec
     )
     as
@@ -3160,14 +3156,14 @@ AS
                 g_baselines(l_key).action_count := l_oldCnt + 1;
                 g_baselines(l_key).avg_ms       := calculate_ewma(l_oldAvg, l_oldCnt + 1, p_rec.used_time, l_params.warmup, l_params.alpha);
                 g_baselines(l_key).dirty        := TRUE;
-                g_baselines(l_key).last_touch_cs := dbms_utility.get_time;  -- PERFORMANCE: je Trace/Event, daher kein SYSTIMESTAMP
+                g_baselines(l_key).last_touch_cs := dbms_utility.get_time;  -- PERFORMANCE: per trace/event, therefore no SYSTIMESTAMP
 
                 p_rec.avg_action_time := g_baselines(l_key).avg_ms;
                 p_rec.baseline_avg    := CASE WHEN l_oldCnt >= coalesce(l_params.warmup, 0) THEN l_oldAvg END;
                 return;
             exception
                 when others then
-                    -- Scope für diese Session abschalten und prozesslokal weiterarbeiten
+                    -- Switch off the scope for this session and continue process-locally
                     logLilamErr(sqlCode, sqlErrM, 'applyBaseline', 'scope_id=' || l_scopeId || '; scope disabled for process ' || p_processId);
                     setScopeId(p_processId, null);
             end;
@@ -3181,7 +3177,7 @@ AS
 
     procedure writeEventToMonitorBuffer (p_processId number, p_actionName varchar2, p_contextName varchar2, p_timestamp timestamp)
     as
-        -- Key-Präfix sollte idealerweise p_processId enthalten für schnelleren Flush-Zugriff
+        -- Key prefix should ideally contain p_processId for faster flush access
         v_key        constant varchar2(200) := buildMonitorKey(p_processId, p_actionName, p_contextName);
         l_new_idx    PLS_INTEGER;
         v_idx        PLS_INTEGER;
@@ -3193,7 +3189,7 @@ AS
             return;
         end if ;
 
-        -- Unbekannter Prozess (weder lokal noch über Dispatcher erreichbar): still ignorieren
+        -- Unknown process (neither local nor reachable via dispatcher): ignore silently
         if not v_indexSession.EXISTS(p_processId) then
             return;
         end if;
@@ -3204,7 +3200,7 @@ AS
             g_firstMonTimeStamp := p_timestamp; 
         end if;
 
-        -- 0. Monitoring-Check (Log-Level Prüfung)
+        -- 0. Monitoring check (log level check)
         if v_indexSession.EXISTS(p_processId) and 
            logLevelMonitor > g_sessionList(v_indexSession(p_processId)).log_level then
             return;
@@ -3216,14 +3212,14 @@ AS
         l_rec.monitor_type := C_MON_TYPE_EVENT;
         l_rec.start_time   := coalesce(p_timestamp, systimestamp);
 
-        -- Die nächsten Werte abhängig davon ob es einen Vorgänger gibt
-        -- Gemessen wird der Abstand zum vorherigen Event (innerhalb des Prozesses).
-        if g_monitor_shadows.EXISTS(v_key) then            -- Es gibt einen Vorgänger
+        -- The next values depend on whether there is a predecessor
+        -- The distance to the previous event (within the process) is measured.
+        if g_monitor_shadows.EXISTS(v_key) then            -- There is a predecessor
             l_prev := g_monitor_shadows(v_key);
             l_rec.action_count := l_prev.action_count + 1;
             l_rec.used_time    := get_ms_diff(l_prev.start_time, l_rec.start_time);
 
-            -- Anzahl gemessener Abstände vor diesem = action_count des Vorgängers - 1
+            -- Number of measured distances before this one = action_count of the predecessor - 1
             applyBaseline(
                 p_processId => p_processId,
                 p_prevAvg   => CASE WHEN l_prev.action_count > 1 THEN l_prev.avg_action_time END,
@@ -3231,9 +3227,9 @@ AS
                 p_rec       => l_rec
             );
         ELSE
-            -- Erster Eintrag der Session/Action
+            -- First entry of the session/action
             l_rec.action_count    := 1;
-            l_rec.used_time       := 0; -- Erster Marker hat keine Dauer
+            l_rec.used_time       := 0; -- First marker has no duration
             l_rec.avg_action_time := 0;
             l_rec.baseline_avg    := NULL;
         end if ;
@@ -3245,7 +3241,7 @@ AS
         l_new_idx := g_monitor_groups(v_key).LAST;
         g_monitor_groups(v_key)(l_new_idx) := l_rec;
 
-        -- vor dem Überschreiben des shadow-Eintrags die Regeln prüfen
+        -- check the rules before overwriting the shadow entry
         evaluateRules(g_monitor_groups(v_key)(l_new_idx), C_MARK_EVENT);
         g_monitor_shadows(v_key) := g_monitor_groups(v_key)(g_monitor_groups(v_key).LAST);         
 
@@ -3273,12 +3269,12 @@ AS
             return;
         end if ;
 
-        -- Unbekannter Prozess (weder lokal noch über Dispatcher erreichbar): still ignorieren
+        -- Unknown process (neither local nor reachable via dispatcher): ignore silently
         if not v_indexSession.EXISTS(p_processId) then
             return;
         end if;
 
-        -- Dummy nur für die Regeln
+        -- Dummy for the rules only
         v_dummyMonRec.process_id := p_processId;
         v_dummyMonRec.start_time := coalesce(p_timestamp, systimestamp);
         v_dummyMonRec.stop_time := null;
@@ -3298,7 +3294,7 @@ AS
 
     procedure writeTraceToMonitorBuffer (p_processId number, p_actionName varchar2, p_contextName varchar2, p_timestamp timestamp)
     as
-        -- Key-Präfix sollte idealerweise p_processId enthalten für schnelleren Flush-Zugriff
+        -- Key prefix should ideally contain p_processId for faster flush access
         v_key        constant varchar2(200) := buildMonitorKey(p_processId, p_actionName, p_contextName);
         v_used_time  number := 0;
         v_new_avg    number := 0;
@@ -3314,7 +3310,7 @@ AS
             return;
         end if ;
 
-        -- Unbekannter Prozess (weder lokal noch über Dispatcher erreichbar): still ignorieren
+        -- Unknown process (neither local nor reachable via dispatcher): ignore silently
         if not v_indexSession.EXISTS(p_processId) then
             return;
         end if;
@@ -3336,7 +3332,7 @@ AS
         v_new_rec.stop_time := coalesce(p_timestamp, systimestamp);
         v_new_rec.used_time := get_ms_diff(v_new_rec.start_time, v_new_rec.stop_time);
 
-        -- action_count bleibt prozesslokal (n-te Ausführung im Prozess; _MON und MAX_OCCURRENCE)
+        -- action_count stays process-local (n-th execution in the process; _MON and MAX_OCCURRENCE)
         IF g_monitor_averages.EXISTS(v_key) THEN
             l_prevAvg := g_monitor_averages(v_key).avg_action_time;
             l_prevCnt := g_monitor_averages(v_key).action_count;
@@ -3346,10 +3342,10 @@ AS
         END IF;
         v_new_rec.action_count := l_prevCnt + 1;
 
-        -- Durchschnitt: prozessübergreifend (Scope) oder prozesslokal
+        -- Average: cross-process (scope) or process-local
         applyBaseline(p_processId, l_prevAvg, l_prevCnt, v_new_rec);
 
-        -- Gedächtnis für den nächsten Lauf aktualisieren
+        -- Update the memory for the next run
         g_monitor_averages(v_key) := v_new_rec;
 
         if NOT g_monitor_groups.EXISTS(v_key) THEN
@@ -3358,7 +3354,7 @@ AS
         g_monitor_groups(v_key).EXTEND;
         g_monitor_groups(v_key)(g_monitor_groups(v_key).LAST) := v_new_rec;
 
-        -- Das Event an die Regelprüfung durchreichen
+        -- Pass the event on to the rule check
         evaluateRules(v_new_rec, C_TRACE_STOP);
         g_monitor_shadows.delete(v_key);
 
@@ -3381,7 +3377,7 @@ AS
     as
         v_key constant varchar2(200) := buildMonitorKey(p_processId, p_actionName, p_contextName);
     begin
-        -- 1. Historie löschen
+        -- 1. Delete history
         if g_monitor_groups.EXISTS(v_key) then
             g_monitor_groups.DELETE(v_key);
         end if ;
@@ -3393,18 +3389,18 @@ AS
     function getLastMonitorEntry(p_processId number, p_actionName varchar2, p_contextName varchar2) return t_monitor_buffer_rec
     as
         v_key    constant varchar2(200) := buildMonitorKey(p_processId, p_actionName, p_contextName);
-        v_empty  t_monitor_buffer_rec; -- Initial leerer Record als Fallback
+        v_empty  t_monitor_buffer_rec; -- Initially empty record as fallback
     begin
-        -- 1. Prüfen, ob die Gruppe (Action) im Cache existiert
+        -- 1. Check whether the group (action) exists in the cache
         if g_monitor_groups.EXISTS(v_key) then
-            -- 2. Prüfen, ob die Historie-Liste Einträge hat
+            -- 2. Check whether the history list has entries
             if g_monitor_groups(v_key).COUNT > 0 then
-                -- Den letzten Eintrag (LAST) der verschachtelten Liste zurückgeben
+                -- Return the last entry (LAST) of the nested list
                 return g_monitor_groups(v_key)(g_monitor_groups(v_key).LAST);
             end if ;
         end if ;
 
-        -- Falls nichts gefunden wurde, wird ein leerer Record zurückgegeben
+        -- If nothing was found, an empty record is returned
         return v_empty;
 
     exception
@@ -3581,7 +3577,7 @@ AS
         end if ;
 
         if getSessionRecord(p_processId).process_id is null then
-            -- neuer Datensatz
+            -- new record
             g_sessionList.extend;
             v_new_idx := g_sessionList.last;
         else
@@ -3609,7 +3605,7 @@ AS
         pragma autonomous_transaction;
         sqlStatement varchar2(1000);
     begin
-        -- PERFORMANCE: im gebündelten Flush nur sammeln, flushBatch schreibt (siehe g_batch_mode)
+        -- PERFORMANCE: in the bundled flush only collect, flushBatch writes (see g_batch_mode)
         if g_batch_mode then
             appendProcBatch(p_process_rec);
             return;
@@ -3640,18 +3636,18 @@ AS
 
     exception
         when others then
-            rollback; -- im Fehlerfall die Transaktion beenden
+            rollback; -- end the transaction in the error case
             logLilamErr(sqlCode, sqlErrM, 'persist_process_record', 'EXECUTE IMMEDIATE');
             
     end;
 
     --------------------------------------------------------------------------
-    -- PERFORMANCE: Schreibt die in SYNC_ALL_DIRTY gesammelten Zeilen aller Prozesse.
-    -- Je Zieltabelle ein FORALL, für alles zusammen EIN Commit (autonome Transaktion).
-    -- STABILITÄT: ohne SAVE EXCEPTIONS (siehe rowFailed). Scheitert ein FORALL, wird nur diese
-    -- Anweisung bis zu ihrem Savepoint zurückgerollt und ihre Zeilen einzeln geschrieben;
-    -- fehlerhafte Zeilen werden protokolliert und übersprungen, die übrigen bleiben erhalten.
-    -- Die anderen Tabellen sind davon nicht betroffen.
+    -- PERFORMANCE: writes the rows of all processes collected in SYNC_ALL_DIRTY.
+    -- One FORALL per target table, ONE commit for everything together (autonomous transaction).
+    -- STABILITY: without SAVE EXCEPTIONS (see rowFailed). If a FORALL fails, only this
+    -- statement is rolled back to its savepoint and its rows are written individually;
+    -- faulty rows are logged and skipped, the others are kept.
+    -- The other tables are not affected by this.
     --------------------------------------------------------------------------
     procedure flushBatch
     as
@@ -3686,7 +3682,7 @@ AS
                               g_log_batches(v_key).callstacks(i), v_user, v_host;
                 exception
                     when others then
-                        -- Fallback: einzeln schreiben, fehlerhafte Zeilen überspringen
+                        -- Fallback: write individually, skip faulty rows
                         rollback to savepoint sp_flush_log;
                         for i in 1 .. g_log_batches(v_key).pids.COUNT loop
                             begin
@@ -3725,7 +3721,7 @@ AS
                               v_user, v_host;
                 exception
                     when others then
-                        -- Fallback: einzeln schreiben, fehlerhafte Zeilen überspringen
+                        -- Fallback: write individually, skip faulty rows
                         rollback to savepoint sp_flush_mon;
                         for i in 1 .. g_mon_batches(v_key).pids.COUNT loop
                             begin
@@ -3746,7 +3742,7 @@ AS
             v_key := g_mon_batches.NEXT(v_key);
         end loop;
 
-        -- Prozess-Datensätze (_PROC)
+        -- Process records (_PROC)
         v_key := g_proc_batches.FIRST;
         while v_key is not null loop
             begin
@@ -3770,7 +3766,7 @@ AS
                               g_proc_batches(v_key).ids(i);
                 exception
                     when others then
-                        -- Fallback: einzeln schreiben, fehlerhafte Zeilen überspringen
+                        -- Fallback: write individually, skip faulty rows
                         rollback to savepoint sp_flush_proc;
                         for i in 1 .. g_proc_batches(v_key).ids.COUNT loop
                             begin
@@ -3921,8 +3917,8 @@ AS
 
     exception
         when others then
-            rollback; -- Auch im Fehlerfall die Transaktion beenden
-            -- Tabelle fehlt: beim naechsten NEW_SESSION erneut pruefen und anlegen
+            rollback; -- End the transaction in the error case as well
+            -- Table missing: check and create again on the next NEW_SESSION
             if sqlcode = -942 then g_checked_masters.DELETE; g_safe_tables.DELETE; end if;
             logLilamErr(sqlCode, sqlErrM, 'persist_new_session'); 
             
@@ -3936,32 +3932,32 @@ AS
         v_now            constant timestamp := systimestamp;
         v_ms_since_flush number;
     begin
-        -- 1. Sicherstellen, dass die Session im Server/Standalone bekannt ist
+        -- 1. Ensure that the session is known in the server/standalone
         if not v_indexSession.EXISTS(p_processId) then
             return;
         end if ;
 
         v_idx := v_indexSession(p_processId);
 
-        -- 2. Zeit seit dem letzten Master-Update berechnen
+        -- 2. Calculate the time since the last master update
         if g_sessionList(v_idx).last_process_flush is null then
             v_ms_since_flush := C_FLUSH_MILLIS_THRESHOLD_MS + 1;
         else
             v_ms_since_flush := get_ms_diff(g_sessionList(v_idx).last_process_flush, v_now);
         end if ;
 
-        -- 3. Die "Smarte" Flush-Bedingung
-        -- Wir flushen nur, wenn FORCE (z.B. Session-Ende), der Zeit-Threshold erreicht ist
-        -- ODER wenn dieser spezifische Prozess als "dirty" markiert wurde.
+        -- 3. The "smart" flush condition
+        -- We only flush if FORCE (e.g. end of session), the time threshold is reached
+        -- OR if this specific process has been marked as "dirty".
         if p_force 
            or (g_sessionList(v_idx).process_is_dirty AND v_ms_since_flush >= C_FLUSH_MILLIS_THRESHOLD_MS)
            or (p_force = false AND v_ms_since_flush >= (C_FLUSH_MILLIS_THRESHOLD_MS * 10)) -- Safety Sync
         then
-            -- Nur schreiben, wenn es auch wirklich Änderungen im Cache gibt
+            -- Only write if there really are changes in the cache
             if g_process_cache.EXISTS(p_processId) then
                 persist_process_record(g_process_cache(p_processId));            
 
-                -- Reset der prozessspezifischen Steuerungsdaten
+                -- Reset the process-specific control data
                 g_sessionList(v_idx).process_is_dirty   := FALSE;
                 g_sessionList(v_idx).last_process_flush := v_now;
             end if ;
@@ -3999,7 +3995,7 @@ AS
         v_now            constant timestamp := systimestamp;
         v_ms_since_flush number;
     begin
-        -- 1. Index der Session holen
+        -- 1. Get the index of the session
         if not v_indexSession.EXISTS(p_processId) then
             return;
         end if ;
@@ -4007,22 +4003,22 @@ AS
         g_sessionList(v_idx).log_dirty_count := coalesce(g_sessionList(v_idx).log_dirty_count, 0) + 1;
         g_dirty_queue(p_processId) := TRUE;
 
-        -- (get_ms_diff ist Ihre optimierte Funktion)
+        -- (get_ms_diff is the optimized function)
         if g_sessionList(v_idx).last_log_flush is null then
             v_ms_since_flush := C_FLUSH_MILLIS_THRESHOLD_MS + 1;
         else
             v_ms_since_flush := get_ms_diff(g_sessionList(v_idx).last_log_flush, v_now);
         end if ;
-        -- 4. Flush-Bedingung: Menge ODER Zeit ODER Force
+        -- 4. Flush condition: amount OR time OR force
         if p_force 
            or g_sessionList(v_idx).log_dirty_count >= C_FLUSH_LOG_THRESHOLD_NO 
            or v_ms_since_flush >= C_FLUSH_MILLIS_THRESHOLD_MS
         then            
-            -- Alle gepufferten Logs dieses Prozesses in die DB schreiben
+            -- Write all buffered logs of this process to the DB
             flushLogs(p_processId);
             g_firstLogTimeStamp := null;
 
-            -- Steuerungsdaten für diesen Prozess zurücksetzen
+            -- Reset the control data for this process
             g_sessionList(v_idx).log_dirty_count := 0;
             g_sessionList(v_idx).last_log_flush  := v_now;
         end if ;
@@ -4037,12 +4033,12 @@ AS
 
     procedure close_sessionRemote(p_processId number, p_procStepsToDo PLS_INTEGER, p_procStepsDone PLS_INTEGER, p_processInfo varchar2, p_processStatus PLS_INTEGER)
     as
-        l_payload JSON_OBJ_LILAM; -- Puffer für den JSON-String
+        l_payload JSON_OBJ_LILAM; -- Buffer for the JSON string
         l_serverMsg varchar2(100);
         l_response  varchar2(1000);
     begin
-        -- Erzeugung des JSON-Objekts
-        -- PERFORMANCE: Nachricht direkt verketten statt über jsonPut (siehe jStr/jNum/jTs)
+        -- Creating the JSON object
+        -- PERFORMANCE: concatenate the message directly instead of via jsonPut (see jStr/jNum/jTs)
         l_payload := '{"process_id":' || jNum(p_processId)
                   || jNum('steps_todo',     p_procStepsToDo)
                   || jNum('steps_done',     p_procStepsDone)
@@ -4068,11 +4064,11 @@ AS
 
     procedure procStepDoneRemote(p_processId number, p_timestamp TIMESTAMP)
     as
-        l_payload JSON_OBJ_LILAM; -- Puffer für den JSON-String
+        l_payload JSON_OBJ_LILAM; -- Buffer for the JSON string
         l_serverMsg varchar2(100);
     begin
-        -- Erzeugung des JSON-Objekts
-        -- PERFORMANCE: Nachricht direkt verketten statt über jsonPut (siehe jStr/jNum/jTs)
+        -- Creating the JSON object
+        -- PERFORMANCE: concatenate the message directly instead of via jsonPut (see jStr/jNum/jTs)
         l_payload := '{"process_id":' || jNum(p_processId)
                   || jTs('timestamp', p_timestamp) || '}';
 
@@ -4082,9 +4078,9 @@ AS
 
     procedure setAnyStatusRemote(p_processId number, p_status pls_integer, p_processInfo varchar2, p_procStepsToDo pls_integer, p_procStepsDone pls_integer, p_immortal pls_integer, p_timestamp TIMESTAMP)
     as
-        l_payload JSON_OBJ_LILAM; -- Puffer für den JSON-String
+        l_payload JSON_OBJ_LILAM; -- Buffer for the JSON string
     begin
-        -- PERFORMANCE: Nachricht direkt verketten statt über jsonPut (siehe jStr/jNum/jTs)
+        -- PERFORMANCE: concatenate the message directly instead of via jsonPut (see jStr/jNum/jTs)
         l_payload := '{"process_id":' || jNum(p_processId)
                   || jNum('steps_todo',       p_procStepsToDo)
                   || jNum('steps_done',       p_procStepsDone)
@@ -4100,9 +4096,9 @@ AS
 
     procedure log_anyRemote(p_processId number, p_level number, p_logText varchar2, p_caller varchar2, p_errStack varchar2, p_errBacktrace varchar2, p_errCallstack varchar2, p_timestamp TIMESTAMP)
     as
-        l_payload JSON_OBJ_LILAM; -- Puffer für den JSON-String
+        l_payload JSON_OBJ_LILAM; -- Buffer for the JSON string
     begin
-        -- PERFORMANCE: Nachricht direkt verketten statt über jsonPut (siehe jStr/jNum/jTs)
+        -- PERFORMANCE: concatenate the message directly instead of via jsonPut (see jStr/jNum/jTs)
         l_payload := '{"process_id":' || jNum(p_processId)
                   || jNum('level',         p_level)
                   || jStr('log_text',      p_logText)
@@ -4122,7 +4118,7 @@ AS
 
     --------------------------------------------------------------------------
 
-    -- capsulation writing to log-buffer and synchronization of buffer
+    -- encapsulates writing to the log buffer and synchronization of the buffer
     procedure log_any(
         p_processId number, 
         p_level number,
@@ -4142,8 +4138,8 @@ AS
         v_stack_unit  UTL_CALL_STACK.unit_qualified_name;        
         l_logText     VARCHAR2(8000);
     begin
-        -- Pauschal kürzen: gilt für Insession und Decoupled (vor dem Versand über die Pipe).
-        -- Zusätzlich auf die 2000 Bytes der Spalte INFO begrenzen (Mehrbyte-Zeichen, z.B. Umlaute)
+        -- Truncate in general: applies to in-session and decoupled (before sending via the pipe).
+        -- Additionally limit to the 2000 bytes of column INFO (multi-byte characters, e.g. umlauts)
         l_logText := substr(p_logText, 1, C_MAX_LOG_TEXT_LEN);
         while lengthb(l_logText) > 2000 loop
             l_logText := substr(l_logText, 1, length(l_logText) - 50);
@@ -4151,13 +4147,13 @@ AS
 
         -- lookup in stack - who called me?
         if l_module is null then
-            -- Name von LILAM könnte sich theoretisch ändern
+            -- The name of LILAM could theoretically change
             l_packageName := $$PLSQL_UNIT; 
             
-            -- Maximale Tiefe des aktuellen Aufrufs ermitteln
+            -- Determine the maximum depth of the current call
             l_maxDepth := UTL_CALL_STACK.dynamic_depth;
             -- looks for first unit with other name
-            -- Loops starts with 3 due to performance
+            -- Loop starts with 3 due to performance
             FOR i IN 3 .. l_maxDepth LOOP
                 v_stack_unit := UTL_CALL_STACK.subprogram(i);
                 IF upper(v_stack_unit(1)) != upper(l_packageName) and upper(v_stack_unit(1)) != '__ANONYMOUS_BLOCK' THEN
@@ -4167,7 +4163,7 @@ AS
             END LOOP;
             
             if l_aimDepth IS NOT NULL then    
-               -- Auslesen des vollqualifizierten Namens des echten Aufrufers
+               -- Read the fully qualified name of the real caller
                l_module := UTL_CALL_STACK.concatenate_subprogram (
                               UTL_CALL_STACK.subprogram(l_aimDepth)
                           );
@@ -4182,7 +4178,7 @@ AS
             return;
         end if ;
 
-        -- Hier nur weiter, wenn nicht remote
+        -- Continue here only if not remote
         if v_indexSession.EXISTS(p_processId) and p_level <= g_sessionList(v_indexSession(p_processId)).log_level then
             write_to_log_buffer(
                 p_processId, 
@@ -4196,7 +4192,7 @@ AS
             );
         end if ;
         
-        -- raise alert (nur für bekannte Prozesse; fire_alert braucht die Session-Daten)
+        -- raise alert (only for known processes; fire_alert needs the session data)
         if v_indexSession.EXISTS(p_processId)
            and g_rules_by_action.EXISTS(g_sessionList(v_indexSession(p_processId)).rule_group || '|' || C_LOGGING) then
             v_dummyMonRec.process_id := p_processId;
@@ -4208,7 +4204,7 @@ AS
             evaluateRules(v_dummyMonRec, C_LOGGING);
         end if;
 
-        -- Wenn harte Fehler, muss das Logfile geschrieben werden
+        -- On hard errors the log must be written
         if p_level = logLevelError then
             SYNC_ALL_DIRTY(true);
         else
@@ -4264,7 +4260,7 @@ AS
 
     --------------------------------------------------------------------------
 
-    -- Zählt einen ERROR- bzw. WARN-Aufruf für den Prozess (GET_COUNTER_ERROR/GET_COUNTER_WARN)
+    -- Counts an ERROR or WARN call for the process (GET_COUNTER_ERROR/GET_COUNTER_WARN)
     procedure countLog(p_processId number, p_isError boolean)
     as
         l_new t_log_counter_rec;
@@ -4306,7 +4302,7 @@ AS
 
     --------------------------------------------------------------------------
 
-    -- Anzahl der WARN-Aufrufe für den Prozess in dieser Session; 0 für unbekannte oder geschlossene Prozesse
+    -- Number of WARN calls for the process in this session; 0 for unknown or closed processes
     FUNCTION GET_COUNTER_WARN(p_processId NUMBER) return PLS_INTEGER
     as
     begin
@@ -4318,7 +4314,7 @@ AS
 
     --------------------------------------------------------------------------
 
-    -- Anzahl der ERROR-Aufrufe für den Prozess in dieser Session; 0 für unbekannte oder geschlossene Prozesse
+    -- Number of ERROR calls for the process in this session; 0 for unknown or closed processes
     FUNCTION GET_COUNTER_ERROR(p_processId NUMBER) return PLS_INTEGER
     as
     begin
@@ -4369,7 +4365,7 @@ AS
             if p_procImmortal   is not null then g_process_cache(p_processId).procImmortal := p_procImmortal; end if;
 
             g_sessionList(v_indexSession(p_processId)).process_is_dirty := TRUE;
-            g_dirty_queue(p_processId) := TRUE; -- Damit SYNC_ALL_DIRTY die Session sieht
+            g_dirty_queue(p_processId) := TRUE; -- So that SYNC_ALL_DIRTY sees the session
 
             evaluateRules(g_process_cache(p_processId), C_PROCESS_UPDATE);                
         end if ;
@@ -4434,11 +4430,11 @@ AS
 
     function getProcessDataRemote(p_processId number) return t_process_rec
     as
-        l_payload JSON_OBJ_LILAM; -- Puffer für den JSON-String
+        l_payload JSON_OBJ_LILAM; -- Buffer for the JSON string
         l_response varchar2(20000);
         l_process_rec t_process_rec;
     begin
-        -- Erzeugung des JSON-Objekts
+        -- Creating the JSON object
         select json_object(
             'process_id'   value p_processId
             returning varchar2
@@ -4559,7 +4555,7 @@ AS
     procedure clearServerData
     as
     begin
-        -- offene Baseline-Deltas sichern (eigene Fehlerbehandlung)
+        -- save open baseline deltas (own error handling)
         syncBaselines(TRUE);
         g_baselines.DELETE;
         g_scope_ids.DELETE;
@@ -4592,7 +4588,7 @@ AS
     --------------------------------------------------------------------------
 
     --------------------------------------------------------------------------
-    -- Offene Traces eines Prozesses als Warnung ins Log schreiben (vor dem letzten Flush in CLOSE_SESSION)
+    -- Write open traces of a process as a warning to the log (before the last flush in CLOSE_SESSION)
     --------------------------------------------------------------------------
     PROCEDURE warnOpenTraces(p_processId NUMBER)
     IS
@@ -4604,11 +4600,11 @@ AS
             RETURN;
         END IF;
 
-        -- PERFORMANCE: direkt beim ersten Schlüssel dieses Prozesses einsteigen (Schlüssel sind sortiert)
+        -- PERFORMANCE: start directly at the first key of this process (keys are sorted)
         v_key := g_monitor_shadows.NEXT(v_search_prefix);
         WHILE v_key IS NOT NULL LOOP
             EXIT WHEN SUBSTR(v_key, 1, LENGTH(v_search_prefix)) != v_search_prefix;
-            -- Auch Events hinterlassen einen Shadow (Abstand zum vorigen Event); offen sind nur Traces
+            -- Events also leave a shadow (distance to the previous event); only traces are open
             IF g_monitor_shadows(v_key).monitor_type = C_MON_TYPE_TRACE THEN
                 write_to_log_buffer(
                     p_processId,
@@ -4640,55 +4636,54 @@ AS
         v_next_key      VARCHAR2(250);
     BEGIN
 
-        -- A) MONITOR-DATEN & CACHES RÄUMEN
-        -- Wir nutzen den sicheren Loop (Sichern vor Löschen)
-        -- PERFORMANCE: direkt beim ersten Schlüssel dieses Prozesses einsteigen (Schlüssel sind sortiert)
+        -- A) CLEAR MONITOR DATA & CACHES
+        -- We use the safe loop (save before delete)
+        -- PERFORMANCE: start directly at the first key of this process (keys are sorted)
         v_key := g_monitor_groups.NEXT(v_search_prefix);
         WHILE v_key IS NOT NULL LOOP
             EXIT WHEN SUBSTR(v_key, 1, LENGTH(v_search_prefix)) != v_search_prefix;
             v_next_key := g_monitor_groups.NEXT(v_key);
-            -- Historie löschen
+            -- Delete history
             g_monitor_groups.DELETE(v_key);
             v_key := v_next_key;
         END LOOP;
 
-        -- B) LOG-GRUPPEN RÄUMEN
-        -- Da g_log_groups ebenfalls mit der ID als Key (String) arbeitet:
+        -- B) CLEAR LOG GROUPS
+        -- Since g_log_groups also uses the ID as key (string):
         if g_log_groups.EXISTS(TO_CHAR(p_processId)) THEN
             g_log_groups.DELETE(TO_CHAR(p_processId));
         end if;
 
-        -- C) DIRTY QUEUE RÄUMEN
+        -- C) CLEAR DIRTY QUEUE
         if g_dirty_queue.EXISTS(p_processId) THEN
             g_dirty_queue.DELETE(p_processId);
         end if;
 
-        -- D) SESSION-METADATEN (MASTER-LISTE) RÄUMEN
+        -- D) CLEAR SESSION METADATA (MASTER LIST)
         if v_indexSession.EXISTS(p_processId) THEN
             v_idx := v_indexSession(p_processId);
-            g_sessionList.DELETE(v_idx);     -- Eintrag in der Nested Table (Slot wird leer)
-            v_indexSession.DELETE(p_processId); -- Wegweiser löschen
+            g_sessionList.DELETE(v_idx);     -- Entry in the nested table (slot becomes empty)
+            v_indexSession.DELETE(p_processId); -- Delete the pointer
         end if;
 
-        -- E) PROZESS CACHE RÄUMEN
+        -- E) CLEAR PROCESS CACHE
         if g_process_cache.EXISTS(p_processId) THEN
             g_process_cache.DELETE(p_processId);
         end if ;
 
-        -- F) Monitor Shadows löschen
-            -- Wir starten am Anfang der Schatten-Map
+        -- F) Delete monitor shadows
+            -- We start at the beginning of the shadow map
         v_key := g_monitor_shadows.FIRST;   
         WHILE v_key IS NOT NULL LOOP
             EXIT WHEN SUBSTR(v_key, 1, 20) > LPAD(p_processId, 20, '0');
             if v_key LIKE v_search_prefix || '%' THEN
                 g_monitor_shadows.DELETE(v_key);
-                -- Optional: DBMS_OUTPUT.PUT_LINE('Shadow gelöscht für: ' || v_key);
             end if ;            
-            -- Zum nächsten Key springen
+            -- Jump to the next key
             v_key := g_monitor_shadows.NEXT(v_key);
         END LOOP;
 
-        -- G) Durchschnittswerte löschen
+        -- G) Delete averages
         v_key := g_monitor_averages.FIRST;
         WHILE v_key IS NOT NULL LOOP
             EXIT WHEN SUBSTR(v_key, 1, 20) > LPAD(p_processId, 20, '0');
@@ -4698,18 +4693,18 @@ AS
             v_key := g_monitor_averages.NEXT(v_key);
         END LOOP;
 
-        -- H) Die Liste der aktiven Server zurücksetzen
+        -- H) Reset the list of active servers
         g_client_pipes.DELETE(p_processId);
 
-        -- I) Speicher von gesendeten Nachrichten und vergangener Zeit für diesen Prozess
+        -- I) Memory of sent messages and elapsed time for this process
         g_local_throttle_cache.DELETE(p_processId);
 
-        -- J) Abgelegte Vorgänger-Aktionen löschen
+        -- J) Delete stored predecessor actions
             IF g_last_action_per_process.EXISTS(p_processId) THEN
                 g_last_action_per_process.DELETE(p_processId);
             END IF;
 
-        -- K) Zähler für ERROR/WARN
+        -- K) Counters for ERROR/WARN
         g_log_counters.DELETE(p_processId);
 
     EXCEPTION
@@ -4740,18 +4735,18 @@ AS
             return;
         end if ;
 
-        -- Hier nur weiter, wenn lokale processId
+        -- Continue here only for a local processId
         if v_indexSession.EXISTS(p_processId) then
-            -- offene Traces melden, solange Puffer und Shadows noch bestehen
+            -- report open traces while buffers and shadows still exist
             warnOpenTraces(p_processId);
-            -- Nur die Puffer dieses Prozesses wegschreiben (nicht die aller offenen Prozesse)
+            -- Write only the buffers of this process (not those of all open processes)
             sync_log(p_processId, true);
             sync_monitor(p_processId, true);
             sync_process(p_processId, true);
             syncBaselines(true);
 
             g_process_cache(p_processId).processEnd := systimestamp;
-            -- Abschlusswerte vor der Regelprüfung übernehmen (PROCESS_STOP sieht den Endstand)
+            -- Take over the final values before the rule check (PROCESS_STOP sees the final state)
             if p_procStepsDone is not null then g_process_cache(p_processId).stepsDone := p_procStepsDone; end if;
             if p_procStepsToDo is not null then g_process_cache(p_processId).stepsTodo := p_procStepsToDo; end if;
             if p_processInfo   is not null then g_process_cache(p_processId).info      := p_processInfo;   end if;
@@ -4780,22 +4775,22 @@ AS
         v_idx       PLS_INTEGER;
     begin
 
-        -- leere Master-Tabelle (z.B. aus JSON ohne tabname_master) => Standard
+        -- empty master table (e.g. from JSON without tabname_master) => default
         l_session_init.tabNameMaster := nvl(trim(l_session_init.tabNameMaster), 'LILAM');
         createLogTables(l_session_init.tabNameMaster);
 
         -- New Process ID by Sequence
         execute immediate 'select seq_lilam_log.nextVal from dual' into p_processId;
         
-        -- default LogLevel logLevelMonitorr
+        -- default LogLevel logLevelMonitor
         if l_session_init.logLevel is null then l_session_init.logLevel := logLevelMonitor; end if;
         
         -- persist to session internal table
         insertSession (l_session_init.tabNameMaster, p_processId, l_session_init.logLevel);
 
-        -- Gruppe für die Regeln: im Server die Servergruppe (Dispatcher: keine Regeln),
-        -- INSESSION die angegebene Gruppe (NULL = keine Regeln). Das Rule Set der Gruppe lädt
-        -- die erste Regelprüfung (PROCESS_START unten), danach höchstens alle C_RULES_CHECK_INTERVAL_MS.
+        -- Group for the rules: in the server the server group (dispatcher: no rules),
+        -- INSESSION the specified group (NULL = no rules). The rule set of the group is loaded by
+        -- the first rule check (PROCESS_START below), afterwards at most every C_RULES_CHECK_INTERVAL_MS.
         v_idx := v_indexSession(p_processId);
         if g_serverPipeName is not null then
             if not g_serverIsDispatcher then
@@ -4808,7 +4803,7 @@ AS
 
         deleteOldLogs(p_processId, upper(trim(l_session_init.processName)), l_session_init.daysToKeep);
 
-        -- Baseline Scope (Default: Prozessname); bei Fehlern NULL => prozesslokal
+        -- Baseline scope (default: process name); on errors NULL => process-local
         l_scopeName := resolveScopeName(l_session_init.processName, l_session_init.baselineScope);
         l_scopeId   := getOrCreateScopeId(l_scopeName);
         setScopeId(p_processId, l_scopeId);
@@ -4868,12 +4863,12 @@ AS
     BEGIN
         g_dispatcher_config(nvl(upper(p_groupName), 'DEFAULT_DISPATCHER')) := p_pipeName;
     
-        -- Vorwärmen nur, wenn eine process_id mitgegeben wurde
+        -- Pre-warm only if a process_id was passed
         if p_processId is not null then
             l_result := SERVER_LINK(p_processId, p_pipeName);
-            -- bewusst kein Raise hier: SERVER_LINK (Function) fängt selbst alles ab
-            -- und loggt über logLilamErr; schlägt das Vorwärmen fehl, greift beim
-            -- nächsten echten API-Aufruf ohnehin der automatische Fallback in is_remote()
+            -- deliberately no raise here: SERVER_LINK (function) catches everything itself
+            -- and logs via logLilamErr; if pre-warming fails, the automatic fallback in is_remote()
+            -- applies on the next real API call anyway
         end if;
     END;
 
@@ -5011,7 +5006,7 @@ AS
         if v_indexSession.EXISTS(l_processId) then
             jsonPut(l_response, 'server_code', get_serverCode(TXT_ACK_SERVER_PROC));
             jsonPut(l_response, 'process_id', l_processId);
-            jsonPut(l_response, 'perf', g_server_perf);   -- Leistungsstufe für die Drosselung des Clients
+            jsonPut(l_response, 'perf', g_server_perf);   -- Performance level for client throttling
         else
             jsonPut(l_response, 'server_code', get_serverCode(TXT_ERR_SERVER_PROC));
         end if;
@@ -5168,7 +5163,7 @@ AS
         jsonPut(l_msg, 'payload', l_payload);
 
         -- no payload, client waits only for unfreezing
-        DBMS_PIPE.RESET_BUFFER; -- Koffer leeren
+        DBMS_PIPE.RESET_BUFFER; -- Empty the buffer
         DBMS_PIPE.PACK_MESSAGE(l_msg);        
         l_status := DBMS_PIPE.SEND_MESSAGE(p_clientChannel, timeout => 0);
 
@@ -5215,7 +5210,7 @@ AS
         jsonPut(l_msg, 'payload', l_payload);
 
         -- no payload, client waits only for unfreezing
-        DBMS_PIPE.RESET_BUFFER; -- Koffer leeren
+        DBMS_PIPE.RESET_BUFFER; -- Empty the buffer
         DBMS_PIPE.PACK_MESSAGE(l_msg);        
         l_status := DBMS_PIPE.SEND_MESSAGE(p_clientChannel, timeout => 0);
 
@@ -5250,7 +5245,7 @@ AS
         jsonPut(l_msg, 'payload', l_payload);
 
         -- no payload, client waits only for unfreezing
-        DBMS_PIPE.RESET_BUFFER; -- Koffer leeren
+        DBMS_PIPE.RESET_BUFFER; -- Empty the buffer
         DBMS_PIPE.PACK_MESSAGE(l_msg);        
         l_status := DBMS_PIPE.SEND_MESSAGE(p_clientChannel, timeout => 0);
 
@@ -5286,9 +5281,9 @@ AS
     begin
         l_payload := JSON_QUERY(p_message, '$.payload');
 
-        -- Verfallszeit des Clients prüfen (mit 500 ms Sicherheitsabstand). Ist sie überschritten, hat der
-        -- Client bereits aufgegeben: keinen Prozess anlegen, keine Route, keine Antwort (der Rückkanal
-        -- existiert nicht mehr; eine Antwort würde dort nur eine verwaiste Pipe erzeugen).
+        -- Check the client's expiry time (with a 500 ms safety margin). If it has passed, the
+        -- client has already given up: no process, no route, no response (the return channel
+        -- no longer exists; a response would only create an orphaned pipe there).
         if jsonTime(l_payload, 'expires_utc') - INTERVAL '0.5' SECOND < sys_extract_utc(systimestamp) then
             logLilamErr(NUM_ERR_SESSION_TIMEOUT, 'NEW_SESSION verworfen, Client wartet nicht mehr: '
                         || jsonString(l_payload, 'process_name'), 'doRemote_newSession', 'EXPIRED');
@@ -5304,10 +5299,10 @@ AS
 
         l_processId := NEW_SESSION(l_session_init);
         registerProcessRoute(l_processId, g_serverPipeName); 
-        touchServerRegistry;   -- Registry sofort aktuell halten (Lastverteilung bei schnellen NEW_SESSION)
+        touchServerRegistry;   -- Keep the registry up to date immediately (load balancing with fast NEW_SESSION)
 
         DBMS_PIPE.RESET_BUFFER;
-        -- perf: Leistungsstufe dieses Servers; der Client richtet seine Drosselung danach aus
+        -- perf: performance level of this server; the client adjusts its throttling accordingly
         DBMS_PIPE.PACK_MESSAGE('{"process_id":' || l_processId || ',"perf":' || g_server_perf || '}');        
         l_status := DBMS_PIPE.SEND_MESSAGE(p_clientChannel, timeout => 1);
     end;    
@@ -5349,7 +5344,7 @@ AS
     FUNCTION GET_SERVER_PIPE(p_processId NUMBER) RETURN VARCHAR2
     as
     begin
-        -- Ungültige ID (z.B. NUM_ERR_SESSION_TIMEOUT aus SERVER_NEW_SESSION): kein Server, keine Exception
+        -- Invalid ID (e.g. NUM_ERR_SESSION_TIMEOUT from SERVER_NEW_SESSION): no server, no exception
         if p_processId is null or p_processId < 0 then
             return null;
         end if;
@@ -5388,13 +5383,13 @@ AS
         l_response  varchar2(100);        
         l_payload   JSON_OBJ_LILAM := p_jsonObject;
     begin                        
-        -- Verfallszeit: Bis dahin wartet der Client auf die Antwort. Kommt der Server erst danach
-        -- an die Nachricht (z.B. volle Pipe), legt er keinen Prozess an (siehe doRemote_newSession).
-        -- So entstehen keine verwaisten, nie geschlossenen Prozesse.
-        -- In UTC, da Client- und Server-Session unterschiedliche Zeitzonen haben können.
+        -- Expiry time: until then the client waits for the response. If the server only gets to the
+        -- message afterwards (e.g. full pipe), it does not create a process (see doRemote_newSession).
+        -- This way no orphaned, never closed processes are created.
+        -- In UTC, since client and server sessions can have different time zones.
         jsonPut(l_payload, 'expires_utc', sys_extract_utc(systimestamp) + numtodsinterval(C_TIMEOUT_NEW_SESSION_SEC, 'SECOND'));
 
-        -- zunächst mal schauen, welche Server bereitstehen
+        -- first check which servers are available
         l_response := waitForResponse(null, 'NEW_SESSION', l_payload, C_TIMEOUT_NEW_SESSION_SEC);
 
         CASE
@@ -5405,13 +5400,13 @@ AS
             WHEN l_response LIKE 'ERROR%' THEN
                 l_ProcessId := NUM_COMM_ERR;
             else
-            -- Erfolgsfall: JSON parsen
+            -- Success: parse JSON
             l_ProcessId := nvl(jsonNumber(l_response, 'process_id'), NUM_COMM_ERR);
         end case;
         
-        -- Kein Prozess angelegt: keine Exception an die Anwendung (Philosophie: kein Impact).
-        -- Die Anwendung erhält die negative ID (Konstanten NUM_ERR_SESSION_* in der Spezifikation);
-        -- alle weiteren API-Aufrufe mit dieser ID werden still ignoriert. Protokoll in LILAM_LOG_INTERNAL.
+        -- No process created: no exception to the application (philosophy: no impact).
+        -- The application receives the negative ID (constants NUM_ERR_SESSION_* in the specification);
+        -- all further API calls with this ID are silently ignored. Logged in LILAM_LOG_INTERNAL.
         if l_ProcessId < 0 then
             g_client_pipes.DELETE(C_PIPE_ID_PENDING);
             logLilamErr(l_ProcessId, 'Could not establish connection to LILAM-Server: ' || l_response,
@@ -5419,12 +5414,12 @@ AS
             return l_ProcessId;
         end if;
         
-        -- Nur valide IDs registrieren
+        -- Register only valid IDs
         if l_ProcessId > 0 THEN
             g_client_pipes(l_ProcessId) := g_client_pipes(C_PIPE_ID_PENDING);
             g_client_pipes.DELETE(C_PIPE_ID_PENDING);
-            g_remote_sessions(l_ProcessId) := TRUE; -- in die Liste der RemoteSessions eintragen
-            -- Drosselung nach der Leistungsstufe des Servers (fehlt der Wert: C_SERVER_PERF_MID)
+            g_remote_sessions(l_ProcessId) := TRUE; -- add to the list of remote sessions
+            -- Throttling according to the server's performance level (if the value is missing: C_SERVER_PERF_MID)
             setPerfLimit(l_ProcessId, jsonNumber(l_response, 'perf'));
         end if ;
         RETURN l_ProcessId;
@@ -5456,7 +5451,7 @@ AS
         l_serverCode := jsonNumber(l_payload, 'server_code');
 
         if l_serverCode = NUM_ACK_SERVER_PROC then
-            -- Drosselung nach der Leistungsstufe des Servers (auch in jeder neuen APEX-Session)
+            -- Throttling according to the server's performance level (also in every new APEX session)
             setPerfLimit(p_processId, jsonNumber(l_payload, 'perf'));
             return jsonNumber(l_payload, 'process_id');
         else
@@ -5473,38 +5468,38 @@ AS
     --------------------------------------------------------------------------
 
     /*
-      Möglichst schnell sicherstellen, dass die Verbindung existiert oder
-      sie bei Bedarf wiederherstellen.
-      1. Wenn Prozess und Pipe bekannt: return p_processId
-      2. Wenn Pipe nicht verfügbar (REGISTRY): return NUM_ERR_PIPE_SERVER
-      3. Anfrage bei Server
-         a) wenn der den Prozess nicht kennt: return NUM_ERR_SERVER_PROC
-         b) wenn bekannt: return p_processId
+      Ensure as quickly as possible that the connection exists, or
+      restore it if necessary.
+      1. If process and pipe are known: return p_processId
+      2. If the pipe is not available (REGISTRY): return NUM_ERR_PIPE_SERVER
+      3. Ask the server
+         a) if it does not know the process: return NUM_ERR_SERVER_PROC
+         b) if known: return p_processId
     */
     FUNCTION SERVER_LINK(p_processId NUMBER, p_pipeName varchar2) RETURN NUMBER
     AS
         l_respProcId number;
     BEGIN
-        -- wenn alles bekannt ist, ist keine weitere Aktion notwendig
+        -- if everything is known, no further action is necessary
         if g_remote_sessions.EXISTS(p_processId)
            and g_client_pipes.EXISTS(p_processId)
            and g_client_pipes(p_processId) = p_pipeName then
             return p_processId;
         end if;
 
-        -- optimistisch die assoziativen Arrays füllen
-        -- das erleichtert den Testaufruf an den Server
+        -- optimistically fill the associative arrays
+        -- this simplifies the test call to the server
         g_remote_sessions(p_processId) := TRUE;
         g_client_pipes(p_processId)    := p_pipeName;
 
-        -- wenn die Server PIPE nicht aktiv ist, direkt abbrechen
+        -- if the server PIPE is not active, abort immediately
         if not isServerPipeActive(p_pipeName) then
             g_remote_sessions.DELETE(p_processId);
             g_client_pipes.DELETE(p_processId);
             return NUM_ERR_PIPE_SERVER;
         end if;
 
-        -- Frage den Server über die PIPE, ob er die PROCESS_ID kennt
+        -- Ask the server via the PIPE whether it knows the PROCESS_ID
         l_respProcId := reconnectRemote(p_processId, p_pipeName);
         if nvl(l_respProcId, NUM_ERR_SERVER_PROC) != p_processId then
             g_remote_sessions.DELETE(p_processId);
@@ -5525,19 +5520,19 @@ AS
     AS
         l_respProcId number;
     BEGIN
-        -- wenn alles bekannt ist, ist keine weitere Aktion notwendig
+        -- if everything is known, no further action is necessary
         if g_remote_sessions.EXISTS(p_processId)
            and g_client_pipes.EXISTS(p_processId)
            and g_client_pipes(p_processId) = p_pipeName then
            return;
         end if;
 
-        -- optimistisch die assoziativen Arrays füllen
-        -- das erleichtert den Testaufruf an den Server
+        -- optimistically fill the associative arrays
+        -- this simplifies the test call to the server
         g_remote_sessions(p_processId) := TRUE;
         g_client_pipes(p_processId)    := p_pipeName;
 
-        -- wenn die Server PIPE nicht aktiv ist, direkt abbrechen
+        -- if the server PIPE is not active, abort immediately
         if not isServerPipeActive(p_pipeName) then
             g_remote_sessions.DELETE(p_processId);
             g_client_pipes.DELETE(p_processId);
@@ -5548,7 +5543,7 @@ AS
             );
         end if;
 
-        -- Frage den Server über die PIPE, ob er die PROCESS_ID kennt
+        -- Ask the server via the PIPE whether it knows the PROCESS_ID
         l_respProcId := reconnectRemote(p_processId, p_pipeName);
         if nvl(l_respProcId, NUM_ERR_SERVER_PROC) != p_processId then
             g_remote_sessions.DELETE(p_processId);
@@ -5574,14 +5569,14 @@ AS
     BEGIN
     dbms_output.enable();
 
-        -- 1. Logs zählen
+        -- 1. Count logs
         v_key := g_log_groups.FIRST;
         WHILE v_key IS NOT NULL LOOP
             v_log_total := v_log_total + g_log_groups(v_key).COUNT;
             v_key := g_log_groups.NEXT(v_key);
         END LOOP;
 
-        -- 2. Monitore zählen
+        -- 2. Count monitors
         v_key := g_monitor_groups.FIRST;
         WHILE v_key IS NOT NULL LOOP
             DBMS_OUTPUT.PUT_LINE('Gefundener Key im Speicher: "' || v_key || '"');
@@ -5649,7 +5644,7 @@ AS
         execute immediate l_sqlStmt into l_exists;
 
         IF l_exists > 0 THEN
-            -- Server existiert
+            -- Server exists
             return true;
         END IF;
         return false;
@@ -5733,8 +5728,8 @@ AS
     --------------------------------------------------------------------------
 
     --------------------------------------------------------------------------
-    -- Zahl aus dem n-ten Teil von 'a|b|c', NLS-unabhängig ('.' als Dezimalzeichen).
-    -- Ungültig oder fehlend => NULL (ohne Fehlerprotokoll; der Aufrufer meldet)
+    -- Number from the n-th part of 'a|b|c', NLS-independent ('.' as decimal separator).
+    -- Invalid or missing => NULL (without error log; the caller reports)
     --------------------------------------------------------------------------
     FUNCTION ruleNumber(p_value VARCHAR2, p_position PLS_INTEGER := 1) RETURN NUMBER
     AS
@@ -5755,8 +5750,8 @@ AS
     END;
 
     --------------------------------------------------------------------------
-    -- Prüft ein Rule Set und bereitet es auf. Liefert NULL, wenn es gültig ist, sonst die Fehlermeldung.
-    -- Die Regeln landen in den OUT-Parametern; die geladenen Regeln des Servers bleiben unberührt.
+    -- Checks a rule set and prepares it. Returns NULL if it is valid, otherwise the error message.
+    -- The rules end up in the OUT parameters; the loaded rules of the server remain untouched.
     --------------------------------------------------------------------------
     FUNCTION parseRuleSet(p_ruleSet CLOB, p_byCtx OUT NOCOPY t_rule_map, p_byAction OUT NOCOPY t_rule_map,
                           p_avg OUT NOCOPY t_avg_params_map) RETURN VARCHAR2
@@ -5805,7 +5800,7 @@ AS
             l_trig := upper(trim(r.trigger_t));
             l_op   := upper(trim(r.operator));
 
-            -- Pflichtfelder und Längen
+            -- Mandatory fields and lengths
             IF r.rule_id IS NULL OR length(r.rule_id) > 50 THEN
                 RETURN fail('"id" missing or longer than 50');
             END IF;
@@ -5820,7 +5815,7 @@ AS
                 RETURN fail('unknown "trigger_type" ' || r.trigger_t);
             END IF;
 
-            -- LOGGING-Regeln hängen immer an der Action LOGGING ("action" darf fehlen)
+            -- LOGGING rules are always attached to the action LOGGING ("action" may be missing)
             IF l_trig = C_LOGGING THEN
                 IF r.action IS NOT NULL AND upper(r.action) != C_LOGGING THEN
                     RETURN fail('"action" of a LOGGING rule must be empty or LOGGING');
@@ -5857,7 +5852,7 @@ AS
             l_rule.alert_severity     := r.severity;
             l_rule.throttle_seconds   := ruleNumber(r.throttle_sec);
 
-            -- Operator: zulässige Trigger
+            -- Operator: allowed triggers
             l_ok := CASE
                 WHEN l_op IN ('ON_START', 'ON_STOP', 'ON_EVENT', 'ON_UPDATE') THEN l_trig != C_LOGGING
                 WHEN l_op = 'SEVERITY' THEN l_trig = C_LOGGING
@@ -5878,7 +5873,7 @@ AS
                 RETURN fail('operator ' || l_op || ' not allowed for trigger ' || l_trig);
             END IF;
 
-            -- Wert prüfen und aufbereiten
+            -- Check and prepare the value
             CASE
                 WHEN l_op IN ('ON_START', 'ON_STOP', 'ON_EVENT', 'ON_UPDATE') THEN
                     NULL;
@@ -5893,7 +5888,7 @@ AS
                         RETURN fail('INFO_CONTAINS needs a text (max. 100)');
                     END IF;
                 WHEN l_op IN ('PRECEDED_BY', 'PRECEDED_BY_WITHIN_SECS') THEN
-                    -- PRECEDED_BY: ACTION[|CONTEXT]; PRECEDED_BY_WITHIN_SECS: ACTION[|CONTEXT]|SEKUNDEN
+                    -- PRECEDED_BY: ACTION[|CONTEXT]; PRECEDED_BY_WITHIN_SECS: ACTION[|CONTEXT]|SECONDS
                     l_parts := CASE WHEN r.value IS NULL THEN 0 ELSE regexp_count(r.value, '\|') + 1 END;
                     IF l_op = 'PRECEDED_BY_WITHIN_SECS' THEN
                         l_rule.cond_num := ruleNumber(r.value, l_parts);
@@ -5913,7 +5908,7 @@ AS
                         RETURN fail(l_op || ' needs ACTION or ACTION|CONTEXT');
                     END IF;
                 ELSE
-                    -- alle übrigen Operatoren: Zahl (AVG_DEVIATION_PCT: 'pct|warmup|alpha')
+                    -- all other operators: number (AVG_DEVIATION_PCT: 'pct|warmup|alpha')
                     l_rule.cond_num := ruleNumber(r.value, 1);
                     IF l_rule.cond_num IS NULL THEN
                         RETURN fail(l_op || ' needs a number (decimal point ".")');
@@ -5925,7 +5920,7 @@ AS
                     END IF;
             END CASE;
 
-            -- Einordnen: Kontext-Regel oder allgemeine Action-Regel
+            -- Classify: context rule or general action rule
             IF l_rule.target_context IS NOT NULL THEN
                 l_key := l_rule.target_action || '|' || l_rule.target_context;
                 IF NOT p_byCtx.EXISTS(l_key) THEN
@@ -5943,7 +5938,7 @@ AS
             END IF;
 
             IF l_op = 'AVG_DEVIATION_PCT' THEN
-                -- 'pct|warmup|alpha'; fehlende Werte => Default
+                -- 'pct|warmup|alpha'; missing values => default
                 p_avg(l_key).warmup := coalesce(ruleNumber(r.value, 2), g_avg_params('DEFAULT').warmup);
                 p_avg(l_key).alpha  := coalesce(ruleNumber(r.value, 3), g_avg_params('DEFAULT').alpha);
             END IF;
@@ -5956,9 +5951,9 @@ AS
     END;
 
     --------------------------------------------------------------------------
-    -- Regeln einer Gruppe aus den globalen Maps entfernen (Schlüssel GRUPPE|...).
-    -- Die Maps sind klein und das geschieht nur beim Laden, daher ein Durchlauf über alle Schlüssel.
-    -- STABILITÄT: unabhängig von der Sortierung der Schlüssel (NLS_SORT).
+    -- Remove the rules of a group from the global maps (key GROUP|...).
+    -- The maps are small and this only happens at load time, hence one pass over all keys.
+    -- STABILITY: independent of the sort order of the keys (NLS_SORT).
     --------------------------------------------------------------------------
     procedure removeGroupRules(p_group varchar2)
     as
@@ -5988,7 +5983,7 @@ AS
             l_key := l_next;
         END LOOP;
 
-        -- Drosselung beginnt mit dem neuen Rule Set von vorn
+        -- Throttling starts over with the new rule set
         l_key := g_alert_history.FIRST;
         WHILE l_key IS NOT NULL LOOP
             l_next := g_alert_history.NEXT(l_key);
@@ -5998,7 +5993,7 @@ AS
     end;
 
     --------------------------------------------------------------------------
-    -- Geprüftes Rule Set für eine Gruppe übernehmen (ersetzt die bisherigen Regeln der Gruppe)
+    -- Take over a checked rule set for a group (replaces the previous rules of the group)
     --------------------------------------------------------------------------
     procedure installGroupRules(p_group varchar2, p_byCtx t_rule_map, p_byAction t_rule_map,
                                 p_avg t_avg_params_map, p_ruleSetName varchar2, p_ruleSetVersion number)
@@ -6025,17 +6020,17 @@ AS
             l_key := p_avg.NEXT(l_key);
         END LOOP;
 
-        -- Name/Version wie in LILAM_RULES (SET_NAME/VERSION); darüber findet der Consumer die Regel
+        -- Name/version as in LILAM_RULES (SET_NAME/VERSION); the consumer finds the rule through it
         g_rule_groups(p_group).set_name    := p_ruleSetName;
         g_rule_groups(p_group).set_version := p_ruleSetVersion;
     end;
 
     --------------------------------------------------------------------------
-    -- Aktives Rule Set einer Gruppe aus LILAM_RULES laden, wenn es sich geändert hat.
-    -- p_force: immer neu laden (Serverstart, UPDATE_RULE).
-    -- Ohne aktives Rule Set hat die Gruppe keine Regeln. STABILITÄT: Ein ungültiges Rule Set wird
-    -- vollständig abgelehnt (einmal je Version protokolliert), die bisherigen Regeln bleiben dann aktiv.
-    -- Fehler erreichen den Aufrufer nie.
+    -- Load the active rule set of a group from LILAM_RULES if it has changed.
+    -- p_force: always reload (server start, UPDATE_RULE).
+    -- Without an active rule set the group has no rules. STABILITY: an invalid rule set is
+    -- rejected completely (logged once per version), the previous rules then remain active.
+    -- Errors never reach the caller.
     --------------------------------------------------------------------------
     procedure refreshGroupRules(p_group varchar2, p_force boolean)
     as
@@ -6052,22 +6047,22 @@ AS
             RETURN;
         END IF;
 
-        -- STABILITÄT: zuerst den Prüfzeitpunkt setzen, damit auch bei Fehlern
-        -- höchstens eine Prüfung je Intervall stattfindet
+        -- STABILITY: set the check time first, so that even on errors
+        -- at most one check per interval takes place
         IF NOT g_rule_groups.EXISTS(p_group) THEN
             g_rule_groups(p_group) := l_new;
         END IF;
         g_rule_groups(p_group).last_check_cs := dbms_utility.get_time;
 
-        -- PERFORMANCE: Der Ausdruck entspricht dem eindeutigen Index idx_lilam_rules_active.
-        -- Der CLOB kommt nur als Locator und wird erst bei einer neuen Version gelesen.
+        -- PERFORMANCE: the expression matches the unique index idx_lilam_rules_active.
+        -- The CLOB comes only as a locator and is read only for a new version.
         BEGIN
             EXECUTE IMMEDIATE 'SELECT rule_set, set_name, version FROM ' || C_LILAM_RULES_TABLE || '
                                 WHERE CASE WHEN is_active = 1 THEN upper(group_name) END = :1'
                 INTO l_ruleSet, l_name, l_version USING p_group;
         EXCEPTION
             WHEN NO_DATA_FOUND THEN
-                -- kein aktives Rule Set für die Gruppe: keine Regeln
+                -- no active rule set for the group: no rules
                 IF p_force OR g_rule_groups(p_group).set_name IS NOT NULL THEN
                     removeGroupRules(p_group);
                 END IF;
@@ -6078,7 +6073,7 @@ AS
                 RETURN;
         END;
 
-        -- unverändert (auch ein bereits abgelehntes Rule Set): nichts zu tun
+        -- unchanged (also an already rejected rule set): nothing to do
         IF NOT p_force
            AND l_name = g_rule_groups(p_group).seen_name AND l_version = g_rule_groups(p_group).seen_version THEN
             RETURN;
@@ -6106,12 +6101,12 @@ AS
     END;
 
     --------------------------------------------------------------------------
-    -- Lädt das aktive Rule Set der eigenen Gruppe aus LILAM_RULES (Start und UPDATE_RULE).
+    -- Loads the active rule set of the own group from LILAM_RULES (start and UPDATE_RULE).
     --------------------------------------------------------------------------
     procedure loadServerRules
     as
     begin
-        -- Dispatcher werten keine Regeln aus
+        -- Dispatchers do not evaluate rules
         if g_serverIsDispatcher then
             return;
         end if;
@@ -6119,13 +6114,13 @@ AS
     END;
 
     --------------------------------------------------------------------------
-    -- Rule Set für eine Servergruppe aktivieren (autonom, damit die Server es sofort sehen)
+    -- Activate a rule set for a server group (autonomous, so that the servers see it immediately)
     --------------------------------------------------------------------------
     procedure activateGroupRules(p_groupName varchar2, p_ruleSetName varchar2, p_ruleSetVersion pls_integer)
     as
         pragma autonomous_transaction;
     begin
-        -- zwei Schritte: der eindeutige Index erlaubt je Gruppe nur ein aktives Rule Set
+        -- two steps: the unique index allows only one active rule set per group
         execute immediate 'UPDATE ' || C_LILAM_RULES_TABLE || ' SET is_active = 0
                             WHERE upper(group_name) = upper(:1) AND is_active = 1'
             using p_groupName;
@@ -6140,10 +6135,10 @@ AS
     end;
 
     --------------------------------------------------------------------------
-    -- Rule Set für alle Server einer Gruppe aktivieren (Dispatcher ausgenommen).
-    -- Das Rule Set wird hier geprüft; ein ungültiges oder fehlendes Rule Set ändert nichts.
-    -- Laufende Server erhalten UPDATE_RULE direkt in ihre Pipe (am Dispatcher vorbei);
-    -- Server, die später starten, laden das aktive Rule Set ihrer Gruppe selbst.
+    -- Activate a rule set for all servers of a group (dispatchers excluded).
+    -- The rule set is checked here; an invalid or missing rule set changes nothing.
+    -- Running servers receive UPDATE_RULE directly in their pipe (bypassing the dispatcher);
+    -- servers that start later load the active rule set of their group themselves.
     --------------------------------------------------------------------------
     PROCEDURE SERVER_UPDATE_RULES(p_groupName VARCHAR2, p_ruleSetName VARCHAR2, p_ruleSetVersion PLS_INTEGER)
     AS
@@ -6174,7 +6169,7 @@ AS
 
         activateGroupRules(p_groupName, p_ruleSetName, p_ruleSetVersion);
 
-        -- laufende Server der Gruppe benachrichtigen; eine Gruppe ohne Server ist kein Fehler
+        -- notify the running servers of the group; a group without servers is not an error
         EXECUTE IMMEDIATE 'SELECT pipe_name FROM ' || C_LILAM_SERVER_REGISTRY || '
                             WHERE upper(group_name) = upper(:1) AND nvl(is_dispatcher, 0) = 0 AND is_active = 1'
             BULK COLLECT INTO l_pipes USING p_groupName;
@@ -6184,7 +6179,7 @@ AS
             DBMS_PIPE.PACK_MESSAGE('{"header":{"msg_type":"API_CALL","request":"UPDATE_RULE"}}');
             l_status := DBMS_PIPE.SEND_MESSAGE(l_pipes(i), timeout => 1);
             IF l_status != 0 THEN
-                -- das Rule Set ist aktiv: der Server lädt es spätestens beim nächsten Start
+                -- the rule set is active: the server loads it at the latest on its next start
                 logLilamErr(l_status, l_label || ': pipe ' || l_pipes(i) || ' not reachable', 'SERVER_UPDATE_RULES');
             END IF;
         END LOOP;
@@ -6193,10 +6188,10 @@ AS
     --------------------------------------------------------------------------
 
     --------------------------------------------------------------------------
-    -- Nach jedem NEW_SESSION sofort offene Prozesse und Zeitpunkt in der Registry nachziehen.
-    -- Sonst sehen schnell aufeinanderfolgende NEW_SESSION (z.B. 20 in 0,5 s) noch die Werte der
-    -- letzten periodischen Aktualisierung und landen alle beim selben Server. Mit der Auswahl
-    -- "aeltester Eintrag zuerst" geht die naechste Anfrage dadurch an einen anderen Server.
+    -- After each NEW_SESSION immediately update open processes and timestamp in the registry.
+    -- Otherwise NEW_SESSION calls in quick succession (e.g. 20 in 0.5 s) still see the values of the
+    -- last periodic update and all end up at the same server. With the selection
+    -- "oldest entry first" the next request thereby goes to another server.
     --------------------------------------------------------------------------
     procedure touchServerRegistry as
         pragma autonomous_transaction;
@@ -6265,7 +6260,7 @@ AS
         UPDATE ' || C_LILAM_SERVER_REGISTRY || '
         SET last_activity = SYSTIMESTAMP, 
             is_active = :1,
-            current_processes = :2,  -- Anzahl offener Prozesse (vorher Spalte current_load = pipe_size aus v$db_pipes, siehe unten)
+            current_processes = :2,  -- Number of open processes (previously column current_load = pipe_size from v$db_pipes, see below)
             status = :3,
             processing = :4,
             avg_log_lat = :5,
@@ -6273,14 +6268,14 @@ AS
             avg_mon_lat = :7,
             max_mon_lat = :8
         WHERE upper(pipe_name) = :9';
-        -- CURRENT_PROCESSES = Anzahl der offenen Prozesse dieses Servers (ohne den Server-Prozess selbst).
-        -- Vorher: pipe_size aus v$db_pipes. Das war ungeeignet und teuer:
-        --   * pipe_size ist ein Höchststand des belegten Speichers und sinkt nach dem Abarbeiten nicht wieder
-        --   * v$db_pipes durchsucht den gesamten Library Cache (ca. 120-190 ms je Abfrage, Server blockiert)
-        --   * erforderte einen zusätzlichen Grant auf V_$DB_PIPES
+        -- CURRENT_PROCESSES = number of open processes of this server (without the server process itself).
+        -- Previously: pipe_size from v$db_pipes. That was unsuitable and expensive:
+        --   * pipe_size is a high-water mark of the used memory and does not go down after processing
+        --   * v$db_pipes searches the entire library cache (approx. 120-190 ms per query, server blocked)
+        --   * required an additional grant on V_$DB_PIPES
         execute immediate l_sqlStmt USING l_booleanAsInt, greatest(v_indexSession.COUNT - 1, 0), l_status, p_eventCounter, 
             g_avgLatencyLogs, g_maxLatencyLogs, g_avgLatencyMon, g_maxLatencyMon, upper(g_serverPipeName);
-        COMMIT; -- Muss autonom sein!
+        COMMIT; -- Must be autonomous!
 
     exception
         when others then
@@ -6297,10 +6292,10 @@ AS
     as
         l_status    PLS_INTEGER;
         l_message   VARCHAR2(32767);
-        c_max_timeout CONSTANT NUMBER := C_SERVER_TIMEOUT_MAX_WAIT_SEC; -- Maximum für den Eco-Mode
+        c_max_timeout CONSTANT NUMBER := C_SERVER_TIMEOUT_MAX_WAIT_SEC; -- Maximum for eco mode
         c_min_timeout CONSTANT NUMBER := C_SERVER_TIMEOUT_WAIT_FOR_MSG_SEC;
     begin
-        l_status := DBMS_PIPE.RECEIVE_MESSAGE(l_pipeName, timeout => p_cur_timeout); --=> C_SERVER_TIMEOUT_WAIT_FOR_MSG_SEC);
+        l_status := DBMS_PIPE.RECEIVE_MESSAGE(l_pipeName, timeout => p_cur_timeout);
 
         if l_status = 0 THEN
             p_cur_timeout := C_SERVER_TIMEOUT_WAIT_FOR_MSG_SEC;
@@ -6338,7 +6333,7 @@ AS
         DBMS_PIPE.PURGE(ctlPipe(p_pipeName));
         l_dummyRes := DBMS_PIPE.REMOVE_PIPE(ctlPipe(p_pipeName));
         l_dummyRes := DBMS_PIPE.CREATE_PIPE(pipename => upper(p_pipeName), maxpipesize => C_MAX_SERVER_PIPE_SIZE, private => false);
-        -- Steuer-Pipe für NEW_SESSION (siehe C_CTL_PIPE_SUFFIX)
+        -- Control pipe for NEW_SESSION (see C_CTL_PIPE_SUFFIX)
         l_dummyRes := DBMS_PIPE.CREATE_PIPE(pipename => ctlPipe(p_pipeName), maxpipesize => C_MAX_CTL_PIPE_SIZE, private => false);
     end;
 
@@ -6350,21 +6345,21 @@ AS
         l_processId  number (19,0);
         l_status PLS_INTEGER;        
     begin
-        -- Dispatcher-Modus: alles weiterleiten, nichts selbst verarbeiten
-        -- Ausnahme: SERVER_SHUTDOWN gilt dem Dispatcher selbst (sonst ist er nicht stoppbar)
+        -- Dispatcher mode: forward everything, process nothing itself
+        -- Exception: SERVER_SHUTDOWN is meant for the dispatcher itself (otherwise it cannot be stopped)
         if g_serverIsDispatcher and p_request not in ('SERVER_SHUTDOWN', 'SERVER_PING') then
             if p_request in ('NEW_SESSION', 'SERVER_NEW_SESSION') then
-                -- Noch keine process_id vorhanden; Auswahl rein lastbasiert
+                -- No process_id yet; selection purely load-based
                 l_targetPipe := getServerPipeAvailable(g_serverGroupName);
             else
                 l_processId := jsonNumber(JSON_QUERY(p_message, '$.payload'), 'process_id');
-                l_targetPipe := resolveDispatchTarget(l_processId); -- Cache, sonst DB-Fallback
+                l_targetPipe := resolveDispatchTarget(l_processId); -- Cache, otherwise DB fallback
             end if;
     
             if l_targetPipe is null then
-                -- Kein Worker verfügbar bzw. keine Route für die process_id.
-                -- Synchrone Anfragen (mit Rückkanal) sofort mit Fehler beantworten, statt sie zu verwerfen:
-                -- sonst wartet der Client den vollen Timeout ab (z.B. Reconnect mit veralteter ID: 5 s je Aufruf).
+                -- No worker available or no route for the process_id.
+                -- Answer synchronous requests (with return channel) immediately with an error instead of discarding them:
+                -- otherwise the client waits for the full timeout (e.g. reconnect with outdated ID: 5 s per call).
                 if p_clientChannel is not null then
                     DBMS_PIPE.RESET_BUFFER;
                     DBMS_PIPE.PACK_MESSAGE('{"header":{"msg_type":"SERVER_RESPONSE","msg_name":"NO_TARGET"},"payload":{"server_code":'
@@ -6377,18 +6372,18 @@ AS
                 return false;
             end if;
     
-            -- unverändert weiterreichen, inkl. des ursprünglichen Client-Rückkanals im Header
+            -- pass on unchanged, including the original client return channel in the header
             DBMS_PIPE.RESET_BUFFER;
             DBMS_PIPE.PACK_MESSAGE(p_message);        
             if p_request in ('NEW_SESSION', 'SERVER_NEW_SESSION') then
-                -- NEW_SESSION an die Steuer-Pipe des Workers, danach Weckruf in dessen Daten-Pipe
+                -- NEW_SESSION to the worker's control pipe, then a wake-up call into its data pipe
                 l_status := DBMS_PIPE.SEND_MESSAGE(ctlPipe(l_targetPipe), timeout => 1);
                 sendPing(l_targetPipe);
             else
                 l_status := DBMS_PIPE.SEND_MESSAGE(l_targetPipe, timeout => 1);
-                -- STABILITÄT: Route des beendeten Prozesses aus dem Cache entfernen, sonst wächst
-                -- g_dispatch_route_cache mit jedem Prozess, der je über den Dispatcher lief.
-                -- Spätere Nachrichten zu dieser ID fallen auf LILAM_PROCESS_ROUTE zurück (resolveDispatchTarget).
+                -- STABILITY: remove the route of the finished process from the cache, otherwise
+                -- g_dispatch_route_cache grows with every process that ever ran via the dispatcher.
+                -- Later messages for this ID fall back to LILAM_PROCESS_ROUTE (resolveDispatchTarget).
                 if p_request = 'CLOSE_SESSION' then
                     g_dispatch_route_cache.DELETE(l_processId);
                 end if;
@@ -6399,14 +6394,13 @@ AS
         CASE p_request
             WHEN 'SERVER_SHUTDOWN' then
                 if handleServerShutdown(p_clientChannel, p_message) then 
-                    -- nur wenn gültiges Passwort geschickt wurde
---                        l_shutdownSignal := TRUE;
+                    -- only if a valid password was sent
                     INFO(g_serverProcessId, g_serverPipeName || '=> Shutdown by remote request');
-                    return true; -- Abbruchsignal
+                    return true; -- Stop signal
                 end if ;
 
             WHEN 'UPDATE_RULE' then
-                loadServerRules; -- aktives Rule Set der Gruppe neu laden
+                loadServerRules; -- reload the active rule set of the group
 
             WHEN 'SERVER_PING' then
             null;
@@ -6454,11 +6448,11 @@ AS
                 end if;
 
             ELSE 
-                -- Unbekanntes Tag loggen
+                -- Log unknown tag
                 warn(g_serverProcessId, g_serverPipeName || '=> Received unknown request: ' || p_request);
         END CASE;
 
-        return false; -- kein Abbruchsignal
+        return false; -- no stop signal
     end;
 
     --------------------------------------------------------------------------
@@ -6481,9 +6475,9 @@ AS
         l_ctlPipe        VARCHAR2(150);
     begin
         g_serverIsDispatcher := CASE nvl(p_isDispatcher, 0) WHEN 1 THEN TRUE ELSE FALSE END;
-        g_server_perf := normPerf(p_perfServer);   -- wird den Clients bei NEW_SESSION/RECONNECT mitgeteilt
+        g_server_perf := normPerf(p_perfServer);   -- is passed to the clients on NEW_SESSION/RECONNECT
         g_shutdownPassword := p_password;
-        g_serverPipeName := p_pipeName; --l_pipe;
+        g_serverPipeName := p_pipeName;
         g_serverGroupName := p_groupName;
         g_serverProcessId := new_session(p_processName => 'LILAM_SERVER', p_logLevel => logLevelMonitor, p_tabNameMaster => 'LILAM_SERVER');
         SET_PROCESS_STATUS(g_serverProcessId, 1, 'RUNNING');
@@ -6499,11 +6493,11 @@ AS
         );
 
         LOOP
-            -- Zuerst die Steuer-Pipe (NEW_SESSION), ohne zu warten. Ist sie leer, kostet das wenige µs.
+            -- First the control pipe (NEW_SESSION), without waiting. If it is empty, this costs only a few µs.
             LOOP
                 l_status := DBMS_PIPE.RECEIVE_MESSAGE(l_ctlPipe, timeout => 0);
                 EXIT WHEN l_status != 0;
-                -- mitzaehlen: PROCESSING in der Registry ist das erste Kriterium der Serverauswahl
+                -- count as well: PROCESSING in the registry is the first criterion of server selection
                 l_msgCnt := l_msgCnt + 1;
                 BEGIN
                     DBMS_PIPE.UNPACK_MESSAGE(l_message);
@@ -6516,7 +6510,7 @@ AS
                 END;
             END LOOP;
 
-            -- Warten auf die nächste Nachricht (Timeout in Sekunden)
+            -- Wait for the next message (timeout in seconds)
             l_message := receiveMessage(g_serverPipeName, l_serverTimeout); 
             if l_message is not null THEN
                 l_msgCnt := l_msgCnt + 1;
@@ -6526,7 +6520,7 @@ AS
                 l_shutdownSignal := processRequest(l_request, l_message, l_clientChannel);
                 EXCEPTION
                     WHEN OTHERS THEN
-                        -- WICHTIG: Fehler loggen, aber die Schleife NICHT verlassen!
+                        -- IMPORTANT: log errors, but do NOT leave the loop!
                         if should_raise_error(g_serverProcessId) then
                             ERROR(g_serverProcessId, g_serverPipeName || '=>Internal START_SERVER; Critical Error while processing command: ' || SQLERRM);
                         end if;
@@ -6543,7 +6537,7 @@ AS
                     l_msgCnt := 0;
                 end if;
 
-                -- Timeout erreicht. Passiert, wenn innerhalb eines Intervalls kein Signal kam.
+                -- Timeout reached. Happens if no signal arrived within an interval.
                 if get_ms_diff(l_lastHeartbeat, sysTimestamp) >= C_SERVER_HEARTBEAT_INTERVAL_MS then
                     INFO(g_serverProcessId, g_serverPipeName || 'HEARTBEAT ' || g_serverPipeName);
                     l_lastHeartbeat := sysTimestamp;
@@ -6553,28 +6547,28 @@ AS
             EXIT when l_shutdownSignal;
             l_loopCounter := l_loopCounter + 1;
         END LOOP;
-        -- Ab jetzt ist der Server nicht mehr erreichbar
+        -- From now on the server is no longer reachable
         updateServerRegistry(FALSE, l_msgCnt);
         SET_PROCESS_STATUS(g_serverProcessId, 0, 'STOPPED');
 
-        -- +++ NEU: DRAIN-PHASE +++
-        -- Wir leeren die Pipe, falls während des Shutdowns noch Nachrichten reinkamen.
+        -- +++ NEW: DRAIN PHASE +++
+        -- We empty the pipe in case messages still arrived during the shutdown.
         LOOP
             l_status := DBMS_PIPE.RECEIVE_MESSAGE(g_serverPipeName, timeout => 0.1);
-            EXIT WHEN l_status != 0; -- Pipe ist leer (1) oder Fehler/Interrupt (!=0)
+            EXIT WHEN l_status != 0; -- Pipe is empty (1) or error/interrupt (!=0)
 
             DBMS_PIPE.UNPACK_MESSAGE(l_message);
             l_clientChannel := extractClientChannel(l_message);
             l_request := extractClientRequest(l_message);
 
-            -- Im Drain verarbeiten wir nur noch Log-Daten, keine neuen Sessions/Shutdowns
+            -- In the drain we only process log data, no new sessions/shutdowns
                 l_shutdownSignal := processRequest(l_request, l_message, l_clientChannel, TRUE);
 
         END LOOP;
 
         DBMS_OUTPUT.ENABLE();
 
-        -- es könnten noch dirty buffered Einträge existieren
+        -- there could still be dirty buffered entries
         sync_all_dirty(true, true);
 
         if g_serverProcessId != -1 THEN
@@ -6589,7 +6583,7 @@ AS
         l_dummyRes := DBMS_PIPE.REMOVE_PIPE(ctlPipe(g_serverPipeName));
         g_remote_sessions.DELETE;
 
-        -- abschließende Analyse der Buffer-Zustände
+        -- final analysis of the buffer states
         DUMP_BUFFER_STATS;
 
         close_session(g_serverProcessId);
@@ -6635,10 +6629,10 @@ PROCEDURE CALL_BY_JSON(
 )
 AS
     l_InObject      JSON_OBJ_LILAM := p_callObject;
-    l_jsonHeaderIn  JSON_OBJ_LILAM;   -- Header aus der Anfrage
-    l_jsonParams    JSON_OBJ_LILAM;   -- Params aus der Anfrage (jetzt tatsächlich befüllt)
-    l_jsonHeader    JSON_OBJ_LILAM;   -- Header der Antwort
-    l_jsonPayload   JSON_OBJ_LILAM;   -- Payload der Antwort
+    l_jsonHeaderIn  JSON_OBJ_LILAM;   -- Header from the request
+    l_jsonParams    JSON_OBJ_LILAM;   -- Params from the request (now actually filled)
+    l_jsonHeader    JSON_OBJ_LILAM;   -- Header of the response
+    l_jsonPayload   JSON_OBJ_LILAM;   -- Payload of the response
     l_api_call      VARCHAR2(30);
     l_proc_id       NUMBER;
     p_session_init  t_session_init;
@@ -6647,13 +6641,13 @@ BEGIN
         RAISE_APPLICATION_ERROR(-20005, 'In-Parameter is invalid JSON-Format');
     end if;
 
-    -- Header und Params aus der Anfrage extrahieren
+    -- Extract header and params from the request
     l_jsonHeaderIn := jsonObject(l_InObject, 'header');
     l_api_call     := jsonString(l_jsonHeaderIn, 'api_call');
     l_jsonParams   := jsonObject(l_InObject, 'params');
 
-    -- Antwort-Grundgerüst; 'status' wird bewusst NUR EINMAL gesetzt,
-    -- entweder unten im jeweiligen Zweig oder im ELSE-Fallback
+    -- Basic response structure; 'status' is deliberately set ONLY ONCE,
+    -- either below in the respective branch or in the ELSE fallback
     jsonPut(l_jsonHeader, 'header', l_jsonHeaderIn);
     jsonPut(l_jsonPayload, 'returns', 'NO_VALUE');
     jsonPut(l_jsonPayload, 'value', 'NULL');
@@ -6692,7 +6686,7 @@ BEGIN
         when 'SERVER_SHUTDOWN' then
             SERVER_SHUTDOWN(
                 jsonNumber(l_jsonParams, 'process_id'),
-                jsonString(l_jsonParams, 'pipe_name'),   -- korrigiert: war 'process_name'
+                jsonString(l_jsonParams, 'pipe_name'),   -- corrected: was 'process_name'
                 jsonString(l_jsonParams, 'password')
             );
             jsonPut(l_jsonHeader, 'status', 'SUCCESS');
@@ -6786,7 +6780,7 @@ END;
 
     FUNCTION quote_literal(p_text IN VARCHAR2) RETURN VARCHAR2 IS
     BEGIN
-        -- Verdoppelt Hochkommas und umschließt den Text mit Hochkommas
+        -- Doubles single quotes and encloses the text in single quotes
         RETURN '''' || REPLACE(p_text, '''', '''''') || '''';
     END quote_literal;
 
@@ -6795,11 +6789,11 @@ END;
     FUNCTION CREATE_SERVER(p_pipeName varchar2, p_groupName varchar2, p_password  varchar2, p_isDispatcher PLS_INTEGER DEFAULT 0,
                            p_perfServer PLS_INTEGER DEFAULT NULL) RETURN VARCHAR2
     AS
-        l_slot_idx PLS_INTEGER := 1; -- Beispielwert, sollte dynamisch ermittelt werden
-        l_action   VARCHAR2(2000); -- Puffer leicht erhöht für längere Strings
+        l_slot_idx PLS_INTEGER := 1; -- Example value, should be determined dynamically
+        l_action   VARCHAR2(2000); -- Buffer slightly increased for longer strings
     BEGIN
-        -- 1. Sicherstellen, dass kein "Leichen"-Job existiert
-        -- Wir fangen gezielt ORA-27475 (Job does not exist) ab
+        -- 1. Make sure that no "orphaned" job exists
+        -- We specifically catch ORA-27475 (job does not exist)
         BEGIN
             null;
             DBMS_SCHEDULER.DROP_JOB(job_name => p_pipeName, force => TRUE);
@@ -6808,8 +6802,8 @@ END;
                 IF SQLCODE != -27475 THEN RAISE; END IF;
         END;
 
-        -- 2. Den PL/SQL Block für den Scheduler zusammenbauen
-        -- Wichtig: p_groupName wurde in die Action integriert
+        -- 2. Assemble the PL/SQL block for the scheduler
+        -- Important: p_groupName has been integrated into the action
         l_action := 'BEGIN ' ||
                     '  LILAM.START_SERVER(' ||
                     '    p_pipeName  => ' || quote_literal(p_pipeName)      || ', ' ||
@@ -6820,7 +6814,7 @@ END;
                     '  ); ' ||
                     'END;';
 
-        -- 3. Den Hintergrund-Prozess "zünden"
+        -- 3. "Fire up" the background process
         DBMS_SCHEDULER.CREATE_JOB (
             job_name   => p_pipeName,
             job_type   => 'PLSQL_BLOCK',

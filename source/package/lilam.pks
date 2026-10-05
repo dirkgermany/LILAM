@@ -47,20 +47,20 @@ create or replace PACKAGE LILAM AS
     NUM_ACK_SERVER_PROC CONSTANT PLS_INTEGER  := 220;
     TXT_ERR_SERVER_PROC CONSTANT VARCHAR2(30) := 'PROCESS_AT_SERVER_INVALID';
     NUM_ERR_SERVER_PROC CONSTANT PLS_INTEGER  := -20021;
-    -- Rückgabewerte von SERVER_NEW_SESSION / SERVER_NEW_SESSION_JSON, wenn kein Prozess angelegt werden konnte.
-    -- Es wird keine Exception geworfen; alle weiteren API-Aufrufe mit dieser ID werden still ignoriert.
+    -- Return values of SERVER_NEW_SESSION / SERVER_NEW_SESSION_JSON if no process could be created.
+    -- No exception is raised; all further API calls with this ID are silently ignored.
     TXT_ERR_SESSION_TIMEOUT   CONSTANT VARCHAR2(30) := 'SESSION_TIMEOUT';
-    NUM_ERR_SESSION_TIMEOUT   CONSTANT PLS_INTEGER  := -20110;  -- Server hat nicht rechtzeitig geantwortet
+    NUM_ERR_SESSION_TIMEOUT   CONSTANT PLS_INTEGER  := -20110;  -- Server did not respond in time
     TXT_ERR_SESSION_THROTTLED CONSTANT VARCHAR2(30) := 'SESSION_THROTTLED';
-    NUM_ERR_SESSION_THROTTLED CONSTANT PLS_INTEGER  := -20120;  -- Server hat abgelehnt (Überlast)
-    -- SERVER_UPDATE_RULES: Rule Set fehlt für die Gruppe oder ist ungültig (Exception mit Begründung)
+    NUM_ERR_SESSION_THROTTLED CONSTANT PLS_INTEGER  := -20120;  -- Server rejected (overload)
+    -- SERVER_UPDATE_RULES: rule set is missing for the group or is invalid (exception with reason)
     TXT_ERR_RULE_SET          CONSTANT VARCHAR2(30) := 'RULE_SET_REJECTED';
     NUM_ERR_RULE_SET          CONSTANT PLS_INTEGER  := -20130;
-    -- Kommunikationsfehler beim Anlegen: NUM_COMM_ERR (-20003)
+    -- Communication error during creation: NUM_COMM_ERR (-20003)
 
-    -- Leistungsstufen eines LILAM-Servers (Parameter p_perfServer von CREATE_SERVER/START_SERVER).
-    -- Wert = Nachrichten je Sekunde und Prozess, die ein Client ohne Abstimmung mit dem Server senden darf.
-    -- Beliebige andere Werte sind erlaubt; 0 = keine Drosselung; NULL oder < 0 = C_SERVER_PERF_MID (Standard).
+    -- Performance levels of a LILAM server (parameter p_perfServer of CREATE_SERVER/START_SERVER).
+    -- Value = messages per second and process that a client may send without coordinating with the server.
+    -- Any other values are allowed; 0 = no throttling; NULL or < 0 = C_SERVER_PERF_MID (default).
     C_SERVER_PERF_LOW   CONSTANT PLS_INTEGER  := 500;
     C_SERVER_PERF_MID   CONSTANT PLS_INTEGER  := 1500;
     C_SERVER_PERF_HIGH  CONSTANT PLS_INTEGER  := 2500;
@@ -97,15 +97,15 @@ create or replace PACKAGE LILAM AS
         processName     VARCHAR2(100),
         logLevel        PLS_INTEGER := logLevelMonitor,
         stepsToDo       PLS_INTEGER,
-        daysToKeep      PLS_INTEGER,    -- NULL = keine automatische Loeschung alter Prozessdaten
+        daysToKeep      PLS_INTEGER,    -- NULL = no automatic deletion of old process data
         procImmortal    PLS_INTEGER := 0,
         tabNameMaster   VARCHAR2(100) DEFAULT 'LILAM',
-        baselineScope   VARCHAR2(100),  -- NULL = Prozessname (prozessübergreifend), '#NONE' = nur pro Prozess
-        groupName       VARCHAR2(50)    -- INSESSION: Gruppe für das aktive Rule Set aus LILAM_RULES; NULL = keine Regeln
+        baselineScope   VARCHAR2(100),  -- NULL = process name (cross-process), '#NONE' = per process only
+        groupName       VARCHAR2(50)    -- INSESSION: group for the active rule set from LILAM_RULES; NULL = no rules
     );
 
     -- ==============================
-    -- Sructure of table LILAM_ALERTS
+    -- Structure of table LILAM_ALERTS
     -- ==============================
     TYPE t_alert_rec IS RECORD (
         alert_id            NUMBER,
@@ -206,7 +206,7 @@ create or replace PACKAGE LILAM AS
                            p_perfServer PLS_INTEGER DEFAULT NULL);
     PROCEDURE SERVER_SHUTDOWN(p_processId number, p_pipeName varchar2, p_password varchar2);
     FUNCTION  GET_SERVER_PIPE(p_processId NUMBER) RETURN VARCHAR2;
-    -- Rule Set für alle Server der Gruppe aktivieren (Dispatcher ausgenommen); Fehler => Exception NUM_ERR_RULE_SET
+    -- Activate a rule set for all servers of the group (dispatchers excluded); error => exception NUM_ERR_RULE_SET
     PROCEDURE SERVER_UPDATE_RULES(p_groupName VARCHAR2, p_ruleSetName VARCHAR2, p_ruleSetVersion PLS_INTEGER);
     PROCEDURE SET_DISPATCHER_PIPE(p_pipeName varchar2, p_groupName varchar2 DEFAULT 'DEFAULT_DISPATCHER', p_processId number DEFAULT null);
 
