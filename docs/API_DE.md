@@ -634,12 +634,12 @@ LILAM puffert Log-Einträge aus Performancegründen. Einträge bis zum **Sync-Le
 | Modus | Einträge bis zum Sync-Level | Alle anderen Einträge |
 | --- | --- | --- |
 | In-Session | werden in einer autonomen Transaktion committet, bevor der Aufruf zurückkehrt. Dabei schreibt LILAM auch alle anderen gepufferten Daten der Datenbanksession weg. | bleiben bis zu etwa 1,5 Sekunden im Puffer, länger, wenn die Session LILAM nicht mehr aufruft |
-| Entkoppelt | schreibt der **Client selbst** in einer autonomen Transaktion, bevor der Aufruf zurückkehrt. Diese Einträge haben in der Spalte `NO` den Wert `-1`. Der Server erhält die Meldung trotzdem (Regeln, Alerts), schreibt sie aber nicht noch einmal. | gehen per Pipe an den Server und werden dort gepuffert |
+| Entkoppelt | schreibt der **Client selbst** in einer autonomen Transaktion, bevor der Aufruf zurückkehrt, und zwar immer in **`LILAM_LOG`** im Schema des Clients (wird bei Bedarf angelegt), mit der Prozess-ID und dem Wert `-1` in der Spalte `NO`. Der Server erhält die Meldung trotzdem (Regeln, Alerts), schreibt sie aber nicht noch einmal. | gehen per Pipe an den Server und werden dort gepuffert |
 
 Ein synchron geschriebener Eintrag übersteht damit auch einen Abbruch der Session und im entkoppelten Modus den Ausfall des LILAM-Servers. Gepufferte Einträge sind verloren, wenn eine Session ohne `CLOSE_SESSION` oder `FINAL_RESCUE` endet. Rufe `CLOSE_SESSION` deshalb im zentralen Exception-Handler auf.
 
 > [!NOTE]
-> Weil die Spalte `NO` bei direkt geschriebenen Einträgen `-1` ist, sortiere im entkoppelten Modus nach `SESSION_TIME`, nicht nach `NO`.
+> Synchron geschriebene Einträge stehen im entkoppelten Modus in `LILAM_LOG` (`NO = -1`), nicht in der Arbeitstabelle des Prozesses. Die Arbeitstabelle kann im Schema des Servers liegen, auf das der Client keinen Zugriff hat.
 
 Ein synchroner Aufruf kostet auf dem Testsystem etwa 1,5 bis 3,5 ms statt rund 0,1 ms, vor allem für den Commit. Details, Messwerte und Ausfallszenarien stehen in [Architecture and Concepts](architecture%20and%20concepts.md#when-is-a-log-entry-stored-sync-level).
 

@@ -631,12 +631,12 @@ LILAM buffers log entries for performance reasons. Entries up to the **sync leve
 | Mode | Entries up to the sync level | All other entries |
 | --- | --- | --- |
 | In-Session | are committed in an autonomous transaction before the call returns. LILAM also writes all other buffered data of the database session. | stay in the buffer for up to about 1.5 seconds, longer if the session does not call LILAM again |
-| Decoupled | are written by the **client itself** in an autonomous transaction before the call returns. These entries have the value `-1` in column `NO`. The server still receives the message (rules, alerts) but does not write it again. | are sent to the server via the pipe and buffered there |
+| Decoupled | are written by the **client itself** in an autonomous transaction before the call returns, always into **`LILAM_LOG`** of the client's schema (created if missing), with the process ID and the value `-1` in column `NO`. The server still receives the message (rules, alerts) but does not write it again. | are sent to the server via the pipe and buffered there |
 
 A synchronously written entry therefore survives an abort of the session and, in decoupled mode, a failure of the LILAM server. Buffered entries are lost if a session ends without `CLOSE_SESSION` or `FINAL_RESCUE`. Therefore call `CLOSE_SESSION` in the central exception handler.
 
 > [!NOTE]
-> Since column `NO` is `-1` for directly written entries, sort by `SESSION_TIME` rather than `NO` in decoupled mode.
+> In decoupled mode, look for synchronously written entries in `LILAM_LOG` (`NO = -1`), not in the work table of the process. The work table may be in the server's schema, which the client cannot reach.
 
 On the test system a synchronous call costs about 1.5 to 3.5 ms instead of about 0.1 ms, mostly for the commit. Details, measurements and failure scenarios are in [Architecture and Concepts](architecture%20and%20concepts.md#when-is-a-log-entry-stored-sync-level).
 

@@ -116,13 +116,15 @@ AS
     -- Client side: what the server reported for a remote process (NEW_SESSION/RECONNECT).
     -- Needed to write entries up to sync_level directly, without waiting for the server.
     TYPE t_remote_sync_rec IS RECORD (
-        tabName_master  VARCHAR2(100),
         log_level       PLS_INTEGER,
         sync_level      PLS_INTEGER
     );
     TYPE t_remote_sync_tab IS TABLE OF t_remote_sync_rec INDEX BY BINARY_INTEGER;
     g_remote_sync t_remote_sync_tab;
     C_NO_DIRECT_WRITE CONSTANT PLS_INTEGER := -1;  -- Column NO of log entries written directly by the client
+    -- Master table of directly written entries: always LILAM (=> LILAM_LOG) in the schema of the calling
+    -- LILAM installation, independent of the work table and of the schema the server runs in.
+    C_DIRECT_WRITE_MASTER CONSTANT VARCHAR2(10) := 'LILAM';
     -- IDs for which a reconnect via the dispatcher failed, with the time of the next allowed
     -- attempt. Prevents every call with an unknown ID from querying the dispatcher synchronously again.
     TYPE t_unknown_pids IS TABLE OF TIMESTAMP INDEX BY BINARY_INTEGER;
@@ -4108,15 +4110,18 @@ AS
     -- Client side (decoupled): writes one log entry directly in an autonomous transaction,
     -- without the server. Used for entries up to the sync level of the process, so that they are
     -- stored when the call returns, even if the server or its pipe fails afterwards.
+    -- Target is always LILAM_LOG of this installation (created if missing), not the work table:
+    -- the work table may live in the server's schema, out of reach of the client.
     -- NO is C_NO_DIRECT_WRITE (-1): the running number is assigned by the server only.
     -- Returns FALSE if the entry could not be written; the caller then sends it via the pipe.
-    function writeLogDirect(p_processId number, p_tabNameMaster varchar2, p_level number, p_logText varchar2,
+    function writeLogDirect(p_processId number, p_level number, p_logText varchar2,
                             p_caller varchar2, p_errStack varchar2, p_errBacktrace varchar2, p_errCallstack varchar2,
                             p_timestamp TIMESTAMP) return boolean
     as
         pragma autonomous_transaction;
     begin
-        execute immediate 'insert into ' || safeTableName(p_tabNameMaster || C_SUFFIX_LOG_TABLE) || '
+        createLogTables(C_DIRECT_WRITE_MASTER);   -- checked only once per session
+        execute immediate 'insert into ' || safeTableName(C_DIRECT_WRITE_MASTER || C_SUFFIX_LOG_TABLE) || '
                 (PROCESS_ID, LOG_LEVEL, LOG_LEVEL_C, INFO, SESSION_TIME, NO, CALLER, ERR_STACK, ERR_BACKTRACE, ERR_CALLSTACK, SESSION_USER, HOST_NAME)
                 values (:1, :2, :3, :4, :5, :6, :7, :8, :9, :10, :11, :12)'
         using p_processId, p_level, logLevelToEnum(p_level), substrb(p_logText, 1, 2000), p_timestamp, C_NO_DIRECT_WRITE,
@@ -4127,7 +4132,7 @@ AS
     exception
         when others then
             rollback;
-            if sqlcode = -942 then g_safe_tables.DELETE; end if;
+            if sqlcode = -942 then g_checked_masters.DELETE; g_safe_tables.DELETE; end if;
             logLilamErr(sqlCode, sqlErrM, 'writeLogDirect');
             return false;
     end;
@@ -4226,7 +4231,7 @@ AS
             if g_remote_sync.EXISTS(p_processId)
                and p_level <= g_remote_sync(p_processId).sync_level
                and p_level <= g_remote_sync(p_processId).log_level then
-                l_persisted := writeLogDirect(p_processId, g_remote_sync(p_processId).tabName_master, p_level, l_logText,
+                l_persisted := writeLogDirect(p_processId, p_level, l_logText,
                                               l_module, p_errStack, p_errBacktrace, p_errCallstack, p_timestamp);
             end if;
             log_anyRemote(p_processId, p_level, l_logText, l_module, p_errStack, p_errBacktrace, p_errCallstack, p_timestamp, l_persisted);
@@ -5073,7 +5078,6 @@ AS
             jsonPut(l_response, 'process_id', l_processId);
             jsonPut(l_response, 'perf', g_server_perf);   -- Performance level for client throttling
             -- Data for the client's direct writing up to sync_level (see setRemoteSync)
-            jsonPut(l_response, 'tabname_master', g_sessionList(v_indexSession(l_processId)).tabName_master);
             jsonPut(l_response, 'log_level',      g_sessionList(v_indexSession(l_processId)).log_level);
             jsonPut(l_response, 'sync_level',     g_sessionList(v_indexSession(l_processId)).sync_level);
         else
@@ -5374,9 +5378,8 @@ AS
 
         DBMS_PIPE.RESET_BUFFER;
         -- perf: performance level of this server; the client adjusts its throttling accordingly
-        -- tabname_master/log_level/sync_level: the client writes entries up to sync_level itself
+        -- log_level/sync_level: the client writes entries up to sync_level itself (see setRemoteSync)
         DBMS_PIPE.PACK_MESSAGE('{"process_id":' || l_processId || ',"perf":' || g_server_perf
-                               || jStr('tabname_master', g_sessionList(v_indexSession(l_processId)).tabName_master)
                                || jNum('log_level',      g_sessionList(v_indexSession(l_processId)).log_level)
                                || jNum('sync_level',     g_sessionList(v_indexSession(l_processId)).sync_level) || '}');
         l_status := DBMS_PIPE.SEND_MESSAGE(p_clientChannel, timeout => 1);
@@ -5454,16 +5457,15 @@ AS
 
     --------------------------------------------------------------------------
 
-    -- Client side: remember table, log level and sync level that the server reported for the process.
+    -- Client side: remember log level and sync level that the server reported for the process.
     -- Without these values (e.g. older server) the client sends everything via the pipe as before.
     procedure setRemoteSync(p_processId number, p_json varchar2)
     as
         l_rec t_remote_sync_rec;
     begin
-        l_rec.tabName_master := jsonString(p_json, 'tabname_master');
         l_rec.log_level      := jsonNumber(p_json, 'log_level');
         l_rec.sync_level     := jsonNumber(p_json, 'sync_level');
-        if l_rec.tabName_master is null or l_rec.log_level is null or l_rec.sync_level is null then
+        if l_rec.log_level is null or l_rec.sync_level is null then
             g_remote_sync.DELETE(p_processId);
         else
             g_remote_sync(p_processId) := l_rec;

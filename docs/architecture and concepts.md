@@ -105,13 +105,15 @@ Buffering makes LILAM fast, but a buffered entry only exists in memory until the
 
 | Data | In-Session | Decoupled (server, also via dispatcher) |
 | --- | --- | --- |
-| Entries up to the sync level (default: `ERROR`) | Written and committed **before the call returns** (autonomous transaction). The call forces a flush of **all** buffered data of the database session: logs, metrics and process status of every open process. | The **client** writes the entry itself in an autonomous transaction **before the call returns**, with `NO = -1`. It then sends the message to the server with the flag `persisted`: the server evaluates the rules and flushes its buffers as for a synchronous entry, but does not write the entry again. If the direct write fails, the client sends the entry via the pipe as before. |
+| Entries up to the sync level (default: `ERROR`) | Written and committed **before the call returns** (autonomous transaction). The call forces a flush of **all** buffered data of the database session: logs, metrics and process status of every open process. | The **client** writes the entry itself in an autonomous transaction **before the call returns**, always into **`LILAM_LOG`** of its own LILAM installation (created if missing), with `NO = -1` and the process ID. It then sends the message to the server with the flag `persisted`: the server evaluates the rules and flushes its buffers as for a synchronous entry, but does not write the entry again. If the direct write fails, the client sends the entry via the pipe as before. |
 | All other entries, metrics, process status | Buffered in the PGA of the session. Flushed when the last flush is at least 1.5 s ago or 50,000 entries are pending, and also by a synchronous entry, `CLOSE_SESSION` and `FINAL_RESCUE`. | Sent via the pipe, buffered in the PGA of the server, flushed by the same rules plus the server's housekeeping (every 0.5 s when idle). |
 
-The server reports table name, log level and sync level of a process to the client when the process is created (`SERVER_NEW_SESSION`) or reconnected (dispatcher, APEX). Without these values (e.g. a server of an older version) the client sends everything via the pipe.
+Why `LILAM_LOG` and not the work table of the process? The work table may be in the schema of the server, which the client cannot reach, and where an entry ends up should not depend on modes, schemas and privileges. The rule is simple: **in Decoupled mode, look for synchronously written entries in `LILAM_LOG` of the client's schema** (`NO = -1`, same `PROCESS_ID`), all other entries are in the work table.
+
+The server reports log level and sync level of a process to the client when the process is created (`SERVER_NEW_SESSION`) or reconnected (dispatcher, APEX). Without these values (e.g. a server of an older version) the client sends everything via the pipe.
 
 > [!NOTE]
-> Column `NO` is the running number that the server assigns per process. Entries written directly by a decoupled client have `NO = -1`. Sort by `SESSION_TIME` to get the chronological order.
+> Column `NO` is the running number that the server assigns per process. Entries written directly by a decoupled client have `NO = -1`.
 
 The time-based flush has no background timer: it is checked only when the session calls LILAM again. A session that stops calling LILAM keeps its buffer, however long it waits.
 
@@ -125,7 +127,7 @@ Measured on Oracle 23.26 Free (2 CPU threads), test schema `LILAM_TEST`:
 | In-Session: `INFO` → `ERROR` → caller `ROLLBACK` | the `ERROR` and the `INFO` before it are stored |
 | Decoupled: `INFO` (client) | 0.1–0.4 ms per call |
 | Decoupled: `ERROR` (client, direct write) | 1.3–3.6 ms per call; for comparison, a plain autonomous insert with commit costs 1.3 ms on this system |
-| Decoupled: `ERROR` visible in the table | immediately after the call |
+| Decoupled: `ERROR` visible in `LILAM_LOG` | immediately after the call |
 | Decoupled: `INFO` visible in the table | after about 2 s |
 
 **What is lost in case of a failure** (default sync level `ERROR`)
@@ -135,7 +137,7 @@ Measured on Oracle 23.26 Free (2 CPU threads), test schema `LILAM_TEST`:
 | Caller `ROLLBACK` | Nothing. All writes are autonomous transactions. | Nothing. |
 | Unhandled exception, session killed, job aborted, without `CLOSE_SESSION` / `FINAL_RESCUE` | Everything buffered since the last flush (e.g. `INFO` and `WARN`). An `ERROR` that has returned is stored, together with everything that was buffered before it. | Nothing on the client side. Entries that have reached the server are lost only if the server fails. |
 | Database session dies during the `ERROR` call | This `ERROR` (it is committed at the end of the call). | This `ERROR`, if it was not yet committed. |
-| LILAM server killed or crashed | – | Everything in the server's buffer and in its pipe, i.e. buffered entries above the sync level. The pipe lives in the SGA only, and a restarted server empties its pipe and does not know the processes of its predecessor. Synchronous entries are already stored (verified by test: an `ERROR` sent while the server was down is in the table). |
+| LILAM server killed or crashed | – | Everything in the server's buffer and in its pipe, i.e. buffered entries above the sync level. The pipe lives in the SGA only, and a restarted server empties its pipe and does not know the processes of its predecessor. Synchronous entries are already stored in `LILAM_LOG` (verified by test: an `ERROR` sent while the server was down is there). |
 | Instance crash | Everything buffered. | Everything buffered and everything in the pipes. |
 | Pipe full (server overloaded) | – | The client retries for a few seconds and then discards the message. It is recorded in `LILAM_LOG_INTERNAL` of the client; the application gets no exception. Synchronous entries are already stored. |
 | Log table not writable (e.g. tablespace full) | The entry is recorded in `LILAM_LOG_INTERNAL`; the application gets no exception. | Same, in the client or the server. |

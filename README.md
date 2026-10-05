@@ -180,7 +180,7 @@ LILAM prioritizes the stability of your application. It uses a Hybrid Model to b
 * As an optional safeguard, LILAM rate-limits hyperactive clients during load peaks to prevent pipe flooding until the bottleneck is cleared.
 
 > [!IMPORTANT]
-> **Buffering means write latency.** Only entries up to the **sync level** of a process (`p_syncLevel`, default `ERROR`) are written synchronously: they are committed before the call returns, in In-Session and in Decoupled mode (there the client writes them itself). All other entries, metrics and status updates stay in memory for up to about 1.5 seconds (longer if the session makes no further LILAM call). If a session dies without `CLOSE_SESSION` or `FINAL_RESCUE`, these entries are lost.
+> **Buffering means write latency.** Only entries up to the **sync level** of a process (`p_syncLevel`, default `ERROR`) are written synchronously: they are committed before the call returns, in In-Session and in Decoupled mode (there the client writes them itself, always into `LILAM_LOG` of its schema). All other entries, metrics and status updates stay in memory for up to about 1.5 seconds (longer if the session makes no further LILAM call). If a session dies without `CLOSE_SESSION` or `FINAL_RESCUE`, these entries are lost.
 > Details, measurements and failure scenarios: [When Is a Log Entry Stored?](docs/architecture%20and%20concepts.md#when-is-a-log-entry-stored-sync-level)
 
 ### Technology
