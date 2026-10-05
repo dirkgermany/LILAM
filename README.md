@@ -179,6 +179,11 @@ LILAM prioritizes the stability of your application. It uses a Hybrid Model to b
 * Active Throttling
 * As an optional safeguard, LILAM rate-limits hyperactive clients during load peaks to prevent pipe flooding until the bottleneck is cleared.
 
+> [!IMPORTANT]
+> **Buffering means write latency.** Only `ERROR` is written synchronously, and only in In-Session mode is it committed before the call returns. `WARN`, `INFO`, `DEBUG`, metrics and status updates stay in memory for up to about 1.5 seconds (longer if the session makes no further LILAM call). If a session dies without `CLOSE_SESSION` or `FINAL_RESCUE`, these entries are lost.
+> In Decoupled mode, `ERROR` also returns immediately: the server usually stores it within milliseconds, but if the LILAM server or the instance fails before that, the entry is lost.
+> Details, measurements and failure scenarios: [When Is a Log Entry Stored?](docs/architecture%20and%20concepts.md#when-is-a-log-entry-stored-write-latency-per-level)
+
 ### Technology
 #### Autonomous Persistence
 LILAM strictly utilizes `PRAGMA AUTONOMOUS_TRANSACTION`. This guarantees that log entries and monitoring data are permanently stored in the database, even if the calling main transaction performs a `ROLLBACK` due to an error. This ensures the root cause remains available for post-mortem analysis.
@@ -187,7 +192,7 @@ LILAM strictly utilizes `PRAGMA AUTONOMOUS_TRANSACTION`. This guarantees that lo
 By leveraging the `UTL_CALL_STACK`, LILAM automatically captures the exact program execution path. Instead of just logging a generic error, it documents the entire call chain, significantly accelerating the debugging process in complex, nested PL/SQL environments.
 
 #### High-Performance Buffering
-To minimize the impact on the main application’s overhead, LILAM features an internal buffering system. Log writing is processed efficiently, offering a decisive performance advantage over simple, row-by-row logging methods, especially in high-load production environments.
+To minimize the impact on the main application’s overhead, LILAM features an internal buffering system. Log writing is processed efficiently, offering a decisive performance advantage over simple, row-by-row logging methods, especially in high-load production environments. The exception is `ERROR`: it forces an immediate flush, so that the error and everything logged before it are stored (see the note under Performance & Safety for the limits of this guarantee).
 
 #### Robust & Non-Invasive (Silent Mode)
 LILAM is designed to be "invisible." The framework ensures that an internal error during the logging process (e.g., table space issues or configuration errors) doesn't crash the calling application logic. Exceptions within LILAM are caught and handled internally, prioritizing the stability of your business transaction over the logging activity itself.

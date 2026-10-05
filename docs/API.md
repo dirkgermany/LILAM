@@ -608,6 +608,14 @@ PROCEDURE DEBUG(
 
 `ERROR` has the highest priority and is always stored unless logging has been switched off completely with `logLevelSilent`.
 
+> [!IMPORTANT]
+> **When an entry is in the table depends on the level and the mode.**
+> - **In-Session:** `ERROR` is written and committed in an autonomous transaction before the call returns. LILAM also writes all other buffered data of the database session. `WARN`, `INFO` and `DEBUG` stay in the buffer for up to about 1.5 seconds, longer if the session does not call LILAM again.
+> - **Decoupled:** `ERROR` also returns immediately. The server writes the message as soon as it reads it from the pipe (measured: 20–30 ms). If the LILAM server or the instance fails before that, the entry is lost.
+> - If a session ends without `CLOSE_SESSION` or `FINAL_RESCUE`, the buffered entries are lost. Therefore call `CLOSE_SESSION` in the central exception handler.
+>
+> Details, measurements and failure scenarios are in [Architecture and Concepts](architecture%20and%20concepts.md#when-is-a-log-entry-stored-write-latency-per-level).
+
 LILAM always handles internal errors silently and logs them in `LILAM_LOG_INTERNAL`; the application never receives an exception. If `logLevelDebug` is active, LILAM additionally writes such errors as `ERROR` to the log of the affected process.
 
 The complete mapping can be found under [Log Levels](#log-levels).
