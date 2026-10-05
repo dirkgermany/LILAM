@@ -189,7 +189,7 @@ AS
         base_count      NUMBER := 0,
         in_db           BOOLEAN := FALSE,
         dirty           BOOLEAN := FALSE,
-        last_touch      TIMESTAMP(6)
+        last_touch_cs   NUMBER          -- letzte Nutzung (DBMS_UTILITY.GET_TIME), für das Verdrängen
     );
     TYPE t_baseline_map IS TABLE OF t_baseline_rec INDEX BY VARCHAR2(250);
     g_baselines t_baseline_map;
@@ -397,7 +397,7 @@ AS
     g_serverIsDispatcher                BOOLEAN                 := FALSE;
 
     g_server_perf                       PLS_INTEGER             := C_SERVER_PERF_MID;  -- Leistungsstufe dieses Servers (p_perfServer)
-    g_last_sync_all                     TIMESTAMP               := NULL;   -- letzter Durchlauf von SYNC_ALL_DIRTY
+    g_last_sync_all_cs                  NUMBER                  := NULL;   -- letzter Durchlauf von SYNC_ALL_DIRTY (DBMS_UTILITY.GET_TIME)
     g_last_check_time                   TIMESTAMP               := SYSTIMESTAMP;
 
     -- Latencies between event generation and persistance in DB
@@ -1059,7 +1059,7 @@ AS
         l_rec.base_avg     := l_rec.avg_ms;
         l_rec.base_count   := l_rec.action_count;
         l_rec.dirty        := FALSE;
-        l_rec.last_touch   := SYSTIMESTAMP;
+        l_rec.last_touch_cs := dbms_utility.get_time;
 
         g_baselines(p_key) := l_rec;
     END;
@@ -2589,6 +2589,7 @@ AS
     AS
         pragma autonomous_transaction;
         l_now        CONSTANT TIMESTAMP(6) := SYSTIMESTAMP;
+        l_now_cs     CONSTANT NUMBER       := dbms_utility.get_time;
         l_key        VARCHAR2(250);
         l_next       VARCHAR2(250);
         l_dbKey      VARCHAR2(250);
@@ -2664,8 +2665,8 @@ AS
                 ELSE
                     l_ins_keys.EXTEND;   l_ins_keys(l_ins_keys.LAST)     := l_key;
                 END IF;
-            ELSIF l_rec.last_touch IS NULL
-               OR (CAST(l_now AS DATE) - CAST(l_rec.last_touch AS DATE)) * 86400 > C_BASELINE_IDLE_EVICT_SEC THEN
+            ELSIF l_rec.last_touch_cs IS NULL
+               OR abs(l_now_cs - l_rec.last_touch_cs) / 100 > C_BASELINE_IDLE_EVICT_SEC THEN
                 g_baselines.DELETE(l_key);
             END IF;
 
@@ -2757,21 +2758,23 @@ AS
         v_id      BINARY_INTEGER;
         v_next_id BINARY_INTEGER;
         v_idx     PLS_INTEGER;
-        v_now     CONSTANT TIMESTAMP := SYSTIMESTAMP;
+        -- PERFORMANCE: GET_TIME (1/100 s) statt SYSTIMESTAMP und get_ms_diff: läuft bei jedem Log-Aufruf
+        v_now_cs  CONSTANT NUMBER := dbms_utility.get_time;
     BEGIN
         -- ======================================================================
         -- TEIL 0: ZEITSPERRE
         -- Ohne Force hoechstens alle C_SYNC_ALL_INTERVAL_MS einen Durchlauf ueber alle
         -- Prozesse. So kostet z.B. jedes INFO nur einen Zeitvergleich, unabhaengig von
         -- der Zahl offener Prozesse. Die Flush-Schwellen (Zeit/Menge) bleiben unveraendert.
+        -- ABS: beim Überlauf von GET_TIME gibt es höchstens einen zusätzlichen Durchlauf.
         -- ======================================================================
         if NOT p_force AND NOT p_isShutdown
-           AND g_last_sync_all IS NOT NULL
-           AND get_ms_diff(g_last_sync_all, v_now) < C_SYNC_ALL_INTERVAL_MS
+           AND g_last_sync_all_cs IS NOT NULL
+           AND abs(v_now_cs - g_last_sync_all_cs) * 10 < C_SYNC_ALL_INTERVAL_MS
         then
             return;
         end if;
-        g_last_sync_all := v_now;
+        g_last_sync_all_cs := v_now_cs;
 
         -- ======================================================================
         -- TEIL 1: BEARBEITUNG DER DRECKIGEN LISTE (Queue)
@@ -3157,7 +3160,7 @@ AS
                 g_baselines(l_key).action_count := l_oldCnt + 1;
                 g_baselines(l_key).avg_ms       := calculate_ewma(l_oldAvg, l_oldCnt + 1, p_rec.used_time, l_params.warmup, l_params.alpha);
                 g_baselines(l_key).dirty        := TRUE;
-                g_baselines(l_key).last_touch   := SYSTIMESTAMP;
+                g_baselines(l_key).last_touch_cs := dbms_utility.get_time;  -- PERFORMANCE: je Trace/Event, daher kein SYSTIMESTAMP
 
                 p_rec.avg_action_time := g_baselines(l_key).avg_ms;
                 p_rec.baseline_avg    := CASE WHEN l_oldCnt >= coalesce(l_params.warmup, 0) THEN l_oldAvg END;
@@ -3615,7 +3618,7 @@ AS
         sqlStatement := '
         update ' || C_PARAM_MASTER_TABLE || '
         set status           = :PH_STATUS,
-            last_update      = current_timestamp,
+            last_update      = systimestamp,
             process_end      = :PH_PROCESS_END,
             steps_todo  = :PH_steps_todo,
             steps_done  = :PH_steps_done,
@@ -3750,7 +3753,7 @@ AS
                 v_stmt := '
                 update ' || C_PARAM_MASTER_TABLE || '
                 set status           = :1,
-                    last_update      = current_timestamp,
+                    last_update      = systimestamp,
                     process_end      = :2,
                     steps_todo       = :3,
                     steps_done       = :4,
@@ -3899,8 +3902,8 @@ AS
         values (
             :PH_PROCESS_ID, 
             :PH_PROCESS_NAME, 
-            current_timestamp,
-            current_timestamp,
+            systimestamp,
+            systimestamp,
             null,
             :PH_STEPS_TO_DO, 
             null,
@@ -4128,7 +4131,7 @@ AS
         p_errStack varchar2,
         p_errBacktrace varchar2,
         p_errCallstack varchar2,
-        p_timestamp TIMESTAMP DEFAULT sysdate
+        p_timestamp TIMESTAMP DEFAULT systimestamp
     )
     as
         l_packageName VARCHAR2(128);
@@ -4417,13 +4420,13 @@ AS
         l_steps number;
     begin
         if is_remote(p_processId) then
-            procStepDoneRemote(p_processId, sysdate);
+            procStepDoneRemote(p_processId, SYSTIMESTAMP);
             return;
         end if ;
 
        if v_indexSession.EXISTS(p_processId) then
             l_steps := coalesce(g_process_cache(p_processId).stepsDone, 0) +1;                
-            setAnyStatus(p_processId, null, null, null, l_steps, null, sysdate);   
+            setAnyStatus(p_processId, null, null, null, l_steps, null, SYSTIMESTAMP);   
         end if;
     end;
 
@@ -4815,7 +4818,7 @@ AS
         v_new_rec.id             := p_processId;
         v_new_rec.tabNameMaster  := l_session_init.tabNameMaster;
         v_new_rec.processName    := l_session_init.processName;
-        v_new_rec.processStart   := current_timestamp;
+        v_new_rec.processStart   := systimestamp;
         v_new_rec.processEnd     := null;
         v_new_rec.lastUpdate     := null;
         v_new_rec.stepsTodo      := l_session_init.stepsToDo;
