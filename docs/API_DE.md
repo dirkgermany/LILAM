@@ -239,7 +239,7 @@ Die Session-Verwaltung steuert den Lebenszyklus eines LILAM Prozesses.
 Beide Funktionen starten einen LILAM Prozess und liefern dessen Process ID zurück. Diese ID wird für alle nachfolgenden API-Aufrufe benötigt.
 
 - `NEW_SESSION` startet den Prozess im In-Session-Modus.
-- `SERVER_NEW_SESSION` startet den Prozess im entkoppelten Modus über einen LILAM Server. Die Parameter sind dieselben, ergänzt um `p_groupName` an zweiter Stelle.
+- `SERVER_NEW_SESSION` startet den Prozess im entkoppelten Modus über einen LILAM Server. Die Parameter sind dieselben; `p_groupName` steht hier an zweiter Stelle, bei `NEW_SESSION` an letzter.
 - Alternativ lassen sich alle Einstellungen in einem Record [`t_session_init`](#record-typ-t_session_init) zusammenfassen (nur `NEW_SESSION`).
 
 Jeder Parameter steht immer an derselben Position. Alle Parameter außer `p_processName` besitzen einen Default und können daher weggelassen oder per Namen übergeben werden.
@@ -251,7 +251,8 @@ FUNCTION NEW_SESSION(
   p_procStepsToDo PLS_INTEGER DEFAULT NULL,
   p_daysToKeep    PLS_INTEGER DEFAULT NULL,
   p_tabNameMaster VARCHAR2    DEFAULT 'LILAM',
-  p_baselineScope VARCHAR2    DEFAULT NULL
+  p_baselineScope VARCHAR2    DEFAULT NULL,
+  p_groupName     VARCHAR2    DEFAULT NULL
 ) RETURN NUMBER
 ```
 
@@ -286,7 +287,7 @@ FUNCTION SERVER_NEW_SESSION_JSON(
 | Parameter | JSON | Default | Beschreibung |
 | --- | --- | --- | --- |
 | `p_processName` | `process_name` | – | Name zur Identifikation des Prozesses |
-| `p_groupName` | `group_name` | `NULL` | Nur `SERVER_NEW_SESSION`: beschränkt die Serverauswahl auf die angegebene Gruppe; `NULL` = beliebiger verfügbarer Server |
+| `p_groupName` | `group_name` | `NULL` | `SERVER_NEW_SESSION`: beschränkt die Serverauswahl auf die angegebene Gruppe; `NULL` = beliebiger verfügbarer Server. `NEW_SESSION`: Der Prozess nutzt das aktive Rule Set dieser Gruppe aus `LILAM_RULES` (siehe [Regeln im INSESSION-Modus](#regeln-im-insession-modus)); `NULL` = keine Regeln |
 | `p_logLevel` | `log_level` | `logLevelMonitor` | Detaillierungsgrad des Loggings, siehe [Log-Level](#log-level) |
 | `p_procStepsToDo` | `steps_todo` | `NULL` | Geplante Anzahl der Prozessschritte |
 | `p_daysToKeep` | `days_to_keep` | `NULL` | `NULL` = keine automatische Bereinigung. Sonst werden beim Start abgeschlossene Prozesse gleichen Namens, die älter als die angegebene Anzahl Tage sind, samt Logs und Metriken gelöscht (außer Prozesse mit `procImmortal = 1`) |
@@ -316,6 +317,7 @@ end if;
 
 > [!NOTE]
 > Durch den Baseline-Scope baut auch eine Anwendung, die häufig neu gestartet wird, eine stabile Vergleichsbasis für ihre Laufzeiten auf. Die Durchschnittswerte werden in den Tabellen `LILAM_SCOPES` und `LILAM_BASELINES` gespeichert.
+> Den Ablauf (Auflösung des Scopes, Laden und Abgleich mit `LILAM_BASELINES`) zeigt ein Diagramm in [architecture and concepts.md](architecture%20and%20concepts.md#baseline-scope).
 
 #### Beispiele
 
@@ -329,6 +331,9 @@ l_processId := lilam.new_session('IMPORT_CUSTOMERS', lilam.logLevelInfo, 500);
 -- einzelne Parameter per Namen
 l_processId := lilam.new_session('IMPORT_CUSTOMERS', p_daysToKeep => 30);
 l_processId := lilam.new_session('IMPORT_CUSTOMERS', p_baselineScope => '#NONE');
+
+-- In-Session mit den Regeln der Gruppe BATCH
+l_processId := lilam.new_session('IMPORT_CUSTOMERS', p_groupName => 'BATCH');
 
 -- entkoppelt: beliebiger verfügbarer Server bzw. Server der Gruppe BATCH
 l_processId := lilam.server_new_session('IMPORT_CUSTOMERS');
@@ -815,7 +820,7 @@ FUNCTION GET_SERVER_PIPE(
 ```
 
 ### Procedure SERVER_UPDATE_RULES
-Rule Sets werden als JSON-Objekte in `LILAM_RULES` gespeichert, jeweils für eine Servergruppe (`GROUP_NAME`, Name, Version). Dasselbe Rule Set kann für mehrere Gruppen eingetragen sein. Je Gruppe ist genau ein Rule Set aktiv (`IS_ACTIVE = 1`); es gilt für alle Server der Gruppe.
+Rule Sets werden als JSON-Objekte in `LILAM_RULES` gespeichert, jeweils für eine Gruppe (`GROUP_NAME`, Name, Version). Dasselbe Rule Set kann für mehrere Gruppen eingetragen sein. Je Gruppe ist genau ein Rule Set aktiv (`IS_ACTIVE = 1`); es gilt für alle Server der Gruppe und für alle INSESSION-Prozesse, die mit dieser Gruppe gestartet wurden.
 
 ```sql
 PROCEDURE SERVER_UPDATE_RULES(
@@ -829,6 +834,7 @@ Ablauf:
 1. Das Rule Set der Gruppe wird in der aufrufenden Session vollständig geprüft. Fehlt es für die Gruppe oder ist eine Regel ungültig, endet der Aufruf mit der Exception `NUM_ERR_RULE_SET` (-20130) und einer Begründung; es ändert sich nichts.
 2. Das Rule Set wird für die Gruppe aktiv, das bisher aktive inaktiv.
 3. Laufende Server der Gruppe erhalten die Anweisung zum Neuladen direkt in ihre Pipe, also auch ohne laufenden Prozess und am Dispatcher vorbei. Dispatcher werten keine Regeln aus.
+4. INSESSION-Prozesse der Gruppe laden das neue Rule Set selbst, spätestens beim ersten API-Aufruf nach 15 Sekunden (siehe [Regeln im INSESSION-Modus](#regeln-im-insession-modus)).
 
 Eine Gruppe ohne laufende Server ist kein Fehler: Jeder Server lädt beim Start das aktive Rule Set seiner Gruppe, auch ein neu hinzukommender. Lehnt ein Server ein Rule Set beim Start ab (z. B. weil es inzwischen direkt in der Tabelle geändert wurde), behält er die bisherigen Regeln (beim Start: keine) und protokolliert den Grund in `LILAM_LOG_INTERNAL` und im Log des Serverprozesses.
 
@@ -839,7 +845,21 @@ VALUES ('METRO', 'METRO_RULES', 2, systimestamp, 'Dirk', '{"rules":[ ... ]}');
 exec LILAM.SERVER_UPDATE_RULES('METRO', 'METRO_RULES', 2);
 ```
 
-Regeln wirken nur in Servern, nicht im INSESSION-Modus. Aufbau der Rule Sets und Operatoren: [Rules Engine](../rules/README.md).
+Aufbau der Rule Sets und Operatoren: [Rules Engine](../rules/README.md).
+
+### Regeln im INSESSION-Modus
+Auch Prozesse im INSESSION-Modus werten Regeln aus, wenn `NEW_SESSION` eine Gruppe erhält (`p_groupName` bzw. `t_session_init.groupName`). Sie nutzen dann dasselbe aktive Rule Set der Gruppe aus `LILAM_RULES` wie die Server dieser Gruppe. Ohne Gruppe gibt es keine Regeln.
+
+- **Laden:** Die erste Regelprüfung eines Prozesses der Gruppe lädt das aktive Rule Set in den Speicher der Datenbank-Session. Weitere Prozesse derselben Gruppe in dieser Session verwenden es mit. Verschiedene Gruppen in einer Session sind möglich und bleiben getrennt.
+- **Änderungen:** Höchstens alle 15 Sekunden prüft LILAM bei einem API-Aufruf, ob sich Name oder Version des aktiven Rule Sets der Gruppe geändert haben, und lädt es dann neu. `SERVER_UPDATE_RULES` wirkt also auch hier, spätestens beim ersten API-Aufruf nach 15 Sekunden. Wird ein Rule Set direkt in der Tabelle geändert, ohne dass sich Name oder Version ändern, bemerkt das eine laufende Session nicht.
+- **Ungültiges Rule Set:** Es wird abgelehnt und einmal je Version in `LILAM_LOG_INTERNAL` protokolliert; die bisherigen Regeln bleiben aktiv. Die Anwendung bemerkt davon nichts.
+- **Alerts:** Ein ausgelöster Alert wird sofort und synchron geschrieben (`LILAM_ALERTS` und `DBMS_ALERT`-Signal, eigene Transaktion). Das kostet die Anwendung pro Alert einen Commit; `throttle_seconds` begrenzt die Häufigkeit. `GROUP_NAME` im Alert ist die Gruppe aus `NEW_SESSION`.
+- **Gedächtnis je Session:** Drosselung (`throttle_seconds`) und der Vorgänger für `PRECEDED_BY` gelten je Datenbank-Session. Mit einem Connection-Pool (z. B. APEX) kann derselbe Alert daher je Pool-Verbindung einmal ausgelöst werden.
+- **Baseline-Parameter:** `warmup` und `alpha` aus `AVG_DEVIATION_PCT`-Regeln gelten wie im Server auch für die Durchschnittswerte des Prozesses.
+
+```sql
+l_processId := lilam.new_session('IMPORT_CUSTOMERS', p_groupName => 'METRO');
+```
 
 ## Dispatcher-Modus
 Ein mit p_isDispatcher => 1 gestarteter Server (Dispatcher) verarbeitet keine Anfragen selbst, sondern leitet sie unverändert an einen passenden Server weiter.
@@ -847,7 +867,7 @@ Ein mit p_isDispatcher => 1 gestarteter Server (Dispatcher) verarbeitet keine An
 Für NEW_SESSION/SERVER_NEW_SESSION wählt der Dispatcher dabei denselben lastbasierten Mechanismus wie die reguläre Serverauswahl und reicht die Anfrage an die Steuer-Pipe des gewählten Servers weiter;
 für alle anderen Anfragen ermittelt er anhand der bereits vergebenen process_id den Server, der für den Prozess der Anwendung zuständig ist und leitet dorthin weiter.
 
-Die Antwort des zuständigen Servers geht direkt an den Client zurück, nicht über den Dispatcher.
+Die Antwort des zuständigen Servers geht direkt an den Client zurück, nicht über den Dispatcher. Ein Sequenzdiagramm des Ablaufs steht in [architecture and concepts.md](architecture%20and%20concepts.md#dispatcher-flow).
 
 Ein Dispatcher ist in der Server-Registry gekennzeichnet (`IS_DISPATCHER = 1`) und wird bei der Serverauswahl nie als Ziel gewählt. Worker und Dispatcher können daher in derselben Gruppe laufen: Clients ohne Dispatcher-Konfiguration erhalten immer direkt einen Worker.
 
@@ -951,7 +971,8 @@ TYPE t_session_init IS RECORD (
   daysToKeep    PLS_INTEGER,                    -- NULL = keine automatische Bereinigung
   procImmortal  PLS_INTEGER := 0,
   tabNameMaster VARCHAR2(100) DEFAULT 'LILAM',
-  baselineScope VARCHAR2(100)                   -- NULL = Prozessname, '#NONE' = nur pro Prozess
+  baselineScope VARCHAR2(100),                  -- NULL = Prozessname, '#NONE' = nur pro Prozess
+  groupName     VARCHAR2(50)                    -- Gruppe für das aktive Rule Set; NULL = keine Regeln
 );
 ```
 
@@ -1004,7 +1025,7 @@ LILAM JSON Requests bestehen aus einem Header und einem Parameterobjekt. Der Hea
 
 | `api_call` | entspricht | Parameter (`params`) |
 | --- | --- | --- |
-| `NEW_SESSION` | `NEW_SESSION` (Record) | `process_name`, `log_level`, `steps_todo`, `days_to_keep`, `process_immortal`, `tabname_master`, `baseline_scope` |
+| `NEW_SESSION` | `NEW_SESSION` (Record) | `process_name`, `log_level`, `steps_todo`, `days_to_keep`, `process_immortal`, `tabname_master`, `baseline_scope`, `group_name` |
 | `SERVER_NEW_SESSION` | `SERVER_NEW_SESSION_JSON` | wie `SERVER_NEW_SESSION`, siehe Tabelle dort |
 | `CLOSE_SESSION` | `CLOSE_SESSION` | `process_id` |
 | `SET_PROCESS_STATUS` | `SET_PROCESS_STATUS` | `process_id`, `process_status`, `process_info` |

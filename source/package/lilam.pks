@@ -100,7 +100,8 @@ create or replace PACKAGE LILAM AS
         daysToKeep      PLS_INTEGER,    -- NULL = keine automatische Loeschung alter Prozessdaten
         procImmortal    PLS_INTEGER := 0,
         tabNameMaster   VARCHAR2(100) DEFAULT 'LILAM',
-        baselineScope   VARCHAR2(100)   -- NULL = Prozessname (prozessübergreifend), '#NONE' = nur pro Prozess
+        baselineScope   VARCHAR2(100),  -- NULL = Prozessname (prozessübergreifend), '#NONE' = nur pro Prozess
+        groupName       VARCHAR2(50)    -- INSESSION: Gruppe für das aktive Rule Set aus LILAM_RULES; NULL = keine Regeln
     );
 
     -- ==============================
@@ -136,7 +137,8 @@ create or replace PACKAGE LILAM AS
         p_procStepsToDo PLS_INTEGER DEFAULT NULL,
         p_daysToKeep    PLS_INTEGER DEFAULT NULL,
         p_tabNameMaster VARCHAR2    DEFAULT 'LILAM',
-        p_baselineScope VARCHAR2    DEFAULT NULL) RETURN NUMBER;
+        p_baselineScope VARCHAR2    DEFAULT NULL,
+        p_groupName     VARCHAR2    DEFAULT NULL) RETURN NUMBER;
 
     FUNCTION  SERVER_NEW_SESSION(
         p_processName   VARCHAR2,

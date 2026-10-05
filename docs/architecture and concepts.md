@@ -23,6 +23,11 @@
 - [Operating Modes](#operating-modes)
   - [In-Session](#in-session)
   - [Decoupled](#decoupled)
+- [Flow Diagrams](#flow-diagrams)
+  - [In-Session and Decoupled Side by Side](#in-session-and-decoupled-side-by-side)
+  - [How an API Call Finds Its Target](#how-an-api-call-finds-its-target)
+  - [Dispatcher Flow](#dispatcher-flow)
+  - [Baseline Scope](#baseline-scope)
 - [Tables](#tables)
   - [Application-Specific Tables](#application-specific-tables)
   - [Fixed Internal Tables](#fixed-internal-tables)
@@ -133,9 +138,16 @@ A process monitors actions **'A'** and **'B'**:
 ## Rule Management & Event Response
 **Rules** define how LILAM servers react to incoming **signals**, transforming LILAM from a passive monitoring tool into an active **orchestrator**. The complete reference (properties, operators, examples) is in [Rules Engine](../rules/README.md).
 
-Rules are organized into **Rule Sets**, structured as JSON objects. The central table `LILAM_RULES` stores each rule set with its **server group**, name and **version**. Exactly one rule set per group is active (`IS_ACTIVE`). Every LILAM server loads the active rule set of its group at startup and when `SERVER_UPDATE_RULES` is called; a new server of the group therefore uses the same rules automatically.
+Rules are organized into **Rule Sets**, structured as JSON objects. The central table `LILAM_RULES` stores each rule set with its **group**, name and **version**. Exactly one rule set per group is active (`IS_ACTIVE`). Every LILAM server loads the active rule set of its group at startup and when `SERVER_UPDATE_RULES` is called; a new server of the group therefore uses the same rules automatically.
 
-Rules are evaluated by LILAM **servers** only. In INSESSION mode no rules are loaded.
+### Rules in INSESSION Mode
+INSESSION processes evaluate rules too if `NEW_SESSION` receives a group (`p_groupName` or `t_session_init.groupName`); without a group they have no rules. They use the same active rule set of the group as the servers.
+
+*   **Loading:** the first rule check of a process loads the group's active rule set into the memory of the database session. Further processes of the group in that session share it. Several groups in one session are kept apart: internally every key is prefixed with the group (`GROUP|Action|Context`); the rule set itself is unchanged.
+*   **Changes:** there is no timer. At most every 15 seconds (`C_RULES_CHECK_INTERVAL_MS`) an API call checks name and version of the active rule set with one small indexed query and reloads only if they changed. Servers keep being notified by `SERVER_UPDATE_RULES`.
+*   **Invalid rule sets** are rejected, logged once per version in `LILAM_LOG_INTERNAL`, and the previous rules stay active. Errors never reach the application.
+*   **Latency:** without a match a rule check is a few lookups in associative arrays; actions without rules cost one `EXISTS`, processes without a group nothing. A fired alert is written synchronously (`LILAM_ALERTS`, `DBMS_ALERT` signal, autonomous transaction), which costs the application one commit per alert. `throttle_seconds` limits how often this happens.
+*   **Session-local state:** throttling and the predecessor for `PRECEDED_BY` live in the database session. With connection pools (e.g. APEX) the same alert can therefore fire once per pooled connection.
 
 ### Trigger and Filter
 Each rule is assigned to a **Trigger Type**, which defines the signal that starts the evaluation.
@@ -246,6 +258,136 @@ Two exceptions must be considered here:
 This would turn LILAM Client 'A' into a producer, the LILAM Server into a dispatcher, and LILAM Client 'C' into a consumer. **A lightweight message broker pattern**
 
 With the possibility of using several LILAM Servers in parallel and simultaneously allowing individual clients to speak with multiple LILAM Servers (and additionally integrating LILAM as a library), the use of LILAM is conceivable in a wide variety of scenarios. Load balancing, separation of mission-critical and less critical applications, division into departments or teams, multi-tenancy...
+
+---
+## Flow Diagrams
+The following diagrams are derived from the code in `lilam.pkb` (version 2.0). Names in `code` style are the internal procedures that perform the step.
+
+### In-Session and Decoupled Side by Side
+The application uses the same API in both modes. Which path a call takes depends only on the process ID: `is_remote` checks whether the ID belongs to a process created with `SERVER_NEW_SESSION`.
+
+```mermaid
+flowchart LR
+    subgraph INS ["In-Session (synchronous, in the application's session)"]
+        direction TB
+        A1["Application<br/>NEW_SESSION (optional p_groupName)"] --> B1["log_any / MARK_EVENT / TRACE_*"]
+        B1 --> C1["PGA buffer of the session<br/>(logs, metrics, process data)"]
+        B1 --> G1{"Process has<br/>a group?"}
+        G1 -- yes --> R1["Rule evaluation in the application session<br/>rule set of the group, checked for changes<br/>at most every 15 s"]
+        R1 -- "rule matches" --> AL1[("LILAM_ALERTS + DBMS_ALERT<br/>synchronous, autonomous transaction")]
+        C1 --> D1{"Flush due?<br/>1500 ms, 50,000 entries,<br/>ERROR or CLOSE_SESSION"}
+        D1 -- yes --> E1["SYNC_ALL_DIRTY<br/>FORALL + COMMIT<br/>(autonomous transaction)"]
+        D1 -- no --> B1
+        E1 --> T1[("Tables<br/>NAME_PROC / _LOG / _MON")]
+    end
+
+    subgraph DEC ["Decoupled (asynchronous, LILAM Server)"]
+        direction TB
+        A2["Application<br/>SERVER_NEW_SESSION"] -- "NEW_SESSION via control pipe<br/>(synchronous, max. 3 s)" --> S2
+        B2["log_any / MARK_EVENT / TRACE_*"] -- "sendNoWait<br/>Fire and Forget via data pipe" --> S2["LILAM Server<br/>(own DB session / job)"]
+        B2 -. "limit per second reached:<br/>UNFREEZE_REQUEST (backpressure)" .-> S2
+        S2 --> C2["PGA buffer of the server<br/>(all its processes)"]
+        C2 --> R2["Rule evaluation in the server<br/>rule set of the server group"]
+        C2 --> E2["SYNC_ALL_DIRTY<br/>housekeeping, at most every 500 ms"]
+        E2 --> T2[("Tables<br/>NAME_PROC / _LOG / _MON")]
+        R2 --> AL[("LILAM_ALERTS<br/>+ DBMS_ALERT")]
+    end
+
+    INS ~~~ DEC
+```
+
+Both modes use the active rule set of a group from `LILAM_RULES`. A server loads it at startup and on `SERVER_UPDATE_RULES`; an In-Session process only has rules if `NEW_SESSION` receives a group, and its alerts cost the application one commit each (see [Rules in INSESSION Mode](#rules-in-insession-mode)).
+
+### How an API Call Finds Its Target
+Every API call with a process ID passes the same decision (`is_remote`). A reconnect is only attempted if a dispatcher is configured (`SET_DISPATCHER_PIPE`); this allows a process created in one session (e.g. an APEX request) to be continued in another.
+
+```mermaid
+flowchart TD
+    CALL["API call with p_processId"] --> R1{"ID known as remote<br/>in this session?"}
+    R1 -- yes --> SEND["Send to the server pipe<br/>(g_client_pipes)"]
+    R1 -- no --> L1{"ID known as local<br/>In-Session process?"}
+    L1 -- yes --> LOCAL["Process locally<br/>(PGA buffer)"]
+    L1 -- no --> N1{"ID NULL or negative?<br/>e.g. NUM_ERR_SESSION_TIMEOUT"}
+    N1 -- yes --> IGN["Silently ignore"]
+    N1 -- no --> D1{"Dispatcher configured?"}
+    D1 -- no --> IGN
+    D1 -- yes --> U1{"Reconnect for this ID<br/>failed recently?"}
+    U1 -- yes --> IGN
+    U1 -- no --> LINK["SERVER_LINK:<br/>RECONNECT_PROCESS via dispatcher"]
+    LINK -- "server knows the process" --> SEND
+    LINK -- "unknown: block for 1 day<br/>no server / timeout: block for 10 s" --> IGN
+```
+
+### Dispatcher Flow
+A dispatcher is a LILAM Server started with `p_isDispatcher => 1`. It processes nothing itself (except `SERVER_SHUTDOWN` and `SERVER_PING`), evaluates no rules and is never selected as a worker. It forwards every message unchanged, including the client's response channel, so workers answer the client directly.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Client (application)
+    participant D as Dispatcher
+    participant R as LILAM_SERVER_REGISTRY
+    participant RT as LILAM_PROCESS_ROUTE
+    participant W as Worker (LILAM Server)
+
+    Note over C,W: Create a process
+    C->>D: NEW_SESSION into control pipe DISPATCHER_CTL + SERVER_PING
+    D->>R: getServerPipeAvailable(group)<br/>fewest messages, then fewest processes,<br/>dispatchers excluded
+    R-->>D: worker pipe
+    D->>W: forward into control pipe WORKER_CTL + SERVER_PING
+    W->>W: NEW_SESSION, unless expires_utc has passed
+    W->>RT: registerProcessRoute(process_id, worker pipe)
+    W-->>C: process_id and perf directly into the response pipe of the client
+
+    Note over C,W: Data messages (LOG_ANY, MARK_EVENT, TRACE ...)
+    C->>D: message into data pipe (Fire and Forget)
+    D->>D: resolveDispatchTarget(process_id)<br/>1. route cache in the PGA
+    D->>RT: 2. otherwise read route
+    D->>W: forward unchanged
+    W-->>C: answer only for synchronous requests
+
+    Note over C,W: End of process
+    C->>D: CLOSE_SESSION
+    D->>D: remove route from the cache
+    D->>W: forward
+    W->>RT: unregisterProcessRoute
+
+    Note over D,C: No worker or no route: synchronous requests are answered<br/>immediately with NUM_ERR_NO_SERVER / NUM_ERR_SERVER_PROC (no waiting for the timeout)
+```
+
+`SERVER_UPDATE_RULES` bypasses the dispatcher: `UPDATE_RULE` is sent directly to the data pipes of all workers of the group.
+
+### Baseline Scope
+The averages (EWMA) of traces and events, which rules such as `AVG_DEVIATION_PCT` compare against, are kept per **scope**. By default the scope is the process name, so every new run of a process continues the averages of its predecessors.
+
+```mermaid
+flowchart TD
+    NS["NEW_SESSION / SERVER_NEW_SESSION<br/>p_baselineScope"] --> RS{"resolveScopeName"}
+    RS -- "NULL" --> PN["Scope = process name"]
+    RS -- "'#NONE'" --> NO["No scope<br/>averages per process only"]
+    RS -- "other '#...'" --> WARN["Entry in LILAM_LOG_INTERNAL<br/>Scope = process name"]
+    RS -- "own name" --> OWN["Scope = this name<br/>(can be shared by several applications)"]
+    PN --> GS
+    WARN --> GS
+    OWN --> GS["getOrCreateScopeId<br/>LILAM_SCOPES (autonomous transaction)"]
+    GS -- "error" --> NO
+    GS --> SID["scope_id stored with the session"]
+
+    SID --> M["Measurement: TRACE_STOP / MARK_EVENT"]
+    NO --> M
+    M --> AB{"applyBaseline:<br/>scope_id set?"}
+    AB -- no --> LOC["EWMA per process<br/>(as before)"]
+    AB -- yes --> EB["ensureBaseline: load from LILAM_BASELINES<br/>once into the PGA (lazy)"]
+    EB --> UPD["Update EWMA in the PGA<br/>baseline_avg = value before the measurement<br/>(NULL during warm-up)"]
+    EB -- "error" --> OFF["Disable scope for this process"] --> LOC
+    UPD --> RULE["Rules compare against baseline_avg"]
+    LOC --> RULE
+    UPD --> SYNC["syncBaselines (at most every 1500 ms,<br/>forced on CLOSE_SESSION)"]
+    SYNC --> DB[("LILAM_BASELINES")]
+    DB -- "total state as the new base" --> SYNC
+```
+
+`syncBaselines` writes only the session's own change since the last synchronisation (delta merge) and then takes over the total state from the table. With one writer the result is exact; with several parallel writers (e.g. several servers or In-Session processes with the same scope) it is a good approximation without lost updates. Baselines unused for 15 minutes are removed from the PGA. The alert throttling (`throttle_seconds`) is also kept per scope, so a restart does not reset it.
 
 ---
 ## Tables
@@ -390,17 +532,17 @@ Rules define how LILAM reacts to incoming signals. They are organized into Rule 
 
 The central table `LILAM_RULES` acts as the repository for these configurations. Its name is fixed and is not derived from `tabNameMaster`.
 
-Rule Sets are stored as JSON documents and identified by server group, name and version. This allows different versions of the same Rule Set to be maintained, and the same Rule Set can be stored for several groups. Per group exactly one row is active; `SERVER_UPDATE_RULES` switches the active row and informs the running servers of the group.
+Rule Sets are stored as JSON documents and identified by group, name and version. This allows different versions of the same Rule Set to be maintained, and the same Rule Set can be stored for several groups. Per group exactly one row is active; `SERVER_UPDATE_RULES` switches the active row and informs the running servers of the group; INSESSION processes of the group pick it up themselves within 15 seconds.
 
 #### Table Structure
 
 | Column | Data Type | Description |
 | --- | --- | --- |
 | `RULE_SET` | `CLOB` | Contains the Rule Set as a JSON document (`IS JSON`). |
-| `GROUP_NAME` | `VARCHAR2(50)` | Server group the Rule Set belongs to (`GROUP_NAME` of the registry). |
+| `GROUP_NAME` | `VARCHAR2(50)` | Group the Rule Set belongs to: `GROUP_NAME` of the registry (servers) or `p_groupName` of `NEW_SESSION` (INSESSION). |
 | `SET_NAME` | `VARCHAR2(30)` | Name identifying the Rule Set. |
 | `VERSION` | `NUMBER` | Version of the Rule Set. |
-| `IS_ACTIVE` | `NUMBER(1)` | `1` for the Rule Set the servers of the group use; at most one per group. |
+| `IS_ACTIVE` | `NUMBER(1)` | `1` for the Rule Set the group uses (servers and INSESSION processes); at most one per group. |
 | `CREATED` | `TIMESTAMP(6)` | Timestamp at which the Rule Set was created. |
 | `AUTHOR` | `VARCHAR2(50)` | Author associated with the Rule Set. |
 
