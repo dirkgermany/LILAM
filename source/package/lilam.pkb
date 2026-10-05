@@ -4107,16 +4107,16 @@ AS
 
     --------------------------------------------------------------------------
 
-    -- Client side (decoupled): writes one log entry directly in an autonomous transaction,
-    -- without the server. Used for entries up to the sync level of the process, so that they are
-    -- stored when the call returns, even if the server or its pipe fails afterwards.
+    -- Client side (decoupled): safety net for entries up to the sync level of the process.
+    -- Writes the entry additionally and directly in an autonomous transaction, so that it is stored
+    -- when the call returns, even if the server or its pipe fails afterwards. The entry is still
+    -- sent to the server, which writes it to the work table as usual.
     -- Target is always LILAM_LOG of this installation (created if missing), not the work table:
     -- the work table may live in the server's schema, out of reach of the client.
     -- NO is C_NO_DIRECT_WRITE (-1): the running number is assigned by the server only.
-    -- Returns FALSE if the entry could not be written; the caller then sends it via the pipe.
-    function writeLogDirect(p_processId number, p_level number, p_logText varchar2,
+    procedure writeLogDirect(p_processId number, p_level number, p_logText varchar2,
                             p_caller varchar2, p_errStack varchar2, p_errBacktrace varchar2, p_errCallstack varchar2,
-                            p_timestamp TIMESTAMP) return boolean
+                            p_timestamp TIMESTAMP)
     as
         pragma autonomous_transaction;
     begin
@@ -4128,21 +4128,16 @@ AS
               substrb(p_caller, 1, 255), substrb(p_errStack, 1, 4000), substrb(p_errBacktrace, 1, 4000), substrb(p_errCallstack, 1, 4000),
               SYS_CONTEXT('USERENV','SESSION_USER'), SYS_CONTEXT('USERENV','HOST');
         commit;
-        return true;
     exception
         when others then
             rollback;
             if sqlcode = -942 then g_checked_masters.DELETE; g_safe_tables.DELETE; end if;
             logLilamErr(sqlCode, sqlErrM, 'writeLogDirect');
-            return false;
     end;
 
     --------------------------------------------------------------------------
 
-    -- p_persisted: the client has already written the entry (writeLogDirect); the server must not
-    -- write it again, but still evaluates the rules and the synchronous flush.
-    procedure log_anyRemote(p_processId number, p_level number, p_logText varchar2, p_caller varchar2, p_errStack varchar2, p_errBacktrace varchar2, p_errCallstack varchar2, p_timestamp TIMESTAMP,
-                            p_persisted boolean default false)
+    procedure log_anyRemote(p_processId number, p_level number, p_logText varchar2, p_caller varchar2, p_errStack varchar2, p_errBacktrace varchar2, p_errCallstack varchar2, p_timestamp TIMESTAMP)
     as
         l_payload JSON_OBJ_LILAM; -- Buffer for the JSON string
     begin
@@ -4154,8 +4149,7 @@ AS
                   || jStr('err_stack',     p_errStack)
                   || jStr('err_backtr',    p_errBacktrace)
                   || jStr('err_callstack', p_errCallstack)
-                  || jTs ('timestamp',     p_timestamp)
-                  || case when p_persisted then ',"persisted":1' end || '}';
+                  || jTs ('timestamp',     p_timestamp) || '}';
 
         sendNoWait(p_processId, 'LOG_ANY', l_payload, 0.5);
 
@@ -4176,12 +4170,10 @@ AS
         p_errStack varchar2,
         p_errBacktrace varchar2,
         p_errCallstack varchar2,
-        p_timestamp TIMESTAMP DEFAULT systimestamp,
-        p_persisted boolean DEFAULT false  -- Server: entry already written by the client (writeLogDirect)
+        p_timestamp TIMESTAMP DEFAULT systimestamp
     )
     as
         l_syncLevel   PLS_INTEGER := logLevelError;
-        l_persisted   BOOLEAN := FALSE;
         l_packageName VARCHAR2(128);
         l_aimDepth    PLS_INTEGER := NULL;
         l_maxDepth    PLS_INTEGER;
@@ -4226,15 +4218,15 @@ AS
         end if;
             
         if is_remote(p_processId) then
-            -- Entries up to the sync level: the client writes them itself, so that they are stored
-            -- when the call returns. The server is informed anyway (rules, flush of its buffer).
+            -- Entries up to the sync level: safety net, the client additionally writes them itself to
+            -- LILAM_LOG, so that they are stored when the call returns. The server writes them as usual.
             if g_remote_sync.EXISTS(p_processId)
                and p_level <= g_remote_sync(p_processId).sync_level
                and p_level <= g_remote_sync(p_processId).log_level then
-                l_persisted := writeLogDirect(p_processId, p_level, l_logText,
-                                              l_module, p_errStack, p_errBacktrace, p_errCallstack, p_timestamp);
+                writeLogDirect(p_processId, p_level, l_logText,
+                               l_module, p_errStack, p_errBacktrace, p_errCallstack, p_timestamp);
             end if;
-            log_anyRemote(p_processId, p_level, l_logText, l_module, p_errStack, p_errBacktrace, p_errCallstack, p_timestamp, l_persisted);
+            log_anyRemote(p_processId, p_level, l_logText, l_module, p_errStack, p_errBacktrace, p_errCallstack, p_timestamp);
             return;
         end if ;
 
@@ -4243,7 +4235,7 @@ AS
         end if;
 
         -- Continue here only if not remote
-        if not p_persisted and v_indexSession.EXISTS(p_processId) and p_level <= g_sessionList(v_indexSession(p_processId)).log_level then
+        if v_indexSession.EXISTS(p_processId) and p_level <= g_sessionList(v_indexSession(p_processId)).log_level then
             write_to_log_buffer(
                 p_processId, 
                 p_level,
@@ -5119,8 +5111,7 @@ AS
         l_errCallstack  := jsonString(l_payload, 'err_callstack');
         l_timestamp     := jsonTime(l_payload, 'timestamp');
 
-        log_any(l_processId, l_level, l_logText, l_caller, l_errStack, l_errBacktrace, l_errCallstack, l_timestamp,
-                nvl(jsonNumber(l_payload, 'persisted'), 0) = 1);
+        log_any(l_processId, l_level, l_logText, l_caller, l_errStack, l_errBacktrace, l_errCallstack, l_timestamp);
     end;
 
     --------------------------------------------------------------------------
