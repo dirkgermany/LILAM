@@ -431,6 +431,8 @@ The process control APIs manage the overall progress and status of a process.
 
 > [!NOTE]
 > Changes to process data implicitly update the `lastUpdate` value of the process record.
+>
+> Process data is buffered and written time-controlled, see [When are metrics and process data written?](#when-are-metrics-and-process-data-written).
 
 ### Procedure SET_PROCESS_STATUS
 
@@ -630,7 +632,7 @@ LILAM buffers log entries for performance reasons. Entries up to the **sync leve
 
 | Mode | Entries up to the sync level | All other entries |
 | --- | --- | --- |
-| In-Session | are committed in an autonomous transaction before the call returns. LILAM also writes all other buffered data of the database session. | stay in the buffer for up to about 1.5 seconds, longer if the session does not call LILAM again (log calls, `MARK_EVENT` and `TRACE_STOP` trigger the write-back, see [When are metrics written?](#when-are-metrics-written)) |
+| In-Session | are committed in an autonomous transaction before the call returns. LILAM also writes all other buffered data of the database session. | stay in the buffer for up to about 1.5 seconds, longer if the session does not call LILAM again (log calls, `MARK_EVENT`, `TRACE_STOP` and process control trigger the write-back, see [When are metrics and process data written?](#when-are-metrics-and-process-data-written)) |
 | Decoupled | go to the server as usual and are written to the work table there. As a **safety net**, the client additionally writes them itself in an autonomous transaction before the call returns, always into **`LILAM_LOG`** of the client's schema (created if missing), with the process ID and the value `-1` in column `NO`. | are sent to the server via the pipe and buffered there |
 
 A synchronously written entry therefore survives an abort of the session and, in decoupled mode, a failure of the LILAM server. Buffered entries are lost if a session ends without `CLOSE_SESSION` or `FINAL_RESCUE`. Therefore call `CLOSE_SESSION` in the central exception handler.
@@ -668,14 +670,14 @@ Metrics record events and logical transactions within a process.
 >
 > A trace started with a context must be stopped with the same combination of action and context.
 
-### When are metrics written?
+### When are metrics and process data written?
 
-LILAM buffers metrics as well. In in-session mode, `MARK_EVENT` and `TRACE_STOP` – like every log call – trigger the time-controlled write-back: data of a process older than about 1.5 seconds is written, and cross-process baselines (`LILAM_BASELINES`) are synchronized about every 1.5 seconds as well. At least 500 ms pass between two check runs of the same database session, so a single call usually costs only one time comparison. `TRACE_START` does not trigger a write-back. This way the measured values reach the database promptly even for pure monitoring applications that never log.
+LILAM buffers metrics and process data (status, progress) as well. In in-session mode, `MARK_EVENT`, `TRACE_STOP` and the [process control](#process-control) procedures (`SET_PROCESS_STATUS`, `SET_PROC_STEPS_TODO`, `SET_PROC_STEPS_DONE`, `PROC_STEP_DONE`, `SET_PROC_IMMORTAL`) – like every log call – trigger the time-controlled write-back: data of a process older than about 1.5 seconds is written, and cross-process baselines (`LILAM_BASELINES`) are synchronized about every 1.5 seconds as well. At least 500 ms pass between two check runs of the same database session, so a single call usually costs only one time comparison. `TRACE_START` does not trigger a write-back. This way measured values and progress reach the database promptly even for pure monitoring applications that never log. API queries (e.g. `GET_PROC_STEPS_DONE`) in the same session read the current state from the buffer anyway.
 
 > [!IMPORTANT]
 > In in-session mode there is no timer. Data is only written when the session calls LILAM. Whatever is still buffered after the last call stays there until the session calls LILAM again. **`CLOSE_SESSION` is the only guaranteed write point.**
 >
-> With a connection pool (e.g. APEX/ORDS) and with processes that span several page requests or database sessions (e.g. AJAX pages that only trace while a final page calls `CLOSE_SESSION`), the buffer lives in the respective pool session and may be written much later or not at all. In these cases use the [decoupled server mode](#decoupled-server-mode) together with the [dispatcher](#dispatcher-mode).
+> With a connection pool (e.g. APEX/ORDS) and with processes that span several page requests or database sessions (e.g. AJAX pages that only trace or report progress while a final page calls `CLOSE_SESSION`), the buffer lives in the respective pool session and may be written much later or not at all. In these cases use the [decoupled server mode](#decoupled-server-mode) together with the [dispatcher](#dispatcher-mode).
 
 ### Procedure MARK_EVENT
 

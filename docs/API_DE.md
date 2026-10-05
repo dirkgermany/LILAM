@@ -434,6 +434,8 @@ Die APIs zur Prozesssteuerung verwalten den Gesamtfortschritt und Status eines P
 
 > [!NOTE]
 > Bei Änderungen an Prozessdaten wird der Wert `lastUpdate` des Prozessdatensatzes implizit aktualisiert.
+>
+> Prozessdaten werden gepuffert und zeitgesteuert geschrieben, siehe [Wann werden Metriken und Prozessdaten geschrieben?](#wann-werden-metriken-und-prozessdaten-geschrieben).
 
 ### Procedure SET_PROCESS_STATUS
 
@@ -633,7 +635,7 @@ LILAM puffert Log-Einträge aus Performancegründen. Einträge bis zum **Sync-Le
 
 | Modus | Einträge bis zum Sync-Level | Alle anderen Einträge |
 | --- | --- | --- |
-| In-Session | werden in einer autonomen Transaktion committet, bevor der Aufruf zurückkehrt. Dabei schreibt LILAM auch alle anderen gepufferten Daten der Datenbanksession weg. | bleiben bis zu etwa 1,5 Sekunden im Puffer, länger, wenn die Session LILAM nicht mehr aufruft (Log-Aufrufe, `MARK_EVENT` und `TRACE_STOP` stoßen die Rückschreibung an, siehe [Wann werden Metriken geschrieben?](#wann-werden-metriken-geschrieben)) |
+| In-Session | werden in einer autonomen Transaktion committet, bevor der Aufruf zurückkehrt. Dabei schreibt LILAM auch alle anderen gepufferten Daten der Datenbanksession weg. | bleiben bis zu etwa 1,5 Sekunden im Puffer, länger, wenn die Session LILAM nicht mehr aufruft (Log-Aufrufe, `MARK_EVENT`, `TRACE_STOP` und die Prozesssteuerung stoßen die Rückschreibung an, siehe [Wann werden Metriken und Prozessdaten geschrieben?](#wann-werden-metriken-und-prozessdaten-geschrieben)) |
 | Entkoppelt | gehen wie gewohnt an den Server und werden dort in die Arbeitstabelle geschrieben. Als **doppelter Boden** schreibt der Client sie zusätzlich selbst in einer autonomen Transaktion, bevor der Aufruf zurückkehrt, und zwar immer in **`LILAM_LOG`** im Schema des Clients (wird bei Bedarf angelegt), mit der Prozess-ID und dem Wert `-1` in der Spalte `NO`. | gehen per Pipe an den Server und werden dort gepuffert |
 
 Ein synchron geschriebener Eintrag übersteht damit auch einen Abbruch der Session und im entkoppelten Modus den Ausfall des LILAM-Servers. Gepufferte Einträge sind verloren, wenn eine Session ohne `CLOSE_SESSION` oder `FINAL_RESCUE` endet. Rufe `CLOSE_SESSION` deshalb im zentralen Exception-Handler auf.
@@ -671,14 +673,14 @@ Metriken erfassen Events und logische Transaktionen innerhalb eines Prozesses.
 >
 > Ein mit einem Context gestarteter Trace muss mit derselben Kombination aus Action und Context beendet werden.
 
-### Wann werden Metriken geschrieben?
+### Wann werden Metriken und Prozessdaten geschrieben?
 
-Auch Metriken puffert LILAM. Im In-Session-Modus stoßen `MARK_EVENT` und `TRACE_STOP` – wie jeder Log-Aufruf – die zeitgesteuerte Rückschreibung an: Daten eines Prozesses, die älter als etwa 1,5 Sekunden sind, werden weggeschrieben, prozessübergreifende Baselines (`LILAM_BASELINES`) ebenfalls im Abstand von etwa 1,5 Sekunden. Zwischen zwei Prüfläufen derselben Datenbanksession liegen mindestens 500 ms, sodass ein einzelner Aufruf meist nur einen Zeitvergleich kostet. `TRACE_START` stößt keine Rückschreibung an. Damit landen auch bei reinen Monitoring-Anwendungen, die nie loggen, die Messwerte zeitnah in der Datenbank.
+Auch Metriken und Prozessdaten (Status, Fortschritt) puffert LILAM. Im In-Session-Modus stoßen `MARK_EVENT`, `TRACE_STOP` und die Prozeduren der [Prozesssteuerung](#prozesssteuerung) (`SET_PROCESS_STATUS`, `SET_PROC_STEPS_TODO`, `SET_PROC_STEPS_DONE`, `PROC_STEP_DONE`, `SET_PROC_IMMORTAL`) – wie jeder Log-Aufruf – die zeitgesteuerte Rückschreibung an: Daten eines Prozesses, die älter als etwa 1,5 Sekunden sind, werden weggeschrieben, prozessübergreifende Baselines (`LILAM_BASELINES`) ebenfalls im Abstand von etwa 1,5 Sekunden. Zwischen zwei Prüfläufen derselben Datenbanksession liegen mindestens 500 ms, sodass ein einzelner Aufruf meist nur einen Zeitvergleich kostet. `TRACE_START` stößt keine Rückschreibung an. Damit landen auch bei reinen Monitoring-Anwendungen, die nie loggen, Messwerte und Fortschritt zeitnah in der Datenbank. Abfragen über die API (z. B. `GET_PROC_STEPS_DONE`) in derselben Session lesen ohnehin den aktuellen Stand aus dem Puffer.
 
 > [!IMPORTANT]
 > Im In-Session-Modus gibt es keinen Timer. Geschrieben wird nur, wenn die Session LILAM aufruft. Was nach dem letzten Aufruf noch im Puffer liegt, bleibt dort, bis die Session LILAM erneut aufruft. **`CLOSE_SESSION` ist der einzige garantierte Schreibpunkt.**
 >
-> Bei einem Connection-Pool (z. B. APEX/ORDS) und bei Prozessen, die sich über mehrere Seitenaufrufe oder Datenbanksessions erstrecken (z. B. AJAX-Seiten, die nur tracen, während erst eine abschließende Seite `CLOSE_SESSION` aufruft), liegt der Puffer in der jeweiligen Pool-Session und wird möglicherweise erst viel später oder gar nicht geschrieben. Verwende in diesen Fällen den [entkoppelten Server-Modus](#entkoppelter-server-modus) zusammen mit dem [Dispatcher](#dispatcher-modus).
+> Bei einem Connection-Pool (z. B. APEX/ORDS) und bei Prozessen, die sich über mehrere Seitenaufrufe oder Datenbanksessions erstrecken (z. B. AJAX-Seiten, die nur tracen oder Fortschritt melden, während erst eine abschließende Seite `CLOSE_SESSION` aufruft), liegt der Puffer in der jeweiligen Pool-Session und wird möglicherweise erst viel später oder gar nicht geschrieben. Verwende in diesen Fällen den [entkoppelten Server-Modus](#entkoppelter-server-modus) zusammen mit dem [Dispatcher](#dispatcher-modus).
 
 ### Procedure MARK_EVENT
 
