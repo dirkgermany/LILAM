@@ -1401,6 +1401,11 @@ create or replace package body lt as
         l_n := q('select count(*) from lilam_mon m join lilam_proc p on p.id = m.process_id
                    where p.process_name = :1 and m.mon_type = 1', p_prefix || '_TRC');
         metric(p_run_id, p_key || '_trc', l_n);
+        l_n := q('select nvl(max(m.action_count), 0) from lilam_mon m join lilam_proc p on p.id = m.process_id
+                   where p.process_name = :1 and m.mon_type = 1', p_prefix || '_TRC');
+        metric(p_run_id, p_key || '_trccnt', l_n);
+        l_n := q('select count(*) from lilam_proc where process_name = :1 and process_end is null', p_prefix || '_TRC');
+        metric(p_run_id, p_key || '_trcopen', l_n);
         l_n := q('select count(*) from lilam_mon m join lilam_proc p on p.id = m.process_id
                    where p.process_name = :1 and m.mon_type = 0', p_prefix || '_EVT');
         metric(p_run_id, p_key || '_evt', l_n);
@@ -1532,6 +1537,32 @@ create or replace package body lt as
                            val(l_key, 'stp') = 3, val(l_key, 'stp'));
                 check_that(l_run, l_key || ' Gegenprobe: Trace direkt danach noch im Puffer (2 statt 3)',
                            val(l_key, 'trc') = 2, val(l_key, 'trc'));
+
+                -- R6 FLUSH schreibt sofort (auch innerhalb der 500-ms-Sperre), der Prozess bleibt offen
+                l_key := p_tag || '_R6';
+                lilam.flush;
+                peek(l_prefix, l_key);
+                check_that(l_run, l_key || ' FLUSH: gepufferter Trace sofort geschrieben (3)',
+                           val(l_key, 'trc') = 3, val(l_key, 'trc'));
+                check_that(l_run, l_key || ' FLUSH: Prozess bleibt offen (PROCESS_END leer)',
+                           val(l_key, 'trcopen') = 1, val(l_key, 'trcopen'));
+
+                -- R7 FLUSH per CALL_BY_JSON; der Prozess zaehlt nach dem FLUSH weiter
+                l_key := p_tag || '_R7';
+                lilam.flush;       -- startet die 500-ms-Sperre: der folgende Trace bleibt im Puffer
+                trace(l_trc);
+                declare
+                    l_resp lilam.JSON_OBJ_LILAM;
+                begin
+                    lilam.call_by_json('{"header":{"api_call":"FLUSH"},"params":{}}', l_resp);
+                    check_that(l_run, l_key || ' CALL_BY_JSON FLUSH: SUCCESS',
+                               instr(l_resp, '"status":"SUCCESS"') > 0, substr(l_resp, 1, 200));
+                end;
+                peek(l_prefix, l_key);
+                check_that(l_run, l_key || ' CALL_BY_JSON FLUSH: vierter Trace sofort geschrieben (4)',
+                           val(l_key, 'trc') = 4, val(l_key, 'trc'));
+                check_that(l_run, l_key || ' nach FLUSH zaehlt der Prozess weiter (ACTION_COUNT 4)',
+                           val(l_key, 'trccnt') = 4, val(l_key, 'trccnt'));
             end if;
 
             lilam.close_session(l_trc);
@@ -1540,10 +1571,11 @@ create or replace package body lt as
             lilam.close_session(l_bas);
 
             if l_ins then
-                l_key := p_tag || '_R6';
+                l_key := p_tag || '_R8';
                 peek(l_prefix, l_key);
-                check_that(l_run, l_key || ' nach CLOSE_SESSION: alle 3 Traces in LILAM_MON',
-                           val(l_key, 'trc') = 3, val(l_key, 'trc'));
+                check_that(l_run, l_key || ' nach CLOSE_SESSION: alle 4 Traces in LILAM_MON, Prozess geschlossen',
+                           val(l_key, 'trc') = 4 and val(l_key, 'trcopen') = 0,
+                           val(l_key, 'trc') || ' Traces / offen ' || val(l_key, 'trcopen'));
             end if;
         end;
     begin
@@ -1552,7 +1584,7 @@ create or replace package body lt as
         if p_manage then setup_servers(c_server, 1); end if;
         run_mode(c_server, 'SV');
         if p_manage then stop_all_servers; end if;
-        check_that(l_run, 'R7 Keine internen LILAM-Fehler', internal_errors_since(run_started(l_run)) = 0,
+        check_that(l_run, 'R9 Keine internen LILAM-Fehler', internal_errors_since(run_started(l_run)) = 0,
                    internal_errors_since(run_started(l_run)));
         -- Testdaten nur bei Erfolg loeschen (sonst zur Analyse stehen lassen)
         if g_check_no > 0 then

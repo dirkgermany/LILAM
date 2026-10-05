@@ -6816,6 +6816,10 @@ BEGIN
             CLOSE_SESSION(jsonNumber(l_jsonParams, 'process_id'));
             jsonPut(l_jsonHeader, 'status', 'SUCCESS');
 
+        when 'FLUSH' THEN
+            FLUSH;
+            jsonPut(l_jsonHeader, 'status', 'SUCCESS');
+
         when 'SET_PROCESS_STATUS' THEN
             SET_PROCESS_STATUS(jsonNumber(l_jsonParams, 'process_id'), jsonNumber(l_jsonParams, 'process_status'), jsonString(l_jsonParams, 'process_info'));
             jsonPut(l_jsonHeader, 'status', 'SUCCESS');
@@ -6956,10 +6960,12 @@ END;
     
     ------------------------------------------------------------------------
 
-    PROCEDURE FINAL_RESCUE
+    -- Forced write-back of all processes of this database session (without the shutdown part).
+    -- The processes stay open. Buffers of remote processes are held and written by the server.
+    PROCEDURE FLUSH
     as
     begin
-        SYNC_ALL_DIRTY(true, true);
+        SYNC_ALL_DIRTY(true);
     end;
 
     ------------------------------------------------------------------------

@@ -10,8 +10,10 @@
 --   R4  nur Baseline (eigener Scope): beide Messungen in LILAM_BASELINES
 --   R5  INSESSION-Gegenprobe: ein Aufruf direkt nach einem schreibenden Aufruf (500-ms-Sperre) bleibt
 --       im Puffer - es gibt keinen Timer
---   R6  INSESSION: nach CLOSE_SESSION ist auch dieser Aufruf geschrieben
---   R7  keine internen LILAM-Fehler
+--   R6  INSESSION: FLUSH schreibt sofort (auch in der 500-ms-Sperre), der Prozess bleibt offen
+--   R7  INSESSION: FLUSH per CALL_BY_JSON; der Prozess zaehlt nach dem FLUSH weiter (ACTION_COUNT)
+--   R8  INSESSION: nach CLOSE_SESSION sind alle Traces geschrieben, der Prozess ist geschlossen
+--   R9  keine internen LILAM-Fehler
 -- Der Test startet und stoppt seinen Server selbst (LT_S1). Bei Erfolg werden die Testdaten geloescht.
 --
 -- Voraussetzungen: LILAM installiert, _COMMON/01_install_testbasis.sql

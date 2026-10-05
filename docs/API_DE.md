@@ -232,7 +232,7 @@ Die Session-Verwaltung steuert den Lebenszyklus eines LILAM Prozesses.
 | `NEW_SESSION` | Startet einen LILAM Prozess im In-Session-Modus |
 | `SERVER_NEW_SESSION` | Startet einen Prozess mit Verbindung zu einem LILAM Server |
 | `CLOSE_SESSION` | Beendet einen Prozess und schreibt gepufferte Daten |
-| `FINAL_RESCUE` | Persistiert zwischengespeicherte Daten nach abnormalen Prozessabbrüchen |
+| `FLUSH` | Schreibt alle gepufferten Daten der Datenbanksession sofort; die Prozesse bleiben offen |
 
 ### Function NEW_SESSION / SERVER_NEW_SESSION
 
@@ -353,7 +353,7 @@ Beendet einen LILAM Prozess. Optional können abschließende Prozessinformatione
 > [!IMPORTANT]
 > Rufe `CLOSE_SESSION` immer auf, wenn ein Prozess endet. LILAM puffert Daten aus Performancegründen. `CLOSE_SESSION` stellt sicher, dass noch vorhandene gepufferte Daten persistiert werden.
 >
-> Daher sollte `CLOSE_SESSION` auch Bestandteil der abschließenden Exception-Behandlung sein.
+> Daher sollte `CLOSE_SESSION` auch Bestandteil der abschließenden Exception-Behandlung sein. Soll der Prozess nach der Exception weiterlaufen (z. B. eine AJAX-Seite arbeitet weiter), verwende stattdessen [`FLUSH`](#procedure-flush).
 
 ```sql
 PROCEDURE CLOSE_SESSION(
@@ -394,21 +394,32 @@ EXCEPTION
     RAISE;
 ```
 
-### Procedure FINAL_RESCUE
+### Procedure FLUSH
 
-LILAM speichert Logging-, Monitoring- und Prozessdaten aus Performancegründen teilweise zwischen.
+LILAM puffert Logging-, Monitoring- und Prozessdaten aus Performancegründen und schreibt sie zeitgesteuert (siehe [Wann werden Metriken und Prozessdaten geschrieben?](#wann-werden-metriken-und-prozessdaten-geschrieben)).
 
-`FINAL_RESCUE` persistiert alle aktuell zwischengespeicherten Daten der aktuellen Datenbanksession.
+`FLUSH` schreibt sofort alle gepufferten Daten aller offenen Prozesse der aktuellen Datenbanksession, auch Baselines. Anders als `CLOSE_SESSION` beendet `FLUSH` keinen Prozess: Die Prozesse bleiben offen, offene Traces laufen weiter, und Zähler und Durchschnitte zählen weiter.
+
+```sql
+PROCEDURE FLUSH
+```
+
+Typische Einsätze:
+
+- Exception-Handler, wenn der Prozess danach weiterlaufen soll (z. B. eine AJAX-Seite arbeitet weiter). Endet der Prozess, verwende `CLOSE_SESSION`.
+- Ein langer In-Session-Prozess soll vor einer längeren Pause ohne LILAM-Aufrufe sofort von außen sichtbar sein.
 
 ```sql
 BEGIN
-  lilam.final_rescue;
+  lilam.flush;
 END;
 /
 ```
 
 > [!IMPORTANT]
-> `FINAL_RESCUE` muss aus der Datenbanksession heraus aufgerufen werden, in der die betroffenen Prozesse ausgeführt wurden.
+> `FLUSH` wirkt nur auf die Datenbanksession, aus der es aufgerufen wird. Für Prozesse im entkoppelten Modus (Server, Dispatcher) ist `FLUSH` wirkungslos: Deren Puffer liegen beim LILAM-Server, der sie selbst zeitgesteuert schreibt.
+>
+> Ein `FLUSH` kostet einen Commit (auf dem Testsystem etwa 1,5 bis 3,5 ms).
 
 ---
 
@@ -638,7 +649,7 @@ LILAM puffert Log-Einträge aus Performancegründen. Einträge bis zum **Sync-Le
 | In-Session | werden in einer autonomen Transaktion committet, bevor der Aufruf zurückkehrt. Dabei schreibt LILAM auch alle anderen gepufferten Daten der Datenbanksession weg. | bleiben bis zu etwa 1,5 Sekunden im Puffer, länger, wenn die Session LILAM nicht mehr aufruft (Log-Aufrufe, `MARK_EVENT`, `TRACE_STOP` und die Prozesssteuerung stoßen die Rückschreibung an, siehe [Wann werden Metriken und Prozessdaten geschrieben?](#wann-werden-metriken-und-prozessdaten-geschrieben)) |
 | Entkoppelt | gehen wie gewohnt an den Server und werden dort in die Arbeitstabelle geschrieben. Als **doppelter Boden** schreibt der Client sie zusätzlich selbst in einer autonomen Transaktion, bevor der Aufruf zurückkehrt, und zwar immer in **`LILAM_LOG`** im Schema des Clients (wird bei Bedarf angelegt), mit der Prozess-ID und dem Wert `-1` in der Spalte `NO`. | gehen per Pipe an den Server und werden dort gepuffert |
 
-Ein synchron geschriebener Eintrag übersteht damit auch einen Abbruch der Session und im entkoppelten Modus den Ausfall des LILAM-Servers. Gepufferte Einträge sind verloren, wenn eine Session ohne `CLOSE_SESSION` oder `FINAL_RESCUE` endet. Rufe `CLOSE_SESSION` deshalb im zentralen Exception-Handler auf.
+Ein synchron geschriebener Eintrag übersteht damit auch einen Abbruch der Session und im entkoppelten Modus den Ausfall des LILAM-Servers. Gepufferte Einträge sind verloren, wenn eine Session ohne `CLOSE_SESSION` oder `FLUSH` endet. Rufe `CLOSE_SESSION` deshalb im zentralen Exception-Handler auf, oder `FLUSH`, wenn der Prozess weiterlaufen soll.
 
 > [!NOTE]
 > Im entkoppelten Modus stehen synchrone Einträge normalerweise zweimal in der Datenbank: in der Arbeitstabelle (vom Server geschrieben) und in `LILAM_LOG` im Schema des Clients (`NO = -1`). Fällt der LILAM-Server aus, findet man den Eintrag weiterhin in `LILAM_LOG`. `LILAM_LOG` wird verwendet, weil die Arbeitstabelle im Schema des Servers liegen kann, auf das der Client keinen Zugriff hat.
@@ -675,12 +686,15 @@ Metriken erfassen Events und logische Transaktionen innerhalb eines Prozesses.
 
 ### Wann werden Metriken und Prozessdaten geschrieben?
 
-Auch Metriken und Prozessdaten (Status, Fortschritt) puffert LILAM. Im In-Session-Modus stoßen `MARK_EVENT`, `TRACE_STOP` und die Prozeduren der [Prozesssteuerung](#prozesssteuerung) (`SET_PROCESS_STATUS`, `SET_PROC_STEPS_TODO`, `SET_PROC_STEPS_DONE`, `PROC_STEP_DONE`, `SET_PROC_IMMORTAL`) – wie jeder Log-Aufruf – die zeitgesteuerte Rückschreibung an: Daten eines Prozesses, die älter als etwa 1,5 Sekunden sind, werden weggeschrieben, prozessübergreifende Baselines (`LILAM_BASELINES`) ebenfalls im Abstand von etwa 1,5 Sekunden. Zwischen zwei Prüfläufen derselben Datenbanksession liegen mindestens 500 ms, sodass ein einzelner Aufruf meist nur einen Zeitvergleich kostet. `TRACE_START` stößt keine Rückschreibung an. Damit landen auch bei reinen Monitoring-Anwendungen, die nie loggen, Messwerte und Fortschritt zeitnah in der Datenbank. Abfragen über die API (z. B. `GET_PROC_STEPS_DONE`) in derselben Session lesen ohnehin den aktuellen Stand aus dem Puffer.
+Auch Metriken und Prozessdaten (Status, Fortschritt) puffert LILAM. Im In-Session-Modus stoßen `MARK_EVENT`, `TRACE_STOP` und die Prozeduren der [Prozesssteuerung](#prozesssteuerung) (`SET_PROCESS_STATUS`, `SET_PROC_STEPS_TODO`, `SET_PROC_STEPS_DONE`, `PROC_STEP_DONE`, `SET_PROC_IMMORTAL`) – wie jeder Log-Aufruf – die zeitgesteuerte Rückschreibung an: Daten eines Prozesses, die älter als etwa 1,5 Sekunden sind, werden weggeschrieben, prozessübergreifende Baselines (`LILAM_BASELINES`) ebenfalls im Abstand von etwa 1,5 Sekunden. Zwischen zwei Prüfläufen derselben Datenbanksession liegen mindestens 500 ms, sodass ein einzelner Aufruf meist nur einen Zeitvergleich kostet. `TRACE_START` stößt keine Rückschreibung an. Damit landen auch bei reinen Monitoring-Anwendungen, die nie loggen, Messwerte und Fortschritt zeitnah in der Datenbank. Abfragen über die API (z. B. `GET_PROC_STEPS_DONE`) in derselben Session lesen ohnehin den aktuellen Stand aus dem Puffer. Mit [`FLUSH`](#procedure-flush) schreibst Du den Puffer sofort, ohne den Prozess zu beenden.
 
 > [!IMPORTANT]
-> Im In-Session-Modus gibt es keinen Timer. Geschrieben wird nur, wenn die Session LILAM aufruft. Was nach dem letzten Aufruf noch im Puffer liegt, bleibt dort, bis die Session LILAM erneut aufruft. **`CLOSE_SESSION` ist der einzige garantierte Schreibpunkt.**
+> Im In-Session-Modus gibt es keinen Timer. Geschrieben wird nur, wenn die Session LILAM aufruft. Was nach dem letzten Aufruf noch im Puffer liegt, bleibt dort, bis die Session LILAM erneut aufruft. **Garantiert geschrieben wird nur mit `CLOSE_SESSION` (Prozess endet) oder `FLUSH` (Prozess bleibt offen).**
 >
-> Bei einem Connection-Pool (z. B. APEX/ORDS) und bei Prozessen, die sich über mehrere Seitenaufrufe oder Datenbanksessions erstrecken (z. B. AJAX-Seiten, die nur tracen oder Fortschritt melden, während erst eine abschließende Seite `CLOSE_SESSION` aufruft), liegt der Puffer in der jeweiligen Pool-Session und wird möglicherweise erst viel später oder gar nicht geschrieben. Verwende in diesen Fällen den [entkoppelten Server-Modus](#entkoppelter-server-modus) zusammen mit dem [Dispatcher](#dispatcher-modus).
+> **AJAX und Connection-Pool (z. B. APEX/ORDS):** Ein In-Session-Prozess lebt nur in der Datenbanksession, die `NEW_SESSION` aufgerufen hat. Der nächste Request läuft im Pool meist in einer anderen Session; dort ist die Prozess-ID unbekannt, und LILAM ignoriert die Aufrufe still. Ein `CLOSE_SESSION` auf einer abschließenden Seite erreicht den Prozess dann nicht, und dessen Puffer bleibt in der ursprünglichen Pool-Session liegen.
+>
+> - **Ein Prozess je Request:** `NEW_SESSION` am Anfang und `CLOSE_SESSION` am Ende desselben Requests. Dann funktioniert der In-Session-Modus auch im Connection-Pool.
+> - **Prozesse über mehrere Requests** (z. B. AJAX-Seiten, die nur tracen oder Fortschritt melden, während erst eine abschließende Seite `CLOSE_SESSION` aufruft): nur mit dem [entkoppelten Server-Modus](#entkoppelter-server-modus) zusammen mit dem [Dispatcher](#dispatcher-modus).
 
 ### Procedure MARK_EVENT
 
@@ -1064,6 +1078,7 @@ LILAM JSON Requests bestehen aus einem Header und einem Parameterobjekt. Der Hea
 | `NEW_SESSION` | `NEW_SESSION` (Record) | `process_name`, `log_level`, `steps_todo`, `days_to_keep`, `process_immortal`, `tabname_master`, `baseline_scope`, `group_name` |
 | `SERVER_NEW_SESSION` | `SERVER_NEW_SESSION_JSON` | wie `SERVER_NEW_SESSION`, siehe Tabelle dort |
 | `CLOSE_SESSION` | `CLOSE_SESSION` | `process_id` |
+| `FLUSH` | `FLUSH` | keine |
 | `SET_PROCESS_STATUS` | `SET_PROCESS_STATUS` | `process_id`, `process_status`, `process_info` |
 | `SET_STEP_TODO` | `SET_PROC_STEPS_TODO` | `process_id`, `steps_todo` |
 | `SET_STEPS_DONE` | `SET_PROC_STEPS_DONE` | `process_id`, `steps_done` |
