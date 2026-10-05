@@ -1,14 +1,14 @@
 -- =============================================================================
--- LILAM: Deinstallation
+-- LILAM: uninstallation
 --
--- Aufruf (SQL*Plus / SQLcl), im Schema angemeldet, in dem LILAM installiert ist:
---   @<Pfad>/source/uninstall.sql
+-- Call (SQL*Plus / SQLcl), logged on to the schema in which LILAM is installed:
+--   @<path>/source/uninstall.sql
 --
--- Standard: Server stoppen und das Package entfernen. Alle Tabellen und Daten
--- bleiben erhalten, eine spätere Neuinstallation arbeitet mit ihnen weiter.
+-- Default: stop the servers and remove the package. All tables and data
+-- are kept, a later reinstallation continues to work with them.
 --
--- Mit LILAM_DROP_DATA = 'J' werden zusätzlich ALLE LILAM-Tabellen samt Daten
--- und die Sequenz gelöscht. Das lässt sich nicht rückgängig machen.
+-- With LILAM_DROP_DATA = 'J', ALL LILAM tables including data
+-- and the sequence are dropped as well. This cannot be undone.
 -- =============================================================================
 
 define LILAM_DROP_DATA = 'N'
@@ -19,10 +19,10 @@ set verify off
 
 prompt
 prompt === LILAM: Server stoppen ===
--- Server, die mit CREATE_SERVER gestartet wurden, laufen als Scheduler-Job mit
--- dem Pipe-Namen als Job-Namen. Server, die mit START_SERVER in einer eigenen
--- Session laufen, kann dieses Skript nicht beenden; sie mit SERVER_SHUTDOWN
--- stoppen oder die Session beenden, sonst blockieren sie das Löschen des Packages.
+-- Servers started with CREATE_SERVER run as scheduler jobs with
+-- the pipe name as job name. Servers that run with START_SERVER in their own
+-- session cannot be ended by this script; stop them with SERVER_SHUTDOWN
+-- or end the session, otherwise they block dropping the package.
 declare
     l_registry_exists pls_integer;
     l_running         pls_integer := 0;
@@ -52,18 +52,18 @@ begin
         dbms_output.put_line('Keine Server-Jobs gefunden.');
     end if;
 
-    -- 1. Jobs anhalten
+    -- 1. Stop jobs
     for i in 1 .. l_jobs.count loop
         begin
             dbms_scheduler.stop_job(job_name => l_jobs(i), force => false);
             dbms_output.put_line('Server-Job gestoppt: ' || l_jobs(i));
         exception
             when others then
-                null; -- Job läuft nicht (mehr)
+                null; -- Job is not running (any more)
         end;
     end loop;
 
-    -- 2. auf das Ende der Jobs warten (höchstens 30 s)
+    -- 2. wait for the jobs to end (at most 30 s)
     for w in 1 .. 30 loop
         l_running := 0;
         for i in 1 .. l_jobs.count loop
@@ -75,14 +75,14 @@ begin
         dbms_session.sleep(1);
     end loop;
 
-    -- 3. Jobs entfernen
+    -- 3. Remove jobs
     for i in 1 .. l_jobs.count loop
         begin
             dbms_scheduler.drop_job(job_name => l_jobs(i), force => false);
             dbms_output.put_line('Server-Job entfernt: ' || l_jobs(i));
         exception
             when others then
-                null; -- auto_drop: Job ist mit seinem Ende bereits verschwunden
+                null; -- auto_drop: the job has already disappeared when it ended
         end;
     end loop;
 
@@ -90,8 +90,8 @@ begin
         dbms_output.put_line('Achtung: ' || l_running || ' Server-Job(s) laufen noch.');
     end if;
 
-    -- 4. Daten- und Steuer-Pipes entfernen. Dynamisch, damit der Block auch ohne
-    --    Recht auf DBMS_PIPE (reine In-Session-Installation) übersetzt wird.
+    -- 4. Remove data and control pipes. Dynamic, so that the block also compiles
+    --    without the privilege on DBMS_PIPE (pure in-session installation).
     for i in 1 .. l_pipes.count loop
         begin
             execute immediate
@@ -146,8 +146,8 @@ begin
         return;
     end if;
 
-    -- Anwendungstabellen <Präfix>_PROC/_LOG/_MON: erkannt an der Prozesstabelle
-    -- mit den LILAM-Spalten TAB_NAME_MASTER und SERVER_PIPE
+    -- Application tables <prefix>_PROC/_LOG/_MON: recognized by the process table
+    -- with the LILAM columns TAB_NAME_MASTER and SERVER_PIPE
     select substr(t.table_name, 1, length(t.table_name) - 5)
     bulk collect into l_tables
     from   user_tables t
@@ -163,7 +163,7 @@ begin
         drop_table(l_tables(i) || '_PROC');
     end loop;
 
-    -- feste Tabellen
+    -- fixed tables
     drop_table('LILAM_ALERTS');
     drop_table('LILAM_RULES');
     drop_table('LILAM_BASELINES');

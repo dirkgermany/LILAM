@@ -9,30 +9,30 @@ create or replace PACKAGE BODY LILAM_MAILER AS
     PROCEDURE send_mail_via_relay(p_subject VARCHAR2, p_body VARCHAR2, p_recipient VARCHAR2) IS
         l_conn  utl_smtp.connection;
         l_offset     NUMBER := 1;
-        l_chunk_size NUMBER := 1500; -- Bleibt sicher unter dem SMTP-Limit
+        l_chunk_size NUMBER := 1500; -- Stays safely below the SMTP limit
         l_body_len   NUMBER := DBMS_LOB.GETLENGTH(p_body);
     BEGIN
-        -- 1. Verbindung zum lokalen Postfix (ohne Wallet!)
+        -- 1. Connection to the local Postfix (without wallet!)
         l_conn := utl_smtp.open_connection('localhost', 25);
         utl_smtp.helo(l_conn, 'localhost');
         
-        -- 2. Absender und Empfänger (Strato braucht eine valide Absender-Mail)
+        -- 2. Sender and recipient (Strato needs a valid sender address)
         utl_smtp.mail(l_conn, 'dirk@dirk-goldbach.de');
         utl_smtp.rcpt(l_conn, p_recipient);
         
-        -- 3. Die Mail-Daten (Header)
+        -- 3. The mail data (header)
         utl_smtp.open_data(l_conn);
 
         utl_smtp.write_data(l_conn, 'From: LILAM Engine <dirk@dirk-goldbach.de>' || utl_tcp.crlf);
         utl_smtp.write_data(l_conn, 'To: ' || p_recipient || utl_tcp.crlf);
         utl_smtp.write_data(l_conn, 'Subject: ' || p_subject || utl_tcp.crlf);
         
-        -- 4. DER ENTSCHEIDENDE TEIL: MIME-Version und HTML Content-Type
+        -- 4. THE CRUCIAL PART: MIME version and HTML content type
         utl_smtp.write_data(l_conn, 'MIME-Version: 1.0' || utl_tcp.crlf);
         utl_smtp.write_data(l_conn, 'Content-Type: text/html; charset=UTF-8' || utl_tcp.crlf);
         utl_smtp.write_data(l_conn, utl_tcp.crlf);
         
-        -- 5. Der CLOB-Splitter (Damit keine Zeilen mehr zerreißen)
+        -- 5. The CLOB splitter (so that lines are no longer torn apart)
         WHILE l_offset <= l_body_len LOOP
             utl_smtp.write_data(l_conn, DBMS_LOB.SUBSTR(p_body, l_chunk_size, l_offset));
             l_offset := l_offset + l_chunk_size;
@@ -51,9 +51,9 @@ create or replace PACKAGE BODY LILAM_MAILER AS
     begin
     
         v_color := CASE p_alertRec.alert_severity 
-                      WHEN 'CRITICAL' THEN '#e74c3c' -- Rot
+                      WHEN 'CRITICAL' THEN '#e74c3c' -- Red
                       WHEN 'WARN'     THEN '#f39c12' -- Orange
-                      ELSE                 '#3498db' -- Blau
+                      ELSE                 '#3498db' -- Blue
                    END;                   
         
         v_html := '<html><body style="font-family: Arial, sans-serif; color: #333; line-height: 1.5;">' || utl_tcp.crlf ||
@@ -61,7 +61,7 @@ create or replace PACKAGE BODY LILAM_MAILER AS
                   '<div style="background-color: ' || v_color || '; color: white; padding: 15px; font-size: 20px; font-weight: bold;">' ||
                   'LILAM Alert: ' || p_alertRec.rule_id || ' (' || p_alertRec.alert_severity || ')</div>' || utl_tcp.crlf ||
                   
-                  -- 1. BLOCK: REGEL (JSON)
+                  -- 1. BLOCK: RULE (JSON)
                   '<h3 style="color: ' || v_color || ';">Regel-Details</h3>' ||
                   '<table style="width: 100%; border-collapse: collapse; margin-bottom: 20px;">' ||
                   '<tr><td style="width: 200px; font-weight: bold; border-bottom: 1px solid #ddd; padding: 8px;">Trigger / Action:</td>' ||
@@ -70,7 +70,7 @@ create or replace PACKAGE BODY LILAM_MAILER AS
                   '<td style="border-bottom: 1px solid #ddd; padding: 8px;">' || p_json_rec.condition_operator || ' (' || p_json_rec.condition_value || ')</td></tr>' ||
                   '</table>' ||
         
-                  -- 2. BLOCK: PROZESS (MASTER)
+                  -- 2. BLOCK: PROCESS (MASTER)
                   '<h3 style="color: ' || v_color || ';">Prozess-Status</h3>' ||
                   '<table style="width: 100%; border-collapse: collapse; margin-bottom: 20px;">' ||
                   '<tr><td style="width: 200px; font-weight: bold; border-bottom: 1px solid #ddd; padding: 8px;">Prozess Name (ID):</td>' ||
@@ -81,7 +81,7 @@ create or replace PACKAGE BODY LILAM_MAILER AS
                   '<td style="border-bottom: 1px solid #ddd; padding: 8px;">' || NVL(l_lilam_rec.info, '-') || '</td></tr>' || utl_tcp.crlf ||
                   '</table>';
         
-        -- 3. BLOCK: MONITORING (Nur wenn vorhanden via LEFT JOIN)
+        -- 3. BLOCK: MONITORING (only if present via LEFT JOIN)
         IF l_lilam_rec.actionName IS NOT NULL THEN
             v_html := v_html || 
                   '<h3 style="color: ' || v_color || ';">Monitoring / Performance</h3>' ||
@@ -113,7 +113,7 @@ create or replace PACKAGE BODY LILAM_MAILER AS
             l_duration := l_lilam_rec.usedMillis;
         end if;
 
-        -- Mail-Body zusammenstellen (Beispiel)
+        -- Assemble the mail body (example)
         l_body := 'LILAM ALERT REPORT' || CHR(10) ||
                        '-------------------' || CHR(10) ||
                        'Alert ID: ' || p_alertRec.alert_id || CHR(10) ||
@@ -127,7 +127,7 @@ create or replace PACKAGE BODY LILAM_MAILER AS
     -------------------------------------------------------------------------
 
     PROCEDURE runMailer IS        
-        -- Dynamische Daten
+        -- Dynamic data
         v_info_text     VARCHAR2(2000);
         v_used_millis   NUMBER;
         v_mail_body     CLOB;
@@ -146,11 +146,11 @@ create or replace PACKAGE BODY LILAM_MAILER AS
         DBMS_OUTPUT.PUT_LINE('LILAM Mail-Log Consumer gestartet...');
     
         LOOP
-            COMMIT; -- Snapshot erneuern für den nächsten Durchgang
+            COMMIT; -- Refresh the snapshot for the next run
             DBMS_ALERT.WAITONE(C_ALERT_MAIL_LOG, v_msg_payload, v_status, 60);
     
             IF v_status = 0 THEN
-                -- Kurzer Check auf PENDING Records
+                -- Quick check for PENDING records
                 SELECT count(*) INTO v_count FROM LILAM_ALERTS 
                 WHERE handler_type = 'MAIL_LOG' AND status = 'PENDING';
     
@@ -160,7 +160,7 @@ create or replace PACKAGE BODY LILAM_MAILER AS
                         WHERE handler_type = 'MAIL_LOG' AND status = 'PENDING'
                         FOR UPDATE SKIP LOCKED
                     ) LOOP
-                        BEGIN -- Sicherungskapsel für den einzelnen Alert
+                        BEGIN -- Protective capsule for the single alert
                             -- 1. Mapping
                             l_alert_rec.alert_id            := rec.alert_id;
                             l_alert_rec.process_id          := rec.process_id; 
@@ -175,23 +175,23 @@ create or replace PACKAGE BODY LILAM_MAILER AS
                             l_alert_rec.rule_set_version    := rec.rule_set_version;
                             l_alert_rec.alert_severity      := rec.alert_severity;
 
-                            -- 2. Daten laden
+                            -- 2. Load data
                             l_json_rec := LILAM_CONSUMER.readJsonRule(l_alert_rec);
                             l_lilam_rec := LILAM_CONSUMER.readProcessData(l_alert_rec.process_id, l_alert_rec.action_name, l_alert_rec.action_count, l_alert_rec.master_table_name, l_alert_rec.monitor_table_name);
 
-                            -- 3. Body bauen & Senden
+                            -- 3. Build body & send
                             v_mail_body := prepareMailBodyHtml(l_lilam_rec, l_alert_rec, l_json_rec);
                             send_mail_via_relay('LILAM-ALERT: ' || l_alert_rec.rule_id, v_mail_body, 'dirk@dirk-goldbach.de');
                             
-                            -- 4. Status auf PROCESSED setzen
+                            -- 4. Set status to PROCESSED
                             LILAM_CONSUMER.updateAlert(rec.alert_id);
                             
-                            COMMIT; -- Einzel-Commit pro Mail ist hier sicher
-                            DBMS_SESSION.SLEEP(1); -- Etwas weniger aggressiv als 10s?
+                            COMMIT; -- A single commit per mail is safe here
+                            DBMS_SESSION.SLEEP(1); -- Somewhat less aggressive than 10s?
                             
                         EXCEPTION WHEN OTHERS THEN
-                            ROLLBACK; -- Sperre lösen
-                            -- Hier evtl. Status auf 'FAILED' setzen, damit er nicht ewig loopt
+                            ROLLBACK; -- Release the lock
+                            -- Possibly set the status to 'FAILED' here so that it does not loop forever
                         END;
                     END LOOP;
                 END IF;

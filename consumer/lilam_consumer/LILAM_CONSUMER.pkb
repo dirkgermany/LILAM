@@ -4,7 +4,7 @@ CREATE OR REPLACE PACKAGE BODY LILAM_CONSUMER AS
     as
         l_json_rec t_json_rec;
     begin
-        -- Regel-Details aus LILAM_RULES extrahieren
+        -- Extract rule details from LILAM_RULES
         SELECT jt.id, jt.trigger_type, jt.action, jt.condition_operator,
             jt.condition_value, jt.alert_handler, jt.alert_severity, jt.alert_throttle
         INTO  l_json_rec.id, l_json_rec.trigger_type, l_json_rec.action, l_json_rec.condition_operator,
@@ -34,7 +34,7 @@ CREATE OR REPLACE PACKAGE BODY LILAM_CONSUMER AS
     as
         l_lilam_rec t_lilam_rec;
     begin
-        -- Da die Tabellennamen variabel sind, nutzen wir EXECUTE IMMEDIATE
+        -- Since the table names are variable, we use EXECUTE IMMEDIATE
         EXECUTE IMMEDIATE 
             'SELECT master.id, master.process_name, master.status,
                 master.info, master.process_start, master.process_end,
@@ -69,22 +69,22 @@ CREATE OR REPLACE PACKAGE BODY LILAM_CONSUMER AS
                 v_err_msg VARCHAR2(2000) := SUBSTR(SQLERRM, 1, 2000);
             begin
                 ROLLBACK;
-                -- Tabellenname ist fest (LILAM.C_LILAM_ALERTS_TABLE); Binds gehen nur für Werte
+                -- Table name is fixed (LILAM.C_LILAM_ALERTS_TABLE); binds work only for values
                 UPDATE LILAM_ALERTS
                    SET status = 'ERROR',
                        error_message = v_err_msg,
-                       processed_at = SYSTIMESTAMP -- Hilfreich für das Debugging
+                       processed_at = SYSTIMESTAMP -- Helpful for debugging
                  WHERE alert_id = p_alertId;
                 COMMIT;
             end;
     end;
     
     FUNCTION get_ms_diff(p_start timestamp, p_end timestamp) RETURN NUMBER AS
-        v_diff interval day(0) to second(3); -- Präzision auf ms begrenzen
+        v_diff interval day(0) to second(3); -- Limit precision to ms
     begin
         v_diff := p_end - p_start;
-        -- Wir extrahieren nur die Sekunden inklusive der Nachkommastellen (ms)
-        -- und addieren die Minuten/Stunden/Tage als Sekunden-Vielfache
+        -- We extract only the seconds including the fractional part (ms)
+        -- and add the minutes/hours/days as multiples of seconds
         return (extract(day from v_diff) * 86400000)
              + (extract(hour from v_diff) * 3600000)
              + (extract(minute from v_diff) * 60000)
