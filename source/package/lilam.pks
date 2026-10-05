@@ -101,7 +101,8 @@ create or replace PACKAGE LILAM AS
         procImmortal    PLS_INTEGER := 0,
         tabNameMaster   VARCHAR2(100) DEFAULT 'LILAM',
         baselineScope   VARCHAR2(100),  -- NULL = process name (cross-process), '#NONE' = per process only
-        groupName       VARCHAR2(50)    -- INSESSION: group for the active rule set from LILAM_RULES; NULL = no rules
+        groupName       VARCHAR2(50),   -- INSESSION: group for the active rule set from LILAM_RULES; NULL = no rules
+        syncLevel       PLS_INTEGER := logLevelError  -- Entries up to this level are written synchronously (logLevelSilent = none)
     );
 
     -- ==============================
@@ -138,7 +139,8 @@ create or replace PACKAGE LILAM AS
         p_daysToKeep    PLS_INTEGER DEFAULT NULL,
         p_tabNameMaster VARCHAR2    DEFAULT 'LILAM',
         p_baselineScope VARCHAR2    DEFAULT NULL,
-        p_groupName     VARCHAR2    DEFAULT NULL) RETURN NUMBER;
+        p_groupName     VARCHAR2    DEFAULT NULL,
+        p_syncLevel     PLS_INTEGER DEFAULT logLevelError) RETURN NUMBER;
 
     FUNCTION  SERVER_NEW_SESSION(
         p_processName   VARCHAR2,
@@ -147,7 +149,8 @@ create or replace PACKAGE LILAM AS
         p_procStepsToDo PLS_INTEGER DEFAULT NULL,
         p_daysToKeep    PLS_INTEGER DEFAULT NULL,
         p_tabNameMaster VARCHAR2    DEFAULT 'LILAM',
-        p_baselineScope VARCHAR2    DEFAULT NULL) RETURN NUMBER;
+        p_baselineScope VARCHAR2    DEFAULT NULL,
+        p_syncLevel     PLS_INTEGER DEFAULT logLevelError) RETURN NUMBER;
     FUNCTION  SERVER_NEW_SESSION_JSON(p_jsonObject JSON_OBJ_LILAM) RETURN NUMBER;
 
     PROCEDURE CLOSE_SESSION(

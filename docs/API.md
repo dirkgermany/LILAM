@@ -237,7 +237,7 @@ Session handling controls the life cycle of a LILAM process.
 Both functions start a LILAM process and return its process ID. This ID is required for all subsequent API calls.
 
 - `NEW_SESSION` starts the process in in-session mode.
-- `SERVER_NEW_SESSION` starts the process in decoupled mode via a LILAM server. The parameters are the same, with `p_groupName` added in second position.
+- `SERVER_NEW_SESSION` starts the process in decoupled mode via a LILAM server. The parameters are the same; `p_groupName` is in second position here and last in `NEW_SESSION`.
 - Alternatively, all settings can be combined in a [`t_session_init`](#record-type-t_session_init) record (`NEW_SESSION` only).
 
 Each parameter always has the same position. All parameters except `p_processName` have a default and can therefore be omitted or passed by name.
@@ -249,7 +249,9 @@ FUNCTION NEW_SESSION(
   p_procStepsToDo PLS_INTEGER DEFAULT NULL,
   p_daysToKeep    PLS_INTEGER DEFAULT NULL,
   p_tabNameMaster VARCHAR2    DEFAULT 'LILAM',
-  p_baselineScope VARCHAR2    DEFAULT NULL
+  p_baselineScope VARCHAR2    DEFAULT NULL,
+  p_groupName     VARCHAR2    DEFAULT NULL,
+  p_syncLevel     PLS_INTEGER DEFAULT logLevelError
 ) RETURN NUMBER
 ```
 
@@ -267,7 +269,8 @@ FUNCTION SERVER_NEW_SESSION(
   p_procStepsToDo PLS_INTEGER DEFAULT NULL,
   p_daysToKeep    PLS_INTEGER DEFAULT NULL,
   p_tabNameMaster VARCHAR2    DEFAULT 'LILAM',
-  p_baselineScope VARCHAR2    DEFAULT NULL
+  p_baselineScope VARCHAR2    DEFAULT NULL,
+  p_syncLevel     PLS_INTEGER DEFAULT logLevelError
 ) RETURN NUMBER
 ```
 
@@ -284,12 +287,13 @@ FUNCTION SERVER_NEW_SESSION_JSON(
 | Parameter | JSON | Default | Description |
 | --- | --- | --- | --- |
 | `p_processName` | `process_name` | – | Name identifying the process |
-| `p_groupName` | `group_name` | `NULL` | `SERVER_NEW_SESSION` only: restricts the server selection to the given group; `NULL` = any available server |
+| `p_groupName` | `group_name` | `NULL` | `SERVER_NEW_SESSION`: restricts the server selection to the given group; `NULL` = any available server. `NEW_SESSION`: the process uses the active rule set of this group from `LILAM_RULES`; `NULL` = no rules |
 | `p_logLevel` | `log_level` | `logLevelMonitor` | Level of detail, see [Log Levels](#log-levels) |
 | `p_procStepsToDo` | `steps_todo` | `NULL` | Planned number of process steps |
 | `p_daysToKeep` | `days_to_keep` | `NULL` | `NULL` = no automatic cleanup. Otherwise, completed processes of the same name older than the given number of days are deleted at startup, including their logs and metrics (except processes with `procImmortal = 1`) |
 | `p_tabNameMaster` | `tabname_master` | `'LILAM'` | Prefix of the PROC, LOG and MON tables |
 | `p_baselineScope` | `baseline_scope` | `NULL` | Scope of the averages (EWMA) of traces and events: `NULL` = process name, i.e. shared by all processes with this name; `'#NONE'` = only within the individual process; otherwise a freely chosen name that can also be shared by several applications |
+| `p_syncLevel` | `sync_level` | `logLevelError` | Entries up to this level are written synchronously, all others are buffered. `logLevelWarn` makes `WARN` synchronous as well, `logLevelSilent` switches synchronous writing off completely. See [Synchronous Writing](#synchronous-writing-p_synclevel) |
 
 **Return value:** `NUMBER`, the process ID.
 
@@ -327,6 +331,12 @@ l_processId := lilam.new_session('IMPORT_CUSTOMERS', lilam.logLevelInfo, 500);
 -- single parameters by name
 l_processId := lilam.new_session('IMPORT_CUSTOMERS', p_daysToKeep => 30);
 l_processId := lilam.new_session('IMPORT_CUSTOMERS', p_baselineScope => '#NONE');
+
+-- In-Session with the rules of the group BATCH
+l_processId := lilam.new_session('IMPORT_CUSTOMERS', p_groupName => 'BATCH');
+
+-- also write WARN immediately and durably
+l_processId := lilam.new_session('IMPORT_CUSTOMERS', p_syncLevel => lilam.logLevelWarn);
 
 -- decoupled: any available server or a server of the group BATCH
 l_processId := lilam.server_new_session('IMPORT_CUSTOMERS');
@@ -608,17 +618,27 @@ PROCEDURE DEBUG(
 
 `ERROR` has the highest priority and is always stored unless logging has been switched off completely with `logLevelSilent`.
 
-> [!IMPORTANT]
-> **When an entry is in the table depends on the level and the mode.**
-> - **In-Session:** `ERROR` is written and committed in an autonomous transaction before the call returns. LILAM also writes all other buffered data of the database session. `WARN`, `INFO` and `DEBUG` stay in the buffer for up to about 1.5 seconds, longer if the session does not call LILAM again.
-> - **Decoupled:** `ERROR` also returns immediately. The server writes the message as soon as it reads it from the pipe (measured: 20–30 ms). If the LILAM server or the instance fails before that, the entry is lost.
-> - If a session ends without `CLOSE_SESSION` or `FINAL_RESCUE`, the buffered entries are lost. Therefore call `CLOSE_SESSION` in the central exception handler.
->
-> Details, measurements and failure scenarios are in [Architecture and Concepts](architecture%20and%20concepts.md#when-is-a-log-entry-stored-write-latency-per-level).
+When an entry is actually in the table is described under [Synchronous Writing](#synchronous-writing-p_synclevel).
 
 LILAM always handles internal errors silently and logs them in `LILAM_LOG_INTERNAL`; the application never receives an exception. If `logLevelDebug` is active, LILAM additionally writes such errors as `ERROR` to the log of the affected process.
 
 The complete mapping can be found under [Log Levels](#log-levels).
+
+### Synchronous Writing (p_syncLevel)
+
+LILAM buffers log entries for performance reasons. Entries up to the **sync level** of the process, however, are written immediately and durably. The sync level is set with `p_syncLevel` when the process is started; the default is `logLevelError`.
+
+| Mode | Entries up to the sync level | All other entries |
+| --- | --- | --- |
+| In-Session | are committed in an autonomous transaction before the call returns. LILAM also writes all other buffered data of the database session. | stay in the buffer for up to about 1.5 seconds, longer if the session does not call LILAM again |
+| Decoupled | go to the server as usual and are written to the work table there. As a **safety net**, the client additionally writes them itself in an autonomous transaction before the call returns, always into **`LILAM_LOG`** of the client's schema (created if missing), with the process ID and the value `-1` in column `NO`. | are sent to the server via the pipe and buffered there |
+
+A synchronously written entry therefore survives an abort of the session and, in decoupled mode, a failure of the LILAM server. Buffered entries are lost if a session ends without `CLOSE_SESSION` or `FINAL_RESCUE`. Therefore call `CLOSE_SESSION` in the central exception handler.
+
+> [!NOTE]
+> In decoupled mode, synchronous entries are normally stored twice: in the work table (written by the server) and in `LILAM_LOG` of the client's schema (`NO = -1`). If the LILAM server fails, the entry can still be found in `LILAM_LOG`. `LILAM_LOG` is used because the work table may be in the server's schema, which the client cannot reach.
+
+On the test system a synchronous call costs about 1.5 to 3.5 ms instead of about 0.1 ms, mostly for the commit. Details, measurements and failure scenarios are in [Architecture and Concepts](architecture%20and%20concepts.md#when-is-a-log-entry-stored-sync-level).
 
 ### Function GET_COUNTER_WARN / GET_COUNTER_ERROR
 
@@ -957,7 +977,9 @@ TYPE t_session_init IS RECORD (
   daysToKeep    PLS_INTEGER,                    -- NULL = no automatic cleanup
   procImmortal  PLS_INTEGER := 0,
   tabNameMaster VARCHAR2(100) DEFAULT 'LILAM',
-  baselineScope VARCHAR2(100)                   -- NULL = process name, '#NONE' = per process only
+  baselineScope VARCHAR2(100),                  -- NULL = process name, '#NONE' = per process only
+  groupName     VARCHAR2(50),                   -- group for the active rule set; NULL = no rules
+  syncLevel     PLS_INTEGER := logLevelError    -- write synchronously up to this level
 );
 ```
 

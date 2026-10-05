@@ -97,7 +97,8 @@ AS
         group_name          VARCHAR2(50),  -- Group as specified (server: server group), for alerts
         rule_group          VARCHAR2(50),  -- upper(group_name): key of the rules; NULL = no rules
         tabName_master      VARCHAR2(100),
-        scope_id            NUMBER(19,0)  -- NULL = no cross-process scope
+        scope_id            NUMBER(19,0),  -- NULL = no cross-process scope
+        sync_level          PLS_INTEGER := 1  -- logLevelError: entries up to this level are written synchronously
     );
 
     -- Table for several processes
@@ -112,6 +113,18 @@ AS
     -- Index is the session ID, value is arbitrary (here Boolean)
     TYPE t_remote_sessions IS TABLE OF BOOLEAN INDEX BY BINARY_INTEGER;
     g_remote_sessions t_remote_sessions;
+    -- Client side: what the server reported for a remote process (NEW_SESSION/RECONNECT).
+    -- Needed to write entries up to sync_level directly, without waiting for the server.
+    TYPE t_remote_sync_rec IS RECORD (
+        log_level       PLS_INTEGER,
+        sync_level      PLS_INTEGER
+    );
+    TYPE t_remote_sync_tab IS TABLE OF t_remote_sync_rec INDEX BY BINARY_INTEGER;
+    g_remote_sync t_remote_sync_tab;
+    C_NO_DIRECT_WRITE CONSTANT PLS_INTEGER := -1;  -- Column NO of log entries written directly by the client
+    -- Master table of directly written entries: always LILAM (=> LILAM_LOG) in the schema of the calling
+    -- LILAM installation, independent of the work table and of the schema the server runs in.
+    C_DIRECT_WRITE_MASTER CONSTANT VARCHAR2(10) := 'LILAM';
     -- IDs for which a reconnect via the dispatcher failed, with the time of the next allowed
     -- attempt. Prevents every call with an unknown ID from querying the dispatcher synchronously again.
     TYPE t_unknown_pids IS TABLE OF TIMESTAMP INDEX BY BINARY_INTEGER;
@@ -4094,6 +4107,36 @@ AS
 
     --------------------------------------------------------------------------
 
+    -- Client side (decoupled): safety net for entries up to the sync level of the process.
+    -- Writes the entry additionally and directly in an autonomous transaction, so that it is stored
+    -- when the call returns, even if the server or its pipe fails afterwards. The entry is still
+    -- sent to the server, which writes it to the work table as usual.
+    -- Target is always LILAM_LOG of this installation (created if missing), not the work table:
+    -- the work table may live in the server's schema, out of reach of the client.
+    -- NO is C_NO_DIRECT_WRITE (-1): the running number is assigned by the server only.
+    procedure writeLogDirect(p_processId number, p_level number, p_logText varchar2,
+                            p_caller varchar2, p_errStack varchar2, p_errBacktrace varchar2, p_errCallstack varchar2,
+                            p_timestamp TIMESTAMP)
+    as
+        pragma autonomous_transaction;
+    begin
+        createLogTables(C_DIRECT_WRITE_MASTER);   -- checked only once per session
+        execute immediate 'insert into ' || safeTableName(C_DIRECT_WRITE_MASTER || C_SUFFIX_LOG_TABLE) || '
+                (PROCESS_ID, LOG_LEVEL, LOG_LEVEL_C, INFO, SESSION_TIME, NO, CALLER, ERR_STACK, ERR_BACKTRACE, ERR_CALLSTACK, SESSION_USER, HOST_NAME)
+                values (:1, :2, :3, :4, :5, :6, :7, :8, :9, :10, :11, :12)'
+        using p_processId, p_level, logLevelToEnum(p_level), substrb(p_logText, 1, 2000), p_timestamp, C_NO_DIRECT_WRITE,
+              substrb(p_caller, 1, 255), substrb(p_errStack, 1, 4000), substrb(p_errBacktrace, 1, 4000), substrb(p_errCallstack, 1, 4000),
+              SYS_CONTEXT('USERENV','SESSION_USER'), SYS_CONTEXT('USERENV','HOST');
+        commit;
+    exception
+        when others then
+            rollback;
+            if sqlcode = -942 then g_checked_masters.DELETE; g_safe_tables.DELETE; end if;
+            logLilamErr(sqlCode, sqlErrM, 'writeLogDirect');
+    end;
+
+    --------------------------------------------------------------------------
+
     procedure log_anyRemote(p_processId number, p_level number, p_logText varchar2, p_caller varchar2, p_errStack varchar2, p_errBacktrace varchar2, p_errCallstack varchar2, p_timestamp TIMESTAMP)
     as
         l_payload JSON_OBJ_LILAM; -- Buffer for the JSON string
@@ -4130,6 +4173,7 @@ AS
         p_timestamp TIMESTAMP DEFAULT systimestamp
     )
     as
+        l_syncLevel   PLS_INTEGER := logLevelError;
         l_packageName VARCHAR2(128);
         l_aimDepth    PLS_INTEGER := NULL;
         l_maxDepth    PLS_INTEGER;
@@ -4174,9 +4218,21 @@ AS
         end if;
             
         if is_remote(p_processId) then
+            -- Entries up to the sync level: safety net, the client additionally writes them itself to
+            -- LILAM_LOG, so that they are stored when the call returns. The server writes them as usual.
+            if g_remote_sync.EXISTS(p_processId)
+               and p_level <= g_remote_sync(p_processId).sync_level
+               and p_level <= g_remote_sync(p_processId).log_level then
+                writeLogDirect(p_processId, p_level, l_logText,
+                               l_module, p_errStack, p_errBacktrace, p_errCallstack, p_timestamp);
+            end if;
             log_anyRemote(p_processId, p_level, l_logText, l_module, p_errStack, p_errBacktrace, p_errCallstack, p_timestamp);
             return;
         end if ;
+
+        if v_indexSession.EXISTS(p_processId) then
+            l_syncLevel := g_sessionList(v_indexSession(p_processId)).sync_level;
+        end if;
 
         -- Continue here only if not remote
         if v_indexSession.EXISTS(p_processId) and p_level <= g_sessionList(v_indexSession(p_processId)).log_level then
@@ -4204,8 +4260,9 @@ AS
             evaluateRules(v_dummyMonRec, C_LOGGING);
         end if;
 
-        -- On hard errors the log must be written
-        if p_level = logLevelError then
+        -- Entries up to the sync level of the process (default: ERROR) must be written immediately,
+        -- together with everything buffered before them
+        if p_level <= l_syncLevel then
             SYNC_ALL_DIRTY(true);
         else
             SYNC_ALL_DIRTY();
@@ -4571,6 +4628,7 @@ AS
             g_sessionList.delete;
         end if;
         g_remote_sessions.DELETE;
+        g_remote_sync.DELETE;
         g_process_cache.DELETE;
         g_monitor_shadows.DELETE;
         g_local_throttle_cache.DELETE;    
@@ -4729,6 +4787,7 @@ AS
         if is_remote(p_processId) then
             close_sessionRemote(p_processId, p_procStepsToDo, p_procStepsDone, p_processInfo, p_processStatus);
             g_remote_sessions.delete(p_processId);
+            g_remote_sync.delete(p_processId);
             g_log_counters.delete(p_processId);
             g_client_pipes.delete(p_processId);
             g_local_throttle_cache.delete(p_processId);
@@ -4800,6 +4859,7 @@ AS
             g_sessionList(v_idx).group_name := trim(l_session_init.groupName);
         end if;
         g_sessionList(v_idx).rule_group := upper(g_sessionList(v_idx).group_name);
+        g_sessionList(v_idx).sync_level := nvl(l_session_init.syncLevel, logLevelError);
 
         deleteOldLogs(p_processId, upper(trim(l_session_init.processName)), l_session_init.daysToKeep);
 
@@ -4841,10 +4901,12 @@ AS
         p_daysToKeep    PLS_INTEGER DEFAULT NULL,
         p_tabNameMaster VARCHAR2    DEFAULT 'LILAM',
         p_baselineScope VARCHAR2    DEFAULT NULL,
-        p_groupName     VARCHAR2    DEFAULT NULL) RETURN NUMBER
+        p_groupName     VARCHAR2    DEFAULT NULL,
+        p_syncLevel     PLS_INTEGER DEFAULT logLevelError) RETURN NUMBER
     as
         l_session_init t_session_init;
     begin
+        l_session_init.syncLevel     := p_syncLevel;
         l_session_init.processName   := p_processName;
         l_session_init.logLevel      := p_logLevel;
         l_session_init.stepsToDo     := p_procStepsToDo;
@@ -5007,6 +5069,9 @@ AS
             jsonPut(l_response, 'server_code', get_serverCode(TXT_ACK_SERVER_PROC));
             jsonPut(l_response, 'process_id', l_processId);
             jsonPut(l_response, 'perf', g_server_perf);   -- Performance level for client throttling
+            -- Data for the client's direct writing up to sync_level (see setRemoteSync)
+            jsonPut(l_response, 'log_level',      g_sessionList(v_indexSession(l_processId)).log_level);
+            jsonPut(l_response, 'sync_level',     g_sessionList(v_indexSession(l_processId)).sync_level);
         else
             jsonPut(l_response, 'server_code', get_serverCode(TXT_ERR_SERVER_PROC));
         end if;
@@ -5296,6 +5361,7 @@ AS
         l_session_init.daysToKeep  := jsonNumber(l_payload, 'days_to_keep');
         l_session_init.tabNameMaster := jsonString(l_payload, 'tabname_master');
         l_session_init.baselineScope := jsonString(l_payload, 'baseline_scope');
+        l_session_init.syncLevel     := nvl(jsonNumber(l_payload, 'sync_level'), logLevelError);
 
         l_processId := NEW_SESSION(l_session_init);
         registerProcessRoute(l_processId, g_serverPipeName); 
@@ -5303,7 +5369,10 @@ AS
 
         DBMS_PIPE.RESET_BUFFER;
         -- perf: performance level of this server; the client adjusts its throttling accordingly
-        DBMS_PIPE.PACK_MESSAGE('{"process_id":' || l_processId || ',"perf":' || g_server_perf || '}');        
+        -- log_level/sync_level: the client writes entries up to sync_level itself (see setRemoteSync)
+        DBMS_PIPE.PACK_MESSAGE('{"process_id":' || l_processId || ',"perf":' || g_server_perf
+                               || jNum('log_level',      g_sessionList(v_indexSession(l_processId)).log_level)
+                               || jNum('sync_level',     g_sessionList(v_indexSession(l_processId)).sync_level) || '}');
         l_status := DBMS_PIPE.SEND_MESSAGE(p_clientChannel, timeout => 1);
     end;    
 
@@ -5360,7 +5429,8 @@ AS
         p_procStepsToDo PLS_INTEGER DEFAULT NULL,
         p_daysToKeep    PLS_INTEGER DEFAULT NULL,
         p_tabNameMaster VARCHAR2    DEFAULT 'LILAM',
-        p_baselineScope VARCHAR2    DEFAULT NULL) RETURN NUMBER
+        p_baselineScope VARCHAR2    DEFAULT NULL,
+        p_syncLevel     PLS_INTEGER DEFAULT logLevelError) RETURN NUMBER
     as
         l_payload JSON_OBJ_LILAM;
     begin
@@ -5371,8 +5441,30 @@ AS
         jsonPut(l_payload, 'days_to_keep',   p_daysToKeep);
         jsonPut(l_payload, 'tabname_master', p_tabNameMaster);
         jsonPut(l_payload, 'baseline_scope', p_baselineScope);
+        jsonPut(l_payload, 'sync_level',     p_syncLevel);
 
         return server_new_session_json(l_payload);
+    end;
+
+    --------------------------------------------------------------------------
+
+    -- Client side: remember log level and sync level that the server reported for the process.
+    -- Without these values (e.g. older server) the client sends everything via the pipe as before.
+    procedure setRemoteSync(p_processId number, p_json varchar2)
+    as
+        l_rec t_remote_sync_rec;
+    begin
+        l_rec.log_level      := jsonNumber(p_json, 'log_level');
+        l_rec.sync_level     := jsonNumber(p_json, 'sync_level');
+        if l_rec.log_level is null or l_rec.sync_level is null then
+            g_remote_sync.DELETE(p_processId);
+        else
+            g_remote_sync(p_processId) := l_rec;
+        end if;
+    exception
+        when others then
+            g_remote_sync.DELETE(p_processId);
+            logLilamErr(sqlCode, sqlErrM, 'setRemoteSync');
     end;
 
     --------------------------------------------------------------------------
@@ -5421,6 +5513,7 @@ AS
             g_remote_sessions(l_ProcessId) := TRUE; -- add to the list of remote sessions
             -- Throttling according to the server's performance level (if the value is missing: C_SERVER_PERF_MID)
             setPerfLimit(l_ProcessId, jsonNumber(l_response, 'perf'));
+            setRemoteSync(l_ProcessId, l_response);
         end if ;
         RETURN l_ProcessId;
     end;
@@ -5453,6 +5546,7 @@ AS
         if l_serverCode = NUM_ACK_SERVER_PROC then
             -- Throttling according to the server's performance level (also in every new APEX session)
             setPerfLimit(p_processId, jsonNumber(l_payload, 'perf'));
+            setRemoteSync(p_processId, l_payload);
             return jsonNumber(l_payload, 'process_id');
         else
             return NUM_ERR_SERVER_PROC;
@@ -6677,6 +6771,7 @@ BEGIN
             p_session_init.tabNameMaster := jsonString(l_jsonParams, 'tabname_master');
             p_session_init.baselineScope := jsonString(l_jsonParams, 'baseline_scope');
             p_session_init.groupName     := jsonString(l_jsonParams, 'group_name');
+            p_session_init.syncLevel     := nvl(jsonNumber(l_jsonParams, 'sync_level'), logLevelError);
 
             l_proc_id := NEW_SESSION(p_session_init);
             jsonPut(l_jsonHeader, 'status', 'SUCCESS');
