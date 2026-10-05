@@ -100,6 +100,49 @@ LILAM deliberately does not use `FORALL ... SAVE EXCEPTIONS`: with dynamic SQL, 
 
 As everywhere in LILAM, such errors never reach the application: they are logged internally and processing continues.
 
+### When Is a Log Entry Stored? (Write Latency per Level)
+Buffering makes LILAM fast, but a buffered entry only exists in memory until the next flush. What survives a hard failure therefore depends on the log level and on the operating mode.
+
+| Data | In-Session | Decoupled (server, also via dispatcher) |
+| --- | --- | --- |
+| `ERROR` | Written and committed **before `ERROR` returns** (autonomous transaction). The call forces a flush of **all** buffered data of the database session: logs, metrics and process status of every open process. | The client puts the message into the pipe and returns at once. The server writes it **as soon as it reads it** with the same forced flush. The client does not wait for this. |
+| `WARN`, `INFO`, `DEBUG`, metrics, process status | Buffered in the PGA of the session. Flushed when the last flush is at least 1.5 s ago or 50,000 entries are pending, and also by `ERROR`, `CLOSE_SESSION` and `FINAL_RESCUE`. | Buffered in the PGA of the server, flushed by the same rules plus the server's housekeeping (every 0.5 s when idle). |
+
+> [!IMPORTANT]
+> `WARN` is buffered like `INFO`. Only `ERROR` is written synchronously.
+
+The time-based flush has no background timer: it is checked only when the session calls LILAM again. A session that stops calling LILAM keeps its buffer, however long it waits.
+
+Measured on Oracle 23.26 Free (2 CPU threads), test schema `LILAM_TEST`:
+
+| Measurement | Result |
+| --- | --- |
+| In-Session: `INFO` | 0.06 ms per call |
+| In-Session: `ERROR`, one open process | 1.8 ms per call |
+| In-Session: 10 × `INFO` in 10 processes + 1 × `ERROR` | 6.1 ms per round (`ERROR` flushes all 11 processes) |
+| In-Session: `INFO` → `ERROR` → caller `ROLLBACK` | the `ERROR` and the `INFO` before it are stored |
+| Decoupled: `ERROR` (client) | about 0.1 ms per call |
+| Decoupled: `ERROR` visible in the table | after 20–30 ms with an idle server; 360 ms when the server first had to process 2,000 `INFO` messages |
+| Decoupled: `INFO` visible in the table | after about 2 s |
+
+**What is lost in case of a failure**
+
+| Failure | In-Session | Decoupled |
+| --- | --- | --- |
+| Caller `ROLLBACK` | Nothing. All writes are autonomous transactions. | Nothing. |
+| Unhandled exception, session killed, job aborted, without `CLOSE_SESSION` / `FINAL_RESCUE` | Everything buffered since the last flush (e.g. `INFO` and `WARN`). An `ERROR` that has returned is stored, together with everything that was buffered before it. | Nothing on the client side. Entries that have reached the server are lost only if the server fails. |
+| Database session dies during the `ERROR` call | This `ERROR` (it is committed at the end of the call). | The message, if it was not yet in the pipe. |
+| LILAM server killed or crashed | – | Everything in the server's buffer and in its pipe. The pipe lives in the SGA only, and a restarted server empties its pipe and does not know the processes of its predecessor. **This includes `ERROR` messages** (verified by test: an `ERROR` sent while the server was down never arrived). |
+| Instance crash | Everything buffered. | Everything buffered and everything in the pipes. |
+| Pipe full (server overloaded) | – | The client retries for a few seconds and then discards the message. It is recorded in `LILAM_LOG_INTERNAL` of the client; the application gets no exception. |
+| Log table not writable (e.g. tablespace full) | The entry is recorded in `LILAM_LOG_INTERNAL`; the application gets no exception. | Same, in the server. |
+
+**Consequences**
+* In-Session, `ERROR` behaves like a direct autonomous insert: once the call returns, the entry is committed. The additional cost compared with `INFO` comes from flushing everything else that is buffered.
+* Decoupled, the return of `ERROR` does **not** mean that the entry is stored. Usually it is stored within milliseconds; if the server or the instance fails before that, it is lost.
+* Processes whose errors must be stored even if a LILAM server fails should log in In-Session mode (hybrid usage is possible).
+* Always call `CLOSE_SESSION` (or at least `FINAL_RESCUE`) in the central exception handler. Otherwise `INFO` and `WARN` entries buffered before the failure are lost.
+
 The session is more of a technical perspective on the workflows within LILAM, while the process is the view 'to the outside.' I believe these two terms—session and process—can be used almost synonymously in daily LILAM operations. It doesn't really hurt if they are mixed a bit.
 
 ---
