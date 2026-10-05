@@ -4608,18 +4608,21 @@ AS
         v_key := g_monitor_shadows.NEXT(v_search_prefix);
         WHILE v_key IS NOT NULL LOOP
             EXIT WHEN SUBSTR(v_key, 1, LENGTH(v_search_prefix)) != v_search_prefix;
-            write_to_log_buffer(
-                p_processId,
-                logLevelWarn,
-                'OPEN TRACE (not stopped before CLOSE_SESSION): Action=>' || g_monitor_shadows(v_key).action_name
-                    || '; Context=>' || g_monitor_shadows(v_key).context_name
-                    || '; Start=>' || to_char(g_monitor_shadows(v_key).start_time, 'YYYY-MM-DD HH24:MI:SS.FF3'),
-                systimestamp,
-                'LILAM',
-                null,
-                null,
-                null
-            );
+            -- Auch Events hinterlassen einen Shadow (Abstand zum vorigen Event); offen sind nur Traces
+            IF g_monitor_shadows(v_key).monitor_type = C_MON_TYPE_TRACE THEN
+                write_to_log_buffer(
+                    p_processId,
+                    logLevelWarn,
+                    'OPEN TRACE (not stopped before CLOSE_SESSION): Action=>' || g_monitor_shadows(v_key).action_name
+                        || '; Context=>' || g_monitor_shadows(v_key).context_name
+                        || '; Start=>' || to_char(g_monitor_shadows(v_key).start_time, 'YYYY-MM-DD HH24:MI:SS.FF3'),
+                    systimestamp,
+                    'LILAM',
+                    null,
+                    null,
+                    null
+                );
+            END IF;
             v_key := g_monitor_shadows.NEXT(v_key);
         END LOOP;
     EXCEPTION
