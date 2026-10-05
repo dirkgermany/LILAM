@@ -37,7 +37,6 @@ create or replace PACKAGE BODY LILAM_MAILER AS
             utl_smtp.write_data(l_conn, DBMS_LOB.SUBSTR(p_body, l_chunk_size, l_offset));
             l_offset := l_offset + l_chunk_size;
         END LOOP;
---        utl_smtp.write_data(l_conn, p_body);
 
         utl_smtp.close_data(l_conn);
         utl_smtp.quit(l_conn);
@@ -193,7 +192,6 @@ create or replace PACKAGE BODY LILAM_MAILER AS
                         EXCEPTION WHEN OTHERS THEN
                             ROLLBACK; -- Sperre lösen
                             -- Hier evtl. Status auf 'FAILED' setzen, damit er nicht ewig loopt
---                            LILAM.LOG_ERROR('Mailer failed for Alert ' || rec.alert_id || ': ' || SQLERRM);
                         END;
                     END LOOP;
                 END IF;

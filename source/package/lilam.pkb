@@ -678,14 +678,14 @@ AS
 
     ------------------------------------------------------------------------
 
-    procedure jsonPut(p_jsonString in out JSON_OBJ_LILAM, jsonKey in varchar2, valueStr in varchar2) --return varchar2
+    procedure jsonPut(p_jsonString in out JSON_OBJ_LILAM, jsonKey in varchar2, valueStr in varchar2)
     -- Achtung! Die If-Konstruktionen sind nicht schön aber deutlich performanter, als case
     -- Auch das Arbeiten mit einem booleschen Wert am Anfang macht die Logik um vieles langsamer
     as
         l_str   JSON_OBJ_LILAM;
         l_value JSON_OBJ_LILAM := trim(valueStr);
     begin
-        if valueStr is null or trim(valueStr) = '' then return; end if; -- p_jsonString; end if;
+        if valueStr is null or trim(valueStr) = '' then return; end if;
 
         if substr(l_value,1,1) != '{' and substr(l_value, -1) != '}' then
             -- Escapen!
@@ -710,16 +710,15 @@ AS
             l_str := l_str || '}';
         end if;
         p_jsonString := l_str;
---            return l_str;
     end;
 
     -------------------------------------------------------------------------------------
 
-    procedure jsonPut(p_jsonString in out varchar2, jsonKey varchar2, valueNum Number) -- return varchar2
+    procedure jsonPut(p_jsonString in out varchar2, jsonKey varchar2, valueNum Number)
     as
         l_str JSON_OBJ_LILAM;
     begin
-        if valueNum is null then return; end if; -- p_jsonString; end if;
+        if valueNum is null then return; end if;
 
         l_str := jsonPutPrep(p_jsonString);
         if p_jsonString is null and substr(valueNum, 1,1) = '{' and substr(valueNum, -1) = '}' then
@@ -729,16 +728,14 @@ AS
             l_str := l_str || valueNum || '}'; 
         end if;
         p_jsonString := l_str;
---            return l_str;
     end;
 
     -------------------------------------------------------------------------------------
 
-    procedure jsonPut(p_jsonString in out JSON_OBJ_LILAM, jsonKey varchar2, valueTS timestamp) -- return varchar2
+    procedure jsonPut(p_jsonString in out JSON_OBJ_LILAM, jsonKey varchar2, valueTS timestamp)
     as
     begin
         jsonPut(p_jsonString, jsonKey, TO_CHAR(valueTS, 'YYYY-MM-DD"T"HH24:MI:SS.FF6'));
---            return jsonPut(p_jsonString, jsonKey, TO_CHAR(valueTS, 'YYYY-MM-DD"T"HH24:MI:SS.FF6'));
     end;
 
     --------------------------------------------------------------------------
@@ -1466,7 +1463,6 @@ AS
         p_request       in varchar2, -- Wird für die Zuordnung/Verzweigung im Server benötigt
         p_payload       IN varchar2, 
         p_timeoutSec    IN PLS_INTEGER
---        p_pipeName   in varchar2 default null
     ) return varchar2
     as
         l_msgReceive    JSON_OBJ_LILAM;
@@ -4682,7 +4678,6 @@ AS
             EXIT WHEN SUBSTR(v_key, 1, 20) > LPAD(p_processId, 20, '0');
             if v_key LIKE v_search_prefix || '%' THEN
                 g_monitor_shadows.DELETE(v_key);
-                -- Optional: DBMS_OUTPUT.PUT_LINE('Shadow gelöscht für: ' || v_key);
             end if ;            
             -- Zum nächsten Key springen
             v_key := g_monitor_shadows.NEXT(v_key);
@@ -6300,7 +6295,7 @@ AS
         c_max_timeout CONSTANT NUMBER := C_SERVER_TIMEOUT_MAX_WAIT_SEC; -- Maximum für den Eco-Mode
         c_min_timeout CONSTANT NUMBER := C_SERVER_TIMEOUT_WAIT_FOR_MSG_SEC;
     begin
-        l_status := DBMS_PIPE.RECEIVE_MESSAGE(l_pipeName, timeout => p_cur_timeout); --=> C_SERVER_TIMEOUT_WAIT_FOR_MSG_SEC);
+        l_status := DBMS_PIPE.RECEIVE_MESSAGE(l_pipeName, timeout => p_cur_timeout);
 
         if l_status = 0 THEN
             p_cur_timeout := C_SERVER_TIMEOUT_WAIT_FOR_MSG_SEC;
@@ -6400,7 +6395,6 @@ AS
             WHEN 'SERVER_SHUTDOWN' then
                 if handleServerShutdown(p_clientChannel, p_message) then 
                     -- nur wenn gültiges Passwort geschickt wurde
---                        l_shutdownSignal := TRUE;
                     INFO(g_serverProcessId, g_serverPipeName || '=> Shutdown by remote request');
                     return true; -- Abbruchsignal
                 end if ;
@@ -6483,7 +6477,7 @@ AS
         g_serverIsDispatcher := CASE nvl(p_isDispatcher, 0) WHEN 1 THEN TRUE ELSE FALSE END;
         g_server_perf := normPerf(p_perfServer);   -- wird den Clients bei NEW_SESSION/RECONNECT mitgeteilt
         g_shutdownPassword := p_password;
-        g_serverPipeName := p_pipeName; --l_pipe;
+        g_serverPipeName := p_pipeName;
         g_serverGroupName := p_groupName;
         g_serverProcessId := new_session(p_processName => 'LILAM_SERVER', p_logLevel => logLevelMonitor, p_tabNameMaster => 'LILAM_SERVER');
         SET_PROCESS_STATUS(g_serverProcessId, 1, 'RUNNING');
