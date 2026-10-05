@@ -252,7 +252,8 @@ FUNCTION NEW_SESSION(
   p_daysToKeep    PLS_INTEGER DEFAULT NULL,
   p_tabNameMaster VARCHAR2    DEFAULT 'LILAM',
   p_baselineScope VARCHAR2    DEFAULT NULL,
-  p_groupName     VARCHAR2    DEFAULT NULL
+  p_groupName     VARCHAR2    DEFAULT NULL,
+  p_syncLevel     PLS_INTEGER DEFAULT logLevelError
 ) RETURN NUMBER
 ```
 
@@ -270,7 +271,8 @@ FUNCTION SERVER_NEW_SESSION(
   p_procStepsToDo PLS_INTEGER DEFAULT NULL,
   p_daysToKeep    PLS_INTEGER DEFAULT NULL,
   p_tabNameMaster VARCHAR2    DEFAULT 'LILAM',
-  p_baselineScope VARCHAR2    DEFAULT NULL
+  p_baselineScope VARCHAR2    DEFAULT NULL,
+  p_syncLevel     PLS_INTEGER DEFAULT logLevelError
 ) RETURN NUMBER
 ```
 
@@ -293,6 +295,7 @@ FUNCTION SERVER_NEW_SESSION_JSON(
 | `p_daysToKeep` | `days_to_keep` | `NULL` | `NULL` = keine automatische Bereinigung. Sonst werden beim Start abgeschlossene Prozesse gleichen Namens, die älter als die angegebene Anzahl Tage sind, samt Logs und Metriken gelöscht (außer Prozesse mit `procImmortal = 1`) |
 | `p_tabNameMaster` | `tabname_master` | `'LILAM'` | Präfix für die PROC-, LOG- und MON-Tabellen |
 | `p_baselineScope` | `baseline_scope` | `NULL` | Bezugsrahmen für die Durchschnittswerte (EWMA) von Traces und Events: `NULL` = Prozessname, d.h. gemeinsam über alle Prozesse mit diesem Namen; `'#NONE'` = nur innerhalb des einzelnen Prozesses; sonst ein frei gewählter Name, der auch von mehreren Anwendungen geteilt werden kann |
+| `p_syncLevel` | `sync_level` | `logLevelError` | Einträge bis zu diesem Level werden synchron geschrieben, alle anderen gepuffert. `logLevelWarn` macht auch `WARN` synchron, `logLevelSilent` schaltet das synchrone Schreiben ganz ab. Siehe [Synchrones Schreiben](#synchrones-schreiben-p_synclevel) |
 
 **Rückgabewert:** `NUMBER`, die Process ID.
 
@@ -334,6 +337,9 @@ l_processId := lilam.new_session('IMPORT_CUSTOMERS', p_baselineScope => '#NONE')
 
 -- In-Session mit den Regeln der Gruppe BATCH
 l_processId := lilam.new_session('IMPORT_CUSTOMERS', p_groupName => 'BATCH');
+
+-- auch WARN sofort und dauerhaft schreiben
+l_processId := lilam.new_session('IMPORT_CUSTOMERS', p_syncLevel => lilam.logLevelWarn);
 
 -- entkoppelt: beliebiger verfügbarer Server bzw. Server der Gruppe BATCH
 l_processId := lilam.server_new_session('IMPORT_CUSTOMERS');
@@ -615,17 +621,27 @@ PROCEDURE DEBUG(
 
 `ERROR` besitzt die höchste Priorität und wird immer gespeichert, sofern das Logging nicht vollständig mit `logLevelSilent` deaktiviert wurde.
 
-> [!IMPORTANT]
-> **Wann ein Eintrag in der Tabelle steht, hängt vom Level und vom Modus ab.**
-> - **In-Session:** `ERROR` wird geschrieben und in einer autonomen Transaktion committet, bevor der Aufruf zurückkehrt. Dabei schreibt LILAM auch alle anderen gepufferten Daten der Datenbanksession weg. `WARN`, `INFO` und `DEBUG` bleiben bis zu etwa 1,5 Sekunden im Puffer, länger, wenn die Session LILAM nicht mehr aufruft.
-> - **Entkoppelt:** Auch `ERROR` kehrt sofort zurück. Der Server schreibt die Meldung, sobald er sie aus der Pipe liest (gemessen: 20–30 ms). Fällt der LILAM-Server oder die Instanz vorher aus, geht der Eintrag verloren.
-> - Endet eine Session ohne `CLOSE_SESSION` oder `FINAL_RESCUE`, sind die gepufferten Einträge verloren. Rufe `CLOSE_SESSION` deshalb im zentralen Exception-Handler auf.
->
-> Details, Messwerte und Ausfallszenarien stehen in [Architecture and Concepts](architecture%20and%20concepts.md#when-is-a-log-entry-stored-write-latency-per-level).
+Wann ein Eintrag tatsächlich in der Tabelle steht, beschreibt [Synchrones Schreiben](#synchrones-schreiben-p_synclevel).
 
 Interne Fehler behandelt LILAM grundsätzlich still und protokolliert sie in `LILAM_LOG_INTERNAL`; die Anwendung erhält keine Exception. Ist `logLevelDebug` aktiv, schreibt LILAM solche Fehler zusätzlich als `ERROR` in das Log des betroffenen Prozesses.
 
 Die vollständige Zuordnung findest Du unter [Log-Level](#log-level).
+
+### Synchrones Schreiben (p_syncLevel)
+
+LILAM puffert Log-Einträge aus Performancegründen. Einträge bis zum **Sync-Level** des Prozesses werden dagegen sofort und dauerhaft geschrieben. Der Sync-Level wird mit `p_syncLevel` beim Start des Prozesses festgelegt; Standard ist `logLevelError`.
+
+| Modus | Einträge bis zum Sync-Level | Alle anderen Einträge |
+| --- | --- | --- |
+| In-Session | werden in einer autonomen Transaktion committet, bevor der Aufruf zurückkehrt. Dabei schreibt LILAM auch alle anderen gepufferten Daten der Datenbanksession weg. | bleiben bis zu etwa 1,5 Sekunden im Puffer, länger, wenn die Session LILAM nicht mehr aufruft |
+| Entkoppelt | schreibt der **Client selbst** in einer autonomen Transaktion, bevor der Aufruf zurückkehrt. Diese Einträge haben in der Spalte `NO` den Wert `-1`. Der Server erhält die Meldung trotzdem (Regeln, Alerts), schreibt sie aber nicht noch einmal. | gehen per Pipe an den Server und werden dort gepuffert |
+
+Ein synchron geschriebener Eintrag übersteht damit auch einen Abbruch der Session und im entkoppelten Modus den Ausfall des LILAM-Servers. Gepufferte Einträge sind verloren, wenn eine Session ohne `CLOSE_SESSION` oder `FINAL_RESCUE` endet. Rufe `CLOSE_SESSION` deshalb im zentralen Exception-Handler auf.
+
+> [!NOTE]
+> Weil die Spalte `NO` bei direkt geschriebenen Einträgen `-1` ist, sortiere im entkoppelten Modus nach `SESSION_TIME`, nicht nach `NO`.
+
+Ein synchroner Aufruf kostet auf dem Testsystem etwa 1,5 bis 3,5 ms statt rund 0,1 ms, vor allem für den Commit. Details, Messwerte und Ausfallszenarien stehen in [Architecture and Concepts](architecture%20and%20concepts.md#when-is-a-log-entry-stored-sync-level).
 
 ### Function GET_COUNTER_WARN / GET_COUNTER_ERROR
 
@@ -980,7 +996,8 @@ TYPE t_session_init IS RECORD (
   procImmortal  PLS_INTEGER := 0,
   tabNameMaster VARCHAR2(100) DEFAULT 'LILAM',
   baselineScope VARCHAR2(100),                  -- NULL = Prozessname, '#NONE' = nur pro Prozess
-  groupName     VARCHAR2(50)                    -- Gruppe für das aktive Rule Set; NULL = keine Regeln
+  groupName     VARCHAR2(50),                   -- Gruppe für das aktive Rule Set; NULL = keine Regeln
+  syncLevel     PLS_INTEGER := logLevelError    -- bis zu diesem Level synchron schreiben
 );
 ```
 
