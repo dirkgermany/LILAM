@@ -3453,7 +3453,11 @@ AS
         l_timestamp TIMESTAMP(6);
     begin
         l_timestamp := coalesce(p_timestamp, SYSTIMESTAMP);
-        writeEventToMonitorBuffer (p_processId, p_actionName, p_contextName, l_timestamp);     
+        writeEventToMonitorBuffer (p_processId, p_actionName, p_contextName, l_timestamp);
+        -- In-session: trigger the time-controlled write-back like log_any (there is no timer here)
+        if not is_remote(p_processId) then
+            SYNC_ALL_DIRTY();
+        end if;
     end;
     --------------------------------------------------------------------------
 
@@ -3476,6 +3480,10 @@ AS
     begin
         l_timestamp := coalesce(p_timestamp, SYSTIMESTAMP);
         writeTraceToMonitorBuffer(p_processId, p_actionName, p_contextName, l_timestamp);
+        -- In-session: trigger the time-controlled write-back like log_any (there is no timer here)
+        if not is_remote(p_processId) then
+            SYNC_ALL_DIRTY();
+        end if;
     end;
 
     --------------------------------------------------------------------------

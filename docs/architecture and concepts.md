@@ -115,7 +115,7 @@ The server reports log level and sync level of a process to the client when the 
 > [!NOTE]
 > Column `NO` is the running number that the server assigns per process. Entries written directly by a decoupled client have `NO = -1`.
 
-The time-based flush has no background timer: it is checked only when the session calls LILAM again. A session that stops calling LILAM keeps its buffer, however long it waits.
+The time-based flush has no background timer: it is checked only when the session calls LILAM again. In in-session mode every log call as well as `MARK_EVENT` and `TRACE_STOP` triggers this check (`TRACE_START` does not), so pure monitoring applications that never log are flushed as well. The check runs at most every 500 ms per database session; cross-process baselines are synchronized at most every 1.5 s. A session that stops calling LILAM keeps its buffer, however long it waits: **in in-session mode `CLOSE_SESSION` is the only guaranteed write point.** With a connection pool (APEX/ORDS) or processes that span several page requests or database sessions (e.g. AJAX pages that only trace, while a final page calls `CLOSE_SESSION`), use the decoupled server together with the dispatcher.
 
 Measured on Oracle 23.26 Free (2 CPU threads), test schema `LILAM_TEST`:
 
@@ -322,7 +322,7 @@ flowchart LR
         B1 --> G1{"Process has<br/>a group?"}
         G1 -- yes --> R1["Rule evaluation in the application session<br/>rule set of the group, checked for changes<br/>at most every 15 s"]
         R1 -- "rule matches" --> AL1[("LILAM_ALERTS + DBMS_ALERT<br/>synchronous, autonomous transaction")]
-        C1 --> D1{"Flush due?<br/>1500 ms, 50,000 entries,<br/>ERROR or CLOSE_SESSION"}
+        C1 --> D1{"Flush due?<br/>checked on log_any, MARK_EVENT, TRACE_STOP:<br/>1500 ms, 50,000 entries,<br/>ERROR or CLOSE_SESSION"}
         D1 -- yes --> E1["SYNC_ALL_DIRTY<br/>FORALL + COMMIT<br/>(autonomous transaction)"]
         D1 -- no --> B1
         E1 --> T1[("Tables<br/>NAME_PROC / _LOG / _MON")]
