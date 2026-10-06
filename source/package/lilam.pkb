@@ -2684,6 +2684,7 @@ AS
 
         TYPE t_key_lookup IS TABLE OF VARCHAR2(250) INDEX BY VARCHAR2(250);
         l_lookup     t_key_lookup;
+        l_ins_sorted t_key_lookup;
 
         FUNCTION dbKey(p_scopeId NUMBER, p_action VARCHAR2, p_dbContext VARCHAR2) RETURN VARCHAR2 IS
         BEGIN
@@ -2741,7 +2742,13 @@ AS
             RETURN;
         END IF;
 
-        -- 2. Delta merge as bulk update
+        -- Lock order: several servers sync the same baselines. Whether a key is updated (step 2) or inserted
+        -- (step 3) depends on when each session loaded it, so one session may update a row that another one
+        -- inserts. Steps 2 and 3 therefore run in separate transactions (commit after step 2), and each step
+        -- locks its rows in ascending key order. A session never holds locks of both steps at the same time,
+        -- so two sessions cannot wait for each other crosswise (ORA-00060, load test BATCHSTART run 1946).
+
+        -- 2. Delta merge as bulk update (key order: g_baselines is iterated in ascending key order)
         --    A negative result (extremely opposing parallel writers) is replaced by the own value.
         IF l_upd_keys.COUNT > 0 THEN
             FORALL i IN 1 .. l_upd_keys.COUNT
@@ -2761,7 +2768,33 @@ AS
                     l_ins_keys.EXTEND; l_ins_keys(l_ins_keys.LAST) := l_upd_keys(i);
                 END IF;
             END LOOP;
+
+            -- Release the row locks before step 3 and take over the overall state at once:
+            -- if step 3 fails, these deltas are committed and must not be written again
+            COMMIT;
+            FOR i IN 1 .. l_ret_scope.COUNT LOOP
+                l_dbKey := dbKey(l_ret_scope(i), l_ret_action(i), l_ret_ctx(i));
+                IF l_lookup.EXISTS(l_dbKey) THEN
+                    takeOver(l_lookup(l_dbKey), l_ret_avg(i), l_ret_cnt(i));
+                END IF;
+            END LOOP;
         END IF;
+
+        IF l_ins_keys.COUNT = 0 THEN
+            RETURN;
+        END IF;
+
+        -- Step 3 in ascending key order as well (re-created entries from step 2 were appended at the end)
+        l_ins_sorted.DELETE;
+        FOR i IN 1 .. l_ins_keys.COUNT LOOP
+            l_ins_sorted(l_ins_keys(i)) := l_ins_keys(i);
+        END LOOP;
+        l_ins_keys.DELETE;
+        l_key := l_ins_sorted.FIRST;
+        WHILE l_key IS NOT NULL LOOP
+            l_ins_keys.EXTEND; l_ins_keys(l_ins_keys.LAST) := l_key;
+            l_key := l_ins_sorted.NEXT(l_key);
+        END LOOP;
 
         -- 3. Create new entries; if another session creates them in parallel, a weighted average is used
         FOR i IN 1 .. l_ins_keys.COUNT LOOP
@@ -2795,14 +2828,7 @@ AS
 
         COMMIT;
 
-        -- 4. Take over the overall state from the DB (new base for the next delta)
-        FOR i IN 1 .. l_ret_scope.COUNT LOOP
-            l_dbKey := dbKey(l_ret_scope(i), l_ret_action(i), l_ret_ctx(i));
-            IF l_lookup.EXISTS(l_dbKey) THEN
-                takeOver(l_lookup(l_dbKey), l_ret_avg(i), l_ret_cnt(i));
-            END IF;
-        END LOOP;
-
+        -- 4. Take over the overall state from the DB (new base for the next delta; updated entries in step 2)
         FOR i IN 1 .. l_ins_keys.COUNT LOOP
             takeOver(l_ins_keys(i), l_ins_avg(i), l_ins_cnt(i));
         END LOOP;
