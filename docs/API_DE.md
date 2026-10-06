@@ -788,7 +788,7 @@ Ein Server nutzt zwei Pipes:
 
 Sind die ersten beiden Kriterien gleich, wechselt der Aufrufer zwischen den Servern ab (Round Robin je Datenbanksession). So verteilen sich auch schnell nacheinander angelegte Prozesse gleichmäßig. Dispatcher werden nie gewählt.
 
-**Server-Loop und Eco-Modus:** Nach einer Nachricht prüft der Server die Pipe einmal ohne zu warten. Ist sie leer, wartet er 1 s, dann 2 s, dann jeweils 5 s; eine eintreffende Nachricht weckt ihn sofort. `DBMS_PIPE` kennt nur ganze Sekunden, daher die ganzzahligen Stufen. Housekeeping (Registry mit Nachrichtenrate, Schreiben der Puffer) läuft alle 500 ms, auch während der Server arbeitet; im Leerlauf beim nächsten Aufwachen.
+**Server-Loop und Eco-Modus:** Nach einer Nachricht prüft der Server die Pipe einmal ohne zu warten. Ist sie leer, wartet er 1 s, dann 2 s, dann jeweils 5 s; eine eintreffende Nachricht weckt ihn sofort. `DBMS_PIPE` kennt nur ganze Sekunden, daher die ganzzahligen Stufen. Housekeeping (Registry mit Nachrichtenrate, Schreiben der Puffer) läuft alle 500 ms, auch während der Server arbeitet; im Leerlauf beim nächsten Aufwachen. Ist die Pipe leer und hält ein Worker noch ungeschriebene Logs, Metriken oder Prozessdaten, schreibt er sie sofort (Leerlauf-Flush, höchstens alle 200 ms; nie auf einem Dispatcher). Nach einer Pause stehen neue Einträge dadurch meist nach wenigen bis einigen hundert Millisekunden in der Tabelle.
 
 | API | Zweck |
 | --- | --- |

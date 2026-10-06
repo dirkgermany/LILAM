@@ -738,6 +738,20 @@ create or replace package body lt as
         lilam.info(p_pid, 'wake after ' || p_idle_s || ' s');
         lilam.mark_event(p_pid, 'LT_WAKE');
         metric(p_run_id, 'wake_call_ms_' || p_idle_s || 's', ms_since(l_t), 'ms');
+
+        -- Sichtbarkeit: ab dem Ende des Aufrufs, bis das INFO in LILAM_LOG steht (alle 10 ms, max. 30 s)
+        declare
+            l_tv timestamp := systimestamp;
+            l_n  number := 0;
+        begin
+            loop
+                execute immediate 'select count(*) from lilam_log where process_id = :1 and info = :2'
+                    into l_n using p_pid, 'wake after ' || p_idle_s || ' s';
+                exit when l_n > 0 or ms_since(l_tv) > 30000;
+                dbms_session.sleep(0.01);
+            end loop;
+            metric(p_run_id, 'wake_visible_ms_' || p_idle_s || 's', case when l_n > 0 then ms_since(l_tv) else -1 end, 'ms');
+        end;
         if p_new_session then
             l_t := systimestamp;
             l_pid := open_process(p_mode, p_proc_name || '_N');
@@ -1149,6 +1163,10 @@ create or replace package body lt as
             l_ms := wait_count(l_prefix, 'LOG', l_exp, 30);
             check_that(l_run, 'Nach ' || p_idle(i) || ' s Ruhe: Logs persistiert', l_ms >= 0, l_ms || ' ms');
             if l_ms >= 0 then metric(l_run, 'wake_persist_ms_' || p_idle(i) || 's', l_ms, 'ms'); end if;
+            -- Sichtbarkeit des INFO ab dem Ende des Aufrufs (in wake_call gemessen): hoechstens 1 s
+            select max(value) into l_ms from lt_metric where run_id = l_run and metric = 'wake_visible_ms_' || p_idle(i) || 's';
+            check_that(l_run, 'Nach ' || p_idle(i) || ' s Ruhe: INFO nach hoechstens 1 s sichtbar',
+                       l_ms between 0 and 1000, nvl(to_char(l_ms), 'keine Messung') || ' ms');
         end loop;
 
         if p_mode = c_dispatcher then

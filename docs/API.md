@@ -785,7 +785,7 @@ A server uses two pipes:
 
 If the first two criteria are equal, the caller alternates between the servers (round robin per database session). This spreads even processes created in quick succession evenly. Dispatchers are never chosen.
 
-**Server loop and eco mode:** After a message, the server checks the pipe once without waiting. If it is empty, it waits 1 s, then 2 s, then 5 s each time; an arriving message wakes it immediately. `DBMS_PIPE` only knows whole seconds, hence the integer steps. Housekeeping (registry with message rate, writing the buffers) runs every 500 ms, also while the server is busy; when idle, at the next wake-up.
+**Server loop and eco mode:** After a message, the server checks the pipe once without waiting. If it is empty, it waits 1 s, then 2 s, then 5 s each time; an arriving message wakes it immediately. `DBMS_PIPE` only knows whole seconds, hence the integer steps. Housekeeping (registry with message rate, writing the buffers) runs every 500 ms, also while the server is busy; when idle, at the next wake-up. If the pipe is empty and a worker still holds unwritten logs, metrics or process data, it writes them at once (idle flush, at most every 200 ms; never on a dispatcher). After a pause, new entries therefore usually reach the table within a few to a few hundred milliseconds.
 
 | API | Purpose |
 | --- | --- |
