@@ -906,7 +906,12 @@ VALUES ('METRO', 'METRO_RULES', 2, systimestamp, 'Dirk', '{"rules":[ ... ]}');
 exec LILAM.SERVER_UPDATE_RULES('METRO', 'METRO_RULES', 2);
 ```
 
-Aufbau der Rule Sets und Operatoren: [Rules Engine](../rules/README.md).
+Aufbau der Rule Sets und Operatoren: [Rules Engine](../rules/README.md). Einige Punkte vorab:
+
+- **Logging-Regeln:** Trigger `LOGGING` kennt `SEVERITY` (genau dieser Level) und `LOG_CONTAINS` mit dem Wert `TEXT` oder `LEVEL|TEXT`: Die Log-Meldung enthält den Text (ohne Unterscheidung von Groß-/Kleinschreibung), wahlweise nur für diesen Level. Der erste Teil gilt nur als Level, wenn er `ERROR`, `WARN`, `MONITOR`, `INFO` oder `DEBUG` ist; sonst ist der ganze Wert der Text (max. 100 Zeichen).
+- **`PRECEDED_BY`, `PRECEDED_BY_WITHIN_SECS`:** Die Reihenfolge wird beim Start einer Aktion geprüft (`MARK_EVENT`, `TRACE_START`, `PROCESS_UPDATE`, `PROCESS_STOP`). Mit `TRACE_STOP` wird die Regel beim Laden abgelehnt, denn dort wäre der Vorgänger meist das eigene `TRACE_START`.
+- **`AVG_DEVIATION_PCT`:** Solange der Durchschnitt unter 1 ms liegt (Messauflösung), wird nicht ausgewertet.
+- **Keine zeitgesteuerte Prüfung:** Regeln werden ausgewertet, wenn ein Signal eintrifft. Ausbleibende Signale (ein hängender Prozess, ein Event, das nie kommt) werden nicht erkannt.
 
 ### Regeln im INSESSION-Modus
 Auch Prozesse im INSESSION-Modus werten Regeln aus, wenn `NEW_SESSION` eine Gruppe erhält (`p_groupName` bzw. `t_session_init.groupName`). Sie nutzen dann dasselbe aktive Rule Set der Gruppe aus `LILAM_RULES` wie die Server dieser Gruppe. Ohne Gruppe gibt es keine Regeln.

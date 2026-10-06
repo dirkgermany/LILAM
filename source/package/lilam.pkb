@@ -1098,7 +1098,9 @@ AS
     as
     begin
         -- If there is no trend yet (initial start / warm-up), we cannot validate anything.
-        if p_monitor_rec.avg_action_time is null or p_monitor_rec.avg_action_time = 0 
+        -- STABILITY: measurement resolution is 1 ms; below that a percentage is noise
+        -- (e.g. avg 0.0005 ms and 1 ms = 200,000 %) => no evaluation.
+        if p_monitor_rec.avg_action_time is null or p_monitor_rec.avg_action_time < 1
            or p_monitor_rec.used_time is null or p_metricFactor is null then
             return TRUE; 
         end if;
@@ -1283,6 +1285,11 @@ AS
                         WHEN 'SEVERITY' THEN
                             fire := p_list(i).cond_upper = upper(p_ctx.context_name);
 
+                        WHEN 'LOG_CONTAINS' THEN
+                            -- cond_context: level (NULL = any level); cond_upper: text
+                            fire := (p_list(i).cond_context IS NULL OR p_list(i).cond_context = upper(p_ctx.context_name))
+                                AND instr(upper(p_ctx.info), p_list(i).cond_upper) > 0;
+
                         -- =====================================================
                         -- COMMON OPERATORS
                         -- =====================================================
@@ -1461,10 +1468,14 @@ AS
     
     
     -- Method used for mapping to the central evaluate method
-    PROCEDURE evaluateRules(p_monitorRec t_monitor_buffer_rec, p_trigger VARCHAR2)
+    -- p_info: log text (LOGGING only, for LOG_CONTAINS)
+    PROCEDURE evaluateRules(p_monitorRec t_monitor_buffer_rec, p_trigger VARCHAR2, p_info VARCHAR2 := NULL)
     AS
+        l_ctx t_eval_context_rec;
     BEGIN
-        evaluateRules_internal(mapMonitorRecToContextRec(p_monitorRec), p_trigger, p_check_context => TRUE);
+        l_ctx      := mapMonitorRecToContextRec(p_monitorRec);
+        l_ctx.info := substr(p_info, 1, 4000);
+        evaluateRules_internal(l_ctx, p_trigger, p_check_context => TRUE);
         -- Remember the predecessor for PRECEDED_BY: only events and traces, no logs
         IF p_trigger != C_LOGGING THEN
             g_last_action_per_process(p_monitorRec.process_id).action_name  := p_monitorRec.action_name;
@@ -1783,6 +1794,20 @@ AS
             end if;
     end;
 
+    -- Removes obsolete columns/indexes of old installations. Same race as add_columns:
+    -- ORA-01418 (index does not exist) and ORA-00904 (column does not exist) only mean
+    -- another session was faster. STABILITY: never raises, the remaining steps continue.
+    procedure drop_obsolete(p_sqlStmt varchar2)
+    as
+    begin
+        execute immediate p_sqlStmt;
+    exception
+        when OTHERS then
+            if sqlcode not in (-1418, -904) then
+                logLilamErr(sqlCode, sqlErrM, 'drop_obsolete', 'EXECUTE IMMEDIATE');
+            end if;
+    end;
+
     --------------------------------------------------------------------------
 
     -- Checks if a database sequence exists
@@ -1996,6 +2021,12 @@ AS
             if l_regCols = 0 then
                 add_columns('ALTER TABLE ' || C_LILAM_SERVER_REGISTRY || ' ADD (msg_rate NUMBER DEFAULT 0, rate_ts TIMESTAMP(3))');
             end if;
+            -- Remove columns of old installations (rule sets are now assigned per server group)
+            for c in (select column_name from user_tab_columns
+                       where table_name = upper(C_LILAM_SERVER_REGISTRY)
+                         and column_name in ('RULE_SET_NAME', 'SET_IN_USE')) loop
+                drop_obsolete('ALTER TABLE ' || C_LILAM_SERVER_REGISTRY || ' DROP COLUMN ' || c.column_name);
+            end loop;
         end if;
 
         if not objectExists(C_LILAM_RULES_TABLE, 'TABLE') then
@@ -2093,6 +2124,10 @@ AS
         end if ;
 
         -- Rule sets: unique per group/name/version; at most one active per group
+        -- Old installations: remove the former index (replaced by idx_lilam_rules_grp)
+        if objectExists('IDX_LILAM_RULES', 'INDEX') then
+            drop_obsolete('DROP INDEX idx_lilam_rules');
+        end if;
         if not objectExists('idx_lilam_rules_grp', 'INDEX') then
             run_sql('CREATE UNIQUE INDEX idx_lilam_rules_grp ON ' || C_LILAM_RULES_TABLE || ' (group_name, set_name, version)');
         end if ;
@@ -4371,7 +4406,7 @@ AS
             v_dummyMonRec.monitor_type := C_MON_TYPE_LOG;
             v_dummyMonRec.action_name := C_LOGGING;
             v_dummyMonRec.context_name := logLevelToEnum(p_level);
-            evaluateRules(v_dummyMonRec, C_LOGGING);
+            evaluateRules(v_dummyMonRec, C_LOGGING, l_logText);
         end if;
 
         -- Entries up to the sync level of the process (default: ERROR) must be written immediately,
@@ -6077,12 +6112,14 @@ AS
             -- Operator: allowed triggers
             l_ok := CASE
                 WHEN l_op IN ('ON_START', 'ON_STOP', 'ON_EVENT', 'ON_UPDATE') THEN l_trig != C_LOGGING
-                WHEN l_op = 'SEVERITY' THEN l_trig = C_LOGGING
+                WHEN l_op IN ('SEVERITY', 'LOG_CONTAINS') THEN l_trig = C_LOGGING
                 WHEN l_op IN ('MAX_DURATION_MS', 'AVG_DEVIATION_PCT') THEN l_trig IN (C_MARK_EVENT, C_TRACE_STOP)
                 WHEN l_op = 'MAX_GAP_SECONDS' THEN l_trig IN (C_MARK_EVENT, C_TRACE_START)
                 WHEN l_op = 'MAX_OCCURRENCE' THEN l_trig IN (C_MARK_EVENT, C_TRACE_STOP, C_PROCESS_UPDATE, C_PROCESS_STOP)
+                -- No TRACE_STOP: the order is decided when the action starts;
+                -- at TRACE_STOP the predecessor is usually the own TRACE_START.
                 WHEN l_op IN ('PRECEDED_BY', 'PRECEDED_BY_WITHIN_SECS') THEN
-                     l_trig IN (C_MARK_EVENT, C_TRACE_START, C_TRACE_STOP, C_PROCESS_UPDATE, C_PROCESS_STOP)
+                     l_trig IN (C_MARK_EVENT, C_TRACE_START, C_PROCESS_UPDATE, C_PROCESS_STOP)
                 WHEN l_op = 'RUNTIME_EXCEEDED' THEN l_trig = C_PROCESS_UPDATE
                 WHEN l_op = 'MAX_RUNTIME_EXCEEDED' THEN l_trig = C_PROCESS_STOP
                 WHEN l_op IN ('STEPS_LEFT_HIGH', 'SUCCESS_RATE_LOW', 'STATUS_EQUALS', 'INFO_CONTAINS') THEN
@@ -6109,6 +6146,21 @@ AS
                     IF l_rule.cond_upper IS NULL OR length(l_rule.cond_upper) > 100 THEN
                         RETURN fail('INFO_CONTAINS needs a text (max. 100)');
                     END IF;
+                WHEN l_op = 'LOG_CONTAINS' THEN
+                    -- TEXT or LEVEL|TEXT; the first part is a level only if it is a known log level,
+                    -- otherwise the whole value is the text. Level in cond_context, text in cond_upper.
+                    l_parts := instr(r.value, '|');
+                    IF l_parts > 0
+                       AND upper(trim(substr(r.value, 1, l_parts - 1))) IN ('ERROR', 'WARN', 'MONITOR', 'INFO', 'DEBUG') THEN
+                        l_rule.cond_context := upper(trim(substr(r.value, 1, l_parts - 1)));
+                    ELSE
+                        l_parts := 0;
+                    END IF;
+                    -- check the length before the assignment (cond_upper holds 100)
+                    IF coalesce(length(substr(r.value, l_parts + 1)), 0) NOT BETWEEN 1 AND 100 THEN
+                        RETURN fail('LOG_CONTAINS needs TEXT or LEVEL|TEXT (text max. 100)');
+                    END IF;
+                    l_rule.cond_upper := upper(substr(r.value, l_parts + 1));
                 WHEN l_op IN ('PRECEDED_BY', 'PRECEDED_BY_WITHIN_SECS') THEN
                     -- PRECEDED_BY: ACTION[|CONTEXT]; PRECEDED_BY_WITHIN_SECS: ACTION[|CONTEXT]|SECONDS
                     l_parts := CASE WHEN r.value IS NULL THEN 0 ELSE regexp_count(r.value, '\|') + 1 END;

@@ -239,16 +239,23 @@ Rules for other actions cost nothing. Multiple rules can be assigned to the same
 | :-------------- | :-------------------- | :---------------------------------------------- | :-------------------------------------------- |
 | **Execution**   | `ON_EVENT`, `ON_START`, `ON_STOP` | trigger fired                       | Trigger an orchestrator as soon as the signal hits. |
 | **Duration**    | `MAX_DURATION_MS`     | `used_time > value` (MARK_EVENT, TRACE_STOP)    | Absolute time limit for a specific action.    |
-| **Variance**    | `AVG_DEVIATION_PCT`   | `used_time > avg_time * (1 + value/100)` (MARK_EVENT, TRACE_STOP) | Relative deviation from moving average. |
+| **Variance**    | `AVG_DEVIATION_PCT`   | `used_time > avg_time * (1 + value/100)` (MARK_EVENT, TRACE_STOP); not evaluated while `avg_time` < 1 ms | Relative deviation from moving average. |
 | **Frequency**   | `MAX_OCCURRENCE`      | `action_count > value` (MARK_EVENT, TRACE_STOP) | Flood protection / infinite loop detection.   |
 | **Interval**    | `MAX_GAP_SECONDS`     | time since previous event (MARK_EVENT) or end of previous trace (TRACE_START) > value | Detect stall between two signals. |
-| **Dependency**  | `PRECEDED_BY`         | last event/trace of the process ≠ `ACTION[\|CONTEXT]` | Validates predecessor.                  |
+| **Dependency**  | `PRECEDED_BY`         | last event/trace of the process ≠ `ACTION[\|CONTEXT]` (MARK_EVENT, TRACE_START; not TRACE_STOP) | Validates predecessor.                  |
 | **Dependency**  | `PRECEDED_BY_WITHIN_SECS` | like `PRECEDED_BY`, plus maximum delay in seconds | Validates predecessor and max. delay.   |
 
 #### Logging
-**Trigger:** LOGGING. Operator `SEVERITY` with the value `ERROR`, `WARN`, `MONITOR`, `INFO` or `DEBUG` fires for log messages of exactly this level.
+**Trigger:** LOGGING.
 
-Only events and traces count as predecessors for `PRECEDED_BY`, not log messages. Rules are evaluated when a signal arrives; there is no timer-based evaluation.
+| Metric          | Operator Name (JSON)  | Technical Condition                             | Use Case                                      |
+| :-------------- | :-------------------- | :---------------------------------------------- | :-------------------------------------------- |
+| **Level**       | `SEVERITY`            | level = `value` (`ERROR`, `WARN`, `MONITOR`, `INFO`, `DEBUG`) | React to every message of a level. |
+| **Log Text**    | `LOG_CONTAINS`        | `UPPER(log text)` contains `UPPER(TEXT)`; with `LEVEL\|TEXT` only for this level | Search log messages for keywords. |
+
+For `LOG_CONTAINS` the first part of the value counts as a level only if it is one of the five levels; otherwise the whole value is the text (max. 100 characters).
+
+Only events and traces count as predecessors for `PRECEDED_BY`, not log messages. The order is checked when an action starts; `PRECEDED_BY*` with `TRACE_STOP` is rejected at load time, because there the predecessor would usually be the trace's own `TRACE_START`. Rules are evaluated when a signal arrives; there is no timer-based evaluation, so missing signals (a hanging process, an event that never arrives) are not detected.
 
 ### JSON Structure
 The JSON object is divided into a header for metadata and an array of individual rules. Alert throttling is managed in seconds:

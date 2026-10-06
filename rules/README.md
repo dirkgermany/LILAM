@@ -113,11 +113,12 @@ A server checks a rule set completely before it uses it: required fields, length
 | :-- | :-- | :-- | :--
 | ON_START, ON_STOP, ON_EVENT, ON_UPDATE | – | all except LOGGING | always (the trigger itself is the condition)
 | SEVERITY | `ERROR`, `WARN`, `MONITOR`, `INFO`, `DEBUG` | LOGGING | a log message with exactly this level arrives
+| LOG_CONTAINS | `TEXT` or `LEVEL\|TEXT` | LOGGING | a log message contains the text (case-insensitive), optionally only for this level (`ERROR`, `WARN`, `MONITOR`, `INFO`, `DEBUG`; otherwise the whole value is the text)
 | MAX_DURATION_MS | milliseconds | MARK_EVENT, TRACE_STOP | duration of the trace, or for events the time since the previous event of the same action, is greater than the value
-| AVG_DEVIATION_PCT | `pct[\|warmup[\|alpha]]` | MARK_EVENT, TRACE_STOP | duration is more than `pct` percent above the moving average (EWMA), see below
+| AVG_DEVIATION_PCT | `pct[\|warmup[\|alpha]]` | MARK_EVENT, TRACE_STOP | duration is more than `pct` percent above the moving average (EWMA); no evaluation while the average is below 1 ms (measurement resolution), see below
 | MAX_OCCURRENCE | count | MARK_EVENT, TRACE_STOP, PROCESS_UPDATE, PROCESS_STOP | the action occurred more often than the value within the process (`ACTION_COUNT`); for processes: `STEPS_DONE` > value
 | MAX_GAP_SECONDS | seconds | MARK_EVENT, TRACE_START | time since the previous event (MARK_EVENT) or since the end of the previous trace (TRACE_START) of the same action is greater than the value
-| PRECEDED_BY | `ACTION` or `ACTION\|CONTEXT` | MARK_EVENT, TRACE_START, TRACE_STOP, PROCESS_UPDATE, PROCESS_STOP | the previous signal of the process was **not** the expected action (and context, if given)⁴
+| PRECEDED_BY | `ACTION` or `ACTION\|CONTEXT` | MARK_EVENT, TRACE_START, PROCESS_UPDATE, PROCESS_STOP | the previous signal of the process was **not** the expected action (and context, if given)⁴
 | PRECEDED_BY_WITHIN_SECS | `ACTION\|SECONDS` or `ACTION\|CONTEXT\|SECONDS` | like PRECEDED_BY | like PRECEDED_BY, or the expected predecessor ended more than the given seconds ago
 | RUNTIME_EXCEEDED | milliseconds | PROCESS_UPDATE | the running process is older than the value
 | MAX_RUNTIME_EXCEEDED | milliseconds | PROCESS_STOP | the total runtime of the process is greater than the value
@@ -126,7 +127,7 @@ A server checks a rule set completely before it uses it: required fields, length
 | STATUS_EQUALS | number | PROCESS_START, PROCESS_UPDATE, PROCESS_STOP | process status = value
 | INFO_CONTAINS | text | PROCESS_START, PROCESS_UPDATE, PROCESS_STOP | process info contains the text (case-insensitive)
 
-⁴ Only events and traces (start and stop) count as predecessors, log messages do not. Without a context in the value, any context of the expected action is accepted.
+⁴ Only events and traces (start and stop) count as predecessors, log messages do not. Without a context in the value, any context of the expected action is accepted. The order is checked when the action starts, not at TRACE_STOP (there the predecessor would usually be the own TRACE_START); loading rejects `PRECEDED_BY*` with TRACE_STOP.
 
 > [!NOTE]
 > Rules are evaluated when a signal arrives. LILAM has no timer-based evaluation: a process that hangs without sending signals, or an event that never arrives ("B must follow A within X seconds" when B never comes), is not detected. The order "B follows A within X seconds" can be checked when B arrives, with `PRECEDED_BY_WITHIN_SECS` on B.
