@@ -75,7 +75,7 @@ Gleiches Diagnoseverfahren (`lt_diag_sel_burst`), Skript `2026-10-06_serverauswa
 | 1913 | FEATURES/RUECKSCHREIBUNG | OK 21/21 | 43,2 s |
 | 1914 | FEATURES/FEHLERFAELLE | OK 12/12 | 9,7 s |
 
-In keinem Lauf gab es interne LILAM-Fehler (höchste ID in `LILAM_LOG_INTERNAL` bleibt 62, das sind die beiden ORA-01430 aus 1882).
+Interne LILAM-Fehler gab es nur dort, wo sie erwartet sind: ID 61–62 sind die beiden ORA-01430 aus 1882 (vor der Korrektur der Migration). ID 63–65 hat FEHLERFAELLE (1914) absichtlich ausgelöst (kein Server, verfallenes NEW_SESSION), wie schon bei früheren Läufen (ID 48–50). Alle übrigen Läufe meldeten 0 interne Fehler.
 
 ### Messwerte im Vergleich zur Komplettsuite vor der Änderung (run 1545–1565)
 
