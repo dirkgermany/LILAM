@@ -48,13 +48,13 @@ Logtexte sind 120 Zeichen lang (`p_text_len`).
 | Kriterium | Grenze |
 |---|---|
 | Clients ungebremst | erreicht ≥ 95 % der angebotenen Aufrufe |
-| Anwendung unbeeinträchtigt | kein normaler Aufruf > 100 ms (ohne ERROR, NEW_SESSION, CLOSE_SESSION) |
+| Anwendung unbeeinträchtigt | höchstens 0,1 % der normalen Aufrufe > 100 ms (`p_max_slow_pct`; ohne ERROR, NEW_SESSION, CLOSE_SESSION) und keiner > 1 s |
 | ERROR | kein ERROR-Aufruf > 500 ms (`p_max_err_ms`; Direktschreiben mit Commit, siehe H6) |
 | CLOSE_SESSION | keine Antwort des Servers ausgeblieben (Client wartet 1 s, siehe H5) |
 | LILAM hält mit | Rückstau wächst in der zweiten Stufenhälfte nicht dauerhaft |
 | Sichtbarkeit | Verzug der Probe-Logs ≤ 5 s (`p_max_lag_ms`) |
 | Prozesse | jedes NEW_SESSION liefert eine gültige ID |
-| Vollständigkeit | nach Lastende innerhalb `p_drain_max` (120 s) alles persistiert |
+| Vollständigkeit | nach Lastende innerhalb `p_drain_max` (Standard 120 s, `DAUERLAST_MIX` 300 s) alles persistiert |
 | Stabilität | keine neuen Einträge in `LILAM_LOG_INTERNAL`, keine Fehler in den Client-Jobs |
 
 **Prüfungen (BESTANDEN/NICHT BESTANDEN)** betreffen nicht die Kapazität, sondern das Verhalten an der Grenze: kein Datenverlust ohne Eintrag in `LILAM_LOG_INTERNAL`, keine Exceptions in der Anwendung, alle Server laufen nach der Last, und ein neuer Prozess arbeitet danach wieder normal (Probe mit 100 Operationen).

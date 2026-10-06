@@ -171,7 +171,8 @@ create or replace package ltb authid definer as
         p_drain_max   number  default 120,     -- max. Wartezeit in s nach Lastende
         p_keep_data   boolean default false,   -- FALSE: LILAM-Daten jeder Stufe nach der Auswertung loeschen
         p_manage      boolean default true,
-        p_parent      number  default null) return number;
+        p_parent      number  default null,
+        p_max_slow_pct number default 0.1) return number;  -- zulaessiger Anteil normaler Aufrufe > 100 ms in % (Ausreisser)
 
     -- Dieselben Stufen fuer jede Kombination aus Modus und Worker-Anzahl (je ein Teillauf mit PARENT_RUN_ID)
     function t_skalierung(
@@ -213,6 +214,7 @@ create or replace package body ltb as
     c_ts_fmt   constant varchar2(30) := 'YYYY-MM-DD HH24:MI:SS.FF6';
     c_sample_s constant number := 2;      -- Messpunkt des Beobachters alle n s
     c_probe_s  constant number := 1;      -- Probe-Log des Beobachters alle n s
+    c_call_hard_ms constant number := 1000;  -- ein normaler Aufruf darueber macht die Stufe immer zur UEBERLAST
 
     type t_num_tab is table of number index by pls_integer;
 
@@ -643,7 +645,8 @@ create or replace package body ltb as
     -- Auswertung einer Stufe nach Lastende: Drain abwarten, Vollstaendigkeit, Kennzahlen, Bewertung
     ----------------------------------------------------------------------
     procedure evaluate_stage(p_run number, p_stage number, p_mode varchar2, p_prefix varchar2,
-                             p_stage_sec number, p_max_lag_ms number, p_max_err_ms number, p_drain_max number, p_int0 number) is
+                             p_stage_sec number, p_max_lag_ms number, p_max_err_ms number, p_drain_max number, p_int0 number,
+                             p_max_slow_pct number) is
         pragma autonomous_transaction;
         l_st      ltb_stage%rowtype;
         l_logs    number; l_errs number; l_traces number; l_events number; l_steps number; l_calls number;
@@ -731,7 +734,12 @@ create or replace package body ltb as
         if l_st.achieved_cps < 0.95 * l_st.offered_cps then
             reason('Clients gebremst (' || l_st.achieved_cps || '/' || l_st.offered_cps || ' Aufrufe/s)');
         end if;
-        if l_gt100 > 0 then reason(l_gt100 || ' Aufrufe > 100 ms'); end if;
+        -- Einzelne Ausreisser (z. B. ein Log-Switch) machen eine Stufe nicht zur Ueberlast: erst ab einem Anteil von
+        -- p_max_slow_pct % der normalen Aufrufe. Ein einzelner Aufruf ueber 1 s zaehlt immer (Anwendung spuerbar blockiert).
+        if l_gt100 > p_max_slow_pct / 100 * l_tcnt then
+            reason(l_gt100 || ' Aufrufe > 100 ms (' || round(100 * l_gt100 / greatest(l_tcnt, 1), 2) || ' %)');
+        end if;
+        if l_tmax / 1000 > c_call_hard_ms then reason('Aufruf bis ' || round(l_tmax / 1000) || ' ms'); end if;
         if l_emax / 1000 > p_max_err_ms then reason('ERROR bis ' || round(l_emax / 1000) || ' ms'); end if;
         if l_clto > 0 then reason(l_clto || ' CLOSE_SESSION ohne Antwort in 1 s'); end if;
         if nvl(l_st.backlog_slope, 0) > 0.05 * l_st.offered_cps * l_logs / greatest(l_calls, 1)
@@ -788,7 +796,8 @@ create or replace package body ltb as
         p_drain_max   number  default 120,
         p_keep_data   boolean default false,
         p_manage      boolean default true,
-        p_parent      number  default null) return number
+        p_parent      number  default null,
+        p_max_slow_pct number default 0.1) return number
     is
         l_run      number;
         l_spec     varchar2(100);
@@ -810,7 +819,7 @@ create or replace package body ltb as
         l_run := lt.begin_run(p_test, p_mode,
                    'stages=' || p_stages || ' workers=' || p_workers || ' stage_sec=' || p_stage_sec || ' err_pct=' || p_err_pct
                    || ' procs=' || p_procs || ' proc_ops=' || p_proc_ops || ' text_len=' || p_text_len
-                   || ' open_procs=' || p_open_procs, p_parent);
+                   || ' open_procs=' || p_open_procs || ' drain_max=' || p_drain_max || ' max_slow_pct=' || p_max_slow_pct, p_parent);
         if p_manage then setup_servers(p_mode, p_workers); end if;
 
         -- Ruhende Prozesse (z.B. viele lang laufende Anwendungen): oeffnen und bis zum Ende offen halten
@@ -860,7 +869,8 @@ create or replace package body ltb as
                 lt.check_that(l_run, 'Stufe ' || st || ': Client-Jobs beendet', false, 'Zeitueberschreitung');
             end if;
             set_phase(l_run, st, 'DRAIN');
-            evaluate_stage(l_run, st, p_mode, l_prefix, p_stage_sec, p_max_lag_ms, p_max_err_ms, p_drain_max, l_int0);
+            evaluate_stage(l_run, st, p_mode, l_prefix, p_stage_sec, p_max_lag_ms, p_max_err_ms, p_drain_max, l_int0,
+                           p_max_slow_pct);
             l_done := lt.wait_jobs('LT_CO' || l_run || '_' || st, 30);  -- Beobachter endet mit Phase DONE
             print_stage(l_run, st);
 

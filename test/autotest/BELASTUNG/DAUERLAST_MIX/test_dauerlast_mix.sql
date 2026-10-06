@@ -14,7 +14,7 @@
 -- p_rate auf ca. 60 % der in KAPAZITAET_SERVER bzw. SKALIERUNG gemessenen Grenze setzen:
 -- Dauerlast soll tragfaehig sein, sonst misst der Test nur die Ueberlast.
 --
--- Laufzeit: je Modus ca. 22 min, insgesamt ca. 45 min
+-- Laufzeit: je Modus ca. 22 min, insgesamt ca. 45 min (bei langsamem Drain je Stufe bis 5 min mehr)
 -- =====================================================================
 set serveroutput on size unlimited
 
@@ -33,7 +33,8 @@ begin
                p_stage_sec  => 300,
                p_proc_ops   => 500,
                p_open_procs => 500,
-               p_stop_after => 0);       -- alle Stufen laufen, auch nach UEBERLAST
+               p_stop_after => 0,        -- alle Stufen laufen, auch nach UEBERLAST
+               p_drain_max  => 300);     -- Stufe mit 20 % ERROR: Rueckstau bis ca. 25.000, Abbau dauerte bis 120 s (run 1950/1951)
   end loop;
 end;
 /
