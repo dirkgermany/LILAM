@@ -1424,7 +1424,7 @@ create or replace package body lt as
     function t_rueckschreibung(p_manage boolean default true, p_parent number default null) return number is
         c_action  constant varchar2(30) := 'RS_ACTION';
         c_pause_s constant number       := 2;     -- > 1,5 s Schwelle je Prozess und Baseline, > 500 ms Sperre
-        c_server_wait_s constant number := 4;     -- SERVER: Zeit fuer den Server-Loop bis zum Schreiben
+        c_server_wait_s constant number := 15;    -- SERVER: hoechstens so lange auf den Server-Loop warten (Dauertest: Last)
         l_run     number;
         l_peeks   pls_integer := 0;
 
@@ -1470,9 +1470,17 @@ create or replace package body lt as
             l_bas    number;
             l_key    varchar2(30);
 
-            procedure settle is
+            -- INSESSION: genau eine Pruefung, der Stand muss sofort sichtbar sein.
+            -- SERVER: der Server schreibt asynchron; wiederholen, bis p_what den Wert p_expected erreicht.
+            procedure peek_wait(p_key varchar2, p_what varchar2, p_expected number) is
+                l_t0 timestamp := systimestamp;
             begin
-                if not l_ins then dbms_session.sleep(c_server_wait_s); end if;
+                loop
+                    if not l_ins then dbms_session.sleep(1); end if;
+                    peek(l_prefix, p_key);
+                    exit when l_ins or nvl(val(p_key, p_what), -1) >= p_expected
+                              or ms_since(l_t0) > c_server_wait_s * 1000;
+                end loop;
             end;
         begin
             -- R1 nur Traces
@@ -1481,8 +1489,7 @@ create or replace package body lt as
             trace(l_trc);
             dbms_session.sleep(c_pause_s);
             trace(l_trc);
-            settle;
-            peek(l_prefix, l_key);
+            peek_wait(l_key, 'trc', 2);
             check_foreign(l_key);
             check_that(l_run, l_key || ' nur Traces: beide Traces vor CLOSE_SESSION in LILAM_MON',
                        val(l_key, 'trc') = 2, val(l_key, 'trc'));
@@ -1493,8 +1500,7 @@ create or replace package body lt as
             lilam.mark_event(l_evt, c_action);
             dbms_session.sleep(c_pause_s);
             lilam.mark_event(l_evt, c_action);
-            settle;
-            peek(l_prefix, l_key);
+            peek_wait(l_key, 'evt', 2);
             check_that(l_run, l_key || ' nur Events: beide Events vor CLOSE_SESSION in LILAM_MON',
                        val(l_key, 'evt') = 2, val(l_key, 'evt'));
 
@@ -1506,8 +1512,7 @@ create or replace package body lt as
             lilam.proc_step_done(l_stp);
             dbms_session.sleep(c_pause_s);
             lilam.set_process_status(l_stp, 2, 'PHASE 2');
-            settle;
-            peek(l_prefix, l_key);
+            peek_wait(l_key, 'sts', 2);
             check_that(l_run, l_key || ' nur Fortschritt: STEPS_DONE = 2 vor CLOSE_SESSION in LILAM_PROC',
                        val(l_key, 'stp') = 2, val(l_key, 'stp'));
             check_that(l_run, l_key || ' nur Fortschritt: STATUS = 2 vor CLOSE_SESSION in LILAM_PROC',
@@ -1519,8 +1524,7 @@ create or replace package body lt as
             trace(l_bas);
             dbms_session.sleep(c_pause_s);
             trace(l_bas);
-            settle;
-            peek(l_prefix, l_key);
+            peek_wait(l_key, 'bas', 2);
             check_that(l_run, l_key || ' nur Baseline: 2 Messungen vor CLOSE_SESSION in LILAM_BASELINES',
                        val(l_key, 'bas') = 2, val(l_key, 'bas'));
 
@@ -2541,6 +2545,7 @@ create or replace package body lt as
             when 'WAKEUP'         then l_run := t_wakeup(p_mode, sys.odcinumberlist(5, 20), false, p_parent);
             when 'LOGTEXT_GRENZEN' then l_run := t_logtext(false, p_parent);
             when 'BASELINE_SCOPE' then l_run := t_baseline_scope(false, p_parent);
+            when 'RUECKSCHREIBUNG' then l_run := t_rueckschreibung(false, p_parent);
             when 'LASTSPITZE'     then l_run := t_lastspitze(p_mode, 4, 20, false, 120, p_parent);
         end case;
     exception
@@ -2637,6 +2642,7 @@ create or replace package body lt as
         if l_decoupled then
             add('LOGTEXT_GRENZEN', 'INSESSION+SERVER', 1);
             add('BASELINE_SCOPE', 'INSESSION+SERVER', 1);
+            add('RUECKSCHREIBUNG', 'INSESSION+SERVER', 1);
         end if;
 
         while systimestamp < p_end_ts loop

@@ -96,7 +96,7 @@ Dauertests stehen in `LT_RUN` mit `PARENT_RUN_ID` = run_id des Dauertests. Umfan
 | MASSENTEST | 50 Prozesse × 10 Operationen | 2 |
 | WAKEUP | Ruhephasen 5 und 20 s (nur decoupled) | 1 |
 | LASTSPITZE | 4 Clients × 20 s (nur decoupled) | 1 |
-| LOGTEXT_GRENZEN, BASELINE_SCOPE | vollständig (wenn ein Server läuft) | je 1 |
+| LOGTEXT_GRENZEN, BASELINE_SCOPE, RUECKSCHREIBUNG | vollständig (wenn ein Server läuft) | je 1 |
 
 Im Dauertest über alle Modi laufen Worker und Dispatcher in derselben Gruppe. Clients im SERVER-Modus erhalten
 trotzdem immer direkt einen Worker, weil Dispatcher in der Registry gekennzeichnet sind (`IS_DISPATCHER`).
