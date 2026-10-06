@@ -777,6 +777,16 @@ A server uses two pipes:
 - **Data pipe** (`<pipe name>`): all logs, traces, events, status changes and queries in the order of their arrival.
 - **Control pipe** (`<pipe name>_CTL`): only the creation of new processes (`SERVER_NEW_SESSION`). The server checks it before every data message without waiting. Creating a process therefore does not have to wait behind the messages of other applications, even under high load. A short wake-up call into the data pipe makes sure that an idle server notices the request immediately.
 
+**Server selection:** A client without a dispatcher and a dispatcher choose a server of the group for every new process by these criteria:
+
+1. fewest open processes (`CURRENT_PROCESSES`; the server updates the value right after each new and each closed process),
+2. lowest message rate (messages per second in the last housekeeping window, in buckets of 100 messages/s; a value older than 1.5 s counts as 0),
+3. the server that has been inactive the longest.
+
+If the first two criteria are equal, the caller alternates between the servers (round robin per database session). This spreads even processes created in quick succession evenly. Dispatchers are never chosen.
+
+**Server loop and eco mode:** After a message, the server checks the pipe once without waiting. If it is empty, it waits 1 s, then 2 s, then 5 s each time; an arriving message wakes it immediately. `DBMS_PIPE` only knows whole seconds, hence the integer steps. Housekeeping (registry with message rate, writing the buffers) runs every 500 ms, also while the server is busy; when idle, at the next wake-up.
+
 | API | Purpose |
 | --- | --- |
 | `START_SERVER` | Starts a LILAM server in the current session |
@@ -855,6 +865,8 @@ PROCEDURE SERVER_SHUTDOWN(
   p_password  VARCHAR2
 )
 ```
+
+On shutdown, the server first unregisters in the registry and is no longer chosen from then on. It then processes the messages that clients have already sent (drain phase) until the pipe stays empty for 1 s, at most about 5 s. Afterwards it writes all buffers and terminates.
 
 ### Function GET_SERVER_PIPE
 Returns the server pipe associated with the connected client process.

@@ -300,6 +300,10 @@ Two exceptions must be considered here:
 
 2. Creating a process (`SERVER_NEW_SESSION`) is synchronous, since the application needs the process ID. To keep this fast under load, each LILAM Server has a separate control pipe (`<pipe name>_CTL`) that it checks before every data message. Creating a process therefore never queues behind the messages of other applications.
 
+**Server loop.** After a message the server checks its data pipe once without waiting; if it is empty, it waits 1 s, then 2 s, then 5 s each time (eco mode). An arriving message wakes it immediately. `DBMS_PIPE` timeouts are whole seconds; fractions are rounded silently (0.2 becomes 0), which is why the steps are integers. Housekeeping (registry entry with message rate, `SYNC_ALL_DIRTY`) is time-controlled: every 500 ms, also while messages keep arriving, and when idle at the next wake-up.
+
+**Shutdown.** On `SERVER_SHUTDOWN` the server first marks itself inactive in the registry, so it is no longer chosen. In the drain phase it then processes the messages that clients have already sent, until the data pipe stays empty for 1 s (at most about 5 s in total). Afterwards it writes all buffers and removes its pipes.
+
 3. Calls that request data packets from the LILAM Server are necessarily synchronous if the application wants to process the response itself afterwards. However, scenarios are also conceivable here in which, for example, LILAM Client 'A' requests a data packet from the LILAM Server on behalf of LILAM Client 'B'. 
 
 This would turn LILAM Client 'A' into a producer, the LILAM Server into a dispatcher, and LILAM Client 'C' into a consumer. **A lightweight message broker pattern**
@@ -335,7 +339,7 @@ flowchart LR
         B2 -. "limit per second reached:<br/>UNFREEZE_REQUEST (backpressure)" .-> S2
         S2 --> C2["PGA buffer of the server<br/>(all its processes)"]
         C2 --> R2["Rule evaluation in the server<br/>rule set of the server group"]
-        C2 --> E2["SYNC_ALL_DIRTY<br/>housekeeping, at most every 500 ms"]
+        C2 --> E2["SYNC_ALL_DIRTY<br/>housekeeping every 500 ms,<br/>also while busy"]
         E2 --> T2[("Tables<br/>NAME_PROC / _LOG / _MON")]
         R2 --> AL[("LILAM_ALERTS<br/>+ DBMS_ALERT")]
     end
@@ -553,7 +557,9 @@ Events and traces share the same table structure. The `MON_TYPE` column identifi
 
 The `LILAM_SERVER_REGISTRY` table maintains the runtime state of registered LILAM servers. Unlike the process, log, and monitor tables, its name is fixed and is not derived from `tabNameMaster`.
 
-Each active LILAM server registers itself in this table and periodically updates its activity information. Clients use the registry to discover suitable servers and to select a server based on its current load: first the number of messages processed in the last interval (`PROCESSING`), then the number of open processes (`CURRENT_PROCESSES`), and on a tie the server that has been idle longest (oldest `LAST_ACTIVITY`). A server updates its entry periodically and additionally right after each new process, so that processes created in quick succession are spread across the servers.
+Each active LILAM server registers itself in this table and periodically updates its activity information. Clients (and dispatchers) use the registry to discover suitable servers and to select a server based on its current load: first the number of open processes (`CURRENT_PROCESSES`), then the message rate of the last housekeeping window (`MSG_RATE`, in buckets of 100 messages per second; a rate whose `RATE_TS` is older than 1.5 s counts as 0), and finally the server that has been idle longest (oldest `LAST_ACTIVITY`). If open processes and rate are equal, the caller alternates between the servers (round robin per database session). A server updates its entry every 500 ms during housekeeping and additionally right after each new and each closed process, so that processes created in quick succession are spread across the servers.
+
+Until October 2026 the raw message count `PROCESSING` was the first criterion. Because each server writes it for its own, unaligned window, a server with a smaller but older count received every new process until it wrote its own count again; bursts of new processes could end up 19:1 on one server (diagnosis in `test/autotest/_DIAG/2026-10-06_serverauswahl_provokation_ergebnis.md`).
 
 If `SERVER_NEW_SESSION` is called with a `p_groupName`, only servers registered for the requested group are considered.
 
@@ -566,10 +572,12 @@ If `SERVER_NEW_SESSION` is called with a `p_groupName`, only servers registered 
 | `PIPE_NAME` | `VARCHAR2(50)` | Unique pipe name used to identify and communicate with the LILAM server. |
 | `GROUP_NAME` | `VARCHAR2(50)` | Optional group to which the server is assigned. Used to restrict server selection when `p_groupName` is specified. |
 | `LAST_ACTIVITY` | `TIMESTAMP(3)` | Timestamp of the server's most recent heartbeat/activity. Used to determine whether the server is still available. |
-| `CURRENT_PROCESSES` | `NUMBER` | Number of processes currently open on the server (excluding the server's own process). Second criterion for server selection. |
+| `CURRENT_PROCESSES` | `NUMBER` | Number of processes currently open on the server (excluding the server's own process). First criterion for server selection. |
 | `IS_ACTIVE` | `NUMBER(1)` | Indicates whether the server is marked as active. |
 | `STATUS` | `VARCHAR2(20)` | Current status of the server. |
-| `PROCESSING` | `NUMBER` | Indicates what the server is currently processing. |
+| `PROCESSING` | `NUMBER` | Number of messages in the last housekeeping window. For monitoring only, no longer used for server selection. |
+| `MSG_RATE` | `NUMBER` | Messages per second in the last housekeeping window. Second criterion for server selection. |
+| `RATE_TS` | `TIMESTAMP(3)` | Time at which `MSG_RATE` was written. A rate older than 1.5 s counts as 0. |
 | `IS_DISPATCHER` | `NUMBER(1)` | `1` for a dispatcher. Dispatchers are never selected as the target of a server selection, neither by clients nor by another dispatcher. |
 
 ### Rules Table

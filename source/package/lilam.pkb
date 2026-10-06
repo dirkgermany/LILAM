@@ -11,11 +11,23 @@ AS
     ---------------------------------------------------------------
 
     -- Dedicated to SERVER_LOOP
-    C_SERVER_SYNC_INTERVAL_MS          CONSTANT PLS_INTEGER := 500;
+    C_SERVER_SYNC_INTERVAL_MS          CONSTANT PLS_INTEGER := 500;   -- housekeeping every n ms, also while busy
     C_SERVER_HEARTBEAT_INTERVAL_MS     CONSTANT PLS_INTEGER := 60000;
-    C_SERVER_MAX_LOOPS_IN_TIME_NO      CONSTANT PLS_INTEGER := 10000; -- 1000
-    C_SERVER_TIMEOUT_WAIT_FOR_MSG_SEC  CONSTANT NUMBER      := 0.2; -- Timeout in seconds when waiting for a message
-    C_SERVER_TIMEOUT_MAX_WAIT_SEC      CONSTANT NUMBER      := 5;
+    -- DBMS_PIPE timeouts are whole seconds (INTEGER); fractions would be rounded silently (0.2 -> 0).
+    -- Eco mode: after a message the server polls once without waiting, then waits 1, 2 and finally 5 s.
+    -- An arriving message always wakes the server immediately.
+    C_SERVER_ECO_STEP1_SEC             CONSTANT PLS_INTEGER := 1;
+    C_SERVER_ECO_STEP2_SEC             CONSTANT PLS_INTEGER := 2;
+    C_SERVER_TIMEOUT_MAX_WAIT_SEC      CONSTANT PLS_INTEGER := 5;
+    -- Drain phase on shutdown: empty the pipe until it stays empty for 1 s, at most about 5 s in total
+    C_SERVER_DRAIN_IDLE_SEC            CONSTANT PLS_INTEGER := 1;
+    C_SERVER_DRAIN_MAX_MS              CONSTANT PLS_INTEGER := 5000;
+    -- Server selection: a message rate older than this counts as 0; rates in the same bucket
+    -- (messages per second) count as equal, then the caller alternates (round robin)
+    C_SELECT_RATE_MAX_AGE_MS           CONSTANT PLS_INTEGER := 1500;
+    C_SELECT_RATE_BUCKET               CONSTANT PLS_INTEGER := 100;
+    -- sendNoWait: wait at most 1 s per attempt when the server pipe is full (whole seconds, see above)
+    C_SEND_TIMEOUT_SEC                 CONSTANT PLS_INTEGER := 1;
     C_MAX_SERVER_PIPE_SIZE             CONSTANT PLS_INTEGER := 16777216; --  16777216, 67108864
     
     C_MAX_REGISTRY_HEARTBEAT_AGE_SEC   CONSTANT PLS_INTEGER  := 15;  --  Server HEARTBEAT in Registry mustn't be older
@@ -408,6 +420,7 @@ AS
     g_serverGroupName                   VARCHAR2(50)            := NULL;
     g_shutdownPassword                  varchar2(50);
     g_serverIsDispatcher                BOOLEAN                 := FALSE;
+    g_lastSelectedPipe                  VARCHAR2(50)            := NULL;   -- last server chosen by getServerPipeAvailable (round robin on ties)
 
     g_server_perf                       PLS_INTEGER             := C_SERVER_PERF_MID;  -- Performance level of this server (p_perfServer)
     g_last_sync_all_cs                  NUMBER                  := NULL;   -- last run of SYNC_ALL_DIRTY (DBMS_UTILITY.GET_TIME)
@@ -1565,35 +1578,52 @@ AS
     function getServerPipeAvailable(p_groupName varchar2) return varchar2
     as
         l_clientChannel  varchar2(50);
-        l_sqlStmt   varchar2(1000);
-        l_serverPipeName varchar2(50);
+        l_sqlStmt   varchar2(1500);
+        l_pipes     sys.odcivarchar2list;
+        l_procs     sys.odcinumberlist;
+        l_rates     sys.odcinumberlist;
+        l_pick      PLS_INTEGER := 1;
     begin
         l_clientChannel := getClientPipe;
 
-        l_sqlStmt := '
-        SELECT pipe_name 
-        FROM ' || C_LILAM_SERVER_REGISTRY || ' 
-        WHERE is_active = 1 
-          AND last_activity > SYSTIMESTAMP - INTERVAL ''' || C_MAX_REGISTRY_HEARTBEAT_AGE_SEC || ''' SECOND ';
-
-        if p_groupName is not null then
-            l_sqlStmt := l_sqlStmt || ' AND upper(group_name) = ''' || upper(p_groupName) || '''';
-        end if;
-
-        -- Order of selection: fewest messages in the last interval, then fewest open processes,
-        -- on a tie the server idle for the longest time (oldest registry entry; a busy
-        -- server updates its entry more often, an idle one less often)
+        -- Order of selection:
+        --   1. fewest open processes (current_processes, kept up to date by touchServerRegistry on NEW_SESSION)
+        --   2. lowest message rate (messages per second of the last housekeeping window, in buckets of
+        --      C_SELECT_RATE_BUCKET); a rate older than C_SELECT_RATE_MAX_AGE_MS counts as 0
+        --   3. the server idle for the longest time (oldest registry entry)
+        -- Previously the raw message count (processing) of unaligned windows came first: a server with a
+        -- smaller, older count received every NEW_SESSION until it wrote its own count again (SERVERAUSWAHL).
         -- Dispatchers are never the target of server selection: neither for clients without a dispatcher setting
         -- (otherwise an unnecessary detour via the dispatcher) nor for a dispatcher itself when choosing
         -- a worker (it would otherwise send the message to itself endlessly)
-        l_sqlStmt := l_sqlStmt || ' AND nvl(is_dispatcher, 0) = 0';
+        l_sqlStmt := '
+        SELECT pipe_name,
+               nvl(current_processes, 0),
+               CASE WHEN rate_ts > SYSTIMESTAMP - NUMTODSINTERVAL(:1 / 1000, ''SECOND'')
+                    THEN floor(nvl(msg_rate, 0) / :2) ELSE 0 END
+        FROM ' || C_LILAM_SERVER_REGISTRY || '
+        WHERE is_active = 1
+          AND last_activity > SYSTIMESTAMP - NUMTODSINTERVAL(:3, ''SECOND'')
+          AND (:4 IS NULL OR upper(group_name) = upper(:5))
+          AND nvl(is_dispatcher, 0) = 0
+        ORDER BY 2, 3, last_activity ASC';
 
-        l_sqlStmt := l_sqlStmt || '
-        ORDER BY processing ASC, current_processes ASC, last_activity ASC 
-        FETCH FIRST 1 ROW ONLY';
+        execute immediate l_sqlStmt bulk collect into l_pipes, l_procs, l_rates
+            using C_SELECT_RATE_MAX_AGE_MS, C_SELECT_RATE_BUCKET, C_MAX_REGISTRY_HEARTBEAT_AGE_SEC, p_groupName, p_groupName;
 
-        execute immediate l_sqlStmt into l_serverPipeName;
-        return l_serverPipeName;
+        if l_pipes.count = 0 then
+            return null;
+        end if;
+
+        -- Tie on open processes and rate: alternate locally (round robin), i.e. do not choose the
+        -- server picked last by this session again if another one is equally good
+        if l_pipes.count > 1 and l_procs(2) = l_procs(1) and l_rates(2) = l_rates(1)
+           and l_pipes(1) = g_lastSelectedPipe then
+            l_pick := 2;
+        end if;
+
+        g_lastSelectedPipe := l_pipes(l_pick);
+        return l_pipes(l_pick);
 
     exception
         when NO_DATA_FOUND then
@@ -1734,6 +1764,19 @@ AS
     exception
         when OTHERS then
             logLilamErr(sqlCode, sqlErrM, 'run_sql', 'EXECUTE IMMEDIATE');
+    end;
+
+    -- Adds columns to an existing table. Several servers may start at the same time and run the
+    -- same migration: ORA-01430 (column already exists) then only means another session was faster.
+    procedure add_columns(p_sqlStmt varchar2)
+    as
+    begin
+        execute immediate p_sqlStmt;
+    exception
+        when OTHERS then
+            if sqlcode != -1430 then
+                logLilamErr(sqlCode, sqlErrM, 'add_columns', 'EXECUTE IMMEDIATE');
+            end if;
     end;
 
     --------------------------------------------------------------------------
@@ -1931,7 +1974,9 @@ AS
                 max_log_lat    NUMBER DEFAULT 0,
                 avg_mon_lat    NUMBER DEFAULT 0,
                 max_mon_lat    NUMBER DEFAULT 0,
-                is_dispatcher  NUMBER(1) DEFAULT 0
+                is_dispatcher  NUMBER(1) DEFAULT 0,
+                msg_rate       NUMBER DEFAULT 0,
+                rate_ts        TIMESTAMP(3)
             )';
             run_sql(sqlStmt);
         else
@@ -1939,7 +1984,13 @@ AS
             select count(*) into l_regCols from user_tab_columns
              where table_name = upper(C_LILAM_SERVER_REGISTRY) and column_name = 'IS_DISPATCHER';
             if l_regCols = 0 then
-                run_sql('ALTER TABLE ' || C_LILAM_SERVER_REGISTRY || ' ADD is_dispatcher NUMBER(1) DEFAULT 0');
+                add_columns('ALTER TABLE ' || C_LILAM_SERVER_REGISTRY || ' ADD is_dispatcher NUMBER(1) DEFAULT 0');
+            end if;
+            -- Extend an existing registry with the message rate used by the server selection
+            select count(*) into l_regCols from user_tab_columns
+             where table_name = upper(C_LILAM_SERVER_REGISTRY) and column_name = 'MSG_RATE';
+            if l_regCols = 0 then
+                add_columns('ALTER TABLE ' || C_LILAM_SERVER_REGISTRY || ' ADD (msg_rate NUMBER DEFAULT 0, rate_ts TIMESTAMP(3))');
             end if;
         end if;
 
@@ -3065,7 +3116,7 @@ AS
                   || jStr('context_name', p_contextName)
                   || jTs ('timestamp',    p_timestamp) || '}';
 
-        sendNoWait(p_processId, 'START_TRACE', l_payload, 0.5);
+        sendNoWait(p_processId, 'START_TRACE', l_payload, C_SEND_TIMEOUT_SEC);
 
     EXCEPTION
         WHEN OTHERS THEN
@@ -3089,7 +3140,7 @@ AS
                   || jStr('context_name', p_contextName)
                   || jTs ('timestamp',    p_timestamp) || '}';
 
-        sendNoWait(p_processId, 'STOP_TRACE', l_payload, 0.5);
+        sendNoWait(p_processId, 'STOP_TRACE', l_payload, C_SEND_TIMEOUT_SEC);
 
     EXCEPTION
         WHEN OTHERS THEN
@@ -3117,7 +3168,7 @@ AS
                   || jStr('context_name', p_contextName)
                   || jTs ('timestamp',    p_timestamp) || '}';
 
-        sendNoWait(p_processId, C_MARK_EVENT, l_payload, 0.5);
+        sendNoWait(p_processId, C_MARK_EVENT, l_payload, C_SEND_TIMEOUT_SEC);
 
     EXCEPTION
         WHEN OTHERS THEN
@@ -4100,7 +4151,7 @@ AS
         l_payload := '{"process_id":' || jNum(p_processId)
                   || jTs('timestamp', p_timestamp) || '}';
 
-        sendNoWait(p_processId, 'PROC_STEP_DONE', l_payload, 0.5);
+        sendNoWait(p_processId, 'PROC_STEP_DONE', l_payload, C_SEND_TIMEOUT_SEC);
     end;
     --------------------------------------------------------------------------
 
@@ -4117,7 +4168,7 @@ AS
                   || jNum('process_immortal', p_immortal)
                   || jTs ('timestamp',        p_timestamp) || '}';
 
-        sendNoWait(p_processId, 'SET_ANY_STATUS', l_payload, 0.5);
+        sendNoWait(p_processId, 'SET_ANY_STATUS', l_payload, C_SEND_TIMEOUT_SEC);
     end;
 
     --------------------------------------------------------------------------
@@ -4166,7 +4217,7 @@ AS
                   || jStr('err_callstack', p_errCallstack)
                   || jTs ('timestamp',     p_timestamp) || '}';
 
-        sendNoWait(p_processId, 'LOG_ANY', l_payload, 0.5);
+        sendNoWait(p_processId, 'LOG_ANY', l_payload, C_SEND_TIMEOUT_SEC);
 
     EXCEPTION
         WHEN OTHERS THEN
@@ -5176,10 +5227,13 @@ AS
 
         CLOSE_SESSION(p_processId => l_processId, p_processInfo => l_processInfo, p_processStatus => l_status,
                       p_procStepsDone => l_procStepsDone, p_procStepsToDo => l_procStepsToDo);
-        unregisterProcessRoute(l_processId); 
+        unregisterProcessRoute(l_processId);
+        -- Open processes are the first criterion of the server selection: update the registry before the
+        -- response, otherwise an idle server (eco mode) keeps a stale count until its next housekeeping
+        touchServerRegistry;
 
         DBMS_PIPE.RESET_BUFFER;
-        DBMS_PIPE.PACK_MESSAGE('{"process_id":' || l_processId || '}');        
+        DBMS_PIPE.PACK_MESSAGE('{"process_id":' || l_processId || '}');
         l_status := DBMS_PIPE.SEND_MESSAGE(p_clientChannel, timeout => 1);
 
     end;    
@@ -6329,9 +6383,11 @@ AS
 
     --------------------------------------------------------------------------
 
-    procedure updateServerRegistry(p_ready BOOLEAN, p_eventCounter PLS_INTEGER) as
+    -- p_windowMs: length of the housekeeping window in which p_eventCounter messages arrived;
+    -- the message rate per second is stored with a timestamp for the server selection
+    procedure updateServerRegistry(p_ready BOOLEAN, p_eventCounter PLS_INTEGER, p_windowMs NUMBER DEFAULT NULL) as
         pragma autonomous_transaction; 
-        l_sqlStmt varchar2(500);
+        l_sqlStmt varchar2(1000);
         l_booleanAsInt NUMBER(1) := 1;
         l_status    varchar2(20);
     begin
@@ -6386,15 +6442,19 @@ AS
             avg_log_lat = :5,
             max_log_lat = :6,
             avg_mon_lat = :7,
-            max_mon_lat = :8
-        WHERE upper(pipe_name) = :9';
+            max_mon_lat = :8,
+            msg_rate = :9,
+            rate_ts = SYSTIMESTAMP
+        WHERE upper(pipe_name) = :10';
         -- CURRENT_PROCESSES = number of open processes of this server (without the server process itself).
         -- Previously: pipe_size from v$db_pipes. That was unsuitable and expensive:
         --   * pipe_size is a high-water mark of the used memory and does not go down after processing
         --   * v$db_pipes searches the entire library cache (approx. 120-190 ms per query, server blocked)
         --   * required an additional grant on V_$DB_PIPES
         execute immediate l_sqlStmt USING l_booleanAsInt, greatest(v_indexSession.COUNT - 1, 0), l_status, p_eventCounter, 
-            g_avgLatencyLogs, g_maxLatencyLogs, g_avgLatencyMon, g_maxLatencyMon, upper(g_serverPipeName);
+            g_avgLatencyLogs, g_maxLatencyLogs, g_avgLatencyMon, g_maxLatencyMon,
+            case when p_windowMs > 0 then round(greatest(p_eventCounter, 0) * 1000 / p_windowMs, 1) else 0 end,
+            upper(g_serverPipeName);
         COMMIT; -- Must be autonomous!
 
     exception
@@ -6408,17 +6468,17 @@ AS
 
     --------------------------------------------------------------------------
 
-    function receiveMessage(l_pipeName IN varchar2, p_cur_timeout IN OUT NUMBER) return varchar2
+    -- Eco mode: p_cur_timeout (whole seconds) is 0 after a message and grows on every empty
+    -- receive: 0 -> C_SERVER_ECO_STEP1_SEC -> C_SERVER_ECO_STEP2_SEC -> C_SERVER_TIMEOUT_MAX_WAIT_SEC
+    function receiveMessage(l_pipeName IN varchar2, p_cur_timeout IN OUT PLS_INTEGER) return varchar2
     as
         l_status    PLS_INTEGER;
         l_message   VARCHAR2(32767);
-        c_max_timeout CONSTANT NUMBER := C_SERVER_TIMEOUT_MAX_WAIT_SEC; -- Maximum for eco mode
-        c_min_timeout CONSTANT NUMBER := C_SERVER_TIMEOUT_WAIT_FOR_MSG_SEC;
     begin
         l_status := DBMS_PIPE.RECEIVE_MESSAGE(l_pipeName, timeout => p_cur_timeout);
 
         if l_status = 0 THEN
-            p_cur_timeout := C_SERVER_TIMEOUT_WAIT_FOR_MSG_SEC;
+            p_cur_timeout := 0;
 
             begin   
                 DBMS_PIPE.UNPACK_MESSAGE(l_message);
@@ -6431,7 +6491,11 @@ AS
                         end if;
                 END; 
         else
-             p_cur_timeout := LEAST(p_cur_timeout + C_SERVER_TIMEOUT_WAIT_FOR_MSG_SEC, c_max_timeout);
+            p_cur_timeout := case
+                                 when p_cur_timeout < C_SERVER_ECO_STEP1_SEC then C_SERVER_ECO_STEP1_SEC
+                                 when p_cur_timeout < C_SERVER_ECO_STEP2_SEC then C_SERVER_ECO_STEP2_SEC
+                                 else C_SERVER_TIMEOUT_MAX_WAIT_SEC
+                             end;
             return null;
         end if;
         
@@ -6587,11 +6651,13 @@ AS
         l_request        VARCHAR2(500);
         l_dummyRes       PLS_INTEGER;
         l_shutdownSignal BOOLEAN := FALSE;
-        l_lastHeartbeat  TIMESTAMP := sysTimestamp;
-        l_lastSync       TIMESTAMP := sysTimestamp;  
-        l_loopCounter    PLS_INTEGER := 0;
+        -- PERFORMANCE: GET_TIME (1/100 s) instead of SYSTIMESTAMP: the time check runs after every message
+        l_lastHeartbeatCs NUMBER := dbms_utility.get_time;
+        l_lastSyncCs     NUMBER := dbms_utility.get_time;
+        l_windowMs       NUMBER;
+        l_drainStartCs   NUMBER;
         l_msgCnt         PLS_INTEGER := 0;
-        l_serverTimeout  NUMBER := C_SERVER_TIMEOUT_WAIT_FOR_MSG_SEC;
+        l_serverTimeout  PLS_INTEGER := 0;
         l_ctlPipe        VARCHAR2(150);
     begin
         g_serverIsDispatcher := CASE nvl(p_isDispatcher, 0) WHEN 1 THEN TRUE ELSE FALSE END;
@@ -6647,43 +6713,45 @@ AS
                 END; 
             end if;
 
-            if l_message is null or l_loopCounter > C_SERVER_MAX_LOOPS_IN_TIME_NO then
-                if get_ms_diff(l_lastSync, sysTimestamp) >= C_SERVER_SYNC_INTERVAL_MS  THEN
-                    -- Housekeeping
-                    updateServerRegistry(TRUE, l_msgCnt);
-                    SYNC_ALL_DIRTY;
-                    l_lastSync := sysTimestamp;
-                    l_loopCounter := 0;
-                    l_msgCnt := 0;
-                end if;
+            -- Housekeeping is time-controlled: every C_SERVER_SYNC_INTERVAL_MS, also while messages keep
+            -- arriving (registry with message rate, flush of the buffers). While idle it runs when the
+            -- server wakes up, i.e. at the latest after the current eco step.
+            -- ABS: on overflow of GET_TIME there is at most one additional run.
+            l_windowMs := abs(dbms_utility.get_time - l_lastSyncCs) * 10;
+            if l_windowMs >= C_SERVER_SYNC_INTERVAL_MS then
+                updateServerRegistry(TRUE, l_msgCnt, l_windowMs);
+                SYNC_ALL_DIRTY;
+                l_lastSyncCs := dbms_utility.get_time;
+                l_msgCnt := 0;
+            end if;
 
-                -- Timeout reached. Happens if no signal arrived within an interval.
-                if get_ms_diff(l_lastHeartbeat, sysTimestamp) >= C_SERVER_HEARTBEAT_INTERVAL_MS then
-                    INFO(g_serverProcessId, g_serverPipeName || 'HEARTBEAT ' || g_serverPipeName);
-                    l_lastHeartbeat := sysTimestamp;
-                end if ;
+            if abs(dbms_utility.get_time - l_lastHeartbeatCs) * 10 >= C_SERVER_HEARTBEAT_INTERVAL_MS then
+                INFO(g_serverProcessId, g_serverPipeName || 'HEARTBEAT ' || g_serverPipeName);
+                l_lastHeartbeatCs := dbms_utility.get_time;
             end if ;
 
             EXIT when l_shutdownSignal;
-            l_loopCounter := l_loopCounter + 1;
         END LOOP;
         -- From now on the server is no longer reachable
-        updateServerRegistry(FALSE, l_msgCnt);
+        updateServerRegistry(FALSE, l_msgCnt, abs(dbms_utility.get_time - l_lastSyncCs) * 10);
         setAnyStatus(g_serverProcessId, 0, 'STOPPED', null, null, null, SYSTIMESTAMP);
 
-        -- +++ NEW: DRAIN PHASE +++
-        -- We empty the pipe in case messages still arrived during the shutdown.
+        -- DRAIN PHASE: the server is no longer selectable; process the messages that clients still send
+        -- until the pipe stays empty for C_SERVER_DRAIN_IDLE_SEC, at most about C_SERVER_DRAIN_MAX_MS in total.
+        -- (Previously timeout => 0.1 was rounded to 0, the loop ended at the first empty moment.)
+        l_drainStartCs := dbms_utility.get_time;
         LOOP
-            l_status := DBMS_PIPE.RECEIVE_MESSAGE(g_serverPipeName, timeout => 0.1);
-            EXIT WHEN l_status != 0; -- Pipe is empty (1) or error/interrupt (!=0)
+            l_status := DBMS_PIPE.RECEIVE_MESSAGE(g_serverPipeName, timeout => C_SERVER_DRAIN_IDLE_SEC);
+            EXIT WHEN l_status != 0; -- Pipe stayed empty (1) or error/interrupt (!=0)
 
             DBMS_PIPE.UNPACK_MESSAGE(l_message);
             l_clientChannel := extractClientChannel(l_message);
             l_request := extractClientRequest(l_message);
 
             -- In the drain we only process log data, no new sessions/shutdowns
-                l_shutdownSignal := processRequest(l_request, l_message, l_clientChannel, TRUE);
+            l_shutdownSignal := processRequest(l_request, l_message, l_clientChannel, TRUE);
 
+            EXIT WHEN abs(dbms_utility.get_time - l_drainStartCs) * 10 >= C_SERVER_DRAIN_MAX_MS;
         END LOOP;
 
         DBMS_OUTPUT.ENABLE();
