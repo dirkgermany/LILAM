@@ -96,7 +96,7 @@ Rules are organized into Rule Sets, stored as JSON documents in the `LILAM_RULES
 Unknown properties (e.g. `_comment`) are ignored.
 
 ### Validation when loading
-A server checks a rule set completely before it uses it: required fields, lengths, unique ids, known trigger types and operators, operators allowed for the trigger, and the format of `condition.value`. If a single rule is invalid, the **whole** rule set is rejected and the previously loaded rules stay active. `SERVER_UPDATE_RULES` performs the same check before it activates a rule set and raises an exception with the reason; a server that rejects a rule set at startup writes the reason to `LILAM_LOG_INTERNAL` and to the log of the server process.
+A server checks a rule set completely before it uses it: required fields, lengths, unique ids, known trigger types and operators, operators allowed for the trigger, and the format of `condition.value`. Values made of several parts separated by `|` must not contain empty parts: `|C1`, `A|` and `20||0.3` are rejected instead of being read differently, and operators that expect a single number reject additional parts (`|5`, `5|x`). If a single rule is invalid, the **whole** rule set is rejected and the previously loaded rules stay active. `SERVER_UPDATE_RULES` performs the same check before it activates a rule set and raises an exception with the reason; a server that rejects a rule set at startup writes the reason to `LILAM_LOG_INTERNAL` and to the log of the server process.
 
 ### Hooks / Trigger Types
 | hook | scope | API call
@@ -138,10 +138,10 @@ This table serves as the central repository for all rule sets. Each rule set is 
 
 | Column | Type | Description |
 | :--- | :--- | :--- |
-| **GROUP_NAME** | `VARCHAR2(50)` | Group the rule set belongs to (server group or `p_groupName` of `NEW_SESSION`). |
-| **SET_NAME** | `VARCHAR2(30)` | Name of the rule set. `GROUP_NAME`, `SET_NAME` and `VERSION` together are unique. |
-| **VERSION** | `NUMBER` | Version number to support testing, staging, and rollbacks. |
-| **IS_ACTIVE** | `NUMBER(1)` | `1` for the rule set the servers and INSESSION processes of the group use (at most one per group). |
+| **GROUP_NAME** | `VARCHAR2(50)` | Group the rule set belongs to (server group or `p_groupName` of `NEW_SESSION`); required. |
+| **SET_NAME** | `VARCHAR2(30)` | Name of the rule set; required. `GROUP_NAME` (without regard to case), `SET_NAME` and `VERSION` together are unique. |
+| **VERSION** | `NUMBER` | Whole-number version to support testing, staging, and rollbacks; required. |
+| **IS_ACTIVE** | `NUMBER(1)` | `1` for the rule set the servers and INSESSION processes of the group use (at most one per group), otherwise `0`. |
 | **RULE_SET** | `CLOB` | The JSON document (header and rules); checked by `IS JSON`. |
 | **CREATED** | `TIMESTAMP` | When this version was created. |
 | **AUTHOR** | `VARCHAR2(50)` | The developer or architect who defined the rule set. |

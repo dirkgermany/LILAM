@@ -287,7 +287,7 @@ The JSON object is divided into a header for metadata and an array of individual
 }
 ```
 
-A server checks a rule set completely before it uses it. If one rule is invalid, the whole rule set is rejected and the previously loaded rules stay active.
+A server checks a rule set completely before it uses it. If one rule is invalid, the whole rule set is rejected and the previously loaded rules stay active. Values made of several parts separated by `|` must not contain empty parts (`|C1`, `A|`, `20||0.3`).
 
 ---
 ## Operating Modes
@@ -604,13 +604,13 @@ Rule Sets are stored as JSON documents and identified by group, name and version
 | --- | --- | --- |
 | `RULE_SET` | `CLOB` | Contains the Rule Set as a JSON document (`IS JSON`). |
 | `GROUP_NAME` | `VARCHAR2(50)` | Group the Rule Set belongs to: `GROUP_NAME` of the registry (servers) or `p_groupName` of `NEW_SESSION` (INSESSION). |
-| `SET_NAME` | `VARCHAR2(30)` | Name identifying the Rule Set. |
-| `VERSION` | `NUMBER` | Version of the Rule Set. |
-| `IS_ACTIVE` | `NUMBER(1)` | `1` for the Rule Set the group uses (servers and INSESSION processes); at most one per group. |
+| `SET_NAME` | `VARCHAR2(30)` | Name identifying the Rule Set (required). |
+| `VERSION` | `NUMBER` | Whole-number version of the Rule Set (required). |
+| `IS_ACTIVE` | `NUMBER(1)` | `1` for the Rule Set the group uses (servers and INSESSION processes); at most one per group. Otherwise `0`. |
 | `CREATED` | `TIMESTAMP(6)` | Timestamp at which the Rule Set was created. |
 | `AUTHOR` | `VARCHAR2(50)` | Author associated with the Rule Set. |
 
-`GROUP_NAME`, `SET_NAME` and `VERSION` together are unique. Alerts (`LILAM_ALERTS`) refer to a rule by `GROUP_NAME`, `RULE_SET_NAME`, `RULE_SET_VERSION` and `RULE_ID`.
+`GROUP_NAME` (required, without regard to case), `SET_NAME` and `VERSION` together are unique. Alerts (`LILAM_ALERTS`) refer to a rule by `GROUP_NAME`, `RULE_SET_NAME`, `RULE_SET_VERSION` and `RULE_ID`.
 
 ### Internal Log Table
 **Table Category:** Fixed Internal Table

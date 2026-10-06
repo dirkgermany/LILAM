@@ -881,7 +881,7 @@ FUNCTION GET_SERVER_PIPE(
 ```
 
 ### Procedure SERVER_UPDATE_RULES
-Rule Sets werden als JSON-Objekte in `LILAM_RULES` gespeichert, jeweils für eine Gruppe (`GROUP_NAME`, Name, Version). Dasselbe Rule Set kann für mehrere Gruppen eingetragen sein. Je Gruppe ist genau ein Rule Set aktiv (`IS_ACTIVE = 1`); es gilt für alle Server der Gruppe und für alle INSESSION-Prozesse, die mit dieser Gruppe gestartet wurden.
+Rule Sets werden als JSON-Objekte in `LILAM_RULES` gespeichert, jeweils für eine Gruppe (`GROUP_NAME`, Name, Version). Dasselbe Rule Set kann für mehrere Gruppen eingetragen sein. Je Gruppe ist genau ein Rule Set aktiv (`IS_ACTIVE = 1`); es gilt für alle Server der Gruppe und für alle INSESSION-Prozesse, die mit dieser Gruppe gestartet wurden. Gruppe, Name und Version sind Pflicht und zusammen eindeutig, die Gruppe ohne Unterscheidung von Groß- und Kleinschreibung; die Version ist ganzzahlig, `IS_ACTIVE` ist 0 oder 1.
 
 ```sql
 PROCEDURE SERVER_UPDATE_RULES(
@@ -892,7 +892,7 @@ PROCEDURE SERVER_UPDATE_RULES(
 ```
 
 Ablauf:
-1. Das Rule Set der Gruppe wird in der aufrufenden Session vollständig geprüft. Fehlt es für die Gruppe oder ist eine Regel ungültig, endet der Aufruf mit der Exception `NUM_ERR_RULE_SET` (-20130) und einer Begründung; es ändert sich nichts.
+1. Das Rule Set der Gruppe wird in der aufrufenden Session vollständig geprüft. Fehlt es für die Gruppe oder ist eine Regel ungültig, endet der Aufruf mit der Exception `NUM_ERR_RULE_SET` (-20130) und einer Begründung; es ändert sich nichts. Werte aus mehreren durch `|` getrennten Teilen dürfen keine leeren Teile enthalten (`|C1`, `A|`, `20||0.3` werden abgelehnt).
 2. Das Rule Set wird für die Gruppe aktiv, das bisher aktive inaktiv.
 3. Laufende Server der Gruppe erhalten die Anweisung zum Neuladen direkt in ihre Pipe, also auch ohne laufenden Prozess und am Dispatcher vorbei. Dispatcher werten keine Regeln aus. Zusätzlich prüft jeder Server höchstens alle 15 Sekunden selbst, ob sich das aktive Rule Set seiner Gruppe geändert hat; ein Server, der die Anweisung verpasst (z. B. volle Pipe), lädt das neue Rule Set so spätestens nach etwa 20 Sekunden.
 4. INSESSION-Prozesse der Gruppe laden das neue Rule Set selbst, spätestens beim ersten API-Aufruf nach 15 Sekunden (siehe [Regeln im INSESSION-Modus](#regeln-im-insession-modus)).

@@ -1794,6 +1794,19 @@ AS
             end if;
     end;
 
+    -- DDL that several servers may run at the same time: p_doneCode (e.g. ORA-00955 object
+    -- already exists) then only means another session was faster.
+    procedure run_ddl(p_sqlStmt varchar2, p_doneCode pls_integer)
+    as
+    begin
+        execute immediate p_sqlStmt;
+    exception
+        when OTHERS then
+            if sqlcode != p_doneCode then
+                logLilamErr(sqlCode, sqlErrM, 'run_ddl', 'EXECUTE IMMEDIATE');
+            end if;
+    end;
+
     -- Removes obsolete columns/indexes of old installations. Same race as add_columns:
     -- ORA-01418 (index does not exist) and ORA-00904 (column does not exist) only mean
     -- another session was faster. STABILITY: never raises, the remaining steps continue.
@@ -2033,10 +2046,10 @@ AS
             sqlStmt := '
             CREATE TABLE ' || C_LILAM_RULES_TABLE || ' (
                 rule_set       CLOB CONSTRAINT ensure_json_rules CHECK (rule_set IS JSON),
-                group_name     VARCHAR2(50),
-                set_name       VARCHAR2(30),
-                version        NUMBER,
-                is_active      NUMBER(1) DEFAULT 0,
+                group_name     VARCHAR2(50) NOT NULL,
+                set_name       VARCHAR2(30) NOT NULL,
+                version        NUMBER NOT NULL CONSTRAINT lilam_rules_chk_version CHECK (version = trunc(version)),
+                is_active      NUMBER(1) DEFAULT 0 NOT NULL CONSTRAINT lilam_rules_chk_active CHECK (is_active IN (0, 1)),
                 created        TIMESTAMP,
                 author         VARCHAR2(50)
             )';
@@ -2047,6 +2060,19 @@ AS
              where table_name = upper(C_LILAM_RULES_TABLE) and column_name = 'GROUP_NAME';
             if l_regCols = 0 then
                 run_sql('ALTER TABLE ' || C_LILAM_RULES_TABLE || ' ADD (group_name VARCHAR2(50), is_active NUMBER(1) DEFAULT 0)');
+            end if;
+            -- Constraints as for a new table. STABILITY: NOVALIDATE, existing rows do not block;
+            -- several servers may run this at the same time (ORA-02264/-01442: already done)
+            select count(*) into l_regCols from user_constraints
+             where table_name = upper(C_LILAM_RULES_TABLE) and constraint_name = 'LILAM_RULES_CHK_ACTIVE';
+            if l_regCols = 0 then
+                run_ddl('ALTER TABLE ' || C_LILAM_RULES_TABLE || ' MODIFY (group_name NOT NULL ENABLE NOVALIDATE)', -1442);
+                run_ddl('ALTER TABLE ' || C_LILAM_RULES_TABLE || ' MODIFY (set_name NOT NULL ENABLE NOVALIDATE)', -1442);
+                run_ddl('ALTER TABLE ' || C_LILAM_RULES_TABLE || ' MODIFY (version NOT NULL ENABLE NOVALIDATE)', -1442);
+                run_ddl('ALTER TABLE ' || C_LILAM_RULES_TABLE || ' ADD CONSTRAINT lilam_rules_chk_version '
+                        || 'CHECK (version = trunc(version)) ENABLE NOVALIDATE', -2264);
+                run_ddl('ALTER TABLE ' || C_LILAM_RULES_TABLE || ' ADD CONSTRAINT lilam_rules_chk_active '
+                        || 'CHECK (is_active IN (0, 1)) ENABLE NOVALIDATE', -2264);
             end if;
         end if;
 
@@ -2123,13 +2149,20 @@ AS
             run_sql(sqlStmt);
         end if ;
 
-        -- Rule sets: unique per group/name/version; at most one active per group
-        -- Old installations: remove the former index (replaced by idx_lilam_rules_grp)
+        -- Rule sets: unique per group/name/version; at most one active per group.
+        -- The group is compared without case everywhere (upper), so the index does that too.
+        -- Old installations: remove the former index (replaced by idx_lilam_rules_set)
         if objectExists('IDX_LILAM_RULES', 'INDEX') then
             drop_obsolete('DROP INDEX idx_lilam_rules');
         end if;
-        if not objectExists('idx_lilam_rules_grp', 'INDEX') then
-            run_sql('CREATE UNIQUE INDEX idx_lilam_rules_grp ON ' || C_LILAM_RULES_TABLE || ' (group_name, set_name, version)');
+        if not objectExists('idx_lilam_rules_set', 'INDEX') then
+            run_ddl('CREATE UNIQUE INDEX idx_lilam_rules_set ON ' || C_LILAM_RULES_TABLE || ' (upper(group_name), set_name, version)', -955);
+        end if ;
+        -- Migration: the old index distinguished the case of the group. STABILITY: dropped only once
+        -- the new one exists; if that fails (rows differing only in case), the old one stays and
+        -- the error is in LILAM_LOG_INTERNAL.
+        if objectExists('idx_lilam_rules_grp', 'INDEX') and objectExists('idx_lilam_rules_set', 'INDEX') then
+            drop_obsolete('DROP INDEX idx_lilam_rules_grp');
         end if ;
         if not objectExists('idx_lilam_rules_active', 'INDEX') then
             run_sql('CREATE UNIQUE INDEX idx_lilam_rules_active ON ' || C_LILAM_RULES_TABLE
@@ -5990,7 +6023,9 @@ AS
     --------------------------------------------------------------------------
     FUNCTION ruleNumber(p_value VARCHAR2, p_position PLS_INTEGER := 1) RETURN NUMBER
     AS
-        l_val  VARCHAR2(100) := TRIM(REGEXP_SUBSTR(p_value, '[^|]+', 1, p_position));
+        -- STABILITY: as long as condition.value, so that a long part ends up as "needs a number"
+        -- and not as ORA-06502 from the declaration section
+        l_val  VARCHAR2(4000) := TRIM(REGEXP_SUBSTR(p_value, '[^|]+', 1, p_position));
         l_sign NUMBER := 1;
     BEGIN
         IF l_val IS NULL THEN
@@ -6014,6 +6049,8 @@ AS
                           p_avg OUT NOCOPY t_avg_params_map) RETURN VARCHAR2
     IS
         TYPE t_seen_map IS TABLE OF BOOLEAN INDEX BY VARCHAR2(50);
+        -- an empty or blank part in 'a|b|c' (start, middle or end)
+        C_EMPTY_PART CONSTANT VARCHAR2(30) := '(^|\|)\s*(\||$)';
         l_seen   t_seen_map;
         l_hasArr PLS_INTEGER;
         l_no     PLS_INTEGER := 0;
@@ -6163,6 +6200,10 @@ AS
                     l_rule.cond_upper := upper(substr(r.value, l_parts + 1));
                 WHEN l_op IN ('PRECEDED_BY', 'PRECEDED_BY_WITHIN_SECS') THEN
                     -- PRECEDED_BY: ACTION[|CONTEXT]; PRECEDED_BY_WITHIN_SECS: ACTION[|CONTEXT]|SECONDS
+                    -- STABILITY: empty parts ('|C1', 'A|') would otherwise be skipped and change the meaning
+                    IF regexp_like(r.value, C_EMPTY_PART) THEN
+                        RETURN fail(l_op || ': empty part in "condition.value"');
+                    END IF;
                     l_parts := CASE WHEN r.value IS NULL THEN 0 ELSE regexp_count(r.value, '\|') + 1 END;
                     IF l_op = 'PRECEDED_BY_WITHIN_SECS' THEN
                         l_rule.cond_num := ruleNumber(r.value, l_parts);
@@ -6183,6 +6224,13 @@ AS
                     END IF;
                 ELSE
                     -- all other operators: number (AVG_DEVIATION_PCT: 'pct|warmup|alpha')
+                    -- STABILITY: no empty parts and no surplus parts, otherwise a value would be
+                    -- read from the wrong position ('20||0.3' => warmup 0.3, '|5' => 5)
+                    IF regexp_like(r.value, C_EMPTY_PART)
+                       OR regexp_count(r.value, '\|') > CASE WHEN l_op = 'AVG_DEVIATION_PCT' THEN 2 ELSE 0 END THEN
+                        RETURN fail(CASE WHEN l_op = 'AVG_DEVIATION_PCT' THEN 'AVG_DEVIATION_PCT needs PCT[|WARMUP[|ALPHA]]'
+                                         ELSE l_op || ' needs a number (decimal point ".")' END);
+                    END IF;
                     l_rule.cond_num := ruleNumber(r.value, 1);
                     IF l_rule.cond_num IS NULL THEN
                         RETURN fail(l_op || ' needs a number (decimal point ".")');

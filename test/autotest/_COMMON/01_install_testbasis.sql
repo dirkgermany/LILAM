@@ -2026,6 +2026,10 @@ create or replace package body lt as
             -- Version 6: ungueltig, leere "action" (Beispiel SEQ-009 der Analyse; r() laesst eine leere Action weg)
             ins(6, '{"id":"X6-01","trigger_type":"MARK_EVENT","action":"","condition":{"operator":"ON_EVENT","value":""}'
                 || ',"alert":{"handler":"' || c_handler || '","severity":"WARN","throttle_seconds":0}}');
+            -- Versionen 7, 8, 10: ungueltig, leere Teile im Wert (C2; vorher still umgedeutet)
+            ins(7,  r('X7-01',  'MARK_EVENT', 'RG_V2', 'PRECEDED_BY', '|C1'));
+            ins(8,  r('X8-01',  'TRACE_STOP', 'RG_V2', 'AVG_DEVIATION_PCT', '20||0.3'));
+            ins(10, r('X10-01', 'TRACE_STOP', 'RG_V2', 'MAX_DURATION_MS', '|5'));
             -- Gruppe ohne Server: Aktivieren ist kein Fehler
             ins(1, r('E1-01', 'MARK_EVENT', 'RG_E', 'ON_EVENT', ''), 'LT_LEER');
             -- INSESSION: Szenarien (Version 1 mit Praefix der INSESSION-Prozesse) und IS-03..IS-05 (Versionen 1, 2, 6)
@@ -2294,8 +2298,9 @@ create or replace package body lt as
         -- L3: SERVER_UPDATE_RULES lehnt ungueltige/fehlende Rule Sets ab, nichts aendert sich
         -- ---------------------------------------------------------------
         l_n := rejected(c_group, 3) + rejected(c_group, 4) + rejected(c_group, 5) + rejected(c_group, 6)
+             + rejected(c_group, 7) + rejected(c_group, 8) + rejected(c_group, 10)
              + rejected(c_group, 9);                -- Version 9 gibt es nicht
-        check_that(l_run, 'L3 SERVER_UPDATE_RULES lehnt 5 Faelle mit NUM_ERR_RULE_SET ab', l_n = 5, l_n);
+        check_that(l_run, 'L3 SERVER_UPDATE_RULES lehnt 8 Faelle mit NUM_ERR_RULE_SET ab', l_n = 8, l_n);
         check_that(l_run, 'L3 aktives Rule Set der Gruppe unveraendert', active = c_set || ' v1', active);
         l_pid := proc('_L3'); lilam.mark_event(l_pid, 'RG_L'); lilam.close_session(l_pid);
         expect('_L3', 'L-01', 1, 'L3 Regeln aus Version 1 bleiben aktiv');
@@ -2304,6 +2309,17 @@ create or replace package body lt as
         l_n := rejected('LT_LEER', 1);
         check_that(l_run, 'L3a Gruppe ohne Server: kein Fehler, Rule Set aktiv',
                    l_n = 0 and active('LT_LEER') = c_set || ' v1', active('LT_LEER'));
+
+        -- L3d: dieselbe Gruppe in anderer Schreibweise lehnt der Unique-Index ab (C2)
+        begin
+            ins(1, r('V2-01', 'MARK_EVENT', 'RG_V2', 'ON_EVENT', ''), lower(c_group));
+            execute immediate 'delete from lilam_rules where group_name = :1' using lower(c_group);
+            commit;
+            l_n := 0;
+        exception
+            when dup_val_on_index then l_n := 1;
+        end;
+        check_that(l_run, 'L3d Gruppe in anderer Schreibweise: Unique-Index lehnt ab', l_n = 1, l_n);
 
         -- L3c: laufende Server erhalten UPDATE_RULE fuer ein von Hand aktiviertes ungueltiges Rule Set (Version 6)
         --      und behalten ihre bisherigen Regeln (Version 1). Die Nachricht geht wie bei SERVER_UPDATE_RULES

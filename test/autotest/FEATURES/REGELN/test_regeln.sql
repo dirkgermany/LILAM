@@ -1,7 +1,7 @@
 -- =====================================================================
 -- LILAM Test: FEATURES / REGELN
 --
--- Prueft die Rules Engine im SERVER- und INSESSION-Modus mit einem eigenen Rule Set LT_REGELN (Versionen 1-6):
+-- Prueft die Rules Engine im SERVER- und INSESSION-Modus mit einem eigenen Rule Set LT_REGELN (Versionen 1-8, 10):
 --   L1     SERVER_UPDATE_RULES fuer die Gruppe LT (LT_S1 und LT_S2): aktives Rule Set in LILAM_RULES
 --   VG     Vorgaenger: PRECEDED_BY (mit/ohne Kontext), PRECEDED_BY_WITHIN_SECS, bei Events und TRACE_START;
 --          Logs zaehlen nicht als Vorgaenger
