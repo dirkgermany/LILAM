@@ -7,8 +7,8 @@
 
 | Lauf | Skript | Inhalt | Ergebnis | Gesamtlaufzeit |
 |---|---|---|---|---|
-| Probe | `_DIAG/2026-10-04_regeln_probe.sql` | 15 Prüfregeln, 5 Phasen (Laden per API, Neustart, fehlerhaftes Rule Set, INSESSION) | 6 Abweichungen von Doku bzw. Erwartung | ca. 30 s |
-| Leistung | `_DIAG/2026-10-04_regeln_perf.sql` | 9 Regelvarianten × 2 Durchgänge, je 10.000 Signale an LT_S1 (ohne Drosselung) | siehe Punkt 5 | ca. 5 min 15 s |
+| Probe | `FEATURES/REGELN/2026-10-04_regeln_probe.sql` | 15 Prüfregeln, 5 Phasen (Laden per API, Neustart, fehlerhaftes Rule Set, INSESSION) | 6 Abweichungen von Doku bzw. Erwartung | ca. 30 s |
+| Leistung | `FEATURES/REGELN/2026-10-04_regeln_perf.sql` | 9 Regelvarianten × 2 Durchgänge, je 10.000 Signale an LT_S1 (ohne Drosselung) | siehe Punkt 5 | ca. 5 min 15 s |
 
 Beide Skripte stoppen ihren Server, setzen die Registry von LT_S1 zurück und löschen ihre Rule Sets wieder. In `LILAM_ALERTS` bleiben 20.135 Alerts der Prozesse `LT_RG_*` und `LT_RP_*`, in `LILAM_LOG_INTERNAL` rund 20.050 interne Fehler aus den Läufen (siehe Befund B2).
 

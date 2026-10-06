@@ -24,7 +24,7 @@ DECOUPLED/
 
 FEATURES/                   Funktionstests einzelner Merkmale (modusübergreifend)
   BASELINE_SCOPE/  LOGTEXT_GRENZEN/  DISPATCHER_APEX/  FEHLERFAELLE/  SERVERAUSWAHL/  SPEICHER/  REGELN/  REGELN_LAST/
-  RUECKSCHREIBUNG/
+  RUECKSCHREIBUNG/  LEERLAUF_FLUSH/
 
 DAUERTEST/                  Dauertest über alle Modi gleichzeitig (Kombination der Tests)
 
@@ -33,6 +33,11 @@ BELASTUNG/                  Belastungstests: Laststufen bis zur Grenze (Konzept 
 ```
 
 Jeder Testordner enthält das Skript `test_*.sql` und einen Ordner `results/` für die Auswertungen.
+
+Diagnose- und Analyseskripte (`JJJJ-MM-TT_<thema>.sql`, Ad-hoc-Messungen mit eigenen Hilfsobjekten) liegen im Ordner
+des Merkmals, zu dem sie gehören; ihre Berichte in dessen `results/`. Einen eigenen `_DIAG`-Ordner gibt es nicht mehr.
+`FEATURES/LEERLAUF_FLUSH/` besteht nur aus solchen Diagnoseskripten und Berichten (kein Autotest);
+`FEATURES/SPEICHER/lilam_diag.pks|pkb` ist die temporäre Diagnosekopie des Packages (Technik: `ARBEITSSTAND.md`, Abschnitt 6.1).
 
 Die Testlogik steht im Package `LT` (`_COMMON/01_install_testbasis.sql`): je Test eine Funktion
 (`lt.t_lasttest`, `lt.t_massentest`, `lt.t_parallel`, `lt.t_zyklen`, `lt.t_wakeup`, `lt.t_lastspitze`,
