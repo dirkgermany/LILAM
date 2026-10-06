@@ -11,6 +11,7 @@ _COMMON/                    Testbasis (einmalig installieren)
   01_install_testbasis.sql    Tabellen LT_* und Package LT
   02_aufraeumen.sql           stoppt alle Test-Server und -Jobs
   03_ergebnisse.sql           Übersicht der Testläufe
+  04_install_belastung.sql    Tabellen LTB_* und Package LTB für die Belastungstests
 
 INSESSION/                  LILAM als Bibliothek in der Session der Anwendung
   LASTTEST/  MASSENTEST/  PARALLELBETRIEB/  PROZESSZYKLEN/  DAUERTEST/
@@ -26,6 +27,9 @@ FEATURES/                   Funktionstests einzelner Merkmale (modusübergreifen
   RUECKSCHREIBUNG/
 
 DAUERTEST/                  Dauertest über alle Modi gleichzeitig (Kombination der Tests)
+
+BELASTUNG/                  Belastungstests: Laststufen bis zur Grenze (Konzept in BELASTUNG/README.md)
+  KAPAZITAET_SERVER/  SKALIERUNG/  DAUERLAST_MIX/  DISPATCHER_ENGPASS/  APEX_STURM/  BATCHSTART/  FEHLERKASKADE/
 ```
 
 Jeder Testordner enthält das Skript `test_*.sql` und einen Ordner `results/` für die Auswertungen.
@@ -110,9 +114,11 @@ trotzdem immer direkt einen Worker, weil Dispatcher in der Registry gekennzeichn
   So stören sich Testläufe nicht und lassen sich gezielt aufräumen.
 - Die Umfänge sind auf ein Notebook mit Oracle Free abgestimmt und lassen sich im `declare`-Block jedes Skripts anpassen.
 
-## Geplant
+## Belastungstests
 
-- **BELASTUNGSTEST**: LILAM gezielt an die Grenzen führen (steigende Last bis zum Einbruch bzw. Fehler),
-  in allen Modi. Ziel: Verhalten an der Grenze prüfen (keine Datenverluste ohne Protokoll, keine Auswirkung
-  auf die Anwendung, saubere Erholung nach Lastende). Bekannte Grenze aus PARALLELBETRIEB run_id 27–30:
-  DBMS_PIPE fällt bei mehreren gleichzeitigen Sendern auf ca. 2.800 Nachrichten/s je Pipe.
+Die Belastungstests unter `BELASTUNG/` führen LILAM in Laststufen an seine Grenzen, in allen Modi
+(Konzept, Szenarien, Bewertungskriterien und Hypothesen in `BELASTUNG/README.md`). Ziel: die tragfähige Last je
+Konfiguration ermitteln und das Verhalten an der Grenze prüfen (keine Datenverluste ohne Protokoll, keine
+Auswirkung auf die Anwendung, saubere Erholung nach Lastende). Die Logik steht im Package `LTB`
+(`_COMMON/04_install_belastung.sql`), das die Hilfen aus `LT` nutzt. Bekannte Grenze aus PARALLELBETRIEB
+run_id 27–30: DBMS_PIPE fällt bei mehreren gleichzeitigen Sendern auf ca. 2.800 Nachrichten/s je Pipe.
