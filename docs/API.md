@@ -230,7 +230,7 @@ Session handling controls the life cycle of a LILAM process.
 | `NEW_SESSION` | Starts a LILAM process in in-session mode |
 | `SERVER_NEW_SESSION` | Starts a process connected to a LILAM server |
 | `CLOSE_SESSION` | Ends a process and writes buffered data |
-| `FINAL_RESCUE` | Persists buffered data after abnormal process terminations |
+| `FLUSH` | Writes all buffered data of the database session immediately; the processes stay open |
 
 ### Function NEW_SESSION / SERVER_NEW_SESSION
 
@@ -350,7 +350,7 @@ Ends a LILAM process. Optionally, final process information, status and progress
 > [!IMPORTANT]
 > Always call `CLOSE_SESSION` when a process ends. LILAM buffers data for performance reasons. `CLOSE_SESSION` makes sure that remaining buffered data is persisted.
 >
-> `CLOSE_SESSION` should therefore also be part of the final exception handling.
+> `CLOSE_SESSION` should therefore also be part of the final exception handling. If the process is to continue after the exception (e.g. an AJAX page keeps working), use [`FLUSH`](#procedure-flush) instead.
 
 ```sql
 PROCEDURE CLOSE_SESSION(
@@ -391,21 +391,32 @@ EXCEPTION
     RAISE;
 ```
 
-### Procedure FINAL_RESCUE
+### Procedure FLUSH
 
-For performance reasons, LILAM partly buffers logging, monitoring and process data.
+For performance reasons, LILAM buffers logging, monitoring and process data and writes them time-controlled (see [When are metrics and process data written?](#when-are-metrics-and-process-data-written)).
 
-`FINAL_RESCUE` persists all data currently buffered in the current database session.
+`FLUSH` immediately writes all buffered data of all open processes of the current database session, including baselines. Unlike `CLOSE_SESSION`, `FLUSH` does not end a process: the processes stay open, open traces keep running, and counters and averages keep counting.
+
+```sql
+PROCEDURE FLUSH
+```
+
+Typical uses:
+
+- Exception handler, if the process is to continue afterwards (e.g. an AJAX page keeps working). If the process ends, use `CLOSE_SESSION`.
+- A long in-session process should be visible from outside immediately, before a longer pause without LILAM calls.
 
 ```sql
 BEGIN
-  lilam.final_rescue;
+  lilam.flush;
 END;
 /
 ```
 
 > [!IMPORTANT]
-> `FINAL_RESCUE` must be called from the database session in which the affected processes were executed.
+> `FLUSH` only affects the database session it is called from. For processes in decoupled mode (server, dispatcher) `FLUSH` has no effect: their buffers are held by the LILAM server, which writes them time-controlled itself.
+>
+> A `FLUSH` costs one commit (about 1.5 to 3.5 ms on the test system).
 
 ---
 
@@ -431,6 +442,8 @@ The process control APIs manage the overall progress and status of a process.
 
 > [!NOTE]
 > Changes to process data implicitly update the `lastUpdate` value of the process record.
+>
+> Process data is buffered and written time-controlled, see [When are metrics and process data written?](#when-are-metrics-and-process-data-written).
 
 ### Procedure SET_PROCESS_STATUS
 
@@ -630,10 +643,10 @@ LILAM buffers log entries for performance reasons. Entries up to the **sync leve
 
 | Mode | Entries up to the sync level | All other entries |
 | --- | --- | --- |
-| In-Session | are committed in an autonomous transaction before the call returns. LILAM also writes all other buffered data of the database session. | stay in the buffer for up to about 1.5 seconds, longer if the session does not call LILAM again |
+| In-Session | are committed in an autonomous transaction before the call returns. LILAM also writes all other buffered data of the database session. | stay in the buffer for up to about 1.5 seconds, longer if the session does not call LILAM again (log calls, `MARK_EVENT`, `TRACE_STOP` and process control trigger the write-back, see [When are metrics and process data written?](#when-are-metrics-and-process-data-written)) |
 | Decoupled | go to the server as usual and are written to the work table there. As a **safety net**, the client additionally writes them itself in an autonomous transaction before the call returns, always into **`LILAM_LOG`** of the client's schema (created if missing), with the process ID and the value `-1` in column `NO`. | are sent to the server via the pipe and buffered there |
 
-A synchronously written entry therefore survives an abort of the session and, in decoupled mode, a failure of the LILAM server. Buffered entries are lost if a session ends without `CLOSE_SESSION` or `FINAL_RESCUE`. Therefore call `CLOSE_SESSION` in the central exception handler.
+A synchronously written entry therefore survives an abort of the session and, in decoupled mode, a failure of the LILAM server. Buffered entries are lost if a session ends without `CLOSE_SESSION` or `FLUSH`. Therefore call `CLOSE_SESSION` in the central exception handler, or `FLUSH` if the process is to continue.
 
 > [!NOTE]
 > In decoupled mode, synchronous entries are normally stored twice: in the work table (written by the server) and in `LILAM_LOG` of the client's schema (`NO = -1`). If the LILAM server fails, the entry can still be found in `LILAM_LOG`. `LILAM_LOG` is used because the work table may be in the server's schema, which the client cannot reach.
@@ -667,6 +680,18 @@ Metrics record events and logical transactions within a process.
 > `p_actionName` and `p_contextName` together identify a metric.
 >
 > A trace started with a context must be stopped with the same combination of action and context.
+
+### When are metrics and process data written?
+
+LILAM buffers metrics and process data (status, progress) as well. In in-session mode, `MARK_EVENT`, `TRACE_STOP` and the [process control](#process-control) procedures (`SET_PROCESS_STATUS`, `SET_PROC_STEPS_TODO`, `SET_PROC_STEPS_DONE`, `PROC_STEP_DONE`, `SET_PROC_IMMORTAL`) – like every log call – trigger the time-controlled write-back: data of a process older than about 1.5 seconds is written, and cross-process baselines (`LILAM_BASELINES`) are synchronized about every 1.5 seconds as well. At least 500 ms pass between two check runs of the same database session, so a single call usually costs only one time comparison. `TRACE_START` does not trigger a write-back. This way measured values and progress reach the database promptly even for pure monitoring applications that never log. API queries (e.g. `GET_PROC_STEPS_DONE`) in the same session read the current state from the buffer anyway. With [`FLUSH`](#procedure-flush) you write the buffer immediately without ending the process.
+
+> [!IMPORTANT]
+> In in-session mode there is no timer. Data is only written when the session calls LILAM. Whatever is still buffered after the last call stays there until the session calls LILAM again. **Data is only guaranteed to be written by `CLOSE_SESSION` (the process ends) or `FLUSH` (the process stays open).**
+>
+> **AJAX and connection pools (e.g. APEX/ORDS):** An in-session process only lives in the database session that called `NEW_SESSION`. In a pool, the next request usually runs in a different session; there the process ID is unknown and LILAM silently ignores the calls. A `CLOSE_SESSION` on a final page then does not reach the process, and its buffer stays in the original pool session.
+>
+> - **One process per request:** `NEW_SESSION` at the beginning and `CLOSE_SESSION` at the end of the same request. Then in-session mode works with a connection pool as well.
+> - **Processes spanning several requests** (e.g. AJAX pages that only trace or report progress while a final page calls `CLOSE_SESSION`): only with the [decoupled server mode](#decoupled-server-mode) together with the [dispatcher](#dispatcher-mode).
 
 ### Procedure MARK_EVENT
 
@@ -1035,6 +1060,7 @@ LILAM JSON requests consist of a header and a parameter object. The header conta
 | `NEW_SESSION` | `NEW_SESSION` (record) | `process_name`, `log_level`, `steps_todo`, `days_to_keep`, `process_immortal`, `tabname_master`, `baseline_scope` |
 | `SERVER_NEW_SESSION` | `SERVER_NEW_SESSION_JSON` | as `SERVER_NEW_SESSION`, see table there |
 | `CLOSE_SESSION` | `CLOSE_SESSION` | `process_id` |
+| `FLUSH` | `FLUSH` | none |
 | `SET_PROCESS_STATUS` | `SET_PROCESS_STATUS` | `process_id`, `process_status`, `process_info` |
 | `SET_STEP_TODO` | `SET_PROC_STEPS_TODO` | `process_id`, `steps_todo` |
 | `SET_STEPS_DONE` | `SET_PROC_STEPS_DONE` | `process_id`, `steps_done` |

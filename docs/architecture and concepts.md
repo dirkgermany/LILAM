@@ -106,7 +106,7 @@ Buffering makes LILAM fast, but a buffered entry only exists in memory until the
 | Data | In-Session | Decoupled (server, also via dispatcher) |
 | --- | --- | --- |
 | Entries up to the sync level (default: `ERROR`) | Written and committed **before the call returns** (autonomous transaction). The call forces a flush of **all** buffered data of the database session: logs, metrics and process status of every open process. | **Safety net:** the client additionally writes the entry itself in an autonomous transaction **before the call returns**, always into **`LILAM_LOG`** of its own LILAM installation (created if missing), with `NO = -1` and the process ID. It then sends the message to the server as usual: the server writes it to the work table of the process (with its normal running number), evaluates the rules and flushes its buffers. Normally the entry is therefore stored twice. |
-| All other entries, metrics, process status | Buffered in the PGA of the session. Flushed when the last flush is at least 1.5 s ago or 50,000 entries are pending, and also by a synchronous entry, `CLOSE_SESSION` and `FINAL_RESCUE`. | Sent via the pipe, buffered in the PGA of the server, flushed by the same rules plus the server's housekeeping (every 0.5 s when idle). |
+| All other entries, metrics, process status | Buffered in the PGA of the session. Flushed when the last flush is at least 1.5 s ago or 50,000 entries are pending, and also by a synchronous entry, `CLOSE_SESSION` and `FLUSH`. | Sent via the pipe, buffered in the PGA of the server, flushed by the same rules plus the server's housekeeping (every 0.5 s when idle). |
 
 Why `LILAM_LOG` and not the work table of the process? The work table may be in the schema of the server, which the client cannot reach, and where the safety net ends up should not depend on modes, schemas and privileges. The rule is simple: all entries are in the work table as usual; **if the LILAM server failed, the synchronous entries are additionally in `LILAM_LOG` of the client's schema** (`NO = -1`, same `PROCESS_ID`).
 
@@ -115,7 +115,7 @@ The server reports log level and sync level of a process to the client when the 
 > [!NOTE]
 > Column `NO` is the running number that the server assigns per process. Entries written directly by a decoupled client have `NO = -1`.
 
-The time-based flush has no background timer: it is checked only when the session calls LILAM again. A session that stops calling LILAM keeps its buffer, however long it waits.
+The time-based flush has no background timer: it is checked only when the session calls LILAM again. In in-session mode every log call as well as `MARK_EVENT`, `TRACE_STOP` and the process control calls (`SET_PROCESS_STATUS`, `SET_PROC_STEPS_TODO`, `SET_PROC_STEPS_DONE`, `PROC_STEP_DONE`, `SET_PROC_IMMORTAL`) triggers this check (`TRACE_START` does not), so pure monitoring applications that never log are flushed as well. On the server these handlers call the internal procedures without the check; the server loop writes there. The check runs at most every 500 ms per database session; cross-process baselines are synchronized at most every 1.5 s. A session that stops calling LILAM keeps its buffer, however long it waits: **in in-session mode data is only guaranteed to be written by `CLOSE_SESSION` (the process ends) or `FLUSH` (the process stays open).** With a connection pool (APEX/ORDS) or processes that span several page requests or database sessions (e.g. AJAX pages that only trace or report progress, while a final page calls `CLOSE_SESSION`), use the decoupled server together with the dispatcher.
 
 Measured on Oracle 23.26 Free (2 CPU threads), test schema `LILAM_TEST`:
 
@@ -135,7 +135,7 @@ Measured on Oracle 23.26 Free (2 CPU threads), test schema `LILAM_TEST`:
 | Failure | In-Session | Decoupled |
 | --- | --- | --- |
 | Caller `ROLLBACK` | Nothing. All writes are autonomous transactions. | Nothing. |
-| Unhandled exception, session killed, job aborted, without `CLOSE_SESSION` / `FINAL_RESCUE` | Everything buffered since the last flush (e.g. `INFO` and `WARN`). An `ERROR` that has returned is stored, together with everything that was buffered before it. | Nothing on the client side. Entries that have reached the server are lost only if the server fails. |
+| Unhandled exception, session killed, job aborted, without `CLOSE_SESSION` / `FLUSH` | Everything buffered since the last flush (e.g. `INFO` and `WARN`). An `ERROR` that has returned is stored, together with everything that was buffered before it. | Nothing on the client side. Entries that have reached the server are lost only if the server fails. |
 | Database session dies during the `ERROR` call | This `ERROR` (it is committed at the end of the call). | This `ERROR`, if it was not yet committed. |
 | LILAM server killed or crashed | – | Everything in the server's buffer and in its pipe, i.e. buffered entries above the sync level. The pipe lives in the SGA only, and a restarted server empties its pipe and does not know the processes of its predecessor. Synchronous entries are stored in `LILAM_LOG` of the client (verified by test: an `ERROR` sent while the server was down is there). |
 | Instance crash | Everything buffered. | Everything buffered and everything in the pipes. |
@@ -145,7 +145,7 @@ Measured on Oracle 23.26 Free (2 CPU threads), test schema `LILAM_TEST`:
 **Consequences**
 * Once a call with a level up to the sync level returns, the entry is committed, in both modes. The additional cost compared with a buffered entry is mostly the commit.
 * Choose `logLevelWarn` as sync level if warnings must survive a failure as well. Each synchronous entry costs a few milliseconds, so keep frequent levels (`INFO`, `DEBUG`) buffered.
-* Always call `CLOSE_SESSION` (or at least `FINAL_RESCUE`) in the central exception handler. Otherwise buffered entries from before the failure are lost.
+* Always call `CLOSE_SESSION` in the central exception handler, or `FLUSH` if the process is to continue (e.g. an AJAX page keeps working). Otherwise buffered entries from before the failure are lost.
 
 The session is more of a technical perspective on the workflows within LILAM, while the process is the view 'to the outside.' I believe these two terms—session and process—can be used almost synonymously in daily LILAM operations. It doesn't really hurt if they are mixed a bit.
 
@@ -322,7 +322,7 @@ flowchart LR
         B1 --> G1{"Process has<br/>a group?"}
         G1 -- yes --> R1["Rule evaluation in the application session<br/>rule set of the group, checked for changes<br/>at most every 15 s"]
         R1 -- "rule matches" --> AL1[("LILAM_ALERTS + DBMS_ALERT<br/>synchronous, autonomous transaction")]
-        C1 --> D1{"Flush due?<br/>1500 ms, 50,000 entries,<br/>ERROR or CLOSE_SESSION"}
+        C1 --> D1{"Flush due?<br/>checked on log_any, MARK_EVENT, TRACE_STOP,<br/>process control:<br/>1500 ms, 50,000 entries,<br/>ERROR or CLOSE_SESSION"}
         D1 -- yes --> E1["SYNC_ALL_DIRTY<br/>FORALL + COMMIT<br/>(autonomous transaction)"]
         D1 -- no --> B1
         E1 --> T1[("Tables<br/>NAME_PROC / _LOG / _MON")]

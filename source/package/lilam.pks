@@ -218,9 +218,10 @@ create or replace PACKAGE LILAM AS
     PROCEDURE CALL_BY_JSON(p_callObject  IN  JSON_OBJ_LILAM, p_respObject  OUT JSON_OBJ_LILAM);
 
     ---------
-    -- Final Rescue
+    -- Flush
     ---------
-    PROCEDURE FINAL_RESCUE;
+    -- Writes all buffered data of this database session immediately; the processes stay open
+    PROCEDURE FLUSH;
 
     ----------
     -- Testing

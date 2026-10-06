@@ -203,6 +203,10 @@ create or replace package lt authid definer as
     -- INSESSION und SERVER in einem Lauf
     function t_logtext(p_manage boolean default true, p_parent number default null) return number;
     function t_baseline_scope(p_manage boolean default true, p_parent number default null) return number;
+    -- Sichtbarkeit vor CLOSE_SESSION: reine Monitoring-Prozesse (ohne Log) schreiben zeitgesteuert zurueck
+    function t_rueckschreibung(p_manage boolean default true, p_parent number default null) return number;
+    -- Baustein von t_rueckschreibung (laeuft als Job = fremde Session): Tabellenstand als Messwerte festhalten
+    procedure rs_peek(p_run_id number, p_prefix varchar2, p_key varchar2);
 
     -- Regeln (Rules Engine) im SERVER-Modus: Laden, Operatoren, Alerts. Nur einzeln (aendert das Rule Set von LT_S1)
     function t_regeln(p_manage boolean default true, p_parent number default null) return number;
@@ -1368,6 +1372,229 @@ create or replace package body lt as
         if p_manage then stop_all_servers; end if;
         check_that(l_run, 'B6 Keine internen LILAM-Fehler', internal_errors_since(run_started(l_run)) = 0,
                    internal_errors_since(run_started(l_run)));
+        end_run(l_run);
+        return l_run;
+    exception
+        when others then
+            abort_run(l_run, p_manage, sqlerrm || ' ' || dbms_utility.format_error_backtrace);
+            if p_manage then raise; end if;
+            return l_run;
+    end;
+
+    ----------------------------------------------------------------------
+    -- Rueckschreibung: Sichtbarkeit vor CLOSE_SESSION
+    ----------------------------------------------------------------------
+    -- Laeuft als Job (fremde Session): liest den Tabellenstand der Testprozesse mit Praefix p_prefix
+    -- und haelt ihn als Messwerte <p_key>_<was> fest. Die pruefende Session liest sie aus LT_METRIC.
+    procedure rs_peek(p_run_id number, p_prefix varchar2, p_key varchar2) is
+        l_n number;
+
+        function q(p_sql varchar2, p_bind varchar2) return number is
+            l_v number;
+        begin
+            execute immediate p_sql into l_v using p_bind;
+            return l_v;
+        exception when others then return -1;
+        end;
+    begin
+        metric(p_run_id, p_key || '_sid', to_number(sys_context('userenv', 'sid')));
+        l_n := q('select count(*) from lilam_mon m join lilam_proc p on p.id = m.process_id
+                   where p.process_name = :1 and m.mon_type = 1', p_prefix || '_TRC');
+        metric(p_run_id, p_key || '_trc', l_n);
+        l_n := q('select nvl(max(m.action_count), 0) from lilam_mon m join lilam_proc p on p.id = m.process_id
+                   where p.process_name = :1 and m.mon_type = 1', p_prefix || '_TRC');
+        metric(p_run_id, p_key || '_trccnt', l_n);
+        l_n := q('select count(*) from lilam_proc where process_name = :1 and process_end is null', p_prefix || '_TRC');
+        metric(p_run_id, p_key || '_trcopen', l_n);
+        l_n := q('select count(*) from lilam_mon m join lilam_proc p on p.id = m.process_id
+                   where p.process_name = :1 and m.mon_type = 0', p_prefix || '_EVT');
+        metric(p_run_id, p_key || '_evt', l_n);
+        l_n := q('select nvl(max(steps_done), -1) from lilam_proc where process_name = :1', p_prefix || '_STP');
+        metric(p_run_id, p_key || '_stp', l_n);
+        l_n := q('select nvl(max(status), -1) from lilam_proc where process_name = :1', p_prefix || '_STP');
+        metric(p_run_id, p_key || '_sts', l_n);
+        l_n := q('select nvl(sum(b.action_count), 0) from lilam_baselines b join lilam_scopes s on s.scope_id = b.scope_id
+                   where s.scope_name = upper(:1)', p_prefix || '_SCOPE');
+        metric(p_run_id, p_key || '_bas', l_n);
+    end;
+
+    -- Je Modus vier Prozesse ohne Log-Aufruf: nur Traces, nur Events, nur Fortschritt, nur Baseline.
+    -- Jeweils ein Aufruf, Pause > 1,5 s, ein weiterer Aufruf; danach prueft ein Job aus fremder Session,
+    -- dass auch der Stand des letzten Aufrufs in der Tabelle steht, bevor CLOSE_SESSION laeuft.
+    function t_rueckschreibung(p_manage boolean default true, p_parent number default null) return number is
+        c_action  constant varchar2(30) := 'RS_ACTION';
+        c_pause_s constant number       := 2;     -- > 1,5 s Schwelle je Prozess und Baseline, > 500 ms Sperre
+        c_server_wait_s constant number := 4;     -- SERVER: Zeit fuer den Server-Loop bis zum Schreiben
+        l_run     number;
+        l_peeks   pls_integer := 0;
+
+        procedure trace(p_pid number) is
+        begin
+            lilam.trace_start(p_pid, c_action);
+            dbms_session.sleep(0.05);
+            lilam.trace_stop(p_pid, c_action);
+        end;
+
+        -- Tabellenstand aus fremder Session (Job) festhalten
+        procedure peek(p_prefix varchar2, p_key varchar2) is
+            l_job varchar2(60);
+        begin
+            l_peeks := l_peeks + 1;
+            l_job := 'LT_C' || l_run || '_PEEK' || l_peeks;
+            run_job(l_job, 'begin lt.rs_peek(' || l_run || ', ''' || p_prefix || ''', ''' || p_key || '''); end;');
+            if not wait_jobs(l_job, 30) then
+                raise_application_error(-20001, 'Job ' || l_job || ' nicht beendet');
+            end if;
+        end;
+
+        function val(p_key varchar2, p_what varchar2) return number is
+            l_v number;
+        begin
+            select max(value) into l_v from lt_metric where run_id = l_run and metric = p_key || '_' || p_what;
+            return l_v;
+        end;
+
+        procedure check_foreign(p_key varchar2) is
+        begin
+            check_that(l_run, p_key || ' Pruefung lief in fremder Session',
+                       val(p_key, 'sid') != to_number(sys_context('userenv', 'sid')),
+                       'SID ' || val(p_key, 'sid') || ' / eigene ' || sys_context('userenv', 'sid'));
+        end;
+
+        procedure run_mode(p_mode varchar2, p_tag varchar2) is
+            l_prefix varchar2(60) := 'LT_' || l_run || '_' || p_tag;
+            l_ins    boolean      := p_mode = c_insession;
+            l_trc    number;
+            l_evt    number;
+            l_stp    number;
+            l_bas    number;
+            l_key    varchar2(30);
+
+            procedure settle is
+            begin
+                if not l_ins then dbms_session.sleep(c_server_wait_s); end if;
+            end;
+        begin
+            -- R1 nur Traces
+            l_key := p_tag || '_R1';
+            l_trc := open_process(p_mode, l_prefix || '_TRC');
+            trace(l_trc);
+            dbms_session.sleep(c_pause_s);
+            trace(l_trc);
+            settle;
+            peek(l_prefix, l_key);
+            check_foreign(l_key);
+            check_that(l_run, l_key || ' nur Traces: beide Traces vor CLOSE_SESSION in LILAM_MON',
+                       val(l_key, 'trc') = 2, val(l_key, 'trc'));
+
+            -- R2 nur Events
+            l_key := p_tag || '_R2';
+            l_evt := open_process(p_mode, l_prefix || '_EVT');
+            lilam.mark_event(l_evt, c_action);
+            dbms_session.sleep(c_pause_s);
+            lilam.mark_event(l_evt, c_action);
+            settle;
+            peek(l_prefix, l_key);
+            check_that(l_run, l_key || ' nur Events: beide Events vor CLOSE_SESSION in LILAM_MON',
+                       val(l_key, 'evt') = 2, val(l_key, 'evt'));
+
+            -- R3 nur Fortschritt (PROC_STEP_DONE, SET_PROCESS_STATUS)
+            l_key := p_tag || '_R3';
+            l_stp := open_process(p_mode, l_prefix || '_STP');
+            lilam.proc_step_done(l_stp);
+            dbms_session.sleep(c_pause_s);
+            lilam.proc_step_done(l_stp);
+            dbms_session.sleep(c_pause_s);
+            lilam.set_process_status(l_stp, 2, 'PHASE 2');
+            settle;
+            peek(l_prefix, l_key);
+            check_that(l_run, l_key || ' nur Fortschritt: STEPS_DONE = 2 vor CLOSE_SESSION in LILAM_PROC',
+                       val(l_key, 'stp') = 2, val(l_key, 'stp'));
+            check_that(l_run, l_key || ' nur Fortschritt: STATUS = 2 vor CLOSE_SESSION in LILAM_PROC',
+                       val(l_key, 'sts') = 2, val(l_key, 'sts'));
+
+            -- R4 nur Baseline (eigener Scope)
+            l_key := p_tag || '_R4';
+            l_bas := open_process(p_mode, l_prefix || '_BAS', l_prefix || '_SCOPE');
+            trace(l_bas);
+            dbms_session.sleep(c_pause_s);
+            trace(l_bas);
+            settle;
+            peek(l_prefix, l_key);
+            check_that(l_run, l_key || ' nur Baseline: 2 Messungen vor CLOSE_SESSION in LILAM_BASELINES',
+                       val(l_key, 'bas') = 2, val(l_key, 'bas'));
+
+            -- R5 (nur INSESSION) Gegenprobe: ohne Timer bleibt nach dem letzten Aufruf etwas im Puffer.
+            -- PROC_STEP_DONE schreibt (letzter Abgleich > 1,5 s her); der Trace direkt danach faellt in die
+            -- 500-ms-Sperre und bleibt im Puffer, bis CLOSE_SESSION ihn schreibt.
+            if l_ins then
+                l_key := p_tag || '_R5';
+                dbms_session.sleep(c_pause_s);
+                lilam.proc_step_done(l_stp);
+                trace(l_trc);
+                peek(l_prefix, l_key);
+                check_that(l_run, l_key || ' Gegenprobe: PROC_STEP_DONE geschrieben (STEPS_DONE = 3)',
+                           val(l_key, 'stp') = 3, val(l_key, 'stp'));
+                check_that(l_run, l_key || ' Gegenprobe: Trace direkt danach noch im Puffer (2 statt 3)',
+                           val(l_key, 'trc') = 2, val(l_key, 'trc'));
+
+                -- R6 FLUSH schreibt sofort (auch innerhalb der 500-ms-Sperre), der Prozess bleibt offen
+                l_key := p_tag || '_R6';
+                lilam.flush;
+                peek(l_prefix, l_key);
+                check_that(l_run, l_key || ' FLUSH: gepufferter Trace sofort geschrieben (3)',
+                           val(l_key, 'trc') = 3, val(l_key, 'trc'));
+                check_that(l_run, l_key || ' FLUSH: Prozess bleibt offen (PROCESS_END leer)',
+                           val(l_key, 'trcopen') = 1, val(l_key, 'trcopen'));
+
+                -- R7 FLUSH per CALL_BY_JSON; der Prozess zaehlt nach dem FLUSH weiter
+                l_key := p_tag || '_R7';
+                lilam.flush;       -- startet die 500-ms-Sperre: der folgende Trace bleibt im Puffer
+                trace(l_trc);
+                declare
+                    l_resp lilam.JSON_OBJ_LILAM;
+                begin
+                    lilam.call_by_json('{"header":{"api_call":"FLUSH"},"params":{}}', l_resp);
+                    check_that(l_run, l_key || ' CALL_BY_JSON FLUSH: SUCCESS',
+                               instr(l_resp, '"status":"SUCCESS"') > 0, substr(l_resp, 1, 200));
+                end;
+                peek(l_prefix, l_key);
+                check_that(l_run, l_key || ' CALL_BY_JSON FLUSH: vierter Trace sofort geschrieben (4)',
+                           val(l_key, 'trc') = 4, val(l_key, 'trc'));
+                check_that(l_run, l_key || ' nach FLUSH zaehlt der Prozess weiter (ACTION_COUNT 4)',
+                           val(l_key, 'trccnt') = 4, val(l_key, 'trccnt'));
+            end if;
+
+            lilam.close_session(l_trc);
+            lilam.close_session(l_evt);
+            lilam.close_session(l_stp);
+            lilam.close_session(l_bas);
+
+            if l_ins then
+                l_key := p_tag || '_R8';
+                peek(l_prefix, l_key);
+                check_that(l_run, l_key || ' nach CLOSE_SESSION: alle 4 Traces in LILAM_MON, Prozess geschlossen',
+                           val(l_key, 'trc') = 4 and val(l_key, 'trcopen') = 0,
+                           val(l_key, 'trc') || ' Traces / offen ' || val(l_key, 'trcopen'));
+            end if;
+        end;
+    begin
+        l_run := begin_run('RUECKSCHREIBUNG', 'INSESSION+SERVER', null, p_parent);
+        run_mode(c_insession, 'IS');
+        if p_manage then setup_servers(c_server, 1); end if;
+        run_mode(c_server, 'SV');
+        if p_manage then stop_all_servers; end if;
+        check_that(l_run, 'R9 Keine internen LILAM-Fehler', internal_errors_since(run_started(l_run)) = 0,
+                   internal_errors_since(run_started(l_run)));
+        -- Testdaten nur bei Erfolg loeschen (sonst zur Analyse stehen lassen)
+        if g_check_no > 0 then
+            declare
+                l_fail number;
+            begin
+                select count(*) into l_fail from lt_check where run_id = l_run and ok = 0;
+                if l_fail = 0 then purge_prefix('LT_' || l_run || '_'); end if;
+            end;
+        end if;
         end_run(l_run);
         return l_run;
     exception

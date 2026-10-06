@@ -23,6 +23,7 @@ DECOUPLED/
 
 FEATURES/                   Funktionstests einzelner Merkmale (modusübergreifend)
   BASELINE_SCOPE/  LOGTEXT_GRENZEN/  DISPATCHER_APEX/  FEHLERFAELLE/  SERVERAUSWAHL/  SPEICHER/  REGELN/  REGELN_LAST/
+  RUECKSCHREIBUNG/
 
 DAUERTEST/                  Dauertest über alle Modi gleichzeitig (Kombination der Tests)
 ```
@@ -31,7 +32,7 @@ Jeder Testordner enthält das Skript `test_*.sql` und einen Ordner `results/` f�
 
 Die Testlogik steht im Package `LT` (`_COMMON/01_install_testbasis.sql`): je Test eine Funktion
 (`lt.t_lasttest`, `lt.t_massentest`, `lt.t_parallel`, `lt.t_zyklen`, `lt.t_wakeup`, `lt.t_lastspitze`,
-`lt.t_logtext`, `lt.t_baseline_scope`, `lt.t_speicher`, `lt.t_regeln`, `lt.t_regeln_last`). Die Skripte rufen diese Funktionen mit sichtbaren, anpassbaren Parametern auf.
+`lt.t_logtext`, `lt.t_baseline_scope`, `lt.t_rueckschreibung`, `lt.t_speicher`, `lt.t_regeln`, `lt.t_regeln_last`). Die Skripte rufen diese Funktionen mit sichtbaren, anpassbaren Parametern auf.
 So kann der Dauertest dieselben Tests wiederverwenden. FEHLERFAELLE und DISPATCHER_APEX bleiben eigenständige Skripte
 (sie stoppen bewusst Server bzw. legen Hilfstabellen an).
 
@@ -47,6 +48,7 @@ So kann der Dauertest dieselben Tests wiederverwenden. FEHLERFAELLE und DISPATCH
 | WAKEUP | Aufrufe nach Ruhephasen des Servers von 5, 16, 30 und 65 s | nur DECOUPLED |
 | LASTSPITZE | mehrere Clients senden eine Zeit lang ohne Pause; danach Erholung: alle Daten vollständig, Prozesse geschlossen, keine Routen übrig, ein neuer Prozess arbeitet wieder normal | 6 Clients × 30 s, nur DECOUPLED |
 | FEATURES/BASELINE_SCOPE | prozessübergreifende Baseline: Default-Scope, `#NONE`, frei gewählter gemeinsamer Scope; INSESSION und SERVER | je Modus 7 kurze Prozesse |
+| FEATURES/RUECKSCHREIBUNG | Sichtbarkeit vor `CLOSE_SESSION`: Prozesse ohne Log-Aufruf (nur Traces, nur Events, nur Fortschritt, nur Baseline); nach Aufruf, Pause 2 s und weiterem Aufruf prüft ein Job aus fremder Session `LILAM_MON`, `LILAM_PROC` und `LILAM_BASELINES`. INSESSION-Gegenprobe: ein Aufruf in der 500-ms-Sperre bleibt im Puffer (kein Timer); `FLUSH` (direkt und per `CALL_BY_JSON`) schreibt ihn sofort, der Prozess bleibt offen und zählt weiter; INSESSION und SERVER | je Modus 4 Prozesse, ca. 55 s |
 | FEATURES/LOGTEXT_GRENZEN | Kürzung langer Logtexte (1.500–5.000 Zeichen, Umlaute); INSESSION und SERVER | 9 Texte je Modus |
 | FEATURES/DISPATCHER_APEX | APEX/AJAX mit Connection Pool: jeder Request ein eigener Job mit leerem PGA, Trace über zwei Requests, parallele Requests, Request ohne Dispatcher, veraltete ID nach CLOSE | 13 Requests |
 | FEATURES/FEHLERFAELLE | Störungen ohne Wirkung auf die Anwendung: kein Server, negative/veraltete ID, Handshake über Dispatcher, verfallene NEW_SESSION | 6 Fälle |
@@ -58,6 +60,22 @@ So kann der Dauertest dieselben Tests wiederverwenden. FEHLERFAELLE und DISPATCH
 Eine Operation besteht aus fünf API-Aufrufen: `INFO`, `TRACE_START`, `TRACE_STOP`, `MARK_EVENT`, `PROC_STEP_DONE`.
 Die Standard-Prüfung kontrolliert danach Vollständigkeit (Logs, Traces, Events, Steps), geschlossene Prozesse,
 die Zählung der Baseline, übrig gebliebene Routen sowie Fehler in Client-Jobs und in `LILAM_LOG_INTERNAL`.
+
+### Sichtbarkeit vor CLOSE_SESSION
+
+Die Standard-Prüfung zählt erst nach `CLOSE_SESSION`, und die Standard-Operation enthält immer ein `INFO`.
+Beides verdeckt, ob gepufferte Daten schon **während** eines Prozesses in den Tabellen stehen: `CLOSE_SESSION`
+schreibt zwangsweise alles, und im INSESSION-Modus stößt jeder Log-Aufruf die zeitgesteuerte Rückschreibung an.
+Deshalb prüft `FEATURES/RUECKSCHREIBUNG` gezielt Prozesse **ohne** Log-Aufruf und liest den Stand **vor**
+`CLOSE_SESSION` aus einer **fremden Session** (Job). Neue API-Aufrufe, die Daten puffern, gehören dort mit
+einem eigenen Prozess in die Prüfung.
+
+| Prüfung | nach `CLOSE_SESSION` | vor `CLOSE_SESSION` (fremde Session) |
+|---|---|---|
+| Logs, Traces, Events, Steps (Standard-Operation) | alle Tests | indirekt (Workload loggt immer) |
+| nur Traces / nur Events / nur Fortschritt / nur Baseline | – | RUECKSCHREIBUNG |
+| Rest im Puffer nach dem letzten Aufruf (INSESSION, kein Timer) | RUECKSCHREIBUNG (R8) | RUECKSCHREIBUNG (R5) |
+| `FLUSH` schreibt sofort, Prozess bleibt offen (auch per `CALL_BY_JSON`) | – | RUECKSCHREIBUNG (R6, R7) |
 
 ## Ablauf
 

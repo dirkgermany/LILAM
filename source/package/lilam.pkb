@@ -2861,6 +2861,19 @@ AS
             flushBatch;
     END SYNC_ALL_DIRTY;
 
+    --------------------------------------------------------------------------
+    -- In-session: trigger the time-controlled write-back after a public API call.
+    -- There is no timer in in-session mode, so every buffering call checks (like log_any).
+    -- Server handlers call the internal procedures instead; the server loop writes there.
+    --------------------------------------------------------------------------
+    procedure syncInSession(p_processId number)
+    as
+    begin
+        if not is_remote(p_processId) then
+            SYNC_ALL_DIRTY();
+        end if;
+    end;
+
 
     --------------------------------------------------------------------------
     -- Write monitor data to detail table
@@ -3453,7 +3466,8 @@ AS
         l_timestamp TIMESTAMP(6);
     begin
         l_timestamp := coalesce(p_timestamp, SYSTIMESTAMP);
-        writeEventToMonitorBuffer (p_processId, p_actionName, p_contextName, l_timestamp);     
+        writeEventToMonitorBuffer (p_processId, p_actionName, p_contextName, l_timestamp);
+        syncInSession(p_processId);
     end;
     --------------------------------------------------------------------------
 
@@ -3476,6 +3490,7 @@ AS
     begin
         l_timestamp := coalesce(p_timestamp, SYSTIMESTAMP);
         writeTraceToMonitorBuffer(p_processId, p_actionName, p_contextName, l_timestamp);
+        syncInSession(p_processId);
     end;
 
     --------------------------------------------------------------------------
@@ -4441,6 +4456,7 @@ AS
     as
     begin
         setAnyStatus(p_processId, p_status, p_processInfo, null, null, null, SYSTIMESTAMP);
+        syncInSession(p_processId);
     end;
 
     --------------------------------------------------------------------------
@@ -4449,6 +4465,7 @@ AS
      as
      begin
         setAnyStatus(p_processId, null, null, p_procStepsToDo, null, null, SYSTIMESTAMP);
+        syncInSession(p_processId);
      end;
 
     --------------------------------------------------------------------------
@@ -4456,20 +4473,22 @@ AS
     procedure SET_PROC_STEPS_DONE(p_processId number, p_procStepsDone number)
     as
     begin
-        setAnyStatus(p_processId, null, null, null, p_procStepsDone, null, SYSTIMESTAMP);   
+        setAnyStatus(p_processId, null, null, null, p_procStepsDone, null, SYSTIMESTAMP);
+        syncInSession(p_processId);
     end;
 
     procedure SET_PROC_IMMORTAL(p_processId number, p_immortal number)
     as
     begin
         setAnyStatus(p_processId, null, null, null, null, p_immortal, SYSTIMESTAMP);
+        syncInSession(p_processId);
     end;
 
     --------------------------------------------------------------------------
 
-    procedure PROC_STEP_DONE(p_processId number)
+    -- Internal: also used by the server (doRemote_procStepDone), therefore without write-back
+    procedure procStepDone(p_processId number)
     as
-        sqlStatement varchar2(500);
         l_steps number;
     begin
         if is_remote(p_processId) then
@@ -4478,9 +4497,16 @@ AS
         end if ;
 
        if v_indexSession.EXISTS(p_processId) then
-            l_steps := coalesce(g_process_cache(p_processId).stepsDone, 0) +1;                
-            setAnyStatus(p_processId, null, null, null, l_steps, null, SYSTIMESTAMP);   
+            l_steps := coalesce(g_process_cache(p_processId).stepsDone, 0) +1;
+            setAnyStatus(p_processId, null, null, null, l_steps, null, SYSTIMESTAMP);
         end if;
+    end;
+
+    procedure PROC_STEP_DONE(p_processId number)
+    as
+    begin
+        procStepDone(p_processId);
+        syncInSession(p_processId);
     end;
 
     --------------------------------------------------------------------------
@@ -5048,7 +5074,7 @@ AS
         l_payload := JSON_QUERY(p_message, '$.payload');
         l_processId  := jsonNumber(l_payload, 'process_id');
 
-        PROC_STEP_DONE(l_processId);
+        procStepDone(l_processId);
     end;
 
     --------------------------------------------------------------------------
@@ -6574,7 +6600,7 @@ AS
         g_serverPipeName := p_pipeName;
         g_serverGroupName := p_groupName;
         g_serverProcessId := new_session(p_processName => 'LILAM_SERVER', p_logLevel => logLevelMonitor, p_tabNameMaster => 'LILAM_SERVER');
-        SET_PROCESS_STATUS(g_serverProcessId, 1, 'RUNNING');
+        setAnyStatus(g_serverProcessId, 1, 'RUNNING', null, null, null, SYSTIMESTAMP);
 
         registerServerPipe;
         preparePipe(g_serverPipeName);
@@ -6643,7 +6669,7 @@ AS
         END LOOP;
         -- From now on the server is no longer reachable
         updateServerRegistry(FALSE, l_msgCnt);
-        SET_PROCESS_STATUS(g_serverProcessId, 0, 'STOPPED');
+        setAnyStatus(g_serverProcessId, 0, 'STOPPED', null, null, null, SYSTIMESTAMP);
 
         -- +++ NEW: DRAIN PHASE +++
         -- We empty the pipe in case messages still arrived during the shutdown.
@@ -6790,6 +6816,10 @@ BEGIN
             CLOSE_SESSION(jsonNumber(l_jsonParams, 'process_id'));
             jsonPut(l_jsonHeader, 'status', 'SUCCESS');
 
+        when 'FLUSH' THEN
+            FLUSH;
+            jsonPut(l_jsonHeader, 'status', 'SUCCESS');
+
         when 'SET_PROCESS_STATUS' THEN
             SET_PROCESS_STATUS(jsonNumber(l_jsonParams, 'process_id'), jsonNumber(l_jsonParams, 'process_status'), jsonString(l_jsonParams, 'process_info'));
             jsonPut(l_jsonHeader, 'status', 'SUCCESS');
@@ -6930,10 +6960,12 @@ END;
     
     ------------------------------------------------------------------------
 
-    PROCEDURE FINAL_RESCUE
+    -- Forced write-back of all processes of this database session (without the shutdown part).
+    -- The processes stay open. Buffers of remote processes are held and written by the server.
+    PROCEDURE FLUSH
     as
     begin
-        SYNC_ALL_DIRTY(true, true);
+        SYNC_ALL_DIRTY(true);
     end;
 
     ------------------------------------------------------------------------
