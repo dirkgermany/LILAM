@@ -106,7 +106,7 @@ Buffering makes LILAM fast, but a buffered entry only exists in memory until the
 | Data | In-Session | Decoupled (server, also via dispatcher) |
 | --- | --- | --- |
 | Entries up to the sync level (default: `ERROR`) | Written and committed **before the call returns** (autonomous transaction). The call forces a flush of **all** buffered data of the database session: logs, metrics and process status of every open process. | **Safety net:** the client additionally writes the entry itself in an autonomous transaction **before the call returns**, always into **`LILAM_LOG`** of its own LILAM installation (created if missing), with `NO = -1` and the process ID. It then sends the message to the server as usual: the server writes it to the work table of the process (with its normal running number), evaluates the rules and flushes its buffers. Normally the entry is therefore stored twice. |
-| All other entries, metrics, process status | Buffered in the PGA of the session. Flushed when the last flush is at least 1.5 s ago or 50,000 entries are pending, and also by a synchronous entry, `CLOSE_SESSION` and `FLUSH`. | Sent via the pipe, buffered in the PGA of the server, flushed by the same rules plus the server's housekeeping (every 0.5 s when idle). |
+| All other entries, metrics, process status | Buffered in the PGA of the session. Flushed when the last flush is at least 1.5 s ago or 50,000 entries are pending, and also by a synchronous entry, `CLOSE_SESSION` and `FLUSH`. | Sent via the pipe, buffered in the PGA of the server, flushed by the same rules plus the server's housekeeping (every 0.5 s) and, when its pipe is empty, by the idle flush (at most every 200 ms). |
 
 Why `LILAM_LOG` and not the work table of the process? The work table may be in the schema of the server, which the client cannot reach, and where the safety net ends up should not depend on modes, schemas and privileges. The rule is simple: all entries are in the work table as usual; **if the LILAM server failed, the synchronous entries are additionally in `LILAM_LOG` of the client's schema** (`NO = -1`, same `PROCESS_ID`).
 
@@ -128,7 +128,7 @@ Measured on Oracle 23.26 Free (2 CPU threads), test schema `LILAM_TEST`:
 | Decoupled: `INFO` (client) | 0.1–0.4 ms per call |
 | Decoupled: `ERROR` (client, direct write) | 1.3–3.6 ms per call; for comparison, a plain autonomous insert with commit costs 1.3 ms on this system |
 | Decoupled: `ERROR` visible in `LILAM_LOG` | immediately after the call |
-| Decoupled: `INFO` visible in the table | after about 2 s |
+| Decoupled: `INFO` visible in the table | usually within 0.4 s (idle flush; via dispatcher after a pause: median 31 ms, max. 371 ms, run 1918) |
 
 **What is lost in case of a failure** (default sync level `ERROR`)
 
@@ -301,6 +301,8 @@ Two exceptions must be considered here:
 2. Creating a process (`SERVER_NEW_SESSION`) is synchronous, since the application needs the process ID. To keep this fast under load, each LILAM Server has a separate control pipe (`<pipe name>_CTL`) that it checks before every data message. Creating a process therefore never queues behind the messages of other applications.
 
 **Server loop.** After a message the server checks its data pipe once without waiting; if it is empty, it waits 1 s, then 2 s, then 5 s each time (eco mode). An arriving message wakes it immediately. `DBMS_PIPE` timeouts are whole seconds; fractions are rounded silently (0.2 becomes 0), which is why the steps are integers. Housekeeping (registry entry with message rate, `SYNC_ALL_DIRTY`) is time-controlled: every 500 ms, also while messages keep arriving, and when idle at the next wake-up.
+
+**Idle flush.** When the data pipe is empty and a worker still holds unwritten logs, metrics or process data, it writes them at once (`SYNC_ALL_DIRTY` with force, without the baseline synchronization) instead of waiting for the next eco step. This happens at most every 200 ms (`C_SERVER_IDLE_FLUSH_MS`), so short gaps under load do not cause a commit each, and never on a dispatcher (it holds no data). A synchronous request (reconnect, `SERVER_NEW_SESSION`, `CLOSE_SESSION`) that arrives during such a flush waits for it (a few milliseconds). The idle flush does not set the time lock of `SYNC_ALL_DIRTY`, so the regular housekeeping and the baseline synchronization keep their interval. The 1.5 s threshold per process counts from the last write that actually wrote data.
 
 **Shutdown.** On `SERVER_SHUTDOWN` the server first marks itself inactive in the registry, so it is no longer chosen. In the drain phase it then processes the messages that clients have already sent, until the data pipe stays empty for 1 s (at most about 5 s in total). Afterwards it writes all buffers and removes its pipes.
 

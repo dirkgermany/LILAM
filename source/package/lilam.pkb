@@ -19,6 +19,10 @@ AS
     C_SERVER_ECO_STEP1_SEC             CONSTANT PLS_INTEGER := 1;
     C_SERVER_ECO_STEP2_SEC             CONSTANT PLS_INTEGER := 2;
     C_SERVER_TIMEOUT_MAX_WAIT_SEC      CONSTANT PLS_INTEGER := 5;
+    -- Idle flush: when the pipe is empty, a worker writes its buffered logs, metrics and process data
+    -- at once instead of waiting for the next eco step (visibility after a pause). At most every n ms,
+    -- so that short gaps under load do not cause a commit each; never on a dispatcher (holds no data).
+    C_SERVER_IDLE_FLUSH_MS             CONSTANT PLS_INTEGER := 200;
     -- Drain phase on shutdown: empty the pipe until it stays empty for 1 s, at most about 5 s in total
     C_SERVER_DRAIN_IDLE_SEC            CONSTANT PLS_INTEGER := 1;
     C_SERVER_DRAIN_MAX_MS              CONSTANT PLS_INTEGER := 5000;
@@ -2813,7 +2817,9 @@ AS
     --------------------------------------------------------------------
     -- Write all dirty entries for all sessions
     --------------------------------------------------------------------
-    PROCEDURE SYNC_ALL_DIRTY(p_force BOOLEAN DEFAULT FALSE, p_isShutdown BOOLEAN DEFAULT FALSE) 
+    -- p_withBaselines FALSE: write logs, metrics and process data only; the cross-process baselines
+    -- keep their own interval (used by the idle flush of the server)
+    PROCEDURE SYNC_ALL_DIRTY(p_force BOOLEAN DEFAULT FALSE, p_isShutdown BOOLEAN DEFAULT FALSE, p_withBaselines BOOLEAN DEFAULT TRUE) 
     IS
         v_id      BINARY_INTEGER;
         v_next_id BINARY_INTEGER;
@@ -2834,7 +2840,11 @@ AS
         then
             return;
         end if;
-        g_last_sync_all_cs := v_now_cs;
+        -- A partial run without baselines (idle flush) does not count as a full run: otherwise frequent
+        -- idle flushes would keep the regular run (and thus the baseline synchronization) behind the time lock
+        if p_withBaselines then
+            g_last_sync_all_cs := v_now_cs;
+        end if;
 
         -- ======================================================================
         -- PART 1: PROCESSING THE DIRTY LIST (queue)
@@ -2902,7 +2912,9 @@ AS
         -- ======================================================================
         -- PART 3: CROSS-PROCESS BASELINES (time-controlled or forced)
         -- ======================================================================
-        syncBaselines(p_force OR p_isShutdown);
+        if p_withBaselines then
+            syncBaselines(p_force OR p_isShutdown);
+        end if;
 
     EXCEPTION
         WHEN OTHERS THEN
@@ -3028,6 +3040,11 @@ AS
             return;
         end if ;
         v_idx := v_indexSession(p_processId);
+
+        -- Nothing buffered: nothing to write, and the time of the last write stays unchanged
+        if coalesce(g_sessionList(v_idx).monitor_dirty_count, 0) = 0 then
+            return;
+        end if;
 
         -- If it has never been flushed (start), we set the difference high
         if g_sessionList(v_idx).last_monitor_flush is null then
@@ -4079,8 +4096,13 @@ AS
             return;
         end if ;
         v_idx := v_indexSession(p_processId);
-        g_sessionList(v_idx).log_dirty_count := coalesce(g_sessionList(v_idx).log_dirty_count, 0) + 1;
-        g_dirty_queue(p_processId) := TRUE;
+
+        -- Nothing buffered: nothing to write, and the time of the last write stays unchanged.
+        -- (Previously every call counted as a new entry and an empty flush restarted the 1.5 s
+        -- threshold, so data arriving shortly after an idle housekeeping waited up to 3 s.)
+        if coalesce(g_sessionList(v_idx).log_dirty_count, 0) = 0 then
+            return;
+        end if;
 
         -- (get_ms_diff is the optimized function)
         if g_sessionList(v_idx).last_log_flush is null then
@@ -6656,6 +6678,7 @@ AS
         l_lastSyncCs     NUMBER := dbms_utility.get_time;
         l_windowMs       NUMBER;
         l_drainStartCs   NUMBER;
+        l_lastIdleFlushCs NUMBER;
         l_msgCnt         PLS_INTEGER := 0;
         l_serverTimeout  PLS_INTEGER := 0;
         l_ctlPipe        VARCHAR2(150);
@@ -6711,6 +6734,15 @@ AS
                             ERROR(g_serverProcessId, g_serverPipeName || '=>Internal START_SERVER; Critical Error while processing command: ' || SQLERRM);
                         end if;
                 END; 
+            end if;
+
+            -- Idle flush (worker only): the pipe is empty and there is buffered data -> write it now,
+            -- at most every C_SERVER_IDLE_FLUSH_MS. Baselines keep their own interval (housekeeping).
+            if l_message is null and not g_serverIsDispatcher and g_dirty_queue.COUNT > 0
+               and (l_lastIdleFlushCs is null
+                    or abs(dbms_utility.get_time - l_lastIdleFlushCs) * 10 >= C_SERVER_IDLE_FLUSH_MS) then
+                SYNC_ALL_DIRTY(p_force => TRUE, p_withBaselines => FALSE);
+                l_lastIdleFlushCs := dbms_utility.get_time;
             end if;
 
             -- Housekeeping is time-controlled: every C_SERVER_SYNC_INTERVAL_MS, also while messages keep
