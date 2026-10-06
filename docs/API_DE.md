@@ -780,6 +780,16 @@ Ein Server nutzt zwei Pipes:
 - **Daten-Pipe** (`<Pipe-Name>`): alle Logs, Traces, Events, Status und Abfragen in der Reihenfolge ihres Eintreffens.
 - **Steuer-Pipe** (`<Pipe-Name>_CTL`): nur das Anlegen neuer Prozesse (`SERVER_NEW_SESSION`). Der Server fragt sie vor jeder Datennachricht ab, ohne zu warten. Dadurch muss das Anlegen eines Prozesses auch unter hoher Last nicht hinter den Nachrichten anderer Anwendungen warten. Ein kurzer Weckruf in die Daten-Pipe sorgt dafür, dass auch ein untätiger Server die Anfrage sofort bemerkt.
 
+**Serverauswahl:** Ein Client ohne Dispatcher und ein Dispatcher wählen für jeden neuen Prozess einen Server der Gruppe nach diesen Kriterien:
+
+1. wenigste offene Prozesse (`CURRENT_PROCESSES`; der Server aktualisiert den Wert direkt nach jedem neuen und jedem geschlossenen Prozess),
+2. niedrigste Nachrichtenrate (Nachrichten je Sekunde im letzten Housekeeping-Fenster, in Stufen zu 100 Nachrichten/s; ein Wert, der älter als 1,5 s ist, zählt als 0),
+3. der am längsten nicht aktive Server.
+
+Sind die ersten beiden Kriterien gleich, wechselt der Aufrufer zwischen den Servern ab (Round Robin je Datenbanksession). So verteilen sich auch schnell nacheinander angelegte Prozesse gleichmäßig. Dispatcher werden nie gewählt.
+
+**Server-Loop und Eco-Modus:** Nach einer Nachricht prüft der Server die Pipe einmal ohne zu warten. Ist sie leer, wartet er 1 s, dann 2 s, dann jeweils 5 s; eine eintreffende Nachricht weckt ihn sofort. `DBMS_PIPE` kennt nur ganze Sekunden, daher die ganzzahligen Stufen. Housekeeping (Registry mit Nachrichtenrate, Schreiben der Puffer) läuft alle 500 ms, auch während der Server arbeitet; im Leerlauf beim nächsten Aufwachen.
+
 | API | Zweck |
 | --- | --- |
 | `START_SERVER` | Startet einen LILAM Server in der aktuellen Session |
@@ -858,6 +868,8 @@ PROCEDURE SERVER_SHUTDOWN(
   p_password  VARCHAR2
 )
 ```
+
+Beim Herunterfahren meldet sich der Server zuerst in der Registry ab und wird ab dann nicht mehr gewählt. Anschließend verarbeitet er noch die Nachrichten, die Clients bereits geschickt haben (Drain-Phase): so lange, bis die Pipe 1 s lang leer bleibt, höchstens etwa 5 s. Danach schreibt er alle Puffer und beendet sich.
 
 ### Function GET_SERVER_PIPE
 Liefert die Server-Pipe, die mit dem verbundenen Client-Prozess verknüpft ist.
