@@ -134,14 +134,14 @@ A server checks a rule set completely before it uses it: required fields, length
 
 ---
 ## Table: LILAM_RULES
-This table serves as the central repository for all rule sets. Each rule set is stored as a versioned JSON document for a **server group**; the same rule set may be stored for several groups. Per group exactly one row is active.
+This table serves as the central repository for all rule sets. Each rule set is stored as a versioned JSON document for a **group** (server group or `p_groupName` of `NEW_SESSION`); the same rule set may be stored for several groups. Per group exactly one row is active.
 
 | Column | Type | Description |
 | :--- | :--- | :--- |
-| **GROUP_NAME** | `VARCHAR2(50)` | Server group the rule set belongs to. |
+| **GROUP_NAME** | `VARCHAR2(50)` | Group the rule set belongs to (server group or `p_groupName` of `NEW_SESSION`). |
 | **SET_NAME** | `VARCHAR2(30)` | Name of the rule set. `GROUP_NAME`, `SET_NAME` and `VERSION` together are unique. |
 | **VERSION** | `NUMBER` | Version number to support testing, staging, and rollbacks. |
-| **IS_ACTIVE** | `NUMBER(1)` | `1` for the rule set the servers of the group use (at most one per group). |
+| **IS_ACTIVE** | `NUMBER(1)` | `1` for the rule set the servers and INSESSION processes of the group use (at most one per group). |
 | **RULE_SET** | `CLOB` | The JSON document (header and rules); checked by `IS JSON`. |
 | **CREATED** | `TIMESTAMP` | When this version was created. |
 | **AUTHOR** | `VARCHAR2(50)` | The developer or architect who defined the rule set. |
@@ -149,12 +149,12 @@ This table serves as the central repository for all rule sets. Each rule set is 
 Alerts and the consumer refer to a rule by `GROUP_NAME`, `SET_NAME`, `VERSION` and `rules.id`.
 
 > **Implementation Note**
-> The LILAM servers load the active rule set of their group into RAM at startup (or when `SERVER_UPDATE_RULES` is called). All rule evaluations work on this cached structure, without database access. Only a firing rule writes to `LILAM_ALERTS`.
+> The LILAM servers load the active rule set of their group into RAM at startup (or when `SERVER_UPDATE_RULES` is called). INSESSION processes with a group load it at their first rule check and then look for a new active rule set at most every 15 seconds. All rule evaluations work on this cached structure, without database access. Only a firing rule writes to `LILAM_ALERTS`.
 
 ---
 ## Loading a Rule Set
 
-`SERVER_UPDATE_RULES` checks the rule set of the group, makes it the active one and tells every running server of the group (dispatchers excluded) to reload it. A group without running servers is not an error: every server loads the active rule set of its group at startup, including newly added servers.
+`SERVER_UPDATE_RULES` checks the rule set of the group, makes it the active one and tells every running server of the group (dispatchers excluded) to reload it. A group without running servers is not an error: every server loads the active rule set of its group at startup, including newly added servers. INSESSION processes of the group pick up the change at their first API call after at most 15 seconds.
 
 ```sql
 INSERT INTO LILAM_RULES (group_name, set_name, version, created, author, rule_set)

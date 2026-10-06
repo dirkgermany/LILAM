@@ -483,7 +483,7 @@ In addition to the process-specific tables, LILAM uses internal tables whose nam
 | Table | Purpose |
 | --- | --- |
 | `LILAM_SERVER_REGISTRY` | Maintains server registration, availability, heartbeat, load, and currently active Rule Set information. |
-| `LILAM_RULES` | Stores versioned Rule Sets per server group, one of them active per group. |
+| `LILAM_RULES` | Stores versioned Rule Sets per group (servers and INSESSION processes), one of them active per group. |
 | `LILAM_LOG_INTERNAL` | Provides independent fallback logging for internal LILAM framework errors. |
 
 > [!NOTE]
