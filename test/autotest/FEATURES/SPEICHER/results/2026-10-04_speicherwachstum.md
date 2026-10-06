@@ -101,6 +101,6 @@ Die Größenordnung passt zum Dauertest. Die Server haben in 4 h mehrere Million
 
 ## Aufräumen
 
-- Das Diagnose-Package `LILAM_DIAG` ist wieder gelöscht. Seine Quellen liegen unter `Test\_DIAG\`.
+- Das Diagnose-Package `LILAM_DIAG` ist wieder gelöscht. Seine Quellen liegen unter `test\autotest\FEATURES\SPEICHER\` (`lilam_diag.pks`, `lilam_diag.pkb`).
 - Testtabellen `LT_MEM_*` sind gelöscht.
 - Einträge mit den Prozessnamen `LT_MEM_*` aus den Messungen stehen noch in den LILAM-Tabellen.

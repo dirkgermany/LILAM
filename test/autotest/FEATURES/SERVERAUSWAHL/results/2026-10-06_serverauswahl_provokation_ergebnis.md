@@ -2,7 +2,7 @@
 
 - **Datum:** 06.10.2026, 10:12:30–10:31:38 (Gesamtlaufzeit 19:08 min)
 - **LILAM-Stand:** Branch `claude`, e0c11f6; keine Änderung an `lilam.pks`/`.pkb`, an der Testbasis oder an bestehenden Tests
-- **Skript:** `test/autotest/_DIAG/2026-10-06_serverauswahl_provokation.sql`. Es legt eigene Diagnoseobjekte an: Tabelle `LT_DIAG_SEL`, Prozeduren `lt_diag_sel_burst` und `lt_diag_sel_driver`. Die Steuerung lief als Job `LT_CDIAG_DRV`, jeder Burst als eigener Client-Job (frische Session).
+- **Skript:** `test/autotest/FEATURES/SERVERAUSWAHL/2026-10-06_serverauswahl_provokation.sql`. Es legt eigene Diagnoseobjekte an: Tabelle `LT_DIAG_SEL`, Prozeduren `lt_diag_sel_burst` und `lt_diag_sel_driver`. Die Steuerung lief als Job `LT_CDIAG_DRV`, jeder Burst als eigener Client-Job (frische Session).
 - **Plan:** `2026-10-06_serverauswahl_provokation.md` (V0–V7, V8 nicht freigegeben)
 - **Umfang:** 290 Wiederholungen bzw. 360 Bursts mit 7.200 `SERVER_NEW_SESSION`. Vor jedem Aufruf wurde ein Registry-Snapshot von LT_S1 und LT_S2 genommen (außer V0 mit `snap=0`). Es gab keine Fehler in den Jobs, keine internen LILAM-Fehler und keine offenen Prozesse. Die LILAM-Daten sind gelöscht (`lt.purge_prefix`); die Messdaten liegen weiter in `LT_DIAG_SEL` (run_id 1881).
 - **Einseitig** heißt: ein Server unter 30 % (weniger als 6 von 20) oder mindestens 8 aufeinanderfolgende Prozesse beim selben Server.
