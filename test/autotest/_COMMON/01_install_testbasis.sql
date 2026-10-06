@@ -2366,6 +2366,22 @@ create or replace package body lt as
         expect('_L4', 'V2-01', 2, 'L4 Regel aus Version 2 aktiv');
 
         -- ---------------------------------------------------------------
+        -- L6: Server laden ein geaendertes Rule Set auch ohne UPDATE_RULE-Nachricht (B7)
+        --     Nur die Tabelle umschalten (Version 2 -> 1), keine Pipe-Nachricht; die Server
+        --     pruefen hoechstens alle 15 s selbst (Housekeeping, Eco-Stufe bis 5 s) => 21 s warten.
+        -- ---------------------------------------------------------------
+        execute immediate 'update lilam_rules set is_active = 0 where upper(group_name) = :1 and is_active = 1' using c_group;
+        execute immediate 'update lilam_rules set is_active = 1 where upper(group_name) = :1 and set_name = :2 and version = 1'
+           using c_group, c_set;
+        commit;
+        dbms_session.sleep(21);
+        -- vier Prozesse, damit beide Server beteiligt sind (Round Robin bei Gleichstand)
+        for i in 1 .. 4 loop
+            l_pid := proc('_L6'); lilam.mark_event(l_pid, 'RG_L'); lilam.close_session(l_pid);
+        end loop;
+        expect('_L6', 'L-01', 4, 'L6 Server laden Version 1 ohne UPDATE_RULE (eigene Pruefung)');
+
+        -- ---------------------------------------------------------------
         -- IS: Besonderheiten des INSESSION-Modus (Pruefungen mit Praefix "IS")
         -- ---------------------------------------------------------------
         l_s := '_IS';

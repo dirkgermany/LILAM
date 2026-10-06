@@ -894,7 +894,7 @@ PROCEDURE SERVER_UPDATE_RULES(
 Ablauf:
 1. Das Rule Set der Gruppe wird in der aufrufenden Session vollständig geprüft. Fehlt es für die Gruppe oder ist eine Regel ungültig, endet der Aufruf mit der Exception `NUM_ERR_RULE_SET` (-20130) und einer Begründung; es ändert sich nichts.
 2. Das Rule Set wird für die Gruppe aktiv, das bisher aktive inaktiv.
-3. Laufende Server der Gruppe erhalten die Anweisung zum Neuladen direkt in ihre Pipe, also auch ohne laufenden Prozess und am Dispatcher vorbei. Dispatcher werten keine Regeln aus.
+3. Laufende Server der Gruppe erhalten die Anweisung zum Neuladen direkt in ihre Pipe, also auch ohne laufenden Prozess und am Dispatcher vorbei. Dispatcher werten keine Regeln aus. Zusätzlich prüft jeder Server höchstens alle 15 Sekunden selbst, ob sich das aktive Rule Set seiner Gruppe geändert hat; ein Server, der die Anweisung verpasst (z. B. volle Pipe), lädt das neue Rule Set so spätestens nach etwa 20 Sekunden.
 4. INSESSION-Prozesse der Gruppe laden das neue Rule Set selbst, spätestens beim ersten API-Aufruf nach 15 Sekunden (siehe [Regeln im INSESSION-Modus](#regeln-im-insession-modus)).
 
 Eine Gruppe ohne laufende Server ist kein Fehler: Jeder Server lädt beim Start das aktive Rule Set seiner Gruppe, auch ein neu hinzukommender. Lehnt ein Server ein Rule Set beim Start ab (z. B. weil es inzwischen direkt in der Tabelle geändert wurde), behält er die bisherigen Regeln (beim Start: keine) und protokolliert den Grund in `LILAM_LOG_INTERNAL` und im Log des Serverprozesses.

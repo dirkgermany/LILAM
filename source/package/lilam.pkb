@@ -47,7 +47,7 @@ AS
     C_SYNC_ALL_INTERVAL_MS             CONSTANT PLS_INTEGER := 500;   -- SYNC_ALL_DIRTY (without force) at most every n ms
 
     -- INSESSION: check for a changed active rule set of the group at most every n ms
-    -- (triggered by API calls; servers are notified via SERVER_UPDATE_RULES)
+    -- (triggered by API calls; servers are notified via SERVER_UPDATE_RULES and check themselves in the housekeeping)
     C_RULES_CHECK_INTERVAL_MS          CONSTANT PLS_INTEGER := 15000;
 
     ---------------------------------------------------------------
@@ -355,7 +355,7 @@ AS
         set_version  NUMBER := 0,
         seen_name    VARCHAR2(30),      -- last seen active rule set, even if rejected
         seen_version NUMBER,            -- (a rejected set is not parsed again on every check)
-        last_check_cs NUMBER            -- INSESSION: last check for a changed active rule set (DBMS_UTILITY.GET_TIME)
+        last_check_cs NUMBER            -- INSESSION and server housekeeping (checkServerRules): last check for a changed active rule set (DBMS_UTILITY.GET_TIME)
     );
     TYPE t_rule_group_map IS TABLE OF t_rule_group_rec INDEX BY VARCHAR2(50);
     g_rule_groups t_rule_group_map;
@@ -1403,7 +1403,7 @@ AS
         END IF;
 
         -- INSESSION: check for a changed active rule set at most every C_RULES_CHECK_INTERVAL_MS
-        -- (servers receive changes via SERVER_UPDATE_RULES).
+        -- (servers: UPDATE_RULE from SERVER_UPDATE_RULES plus their own check in the housekeeping, checkServerRules).
         -- PERFORMANCE: DBMS_UTILITY.GET_TIME instead of SYSTIMESTAMP and interval arithmetic (measured < 1 µs instead of approx. 10–25 µs).
         -- ABS: on overflow of GET_TIME there is at most one additional check.
         IF g_serverPipeName IS NULL
@@ -6302,6 +6302,7 @@ AS
     --------------------------------------------------------------------------
     -- Load the active rule set of a group from LILAM_RULES if it has changed.
     -- p_force: always reload (server start, UPDATE_RULE).
+    -- Without p_force (INSESSION rule check, server housekeeping) only a new name/version is loaded.
     -- Without an active rule set the group has no rules. STABILITY: an invalid rule set is
     -- rejected completely (logged once per version), the previous rules then remain active.
     -- Errors never reach the caller.
@@ -6388,6 +6389,33 @@ AS
     END;
 
     --------------------------------------------------------------------------
+    -- Own check of the server for a changed active rule set of its group (B7).
+    -- UPDATE_RULE from SERVER_UPDATE_RULES is only the immediate trigger: if a server missed it
+    -- (pipe full, send timeout), it would keep the old rules until its next start.
+    -- STABILITY: every server catches up within C_RULES_CHECK_INTERVAL_MS, as INSESSION does.
+    -- PERFORMANCE: at most one small indexed query per interval; the rule set is parsed only for a
+    -- new name/version (refreshGroupRules with p_force => FALSE). Errors never leave refreshGroupRules.
+    --------------------------------------------------------------------------
+    procedure checkServerRules
+    as
+        l_group varchar2(50);
+    begin
+        -- Dispatchers do not evaluate rules
+        if g_serverIsDispatcher then
+            return;
+        end if;
+        l_group := upper(trim(g_serverGroupName));
+        if l_group is null then
+            return;
+        end if;
+        -- ABS: on overflow of GET_TIME there is at most one additional check
+        if not g_rule_groups.EXISTS(l_group)
+           or abs(dbms_utility.get_time - g_rule_groups(l_group).last_check_cs) >= C_RULES_CHECK_INTERVAL_MS / 10 then
+            refreshGroupRules(l_group, p_force => FALSE);
+        end if;
+    end;
+
+    --------------------------------------------------------------------------
     -- Activate a rule set for a server group (autonomous, so that the servers see it immediately)
     --------------------------------------------------------------------------
     procedure activateGroupRules(p_groupName varchar2, p_ruleSetName varchar2, p_ruleSetVersion pls_integer)
@@ -6413,6 +6441,7 @@ AS
     -- The rule set is checked here; an invalid or missing rule set changes nothing.
     -- Running servers receive UPDATE_RULE directly in their pipe (bypassing the dispatcher);
     -- servers that start later load the active rule set of their group themselves.
+    -- A server that misses UPDATE_RULE loads the active rule set itself within C_RULES_CHECK_INTERVAL_MS.
     --------------------------------------------------------------------------
     PROCEDURE SERVER_UPDATE_RULES(p_groupName VARCHAR2, p_ruleSetName VARCHAR2, p_ruleSetVersion PLS_INTEGER)
     AS
@@ -6453,7 +6482,7 @@ AS
             DBMS_PIPE.PACK_MESSAGE('{"header":{"msg_type":"API_CALL","request":"UPDATE_RULE"}}');
             l_status := DBMS_PIPE.SEND_MESSAGE(l_pipes(i), timeout => 1);
             IF l_status != 0 THEN
-                -- the rule set is active: the server loads it at the latest on its next start
+                -- the rule set is active: the server loads it itself within C_RULES_CHECK_INTERVAL_MS (checkServerRules)
                 logLilamErr(l_status, l_label || ': pipe ' || l_pipes(i) || ' not reachable', 'SERVER_UPDATE_RULES');
             END IF;
         END LOOP;
@@ -6831,6 +6860,8 @@ AS
             if l_windowMs >= C_SERVER_SYNC_INTERVAL_MS then
                 updateServerRegistry(TRUE, l_msgCnt, l_windowMs);
                 SYNC_ALL_DIRTY;
+                -- rule set of the group: own check at most every C_RULES_CHECK_INTERVAL_MS (B7)
+                checkServerRules;
                 l_lastSyncCs := dbms_utility.get_time;
                 l_msgCnt := 0;
             end if;
