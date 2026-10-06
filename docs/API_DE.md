@@ -797,6 +797,7 @@ Sind die ersten beiden Kriterien gleich, wechselt der Aufrufer zwischen den Serv
 | `SERVER_SHUTDOWN` | Beendet einen Server |
 | `GET_SERVER_PIPE` | Liefert die Server-Pipe eines verbundenen Clients |
 | `SERVER_UPDATE_RULES` | Aktiviert ein aktualisiertes Rule Set |
+| `CHECK_RULE_SET` | Prüft ein Rule Set, ohne es zu speichern oder zu aktivieren |
 | `SET_DISPATCHER_PIPE` | Konfiguriert einen Dispatcher für automatisches Routing und Reconnect |
 
 ### Procedure START_SERVER
@@ -880,6 +881,19 @@ FUNCTION GET_SERVER_PIPE(
 ) RETURN VARCHAR2
 ```
 
+### Function CHECK_RULE_SET
+Prüft ein Rule Set genauso wie `SERVER_UPDATE_RULES`, ohne es zu speichern oder zu aktivieren. Liefert `NULL`, wenn es gültig ist, sonst die Begründung; die Funktion wirft keine Exception.
+
+```sql
+FUNCTION CHECK_RULE_SET(
+  p_ruleSet CLOB
+) RETURN VARCHAR2
+```
+
+```sql
+SELECT LILAM.CHECK_RULE_SET('{"rules":[ ... ]}') FROM dual;
+```
+
 ### Procedure SERVER_UPDATE_RULES
 Rule Sets werden als JSON-Objekte in `LILAM_RULES` gespeichert, jeweils für eine Gruppe (`GROUP_NAME`, Name, Version). Dasselbe Rule Set kann für mehrere Gruppen eingetragen sein. Je Gruppe ist genau ein Rule Set aktiv (`IS_ACTIVE = 1`); es gilt für alle Server der Gruppe und für alle INSESSION-Prozesse, die mit dieser Gruppe gestartet wurden. Gruppe, Name und Version sind Pflicht und zusammen eindeutig, die Gruppe ohne Unterscheidung von Groß- und Kleinschreibung; die Version ist ganzzahlig, `IS_ACTIVE` ist 0 oder 1.
 
@@ -892,7 +906,7 @@ PROCEDURE SERVER_UPDATE_RULES(
 ```
 
 Ablauf:
-1. Das Rule Set der Gruppe wird in der aufrufenden Session vollständig geprüft. Fehlt es für die Gruppe oder ist eine Regel ungültig, endet der Aufruf mit der Exception `NUM_ERR_RULE_SET` (-20130) und einer Begründung; es ändert sich nichts. Werte aus mehreren durch `|` getrennten Teilen dürfen keine leeren Teile enthalten (`|C1`, `A|`, `20||0.3` werden abgelehnt).
+1. Das Rule Set der Gruppe wird in der aufrufenden Session vollständig geprüft. Fehlt es für die Gruppe oder ist eine Regel ungültig, endet der Aufruf mit der Exception `NUM_ERR_RULE_SET` (-20130) und einer Begründung; es ändert sich nichts. Werte aus mehreren durch `|` getrennten Teilen dürfen keine leeren Teile enthalten (`|C1`, `A|`, `20||0.3` werden abgelehnt). Unbekannte Schlüssel einer Regel, in `condition` oder `alert` werden abgelehnt (außer solchen, die mit `_` beginnen, z. B. `_comment`), ebenso Felder, die Objekte, Arrays oder Texte über 4000 Zeichen sind.
 2. Das Rule Set wird für die Gruppe aktiv, das bisher aktive inaktiv.
 3. Laufende Server der Gruppe erhalten die Anweisung zum Neuladen direkt in ihre Pipe, also auch ohne laufenden Prozess und am Dispatcher vorbei. Dispatcher werten keine Regeln aus. Zusätzlich prüft jeder Server höchstens alle 15 Sekunden selbst, ob sich das aktive Rule Set seiner Gruppe geändert hat; ein Server, der die Anweisung verpasst (z. B. volle Pipe), lädt das neue Rule Set so spätestens nach etwa 20 Sekunden.
 4. INSESSION-Prozesse der Gruppe laden das neue Rule Set selbst, spätestens beim ersten API-Aufruf nach 15 Sekunden (siehe [Regeln im INSESSION-Modus](#regeln-im-insession-modus)).

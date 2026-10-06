@@ -287,7 +287,7 @@ The JSON object is divided into a header for metadata and an array of individual
 }
 ```
 
-A server checks a rule set completely before it uses it. If one rule is invalid, the whole rule set is rejected and the previously loaded rules stay active. Values made of several parts separated by `|` must not contain empty parts (`|C1`, `A|`, `20||0.3`).
+A server checks a rule set completely before it uses it. If one rule is invalid, the whole rule set is rejected and the previously loaded rules stay active. Values made of several parts separated by `|` must not contain empty parts (`|C1`, `A|`, `20||0.3`); unknown properties (except those starting with `_`) and fields that are objects, arrays or texts over 4000 characters are rejected. `CHECK_RULE_SET` performs the same check without storing or activating the rule set.
 
 ---
 ## Operating Modes
@@ -688,4 +688,5 @@ The LILAM API consists of approximately 35 procedures and functions, some of whi
 * **SERVER_SHUTDOWN:** Shuts down a LILAM server.
 * **GET_SERVER_PIPE:** Returns the name of the pipe used to communicate with the server.
 * **SERVER_UPDATE_RULES:** Implements or changes the used rule set
+* **CHECK_RULE_SET:** Checks a rule set without storing or activating it (`NULL` = valid, otherwise the reason)
 

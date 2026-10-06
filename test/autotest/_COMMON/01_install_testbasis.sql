@@ -2030,6 +2030,9 @@ create or replace package body lt as
             ins(7,  r('X7-01',  'MARK_EVENT', 'RG_V2', 'PRECEDED_BY', '|C1'));
             ins(8,  r('X8-01',  'TRACE_STOP', 'RG_V2', 'AVG_DEVIATION_PCT', '20||0.3'));
             ins(10, r('X10-01', 'TRACE_STOP', 'RG_V2', 'MAX_DURATION_MS', '|5'));
+            -- Versionen 11, 12: ungueltig, unbekannter Schluessel bzw. Objekt statt Text (C2, G6 = C+)
+            ins(11, replace(r('X11-01', 'MARK_EVENT', 'RG_V2', 'ON_EVENT', '', 'C1'), '"context"', '"contxt"'));
+            ins(12, replace(r('X12-01', 'MARK_EVENT', 'RG_V2', 'ON_EVENT', '', 'C1'), '"context":"C1"', '"context":{"name":"C1"}'));
             -- Gruppe ohne Server: Aktivieren ist kein Fehler
             ins(1, r('E1-01', 'MARK_EVENT', 'RG_E', 'ON_EVENT', ''), 'LT_LEER');
             -- INSESSION: Szenarien (Version 1 mit Praefix der INSESSION-Prozesse) und IS-03..IS-05 (Versionen 1, 2, 6)
@@ -2299,8 +2302,9 @@ create or replace package body lt as
         -- ---------------------------------------------------------------
         l_n := rejected(c_group, 3) + rejected(c_group, 4) + rejected(c_group, 5) + rejected(c_group, 6)
              + rejected(c_group, 7) + rejected(c_group, 8) + rejected(c_group, 10)
+             + rejected(c_group, 11) + rejected(c_group, 12)
              + rejected(c_group, 9);                -- Version 9 gibt es nicht
-        check_that(l_run, 'L3 SERVER_UPDATE_RULES lehnt 8 Faelle mit NUM_ERR_RULE_SET ab', l_n = 8, l_n);
+        check_that(l_run, 'L3 SERVER_UPDATE_RULES lehnt 10 Faelle mit NUM_ERR_RULE_SET ab', l_n = 10, l_n);
         check_that(l_run, 'L3 aktives Rule Set der Gruppe unveraendert', active = c_set || ' v1', active);
         l_pid := proc('_L3'); lilam.mark_event(l_pid, 'RG_L'); lilam.close_session(l_pid);
         expect('_L3', 'L-01', 1, 'L3 Regeln aus Version 1 bleiben aktiv');
@@ -2320,6 +2324,13 @@ create or replace package body lt as
             when dup_val_on_index then l_n := 1;
         end;
         check_that(l_run, 'L3d Gruppe in anderer Schreibweise: Unique-Index lehnt ab', l_n = 1, l_n);
+
+        -- L3e: CHECK_RULE_SET prueft ohne zu speichern: gueltig => NULL, unbekannter Schluessel und kein JSON => Grund (C2)
+        l_n := case when lilam.check_rule_set(rule_set(2, r('V2-01', 'MARK_EVENT', 'RG_V2', 'ON_EVENT', ''), l_p)) is null then 1 else 0 end
+             + case when lilam.check_rule_set(rule_set(11, replace(r('X11-01', 'MARK_EVENT', 'RG_V2', 'ON_EVENT', '', 'C1'),
+                                                           '"context"', '"contxt"'), l_p)) like '%unknown key "contxt"%' then 1 else 0 end
+             + case when lilam.check_rule_set('kein JSON') is not null then 1 else 0 end;
+        check_that(l_run, 'L3e CHECK_RULE_SET: gueltig NULL, ungueltig mit Grund', l_n = 3, l_n);
 
         -- L3c: laufende Server erhalten UPDATE_RULE fuer ein von Hand aktiviertes ungueltiges Rule Set (Version 6)
         --      und behalten ihre bisherigen Regeln (Version 1). Die Nachricht geht wie bei SERVER_UPDATE_RULES

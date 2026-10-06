@@ -6052,7 +6052,13 @@ AS
         -- an empty or blank part in 'a|b|c' (start, middle or end)
         C_EMPTY_PART CONSTANT VARCHAR2(30) := '(^|\|)\s*(\||$)';
         l_seen   t_seen_map;
-        l_hasArr PLS_INTEGER;
+        l_doc    JSON_OBJECT_T;
+        l_el     JSON_ELEMENT_T;
+        l_rules  JSON_ARRAY_T;
+        l_obj    JSON_OBJECT_T;
+        l_cond   JSON_OBJECT_T;
+        l_alert  JSON_OBJECT_T;
+        l_bad    VARCHAR2(4000);
         l_no     PLS_INTEGER := 0;
         l_parts  PLS_INTEGER;
         l_rule   t_rule_rec;
@@ -6066,11 +6072,61 @@ AS
         BEGIN
             RETURN substr('rule #' || l_no || ' (id ' || coalesce(l_rule.rule_id, '?') || '): ' || p_msg, 1, 1000);
         END;
+
+        -- Sub-object of a rule ("condition", "alert"); NULL if missing. p_ok = FALSE if present but no object.
+        FUNCTION subObject(p_parent JSON_OBJECT_T, p_key VARCHAR2, p_ok OUT BOOLEAN) RETURN JSON_OBJECT_T IS
+            l_sub JSON_ELEMENT_T := p_parent.get(p_key);
+        BEGIN
+            p_ok := l_sub IS NULL OR l_sub.is_null OR l_sub.is_object;
+            IF l_sub IS NOT NULL AND l_sub.is_object THEN
+                RETURN TREAT(l_sub AS JSON_OBJECT_T);
+            END IF;
+            RETURN NULL;
+        END;
+
+        -- First key that is not allowed (keys starting with "_" are comments); NULL if all are known.
+        -- p_allowed: ',key1,key2,'
+        FUNCTION unknownKey(p_obj JSON_OBJECT_T, p_allowed VARCHAR2) RETURN VARCHAR2 IS
+            l_keys JSON_KEY_LIST;
+        BEGIN
+            IF p_obj IS NULL THEN
+                RETURN NULL;
+            END IF;
+            l_keys := p_obj.get_keys;
+            FOR i IN 1 .. l_keys.COUNT LOOP
+                IF substr(l_keys(i), 1, 1) != '_'
+                   AND (instr(l_keys(i), ',') > 0 OR instr(p_allowed, ',' || l_keys(i) || ',') = 0) THEN
+                    RETURN l_keys(i);
+                END IF;
+            END LOOP;
+            RETURN NULL;
+        END;
+
+        -- STABILITY: JSON_TABLE silently returns NULL for an object, an array or a text over 4000
+        -- characters. Such a field must not be treated as missing (e.g. "context" would then
+        -- widen the rule to all contexts). p_val: the value JSON_TABLE read.
+        FUNCTION unreadable(p_obj JSON_OBJECT_T, p_key VARCHAR2, p_val VARCHAR2) RETURN BOOLEAN IS
+            l_val JSON_ELEMENT_T;
+        BEGIN
+            IF p_obj IS NULL OR p_val IS NOT NULL THEN
+                RETURN FALSE;
+            END IF;
+            l_val := p_obj.get(p_key);
+            RETURN l_val IS NOT NULL AND NOT l_val.is_null
+                   AND NOT (l_val.is_string AND dbms_lob.getlength(l_val.to_clob) = 2); -- "" counts as missing
+        END;
     BEGIN
-        SELECT count(*) INTO l_hasArr FROM dual WHERE JSON_EXISTS(p_ruleSet, '$.rules');
-        IF l_hasArr = 0 THEN
+        BEGIN
+            l_doc := JSON_OBJECT_T.parse(p_ruleSet);
+        EXCEPTION
+            WHEN OTHERS THEN
+                RETURN 'no valid JSON object: ' || substr(sqlErrM, 1, 200);
+        END;
+        l_el := l_doc.get('rules');
+        IF l_el IS NULL OR NOT l_el.is_array THEN
             RETURN 'array "rules" missing';
         END IF;
+        l_rules := TREAT(l_el AS JSON_ARRAY_T);
 
         FOR r IN (
             SELECT *
@@ -6093,6 +6149,50 @@ AS
             l_rule := l_empty;
             l_trig := upper(trim(r.trigger_t));
             l_op   := upper(trim(r.operator));
+
+            -- Structure: known keys only (typos such as "contxt" or "throttle" would otherwise be
+            -- ignored silently), no objects/arrays/overlong texts where a value is expected.
+            -- JSON_TABLE returns the rules in array order, so rule #n is element n-1.
+            l_el := l_rules.get(l_no - 1);
+            IF l_el IS NULL OR NOT l_el.is_object THEN
+                RETURN fail('not a JSON object');
+            END IF;
+            l_obj   := TREAT(l_el AS JSON_OBJECT_T);
+            l_cond  := subObject(l_obj, 'condition', l_ok);
+            IF NOT l_ok THEN
+                RETURN fail('"condition" is not an object');
+            END IF;
+            l_alert := subObject(l_obj, 'alert', l_ok);
+            IF NOT l_ok THEN
+                RETURN fail('"alert" is not an object');
+            END IF;
+            l_bad := unknownKey(l_obj, ',id,trigger_type,action,context,condition,alert,');
+            IF l_bad IS NOT NULL THEN
+                RETURN fail('unknown key "' || substr(l_bad, 1, 100) || '"');
+            END IF;
+            l_bad := unknownKey(l_cond, ',operator,value,metric,');
+            IF l_bad IS NOT NULL THEN
+                RETURN fail('unknown key "condition.' || substr(l_bad, 1, 100) || '"');
+            END IF;
+            l_bad := unknownKey(l_alert, ',handler,severity,throttle_seconds,');
+            IF l_bad IS NOT NULL THEN
+                RETURN fail('unknown key "alert.' || substr(l_bad, 1, 100) || '"');
+            END IF;
+            l_bad := CASE
+                WHEN unreadable(l_obj,   'id',               r.rule_id)      THEN 'id'
+                WHEN unreadable(l_obj,   'trigger_type',     r.trigger_t)    THEN 'trigger_type'
+                WHEN unreadable(l_obj,   'action',           r.action)       THEN 'action'
+                WHEN unreadable(l_obj,   'context',          r.context)      THEN 'context'
+                WHEN unreadable(l_cond,  'operator',         r.operator)     THEN 'condition.operator'
+                WHEN unreadable(l_cond,  'value',            r.value)        THEN 'condition.value'
+                WHEN unreadable(l_cond,  'metric',           r.metric)       THEN 'condition.metric'
+                WHEN unreadable(l_alert, 'handler',          r.handler)      THEN 'alert.handler'
+                WHEN unreadable(l_alert, 'severity',         r.severity)     THEN 'alert.severity'
+                WHEN unreadable(l_alert, 'throttle_seconds', r.throttle_sec) THEN 'alert.throttle_seconds'
+            END;
+            IF l_bad IS NOT NULL THEN
+                RETURN fail('"' || l_bad || '" is not a text or number, or longer than 4000');
+            END IF;
 
             -- Mandatory fields and lengths
             IF r.rule_id IS NULL OR length(r.rule_id) > 50 THEN
@@ -6483,6 +6583,22 @@ AS
             rollback;
             raise;
     end;
+
+    --------------------------------------------------------------------------
+    -- Checks a rule set without storing or activating it (same check as SERVER_UPDATE_RULES).
+    -- Returns NULL if it is valid, otherwise the reason. STABILITY: never raises.
+    --------------------------------------------------------------------------
+    FUNCTION CHECK_RULE_SET(p_ruleSet CLOB) RETURN VARCHAR2
+    AS
+        l_byCtx    t_rule_map;
+        l_byAction t_rule_map;
+        l_avg      t_avg_params_map;
+    BEGIN
+        RETURN parseRuleSet(p_ruleSet, l_byCtx, l_byAction, l_avg);
+    EXCEPTION
+        WHEN OTHERS THEN
+            RETURN substr(sqlErrM, 1, 1000);
+    END;
 
     --------------------------------------------------------------------------
     -- Activate a rule set for all servers of a group (dispatchers excluded).

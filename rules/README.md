@@ -93,10 +93,12 @@ Rules are organized into Rule Sets, stored as JSON documents in the `LILAM_RULES
     }
 ```
 
-Unknown properties (e.g. `_comment`) are ignored.
+Properties whose name starts with `_` (e.g. `_comment`) are ignored. Any other unknown property of a rule, of `condition` or of `alert` is rejected, so that a typo such as `contxt` or `throttle` does not go unnoticed (the header is not checked).
 
 ### Validation when loading
-A server checks a rule set completely before it uses it: required fields, lengths, unique ids, known trigger types and operators, operators allowed for the trigger, and the format of `condition.value`. Values made of several parts separated by `|` must not contain empty parts: `|C1`, `A|` and `20||0.3` are rejected instead of being read differently, and operators that expect a single number reject additional parts (`|5`, `5|x`). If a single rule is invalid, the **whole** rule set is rejected and the previously loaded rules stay active. `SERVER_UPDATE_RULES` performs the same check before it activates a rule set and raises an exception with the reason; a server that rejects a rule set at startup writes the reason to `LILAM_LOG_INTERNAL` and to the log of the server process.
+A server checks a rule set completely before it uses it: required fields, lengths, unique ids, known trigger types and operators, operators allowed for the trigger, and the format of `condition.value`. Values made of several parts separated by `|` must not contain empty parts: `|C1`, `A|` and `20||0.3` are rejected instead of being read differently, and operators that expect a single number reject additional parts (`|5`, `5|x`). Fields must be texts or numbers: an object, an array or a text longer than 4000 characters is rejected, unknown properties as well (see above). If a single rule is invalid, the **whole** rule set is rejected and the previously loaded rules stay active. `SERVER_UPDATE_RULES` performs the same check before it activates a rule set and raises an exception with the reason; a server that rejects a rule set at startup writes the reason to `LILAM_LOG_INTERNAL` and to the log of the server process.
+
+To check a rule set before storing or activating it, call `LILAM.CHECK_RULE_SET(p_ruleSet)`. It performs the same check and returns `NULL` if the rule set is valid, otherwise the reason (it never raises an exception).
 
 ### Hooks / Trigger Types
 | hook | scope | API call
