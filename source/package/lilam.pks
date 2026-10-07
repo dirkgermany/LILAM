@@ -234,5 +234,3 @@ create or replace PACKAGE LILAM AS
     PROCEDURE IS_ALIVE;
 
 END LILAM;
-
-/
