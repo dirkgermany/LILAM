@@ -125,77 +125,119 @@ create or replace PACKAGE BODY LILAM_MAILER AS
     end;
         
     -------------------------------------------------------------------------
+    -- Set an alert to ERROR (call after ROLLBACK) so that it is not retried forever
+    -------------------------------------------------------------------------
+    PROCEDURE markError(p_alertId NUMBER, p_msg VARCHAR2) IS
+    BEGIN
+        UPDATE LILAM_ALERTS
+           SET status = 'ERROR',
+               error_message = p_msg,
+               processed_at = SYSTIMESTAMP
+         WHERE alert_id = p_alertId;
+        COMMIT;
+    EXCEPTION
+        WHEN OTHERS THEN
+            ROLLBACK;
+            DBMS_OUTPUT.PUT_LINE('LILAM Mailer: could not set alert ' || p_alertId || ' to ERROR: ' || SQLERRM);
+    END;
 
-    PROCEDURE runMailer IS        
-        -- Dynamic data
-        v_info_text     VARCHAR2(2000);
-        v_used_millis   NUMBER;
-        v_mail_body     CLOB;
-        
+    -------------------------------------------------------------------------
+    -- Process all pending mail alerts.
+    -- STABILITY: read the IDs first, then lock and commit each alert on its own
+    -- (a COMMIT inside a FOR UPDATE loop raises ORA-01002 on the next fetch).
+    -------------------------------------------------------------------------
+    PROCEDURE processPending IS
+        TYPE t_id_list IS TABLE OF LILAM_ALERTS.alert_id%TYPE;
+        CURSOR c_lock(p_alertId NUMBER) IS
+            SELECT * FROM LILAM_ALERTS
+             WHERE alert_id = p_alertId AND status = 'PENDING'
+               FOR UPDATE SKIP LOCKED;
+
+        l_ids         t_id_list;
+        rec           c_lock%ROWTYPE;
+        l_found       BOOLEAN;
+        v_mail_body   CLOB;
         l_alert_rec   t_alert_rec;
         l_json_rec    t_json_rec;
         l_lilam_rec   t_lilam_rec;
-        
+    BEGIN
+        SELECT alert_id BULK COLLECT INTO l_ids
+          FROM LILAM_ALERTS
+         WHERE handler_type = C_ALERT_MAIL_LOG AND status = 'PENDING'
+         ORDER BY alert_id;
+
+        FOR i IN 1 .. l_ids.COUNT LOOP
+            BEGIN -- Protective capsule for the single alert
+                -- Lock; locked by another mailer or already processed => skip
+                OPEN c_lock(l_ids(i));
+                FETCH c_lock INTO rec;
+                l_found := c_lock%FOUND;
+                CLOSE c_lock;
+
+                IF l_found THEN
+                    -- 1. Mapping
+                    l_alert_rec.alert_id            := rec.alert_id;
+                    l_alert_rec.process_id          := rec.process_id;
+                    l_alert_rec.master_table_name   := rec.master_table_name;
+                    l_alert_rec.monitor_table_name  := rec.monitor_table_name;
+                    l_alert_rec.action_name         := rec.action_name;
+                    l_alert_rec.context_name        := rec.context_name;
+                    l_alert_rec.action_count        := rec.action_count;
+                    l_alert_rec.group_name          := rec.group_name;
+                    l_alert_rec.rule_set_name       := rec.rule_set_name;
+                    l_alert_rec.rule_id             := rec.rule_id;
+                    l_alert_rec.rule_set_version    := rec.rule_set_version;
+                    l_alert_rec.alert_severity      := rec.alert_severity;
+
+                    -- 2. Load data
+                    l_json_rec := LILAM_CONSUMER.readJsonRule(l_alert_rec);
+                    l_lilam_rec := LILAM_CONSUMER.readProcessData(l_alert_rec.process_id, l_alert_rec.action_name, l_alert_rec.action_count, l_alert_rec.master_table_name, l_alert_rec.monitor_table_name);
+
+                    -- 3. Build body & send
+                    v_mail_body := prepareMailBodyHtml(l_lilam_rec, l_alert_rec, l_json_rec);
+                    send_mail_via_relay('LILAM-ALERT: ' || l_alert_rec.rule_id, v_mail_body, 'dirk@dirk-goldbach.de');
+
+                    -- 4. Set status to PROCESSED
+                    LILAM_CONSUMER.updateAlert(rec.alert_id);
+
+                    COMMIT; -- A single commit per mail is safe here
+                    DBMS_SESSION.SLEEP(1); -- Somewhat less aggressive than 10s?
+                END IF;
+
+            EXCEPTION WHEN OTHERS THEN
+                DECLARE
+                    v_err_msg VARCHAR2(2000) := SUBSTR(SQLERRM, 1, 2000);
+                BEGIN
+                    IF c_lock%ISOPEN THEN CLOSE c_lock; END IF;
+                    ROLLBACK; -- Release the lock
+                    -- STABILITY: set the alert to ERROR, otherwise it is retried on every run
+                    markError(l_ids(i), v_err_msg);
+                END;
+            END;
+        END LOOP;
+    EXCEPTION
+        WHEN OTHERS THEN
+            -- STABILITY: an error while reading the list does not stop the mailer
+            ROLLBACK;
+            DBMS_OUTPUT.PUT_LINE('LILAM Mailer: ' || SQLERRM);
+    END;
+
+    -------------------------------------------------------------------------
+
+    PROCEDURE runMailer IS
         v_msg_payload varchar2(4000);
         v_status    pls_integer;
-        v_count     pls_integer;
-
     BEGIN
         DBMS_ALERT.REMOVE(C_ALERT_MAIL_LOG);
         DBMS_ALERT.REGISTER(C_ALERT_MAIL_LOG);
         DBMS_OUTPUT.PUT_LINE('LILAM Mail-Log Consumer gestartet...');
-    
+
         LOOP
+            -- STABILITY: process pending alerts at start, after every signal and after the timeout
+            -- (DBMS_ALERT may merge signals; alerts written while the mailer was down)
+            processPending;
             COMMIT; -- Refresh the snapshot for the next run
             DBMS_ALERT.WAITONE(C_ALERT_MAIL_LOG, v_msg_payload, v_status, 60);
-    
-            IF v_status = 0 THEN
-                -- Quick check for PENDING records
-                SELECT count(*) INTO v_count FROM LILAM_ALERTS 
-                WHERE handler_type = 'MAIL_LOG' AND status = 'PENDING';
-    
-                IF v_count > 0 THEN
-                    FOR rec IN (
-                        SELECT * FROM LILAM_ALERTS
-                        WHERE handler_type = 'MAIL_LOG' AND status = 'PENDING'
-                        FOR UPDATE SKIP LOCKED
-                    ) LOOP
-                        BEGIN -- Protective capsule for the single alert
-                            -- 1. Mapping
-                            l_alert_rec.alert_id            := rec.alert_id;
-                            l_alert_rec.process_id          := rec.process_id; 
-                            l_alert_rec.master_table_name   := rec.master_table_name;
-                            l_alert_rec.monitor_table_name  := rec.monitor_table_name;
-                            l_alert_rec.action_name         := rec.action_name;
-                            l_alert_rec.context_name        := rec.context_name;
-                            l_alert_rec.action_count        := rec.action_count;
-                            l_alert_rec.group_name          := rec.group_name;
-                            l_alert_rec.rule_set_name       := rec.rule_set_name;
-                            l_alert_rec.rule_id             := rec.rule_id;
-                            l_alert_rec.rule_set_version    := rec.rule_set_version;
-                            l_alert_rec.alert_severity      := rec.alert_severity;
-
-                            -- 2. Load data
-                            l_json_rec := LILAM_CONSUMER.readJsonRule(l_alert_rec);
-                            l_lilam_rec := LILAM_CONSUMER.readProcessData(l_alert_rec.process_id, l_alert_rec.action_name, l_alert_rec.action_count, l_alert_rec.master_table_name, l_alert_rec.monitor_table_name);
-
-                            -- 3. Build body & send
-                            v_mail_body := prepareMailBodyHtml(l_lilam_rec, l_alert_rec, l_json_rec);
-                            send_mail_via_relay('LILAM-ALERT: ' || l_alert_rec.rule_id, v_mail_body, 'dirk@dirk-goldbach.de');
-                            
-                            -- 4. Set status to PROCESSED
-                            LILAM_CONSUMER.updateAlert(rec.alert_id);
-                            
-                            COMMIT; -- A single commit per mail is safe here
-                            DBMS_SESSION.SLEEP(1); -- Somewhat less aggressive than 10s?
-                            
-                        EXCEPTION WHEN OTHERS THEN
-                            ROLLBACK; -- Release the lock
-                            -- Possibly set the status to 'FAILED' here so that it does not loop forever
-                        END;
-                    END LOOP;
-                END IF;
-            END IF;
         END LOOP;
     END;
 
