@@ -286,4 +286,3 @@ create or replace PACKAGE BODY LILAM_GRAFANA AS
     END;
 
 END LILAM_GRAFANA;
-/

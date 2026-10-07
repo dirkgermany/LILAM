@@ -7459,5 +7459,3 @@ END;
         g_avg_params('DEFAULT').warmup := 3; 
 
 END LILAM;
-
-/

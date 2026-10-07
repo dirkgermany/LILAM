@@ -25,7 +25,9 @@ create table if not exists lilam_grafana_outbox (
 create index if not exists lilam_grafana_outbox_alert on lilam_grafana_outbox (alert_id);
 
 @@LILAM_GRAFANA.pks
+/
 @@LILAM_GRAFANA.pkb
+/
 
 show errors package lilam_grafana
 show errors package body lilam_grafana

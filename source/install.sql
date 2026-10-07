@@ -24,7 +24,9 @@ whenever sqlerror exit failure
 prompt
 prompt === LILAM: Package kompilieren ===
 @@package/lilam.pks
+/
 @@package/lilam.pkb
+/
 
 prompt
 prompt === LILAM: Status der Objekte ===
