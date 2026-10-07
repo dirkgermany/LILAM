@@ -370,6 +370,10 @@ AS
 
     TYPE t_alert_history IS TABLE OF TIMESTAMP INDEX BY VARCHAR2(250);
     g_alert_history t_alert_history;
+    -- Throttling for processes without scope (key: process_id, then GROUP|RULE|ACTION).
+    -- STABILITY: removed when the session ends; otherwise g_alert_history would grow with every process_id
+    TYPE t_alert_history_proc IS TABLE OF t_alert_history INDEX BY PLS_INTEGER;
+    g_alert_history_proc t_alert_history_proc;
 
     ----------
     -- TRIGGER
@@ -1217,7 +1221,9 @@ AS
     PROCEDURE fire_alert(p_rule t_rule_rec, p_rec t_monitor_buffer_rec) IS
         v_throttle_sec  NUMBER := coalesce(p_rule.throttle_seconds, 0);
         v_scope_id      NUMBER;
+        v_group         VARCHAR2(50);
         v_history_key   VARCHAR2(250);
+        v_empty         t_alert_history;
     BEGIN
         IF v_throttle_sec <= 0 THEN
             -- without throttling no memory is needed
@@ -1225,21 +1231,40 @@ AS
             RETURN;
         END IF;
 
-        -- Throttle per scope (if any), so that restarts do not lift the lock period.
         -- Group first: rule IDs are only unique per rule set (see also installGroupRules)
-        v_scope_id    := getScopeId(p_rec.process_id);
-        v_history_key := g_sessionList(v_indexSession(p_rec.process_id)).rule_group || '|'
-                         || CASE WHEN v_scope_id IS NOT NULL THEN 'S' || v_scope_id ELSE 'P' || p_rec.process_id END
-                         || '|' || p_rule.rule_id || '|' || p_rec.action_name;
+        v_group    := g_sessionList(v_indexSession(p_rec.process_id)).rule_group;
+        v_scope_id := getScopeId(p_rec.process_id);
 
-        -- Lock period since the last alert has not yet expired -> do nothing
-        IF g_alert_history.EXISTS(v_history_key)
-           AND g_alert_history(v_history_key) + numtodsinterval(v_throttle_sec, 'SECOND') > SYSTIMESTAMP THEN
-            RETURN;
-        END IF;
+        IF v_scope_id IS NOT NULL THEN
+            -- Throttle per scope, so that restarts do not lift the lock period
+            v_history_key := v_group || '|S' || v_scope_id || '|' || p_rule.rule_id || '|' || p_rec.action_name;
 
-        IF persist_alert(p_rule, p_rec) THEN
-            g_alert_history(v_history_key) := SYSTIMESTAMP;
+            -- Lock period since the last alert has not yet expired -> do nothing
+            IF g_alert_history.EXISTS(v_history_key)
+               AND g_alert_history(v_history_key) + numtodsinterval(v_throttle_sec, 'SECOND') > SYSTIMESTAMP THEN
+                RETURN;
+            END IF;
+
+            IF persist_alert(p_rule, p_rec) THEN
+                g_alert_history(v_history_key) := SYSTIMESTAMP;
+            END IF;
+        ELSE
+            -- Without scope: throttle per process; the entries are removed with the session
+            -- (STABILITY: see g_alert_history_proc)
+            v_history_key := v_group || '|' || p_rule.rule_id || '|' || p_rec.action_name;
+
+            IF g_alert_history_proc.EXISTS(p_rec.process_id)
+               AND g_alert_history_proc(p_rec.process_id).EXISTS(v_history_key)
+               AND g_alert_history_proc(p_rec.process_id)(v_history_key) + numtodsinterval(v_throttle_sec, 'SECOND') > SYSTIMESTAMP THEN
+                RETURN;
+            END IF;
+
+            IF persist_alert(p_rule, p_rec) THEN
+                IF NOT g_alert_history_proc.EXISTS(p_rec.process_id) THEN
+                    g_alert_history_proc(p_rec.process_id) := v_empty;
+                END IF;
+                g_alert_history_proc(p_rec.process_id)(v_history_key) := SYSTIMESTAMP;
+            END IF;
         END IF;
     exception
         when others then
@@ -4843,6 +4868,7 @@ AS
         g_monitor_shadows.DELETE;
         g_local_throttle_cache.DELETE;    
         g_alert_history.DELETE;
+        g_alert_history_proc.DELETE;
         g_rules_by_context.DELETE;
         g_rules_by_action.DELETE;
         g_rule_groups.DELETE;
@@ -4974,6 +5000,9 @@ AS
 
         -- K) Counters for ERROR/WARN
         g_log_counters.DELETE(p_processId);
+
+        -- L) Throttling memory of processes without scope
+        g_alert_history_proc.DELETE(p_processId);
 
     EXCEPTION
         WHEN OTHERS THEN
@@ -6400,6 +6429,7 @@ AS
         l_len    PLS_INTEGER  := length(p_group) + 1;
         l_key    VARCHAR2(300);
         l_next   VARCHAR2(300);
+        l_pid    PLS_INTEGER;
     begin
         l_key := g_rules_by_context.FIRST;
         WHILE l_key IS NOT NULL LOOP
@@ -6428,6 +6458,17 @@ AS
             l_next := g_alert_history.NEXT(l_key);
             IF substr(l_key, 1, l_len) = l_prefix THEN g_alert_history.DELETE(l_key); END IF;
             l_key := l_next;
+        END LOOP;
+
+        l_pid := g_alert_history_proc.FIRST;
+        WHILE l_pid IS NOT NULL LOOP
+            l_key := g_alert_history_proc(l_pid).FIRST;
+            WHILE l_key IS NOT NULL LOOP
+                l_next := g_alert_history_proc(l_pid).NEXT(l_key);
+                IF substr(l_key, 1, l_len) = l_prefix THEN g_alert_history_proc(l_pid).DELETE(l_key); END IF;
+                l_key := l_next;
+            END LOOP;
+            l_pid := g_alert_history_proc.NEXT(l_pid);
         END LOOP;
     end;
 

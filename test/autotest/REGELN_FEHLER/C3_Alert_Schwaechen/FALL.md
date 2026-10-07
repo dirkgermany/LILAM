@@ -3,7 +3,7 @@
 - **Projekt:** REGELN_FEHLER (Kontext: `../PROJEKT_KONTEXT.md`)
 - **Quelle:** Analyse `FEATURES\REGELN\results\2026-10-04_regeln_analyse.md`, Abschnitt 6 (Schwächen)
 - **Schwere:** mittel
-- **Status:** Umsetzung (V2, V4 committet 35ae13d; V3, V6 umgesetzt, nicht committet; V5 wartet auf `lilam.pkb`-Sperre)
+- **Status:** Umsetzung (V2, V4 committet 35ae13d; V3, V5, V6 umgesetzt, nicht committet)
 
 ## Befund (laut Analyse vom 04.10.2026)
 
@@ -47,3 +47,4 @@ _(Datum, Schritt, Ergebnis; neueste zuletzt.)_
 - **06.10.2026, Schritt 4:** V4 umgesetzt in `lilam.pkb` (CREATE TABLE `PROCESS_NAME` VARCHAR2(100), bestehende Tabellen per `ALTER TABLE … MODIFY`). Nicht kompiliert, nicht getestet.
 - **07.10.2026, Schritt 6 (teilweise):** V2 und V4 committet (35ae13d) und nach origin/claude gepusht. Offen: V3, V5, V6; Kompilieren/Test nur auf Dirks Anweisung.
 - **07.10.2026, Schritt 4:** Dirk gibt V3, V5 und V6 frei. V3 (Consumer: Spalten `steps_todo/_done`, Kontext im Join, neuer Parameter `p_context`, Typen auf 100/250; Mailer übergibt den Kontext) und V6 (`consumer\README.md`) umgesetzt. Die Zeile `HANDLER_TYPE` im README hatte schon die neue Bedeutung (C1) und blieb unverändert. Nicht kompiliert, nicht getestet, nicht committet. V5 wartet auf die `lilam.pkb`-Sperre.
+- **07.10.2026, Schritt 4 (V5):** V5 umgesetzt in `lilam.pkb` (`g_alert_history_proc` je Prozess, gelöscht in `clearAllSessionData`, `removeGroupRules`, `clearServerData`). Nicht kompiliert, nicht getestet, nicht committet.

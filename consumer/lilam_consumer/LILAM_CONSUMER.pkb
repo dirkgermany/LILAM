@@ -30,7 +30,7 @@ CREATE OR REPLACE PACKAGE BODY LILAM_CONSUMER AS
         return l_json_rec;
     end;
     
-    FUNCTION readProcessData(p_processId NUMBER, p_action VARCHAR2, p_actionCount PLS_INTEGER, p_procTabName VARCHAR2, p_monitorTabName VARCHAR2) RETURN t_lilam_rec
+    FUNCTION readProcessData(p_processId NUMBER, p_action VARCHAR2, p_actionCount PLS_INTEGER, p_procTabName VARCHAR2, p_monitorTabName VARCHAR2, p_context VARCHAR2 DEFAULT NULL) RETURN t_lilam_rec
     as
         l_lilam_rec t_lilam_rec;
     begin
@@ -38,7 +38,7 @@ CREATE OR REPLACE PACKAGE BODY LILAM_CONSUMER AS
         EXECUTE IMMEDIATE 
             'SELECT master.id, master.process_name, master.status,
                 master.info, master.process_start, master.process_end,
-                master.proc_steps_todo, master.proc_steps_done, monitor.mon_type,
+                master.steps_todo, master.steps_done, monitor.mon_type,
                 monitor.action, monitor.context,monitor.start_time, monitor.stop_time,
                 monitor.action_count, monitor.used_millis, monitor.avg_millis
              FROM ' || p_procTabName || ' master
@@ -46,14 +46,15 @@ CREATE OR REPLACE PACKAGE BODY LILAM_CONSUMER AS
                 ON master.id = monitor.process_id
                 AND monitor.action = :1
                 AND monitor.action_count = :2
-             WHERE master.id = :3'
+                AND (monitor.context = :3 OR (monitor.context IS NULL AND :4 IS NULL))
+             WHERE master.id = :5'
         INTO l_lilam_rec.processId, l_lilam_rec.processName, l_lilam_rec.status,
             l_lilam_rec.info, l_lilam_rec.processStart, l_lilam_rec.processEnd,
             l_lilam_rec.stepsTodo, l_lilam_rec.stepsDone,
             l_lilam_rec.monitorType, l_lilam_rec.actionName, l_lilam_rec.contextName,
             l_lilam_rec.actionStart, l_lilam_rec.actionStop, l_lilam_rec.actionCount,
             l_lilam_rec.usedMillis,l_lilam_rec.avgMillis      
-        USING p_action, p_actionCount, p_processId;
+        USING p_action, p_actionCount, p_context, p_context, p_processId;
         
         return l_lilam_rec;
     end;
