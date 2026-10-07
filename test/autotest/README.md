@@ -30,6 +30,9 @@ DAUERTEST/                  Dauertest über alle Modi gleichzeitig (Kombination 
 
 BELASTUNG/                  Belastungstests: Laststufen bis zur Grenze (Konzept in BELASTUNG/README.md)
   KAPAZITAET_SERVER/  SKALIERUNG/  DAUERLAST_MIX/  DISPATCHER_ENGPASS/  APEX_STURM/  BATCHSTART/  FEHLERKASKADE/
+
+REGELN_FEHLER/              Projekt zu den Fehlern der Regel-Engine (Arbeitsprotokolle, kein Test; vorläufig)
+  PROJEKT_KONTEXT.md, je Fall ein Ordner mit FALL.md (B1–B8, C1–C4, G_Grundsatzfragen)
 ```
 
 Jeder Testordner enthält das Skript `test_*.sql` und einen Ordner `results/` für die Auswertungen.
