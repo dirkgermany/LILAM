@@ -976,6 +976,8 @@ Wird p_processId mitgegeben, findet dieser Roundtrip bereits beim Aufruf von SET
 ### Procedure SET_DISPATCHER_PIPE
 Teilt LILAM mit, über welche Pipe ein Dispatcher erreichbar ist. Diese Information wird ausschließlich im Speicher der aktuellen physischen Datenbanksession gehalten.
 
+Ein Dispatcher leitet nur an die Server seiner eigenen Gruppe weiter. Deshalb nutzt `SERVER_NEW_SESSION` den Standard-Dispatcher nur, wenn keine Gruppe angegeben ist oder die Gruppe des Dispatchers (laut `LILAM_SERVER_REGISTRY`) der angegebenen Gruppe entspricht. Prozesse anderer Gruppen erhalten wie ohne Dispatcher direkt einen Server ihrer Gruppe. Ein mit `p_groupName` gesetzter Dispatcher gilt nur für `SERVER_NEW_SESSION` dieser Gruppe. `SET_DISPATCHER_PIPE(NULL)` hebt die Einstellung wieder auf.
+
 > [!IMPORTANT]
 > Da die Konfiguration nur für die aktuelle physische Session gilt, muss SET_DISPATCHER_PIPE bei jedem neuen Verbindungsaufbau erneut aufgerufen werden – bei Connection Pooling also potenziell auf jeder Seite, nicht nur einmalig beim ersten Seitenaufruf.
 
@@ -991,8 +993,8 @@ PROCEDURE SET_DISPATCHER_PIPE(
 #### Parameter
 | Parameter | Typ | Bedeutung |
 | --------- | --- | --------- |
-| p_pipeName | varchar2 | Pipe-Name des Dispatchers |
-| p_groupName | varchar2 | Optionale Kennung, falls mehrere Dispatcher parallel genutzt werden. [Automatisches Reconnect](#automatisches-reconnect) verwendet ausschließlich die Standardkennung 'DEFAULT_DISPATCHER' |
+| p_pipeName | varchar2 | Pipe-Name des Dispatchers. `NULL` hebt die Einstellung für die angegebene Kennung wieder auf |
+| p_groupName | varchar2 | Optional. Name einer Servergruppe, falls mehrere Dispatcher parallel genutzt werden: Der Dispatcher gilt dann nur für `SERVER_NEW_SESSION` dieser Gruppe. [Automatisches Reconnect](#automatisches-reconnect) verwendet ausschließlich die Standardkennung 'DEFAULT_DISPATCHER' |
 | p_processId | number | Optional. Ist bereits eine process_id bekannt, stellt LILAM die Verbindung zu dieser sofort wieder her (siehe [Vorwärmen](#vorwärmen)), statt erst beim nächsten API-Aufruf |
 
 ```sql

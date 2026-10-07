@@ -213,6 +213,8 @@ create or replace PACKAGE LILAM AS
     PROCEDURE SERVER_UPDATE_RULES(p_groupName VARCHAR2, p_ruleSetName VARCHAR2, p_ruleSetVersion PLS_INTEGER);
     -- Check a rule set without storing or activating it: NULL = valid, otherwise the reason (never raises)
     FUNCTION CHECK_RULE_SET(p_ruleSet CLOB) RETURN VARCHAR2;
+    -- Dispatcher of this session. Default: used for NEW_SESSION without group or of the dispatcher's group (registry),
+    -- other groups go to their own servers; p_groupName = group: only for NEW_SESSION of this group; p_pipeName NULL removes it
     PROCEDURE SET_DISPATCHER_PIPE(p_pipeName varchar2, p_groupName varchar2 DEFAULT 'DEFAULT_DISPATCHER', p_processId number DEFAULT null);
 
 
