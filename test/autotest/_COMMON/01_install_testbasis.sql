@@ -1955,6 +1955,7 @@ create or replace package body lt as
         l_st      integer;
         l_n       number;
         l_t       timestamp;
+        l_ts      timestamp;      -- feste Zeitstempel fuer AV-02
         l_pipes   sys.odcivarchar2list;
 
         -- eine Regel als JSON
@@ -1998,6 +1999,7 @@ create or replace package body lt as
             l := l || ',' || r('DU-02', 'MARK_EVENT',  'RG_DE', 'MAX_DURATION_MS', '500');
             l := l || ',' || r('OC-01', 'MARK_EVENT',  'RG_OC', 'MAX_OCCURRENCE', '3');
             l := l || ',' || r('AV-01', 'TRACE_STOP',  'RG_AV', 'AVG_DEVIATION_PCT', '50|3|0.5');
+            l := l || ',' || r('AV-02', 'TRACE_STOP',  'RG_AV0', 'AVG_DEVIATION_PCT', '100|3|0.1');
             l := l || ',' || r('PR-01', 'PROCESS_START',  '#P#_PS', 'ON_START', '');
             l := l || ',' || r('PR-02', 'PROCESS_UPDATE', '#P#_ST', 'STATUS_EQUALS', '3');
             l := l || ',' || r('PR-03', 'PROCESS_UPDATE', '#P#_IN', 'INFO_CONTAINS', 'kaputt');
@@ -2008,6 +2010,8 @@ create or replace package body lt as
             l := l || ',' || r('PR-08', 'PROCESS_UPDATE', '#P#_RT', 'RUNTIME_EXCEEDED', '500');
             l := l || ',' || r('LG-01', 'LOGGING', 'LOGGING', 'SEVERITY', 'ERROR');
             l := l || ',' || r('LG-02', 'LOGGING', null, 'SEVERITY', 'WARN');
+            l := l || ',' || r('LC-01', 'LOGGING', null, 'LOG_CONTAINS', 'RG_LC_TEXT');
+            l := l || ',' || r('LC-02', 'LOGGING', null, 'LOG_CONTAINS', 'ERROR|RG_LC_LVL');
             l := l || ',' || r('KX-01', 'MARK_EVENT',  'RG_K',  'ON_EVENT', '', 'C1');
             l := l || ',' || r('KX-02', 'MARK_EVENT',  'RG_K',  'ON_EVENT', '');
             l := l || ',' || r('TF-01', 'TRACE_STOP',  'RG_TF', 'ON_STOP', '');
@@ -2033,6 +2037,9 @@ create or replace package body lt as
             -- Versionen 11, 12: ungueltig, unbekannter Schluessel bzw. Objekt statt Text (C2, G6 = C+)
             ins(11, replace(r('X11-01', 'MARK_EVENT', 'RG_V2', 'ON_EVENT', '', 'C1'), '"context"', '"contxt"'));
             ins(12, replace(r('X12-01', 'MARK_EVENT', 'RG_V2', 'ON_EVENT', '', 'C1'), '"context":"C1"', '"context":{"name":"C1"}'));
+            -- Versionen 13, 14: ungueltig, PRECEDED_BY bei TRACE_STOP bzw. LOG_CONTAINS ohne Text (C4)
+            ins(13, r('X13-01', 'TRACE_STOP', 'RG_V2', 'PRECEDED_BY', 'RG_A'));
+            ins(14, r('X14-01', 'LOGGING', null, 'LOG_CONTAINS', 'ERROR|'));
             -- Gruppe ohne Server: Aktivieren ist kein Fehler
             ins(1, r('E1-01', 'MARK_EVENT', 'RG_E', 'ON_EVENT', ''), 'LT_LEER');
             -- INSESSION: Szenarien (Version 1 mit Praefix der INSESSION-Prozesse) und IS-03..IS-05 (Versionen 1, 2, 6)
@@ -2195,6 +2202,18 @@ create or replace package body lt as
         expect('_MON', 'OC-01', 2, 'MAX_OCCURRENCE 3 bei 5 Events');
         expect('_MON', 'AV-01', 1, 'AVG_DEVIATION_PCT 50 % nach Warm-up');
 
+        -- AVG_DEVIATION_PCT unter 1 ms (C4): feste Zeitstempel, Dauern 1, 0, 0 ms => Durchschnitt 1/3 ms,
+        -- dann 1 ms (+200 %, ueber 100 %) => keine Auswertung unter der Messaufloesung von 1 ms
+        l_pid := proc('_AV0');
+        l_ts  := systimestamp - interval '10' second;
+        for i in 1 .. 4 loop
+            lilam.trace_start(l_pid, 'RG_AV0', p_timestamp => l_ts + numtodsinterval(i, 'SECOND'));
+            lilam.trace_stop(l_pid, 'RG_AV0', p_timestamp => l_ts + numtodsinterval(i, 'SECOND')
+                             + numtodsinterval(case when i in (2, 3) then 0 else 0.001 end, 'SECOND'));
+        end loop;                                                                                       -- 0
+        lilam.close_session(l_pid);
+        expect('_AV0', 'AV-02', 0, 'AVG_DEVIATION_PCT: Durchschnitt unter 1 ms wird nicht ausgewertet');
+
         -- ---------------------------------------------------------------
         -- Prozess-Regeln (je ein Prozess, die Werte bleiben im Prozess stehen)
         -- ---------------------------------------------------------------
@@ -2234,6 +2253,17 @@ create or replace package body lt as
         lilam.close_session(l_pid);
         expect('_LG', 'LG-01', 1, 'SEVERITY ERROR');
         expect('_LG', 'LG-02', 1, 'SEVERITY WARN als zweite Log-Regel (ohne "action")');
+
+        -- LOG_CONTAINS (C4): Text ohne Level (jeder Level) und mit Level ERROR
+        l_pid := proc('_LC');
+        lilam.info(l_pid, 'Start Rg_Lc_Text gemischt');                                            -- LC-01: 1
+        lilam.error(l_pid, 'Fehler rg_lc_TEXT');                                                   -- LC-01: 1
+        lilam.info(l_pid, 'ohne Suchtext');                                                        -- 0
+        lilam.info(l_pid, 'info rg_lc_lvl');                                                       -- LC-02: 0 (falscher Level)
+        lilam.error(l_pid, 'Fehler RG_LC_LVL');                                                    -- LC-02: 1
+        lilam.close_session(l_pid);
+        expect('_LC', 'LC-01', 2, 'LOG_CONTAINS ohne Level (INFO und ERROR, Gross/Klein egal)');
+        expect('_LC', 'LC-02', 1, 'LOG_CONTAINS ERROR|TEXT nur fuer ERROR');
 
         -- ---------------------------------------------------------------
         -- Kontext- und Action-Regel, Trigger-Filter, Drosselung
@@ -2303,8 +2333,9 @@ create or replace package body lt as
         l_n := rejected(c_group, 3) + rejected(c_group, 4) + rejected(c_group, 5) + rejected(c_group, 6)
              + rejected(c_group, 7) + rejected(c_group, 8) + rejected(c_group, 10)
              + rejected(c_group, 11) + rejected(c_group, 12)
+             + rejected(c_group, 13) + rejected(c_group, 14)
              + rejected(c_group, 9);                -- Version 9 gibt es nicht
-        check_that(l_run, 'L3 SERVER_UPDATE_RULES lehnt 10 Faelle mit NUM_ERR_RULE_SET ab', l_n = 10, l_n);
+        check_that(l_run, 'L3 SERVER_UPDATE_RULES lehnt 12 Faelle mit NUM_ERR_RULE_SET ab', l_n = 12, l_n);
         check_that(l_run, 'L3 aktives Rule Set der Gruppe unveraendert', active = c_set || ' v1', active);
         l_pid := proc('_L3'); lilam.mark_event(l_pid, 'RG_L'); lilam.close_session(l_pid);
         expect('_L3', 'L-01', 1, 'L3 Regeln aus Version 1 bleiben aktiv');
