@@ -30,7 +30,7 @@
 </details>
 
 > [!TIP]
-> Dieses Dokument dient als LILAM API-Referenz. Wenn Du neu bei LILAM bist, empfiehlt es sich, zunächst [architecture and concepts.md](architecture%20and%20concepts.md) zu lesen, um die zugrunde liegenden Konzepte kennenzulernen. Die Beispiele im Ordner `demo` zeigen, wie sich die LILAM API in Anwendungen integrieren lässt.
+> Dieses Dokument dient als LILAM API-Referenz. Wenn Du neu bei LILAM bist, empfiehlt es sich, zunächst [Architektur und Konzepte.md](Architektur%20und%20Konzepte.md) zu lesen, um die zugrunde liegenden Konzepte kennenzulernen. Die Beispiele im Ordner `demo` zeigen, wie sich die LILAM API in Anwendungen integrieren lässt.
 
 ---
 
@@ -320,7 +320,7 @@ end if;
 
 > [!NOTE]
 > Durch den Baseline-Scope baut auch eine Anwendung, die häufig neu gestartet wird, eine stabile Vergleichsbasis für ihre Laufzeiten auf. Die Durchschnittswerte werden in den Tabellen `LILAM_SCOPES` und `LILAM_BASELINES` gespeichert.
-> Den Ablauf (Auflösung des Scopes, Laden und Abgleich mit `LILAM_BASELINES`) zeigt ein Diagramm in [architecture and concepts.md](architecture%20and%20concepts.md#baseline-scope).
+> Den Ablauf (Auflösung des Scopes, Laden und Abgleich mit `LILAM_BASELINES`) zeigt ein Diagramm in [Architektur und Konzepte.md](Architektur%20und%20Konzepte.md#baseline-scope).
 
 #### Beispiele
 
@@ -654,7 +654,7 @@ Ein synchron geschriebener Eintrag übersteht damit auch einen Abbruch der Sessi
 > [!NOTE]
 > Im entkoppelten Modus stehen synchrone Einträge normalerweise zweimal in der Datenbank: in der Arbeitstabelle (vom Server geschrieben) und in `LILAM_LOG` im Schema des Clients (`NO = -1`). Fällt der LILAM-Server aus, findet man den Eintrag weiterhin in `LILAM_LOG`. `LILAM_LOG` wird verwendet, weil die Arbeitstabelle im Schema des Servers liegen kann, auf das der Client keinen Zugriff hat.
 
-Ein synchroner Aufruf kostet auf dem Testsystem etwa 1,5 bis 3,5 ms statt rund 0,1 ms, vor allem für den Commit. Details, Messwerte und Ausfallszenarien stehen in [Architecture and Concepts](architecture%20and%20concepts.md#when-is-a-log-entry-stored-sync-level).
+Ein synchroner Aufruf kostet auf dem Testsystem etwa 1,5 bis 3,5 ms statt rund 0,1 ms, vor allem für den Commit. Details, Messwerte und Ausfallszenarien stehen in [Architektur und Konzepte](Architektur%20und%20Konzepte.md#wann-wird-ein-log-eintrag-gespeichert-sync-level).
 
 ### Function GET_COUNTER_WARN / GET_COUNTER_ERROR
 
@@ -948,7 +948,7 @@ Ein mit p_isDispatcher => 1 gestarteter Server (Dispatcher) verarbeitet keine An
 Für NEW_SESSION/SERVER_NEW_SESSION wählt der Dispatcher dabei denselben lastbasierten Mechanismus wie die reguläre Serverauswahl und reicht die Anfrage an die Steuer-Pipe des gewählten Servers weiter;
 für alle anderen Anfragen ermittelt er anhand der bereits vergebenen process_id den Server, der für den Prozess der Anwendung zuständig ist und leitet dorthin weiter.
 
-Die Antwort des zuständigen Servers geht direkt an den Client zurück, nicht über den Dispatcher. Ein Sequenzdiagramm des Ablaufs steht in [architecture and concepts.md](architecture%20and%20concepts.md#dispatcher-flow).
+Die Antwort des zuständigen Servers geht direkt an den Client zurück, nicht über den Dispatcher. Ein Sequenzdiagramm des Ablaufs steht in [Architektur und Konzepte.md](Architektur%20und%20Konzepte.md#ablauf-im-dispatcher).
 
 Ein Dispatcher ist in der Server-Registry gekennzeichnet (`IS_DISPATCHER = 1`) und wird bei der Serverauswahl nie als Ziel gewählt. Worker und Dispatcher können daher in derselben Gruppe laufen: Clients ohne Dispatcher-Konfiguration erhalten immer direkt einen Worker.
 
