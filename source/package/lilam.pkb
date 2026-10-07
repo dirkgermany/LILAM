@@ -47,7 +47,7 @@ AS
     C_SYNC_ALL_INTERVAL_MS             CONSTANT PLS_INTEGER := 500;   -- SYNC_ALL_DIRTY (without force) at most every n ms
 
     -- INSESSION: check for a changed active rule set of the group at most every n ms
-    -- (triggered by API calls; servers are notified via SERVER_UPDATE_RULES)
+    -- (triggered by API calls; servers are notified via SERVER_UPDATE_RULES and check themselves in the housekeeping)
     C_RULES_CHECK_INTERVAL_MS          CONSTANT PLS_INTEGER := 15000;
 
     ---------------------------------------------------------------
@@ -355,7 +355,7 @@ AS
         set_version  NUMBER := 0,
         seen_name    VARCHAR2(30),      -- last seen active rule set, even if rejected
         seen_version NUMBER,            -- (a rejected set is not parsed again on every check)
-        last_check_cs NUMBER            -- INSESSION: last check for a changed active rule set (DBMS_UTILITY.GET_TIME)
+        last_check_cs NUMBER            -- INSESSION and server housekeeping (checkServerRules): last check for a changed active rule set (DBMS_UTILITY.GET_TIME)
     );
     TYPE t_rule_group_map IS TABLE OF t_rule_group_rec INDEX BY VARCHAR2(50);
     g_rule_groups t_rule_group_map;
@@ -370,6 +370,10 @@ AS
 
     TYPE t_alert_history IS TABLE OF TIMESTAMP INDEX BY VARCHAR2(250);
     g_alert_history t_alert_history;
+    -- Throttling for processes without scope (key: process_id, then GROUP|RULE|ACTION).
+    -- STABILITY: removed when the session ends; otherwise g_alert_history would grow with every process_id
+    TYPE t_alert_history_proc IS TABLE OF t_alert_history INDEX BY PLS_INTEGER;
+    g_alert_history_proc t_alert_history_proc;
 
     ----------
     -- TRIGGER
@@ -1098,7 +1102,9 @@ AS
     as
     begin
         -- If there is no trend yet (initial start / warm-up), we cannot validate anything.
-        if p_monitor_rec.avg_action_time is null or p_monitor_rec.avg_action_time = 0 
+        -- STABILITY: measurement resolution is 1 ms; below that a percentage is noise
+        -- (e.g. avg 0.0005 ms and 1 ms = 200,000 %) => no evaluation.
+        if p_monitor_rec.avg_action_time is null or p_monitor_rec.avg_action_time < 1
            or p_monitor_rec.used_time is null or p_metricFactor is null then
             return TRUE; 
         end if;
@@ -1215,7 +1221,9 @@ AS
     PROCEDURE fire_alert(p_rule t_rule_rec, p_rec t_monitor_buffer_rec) IS
         v_throttle_sec  NUMBER := coalesce(p_rule.throttle_seconds, 0);
         v_scope_id      NUMBER;
+        v_group         VARCHAR2(50);
         v_history_key   VARCHAR2(250);
+        v_empty         t_alert_history;
     BEGIN
         IF v_throttle_sec <= 0 THEN
             -- without throttling no memory is needed
@@ -1223,21 +1231,40 @@ AS
             RETURN;
         END IF;
 
-        -- Throttle per scope (if any), so that restarts do not lift the lock period.
         -- Group first: rule IDs are only unique per rule set (see also installGroupRules)
-        v_scope_id    := getScopeId(p_rec.process_id);
-        v_history_key := g_sessionList(v_indexSession(p_rec.process_id)).rule_group || '|'
-                         || CASE WHEN v_scope_id IS NOT NULL THEN 'S' || v_scope_id ELSE 'P' || p_rec.process_id END
-                         || '|' || p_rule.rule_id || '|' || p_rec.action_name;
+        v_group    := g_sessionList(v_indexSession(p_rec.process_id)).rule_group;
+        v_scope_id := getScopeId(p_rec.process_id);
 
-        -- Lock period since the last alert has not yet expired -> do nothing
-        IF g_alert_history.EXISTS(v_history_key)
-           AND g_alert_history(v_history_key) + numtodsinterval(v_throttle_sec, 'SECOND') > SYSTIMESTAMP THEN
-            RETURN;
-        END IF;
+        IF v_scope_id IS NOT NULL THEN
+            -- Throttle per scope, so that restarts do not lift the lock period
+            v_history_key := v_group || '|S' || v_scope_id || '|' || p_rule.rule_id || '|' || p_rec.action_name;
 
-        IF persist_alert(p_rule, p_rec) THEN
-            g_alert_history(v_history_key) := SYSTIMESTAMP;
+            -- Lock period since the last alert has not yet expired -> do nothing
+            IF g_alert_history.EXISTS(v_history_key)
+               AND g_alert_history(v_history_key) + numtodsinterval(v_throttle_sec, 'SECOND') > SYSTIMESTAMP THEN
+                RETURN;
+            END IF;
+
+            IF persist_alert(p_rule, p_rec) THEN
+                g_alert_history(v_history_key) := SYSTIMESTAMP;
+            END IF;
+        ELSE
+            -- Without scope: throttle per process; the entries are removed with the session
+            -- (STABILITY: see g_alert_history_proc)
+            v_history_key := v_group || '|' || p_rule.rule_id || '|' || p_rec.action_name;
+
+            IF g_alert_history_proc.EXISTS(p_rec.process_id)
+               AND g_alert_history_proc(p_rec.process_id).EXISTS(v_history_key)
+               AND g_alert_history_proc(p_rec.process_id)(v_history_key) + numtodsinterval(v_throttle_sec, 'SECOND') > SYSTIMESTAMP THEN
+                RETURN;
+            END IF;
+
+            IF persist_alert(p_rule, p_rec) THEN
+                IF NOT g_alert_history_proc.EXISTS(p_rec.process_id) THEN
+                    g_alert_history_proc(p_rec.process_id) := v_empty;
+                END IF;
+                g_alert_history_proc(p_rec.process_id)(v_history_key) := SYSTIMESTAMP;
+            END IF;
         END IF;
     exception
         when others then
@@ -1283,6 +1310,11 @@ AS
                         WHEN 'SEVERITY' THEN
                             fire := p_list(i).cond_upper = upper(p_ctx.context_name);
 
+                        WHEN 'LOG_CONTAINS' THEN
+                            -- cond_context: level (NULL = any level); cond_upper: text
+                            fire := (p_list(i).cond_context IS NULL OR p_list(i).cond_context = upper(p_ctx.context_name))
+                                AND instr(upper(p_ctx.info), p_list(i).cond_upper) > 0;
+
                         -- =====================================================
                         -- COMMON OPERATORS
                         -- =====================================================
@@ -1304,7 +1336,13 @@ AS
 
                         WHEN 'PRECEDED_BY_WITHIN_SECS' THEN
                             IF g_last_action_per_process.EXISTS(p_ctx.process_id) AND predecessorMatches(p_list(i)) THEN
-                                l_diff_ms := get_ms_diff(g_last_action_per_process(p_ctx.process_id).stop_time, p_ctx.start_time);
+                                -- For process triggers start_time is the process start; use the time of the signal
+                                -- (PROCESS_STOP: process_end, PROCESS_UPDATE: signal time in last_update).
+                                -- PERFORMANCE: SYSTIMESTAMP only as fallback.
+                                l_diff_ms := get_ms_diff(g_last_action_per_process(p_ctx.process_id).stop_time,
+                                    CASE WHEN p_trigger IN (C_PROCESS_UPDATE, C_PROCESS_STOP)
+                                         THEN coalesce(p_ctx.process_end, p_ctx.last_update, systimestamp)
+                                         ELSE p_ctx.start_time END);
                                 fire := l_diff_ms / 1000 > p_list(i).cond_num;
                             ELSE
                                 fire := TRUE;
@@ -1396,7 +1434,7 @@ AS
         END IF;
 
         -- INSESSION: check for a changed active rule set at most every C_RULES_CHECK_INTERVAL_MS
-        -- (servers receive changes via SERVER_UPDATE_RULES).
+        -- (servers: UPDATE_RULE from SERVER_UPDATE_RULES plus their own check in the housekeeping, checkServerRules).
         -- PERFORMANCE: DBMS_UTILITY.GET_TIME instead of SYSTIMESTAMP and interval arithmetic (measured < 1 µs instead of approx. 10–25 µs).
         -- ABS: on overflow of GET_TIME there is at most one additional check.
         IF g_serverPipeName IS NULL
@@ -1461,10 +1499,14 @@ AS
     
     
     -- Method used for mapping to the central evaluate method
-    PROCEDURE evaluateRules(p_monitorRec t_monitor_buffer_rec, p_trigger VARCHAR2)
+    -- p_info: log text (LOGGING only, for LOG_CONTAINS)
+    PROCEDURE evaluateRules(p_monitorRec t_monitor_buffer_rec, p_trigger VARCHAR2, p_info VARCHAR2 := NULL)
     AS
+        l_ctx t_eval_context_rec;
     BEGIN
-        evaluateRules_internal(mapMonitorRecToContextRec(p_monitorRec), p_trigger, p_check_context => TRUE);
+        l_ctx      := mapMonitorRecToContextRec(p_monitorRec);
+        l_ctx.info := substr(p_info, 1, 4000);
+        evaluateRules_internal(l_ctx, p_trigger, p_check_context => TRUE);
         -- Remember the predecessor for PRECEDED_BY: only events and traces, no logs
         IF p_trigger != C_LOGGING THEN
             g_last_action_per_process(p_monitorRec.process_id).action_name  := p_monitorRec.action_name;
@@ -1479,10 +1521,14 @@ AS
     END evaluateRules;
 
     -- Method used for mapping to the central evaluate method
-    PROCEDURE evaluateRules(p_processRec t_process_rec, p_trigger VARCHAR2)
+    -- p_signalTime: time of the signal (PROCESS_UPDATE), reference time for PRECEDED_BY_WITHIN_SECS
+    PROCEDURE evaluateRules(p_processRec t_process_rec, p_trigger VARCHAR2, p_signalTime TIMESTAMP := NULL)
     AS
+        l_ctx t_eval_context_rec;
     BEGIN
-        evaluateRules_internal(mapProcessRecToContextRec(p_processRec), p_trigger, p_check_context => FALSE);
+        l_ctx := mapProcessRecToContextRec(p_processRec);
+        l_ctx.last_update := coalesce(p_signalTime, l_ctx.last_update);
+        evaluateRules_internal(l_ctx, p_trigger, p_check_context => FALSE);
     END evaluateRules;
 
     --------------------------------------------------------------------------
@@ -1783,6 +1829,33 @@ AS
             end if;
     end;
 
+    -- DDL that several servers may run at the same time: p_doneCode (e.g. ORA-00955 object
+    -- already exists) then only means another session was faster.
+    procedure run_ddl(p_sqlStmt varchar2, p_doneCode pls_integer)
+    as
+    begin
+        execute immediate p_sqlStmt;
+    exception
+        when OTHERS then
+            if sqlcode != p_doneCode then
+                logLilamErr(sqlCode, sqlErrM, 'run_ddl', 'EXECUTE IMMEDIATE');
+            end if;
+    end;
+
+    -- Removes obsolete columns/indexes of old installations. Same race as add_columns:
+    -- ORA-01418 (index does not exist) and ORA-00904 (column does not exist) only mean
+    -- another session was faster. STABILITY: never raises, the remaining steps continue.
+    procedure drop_obsolete(p_sqlStmt varchar2)
+    as
+    begin
+        execute immediate p_sqlStmt;
+    exception
+        when OTHERS then
+            if sqlcode not in (-1418, -904) then
+                logLilamErr(sqlCode, sqlErrM, 'drop_obsolete', 'EXECUTE IMMEDIATE');
+            end if;
+    end;
+
     --------------------------------------------------------------------------
 
     -- Checks if a database sequence exists
@@ -1996,16 +2069,22 @@ AS
             if l_regCols = 0 then
                 add_columns('ALTER TABLE ' || C_LILAM_SERVER_REGISTRY || ' ADD (msg_rate NUMBER DEFAULT 0, rate_ts TIMESTAMP(3))');
             end if;
+            -- Remove columns of old installations (rule sets are now assigned per server group)
+            for c in (select column_name from user_tab_columns
+                       where table_name = upper(C_LILAM_SERVER_REGISTRY)
+                         and column_name in ('RULE_SET_NAME', 'SET_IN_USE')) loop
+                drop_obsolete('ALTER TABLE ' || C_LILAM_SERVER_REGISTRY || ' DROP COLUMN ' || c.column_name);
+            end loop;
         end if;
 
         if not objectExists(C_LILAM_RULES_TABLE, 'TABLE') then
             sqlStmt := '
             CREATE TABLE ' || C_LILAM_RULES_TABLE || ' (
                 rule_set       CLOB CONSTRAINT ensure_json_rules CHECK (rule_set IS JSON),
-                group_name     VARCHAR2(50),
-                set_name       VARCHAR2(30),
-                version        NUMBER,
-                is_active      NUMBER(1) DEFAULT 0,
+                group_name     VARCHAR2(50) NOT NULL,
+                set_name       VARCHAR2(30) NOT NULL,
+                version        NUMBER NOT NULL CONSTRAINT lilam_rules_chk_version CHECK (version = trunc(version)),
+                is_active      NUMBER(1) DEFAULT 0 NOT NULL CONSTRAINT lilam_rules_chk_active CHECK (is_active IN (0, 1)),
                 created        TIMESTAMP,
                 author         VARCHAR2(50)
             )';
@@ -2017,6 +2096,19 @@ AS
             if l_regCols = 0 then
                 run_sql('ALTER TABLE ' || C_LILAM_RULES_TABLE || ' ADD (group_name VARCHAR2(50), is_active NUMBER(1) DEFAULT 0)');
             end if;
+            -- Constraints as for a new table. STABILITY: NOVALIDATE, existing rows do not block;
+            -- several servers may run this at the same time (ORA-02264/-01442: already done)
+            select count(*) into l_regCols from user_constraints
+             where table_name = upper(C_LILAM_RULES_TABLE) and constraint_name = 'LILAM_RULES_CHK_ACTIVE';
+            if l_regCols = 0 then
+                run_ddl('ALTER TABLE ' || C_LILAM_RULES_TABLE || ' MODIFY (group_name NOT NULL ENABLE NOVALIDATE)', -1442);
+                run_ddl('ALTER TABLE ' || C_LILAM_RULES_TABLE || ' MODIFY (set_name NOT NULL ENABLE NOVALIDATE)', -1442);
+                run_ddl('ALTER TABLE ' || C_LILAM_RULES_TABLE || ' MODIFY (version NOT NULL ENABLE NOVALIDATE)', -1442);
+                run_ddl('ALTER TABLE ' || C_LILAM_RULES_TABLE || ' ADD CONSTRAINT lilam_rules_chk_version '
+                        || 'CHECK (version = trunc(version)) ENABLE NOVALIDATE', -2264);
+                run_ddl('ALTER TABLE ' || C_LILAM_RULES_TABLE || ' ADD CONSTRAINT lilam_rules_chk_active '
+                        || 'CHECK (is_active IN (0, 1)) ENABLE NOVALIDATE', -2264);
+            end if;
         end if;
 
 
@@ -2025,7 +2117,7 @@ AS
             CREATE TABLE ' || C_LILAM_ALERTS_TABLE || ' (
                 alert_id           NUMBER GENERATED BY DEFAULT AS IDENTITY,
                 process_id         NUMBER(19,0) NOT NULL,
-                process_name       VARCHAR2(50),
+                process_name       VARCHAR2(100),
                 master_table_name  VARCHAR2(50), 
                 monitor_table_name VARCHAR2(50), 
                 logging_table_name VARCHAR2(50), 
@@ -2046,6 +2138,13 @@ AS
                 CONSTRAINT pk_lila_alerts PRIMARY KEY (alert_id)
             )';
             run_sql(sqlStmt);
+        else
+            -- Existing table: process names have up to 100 characters (as in the process table)
+            select count(*) into l_regCols from user_tab_columns
+             where table_name = upper(C_LILAM_ALERTS_TABLE) and column_name = 'PROCESS_NAME' and char_length < 100;
+            if l_regCols > 0 then
+                run_sql('ALTER TABLE ' || C_LILAM_ALERTS_TABLE || ' MODIFY (process_name VARCHAR2(100))');
+            end if;
         end if;
 
         -- Baseline scopes: fixed identity of an application across processes
@@ -2092,9 +2191,20 @@ AS
             run_sql(sqlStmt);
         end if ;
 
-        -- Rule sets: unique per group/name/version; at most one active per group
-        if not objectExists('idx_lilam_rules_grp', 'INDEX') then
-            run_sql('CREATE UNIQUE INDEX idx_lilam_rules_grp ON ' || C_LILAM_RULES_TABLE || ' (group_name, set_name, version)');
+        -- Rule sets: unique per group/name/version; at most one active per group.
+        -- The group is compared without case everywhere (upper), so the index does that too.
+        -- Old installations: remove the former index (replaced by idx_lilam_rules_set)
+        if objectExists('IDX_LILAM_RULES', 'INDEX') then
+            drop_obsolete('DROP INDEX idx_lilam_rules');
+        end if;
+        if not objectExists('idx_lilam_rules_set', 'INDEX') then
+            run_ddl('CREATE UNIQUE INDEX idx_lilam_rules_set ON ' || C_LILAM_RULES_TABLE || ' (upper(group_name), set_name, version)', -955);
+        end if ;
+        -- Migration: the old index distinguished the case of the group. STABILITY: dropped only once
+        -- the new one exists; if that fails (rows differing only in case), the old one stays and
+        -- the error is in LILAM_LOG_INTERNAL.
+        if objectExists('idx_lilam_rules_grp', 'INDEX') and objectExists('idx_lilam_rules_set', 'INDEX') then
+            drop_obsolete('DROP INDEX idx_lilam_rules_grp');
         end if ;
         if not objectExists('idx_lilam_rules_active', 'INDEX') then
             run_sql('CREATE UNIQUE INDEX idx_lilam_rules_active ON ' || C_LILAM_RULES_TABLE
@@ -4371,7 +4481,7 @@ AS
             v_dummyMonRec.monitor_type := C_MON_TYPE_LOG;
             v_dummyMonRec.action_name := C_LOGGING;
             v_dummyMonRec.context_name := logLevelToEnum(p_level);
-            evaluateRules(v_dummyMonRec, C_LOGGING);
+            evaluateRules(v_dummyMonRec, C_LOGGING, l_logText);
         end if;
 
         -- Entries up to the sync level of the process (default: ERROR) must be written immediately,
@@ -4538,7 +4648,7 @@ AS
             g_sessionList(v_indexSession(p_processId)).process_is_dirty := TRUE;
             g_dirty_queue(p_processId) := TRUE; -- So that SYNC_ALL_DIRTY sees the session
 
-            evaluateRules(g_process_cache(p_processId), C_PROCESS_UPDATE);                
+            evaluateRules(g_process_cache(p_processId), C_PROCESS_UPDATE, p_timestamp);
         end if ;
 
     exception
@@ -4758,6 +4868,7 @@ AS
         g_monitor_shadows.DELETE;
         g_local_throttle_cache.DELETE;    
         g_alert_history.DELETE;
+        g_alert_history_proc.DELETE;
         g_rules_by_context.DELETE;
         g_rules_by_action.DELETE;
         g_rule_groups.DELETE;
@@ -4889,6 +5000,9 @@ AS
 
         -- K) Counters for ERROR/WARN
         g_log_counters.DELETE(p_processId);
+
+        -- L) Throttling memory of processes without scope
+        g_alert_history_proc.DELETE(p_processId);
 
     EXCEPTION
         WHEN OTHERS THEN
@@ -5955,7 +6069,9 @@ AS
     --------------------------------------------------------------------------
     FUNCTION ruleNumber(p_value VARCHAR2, p_position PLS_INTEGER := 1) RETURN NUMBER
     AS
-        l_val  VARCHAR2(100) := TRIM(REGEXP_SUBSTR(p_value, '[^|]+', 1, p_position));
+        -- STABILITY: as long as condition.value, so that a long part ends up as "needs a number"
+        -- and not as ORA-06502 from the declaration section
+        l_val  VARCHAR2(4000) := TRIM(REGEXP_SUBSTR(p_value, '[^|]+', 1, p_position));
         l_sign NUMBER := 1;
     BEGIN
         IF l_val IS NULL THEN
@@ -5979,8 +6095,16 @@ AS
                           p_avg OUT NOCOPY t_avg_params_map) RETURN VARCHAR2
     IS
         TYPE t_seen_map IS TABLE OF BOOLEAN INDEX BY VARCHAR2(50);
+        -- an empty or blank part in 'a|b|c' (start, middle or end)
+        C_EMPTY_PART CONSTANT VARCHAR2(30) := '(^|\|)\s*(\||$)';
         l_seen   t_seen_map;
-        l_hasArr PLS_INTEGER;
+        l_doc    JSON_OBJECT_T;
+        l_el     JSON_ELEMENT_T;
+        l_rules  JSON_ARRAY_T;
+        l_obj    JSON_OBJECT_T;
+        l_cond   JSON_OBJECT_T;
+        l_alert  JSON_OBJECT_T;
+        l_bad    VARCHAR2(4000);
         l_no     PLS_INTEGER := 0;
         l_parts  PLS_INTEGER;
         l_rule   t_rule_rec;
@@ -5994,11 +6118,61 @@ AS
         BEGIN
             RETURN substr('rule #' || l_no || ' (id ' || coalesce(l_rule.rule_id, '?') || '): ' || p_msg, 1, 1000);
         END;
+
+        -- Sub-object of a rule ("condition", "alert"); NULL if missing. p_ok = FALSE if present but no object.
+        FUNCTION subObject(p_parent JSON_OBJECT_T, p_key VARCHAR2, p_ok OUT BOOLEAN) RETURN JSON_OBJECT_T IS
+            l_sub JSON_ELEMENT_T := p_parent.get(p_key);
+        BEGIN
+            p_ok := l_sub IS NULL OR l_sub.is_null OR l_sub.is_object;
+            IF l_sub IS NOT NULL AND l_sub.is_object THEN
+                RETURN TREAT(l_sub AS JSON_OBJECT_T);
+            END IF;
+            RETURN NULL;
+        END;
+
+        -- First key that is not allowed (keys starting with "_" are comments); NULL if all are known.
+        -- p_allowed: ',key1,key2,'
+        FUNCTION unknownKey(p_obj JSON_OBJECT_T, p_allowed VARCHAR2) RETURN VARCHAR2 IS
+            l_keys JSON_KEY_LIST;
+        BEGIN
+            IF p_obj IS NULL THEN
+                RETURN NULL;
+            END IF;
+            l_keys := p_obj.get_keys;
+            FOR i IN 1 .. l_keys.COUNT LOOP
+                IF substr(l_keys(i), 1, 1) != '_'
+                   AND (instr(l_keys(i), ',') > 0 OR instr(p_allowed, ',' || l_keys(i) || ',') = 0) THEN
+                    RETURN l_keys(i);
+                END IF;
+            END LOOP;
+            RETURN NULL;
+        END;
+
+        -- STABILITY: JSON_TABLE silently returns NULL for an object, an array or a text over 4000
+        -- characters. Such a field must not be treated as missing (e.g. "context" would then
+        -- widen the rule to all contexts). p_val: the value JSON_TABLE read.
+        FUNCTION unreadable(p_obj JSON_OBJECT_T, p_key VARCHAR2, p_val VARCHAR2) RETURN BOOLEAN IS
+            l_val JSON_ELEMENT_T;
+        BEGIN
+            IF p_obj IS NULL OR p_val IS NOT NULL THEN
+                RETURN FALSE;
+            END IF;
+            l_val := p_obj.get(p_key);
+            RETURN l_val IS NOT NULL AND NOT l_val.is_null
+                   AND NOT (l_val.is_string AND nvl(dbms_lob.getlength(l_val.to_clob), 0) IN (0, 2)); -- "" counts as missing
+        END;
     BEGIN
-        SELECT count(*) INTO l_hasArr FROM dual WHERE JSON_EXISTS(p_ruleSet, '$.rules');
-        IF l_hasArr = 0 THEN
+        BEGIN
+            l_doc := JSON_OBJECT_T.parse(p_ruleSet);
+        EXCEPTION
+            WHEN OTHERS THEN
+                RETURN 'no valid JSON object: ' || substr(sqlErrM, 1, 200);
+        END;
+        l_el := l_doc.get('rules');
+        IF l_el IS NULL OR NOT l_el.is_array THEN
             RETURN 'array "rules" missing';
         END IF;
+        l_rules := TREAT(l_el AS JSON_ARRAY_T);
 
         FOR r IN (
             SELECT *
@@ -6021,6 +6195,50 @@ AS
             l_rule := l_empty;
             l_trig := upper(trim(r.trigger_t));
             l_op   := upper(trim(r.operator));
+
+            -- Structure: known keys only (typos such as "contxt" or "throttle" would otherwise be
+            -- ignored silently), no objects/arrays/overlong texts where a value is expected.
+            -- JSON_TABLE returns the rules in array order, so rule #n is element n-1.
+            l_el := l_rules.get(l_no - 1);
+            IF l_el IS NULL OR NOT l_el.is_object THEN
+                RETURN fail('not a JSON object');
+            END IF;
+            l_obj   := TREAT(l_el AS JSON_OBJECT_T);
+            l_cond  := subObject(l_obj, 'condition', l_ok);
+            IF NOT l_ok THEN
+                RETURN fail('"condition" is not an object');
+            END IF;
+            l_alert := subObject(l_obj, 'alert', l_ok);
+            IF NOT l_ok THEN
+                RETURN fail('"alert" is not an object');
+            END IF;
+            l_bad := unknownKey(l_obj, ',id,trigger_type,action,context,condition,alert,');
+            IF l_bad IS NOT NULL THEN
+                RETURN fail('unknown key "' || substr(l_bad, 1, 100) || '"');
+            END IF;
+            l_bad := unknownKey(l_cond, ',operator,value,metric,');
+            IF l_bad IS NOT NULL THEN
+                RETURN fail('unknown key "condition.' || substr(l_bad, 1, 100) || '"');
+            END IF;
+            l_bad := unknownKey(l_alert, ',handler,severity,throttle_seconds,');
+            IF l_bad IS NOT NULL THEN
+                RETURN fail('unknown key "alert.' || substr(l_bad, 1, 100) || '"');
+            END IF;
+            l_bad := CASE
+                WHEN unreadable(l_obj,   'id',               r.rule_id)      THEN 'id'
+                WHEN unreadable(l_obj,   'trigger_type',     r.trigger_t)    THEN 'trigger_type'
+                WHEN unreadable(l_obj,   'action',           r.action)       THEN 'action'
+                WHEN unreadable(l_obj,   'context',          r.context)      THEN 'context'
+                WHEN unreadable(l_cond,  'operator',         r.operator)     THEN 'condition.operator'
+                WHEN unreadable(l_cond,  'value',            r.value)        THEN 'condition.value'
+                WHEN unreadable(l_cond,  'metric',           r.metric)       THEN 'condition.metric'
+                WHEN unreadable(l_alert, 'handler',          r.handler)      THEN 'alert.handler'
+                WHEN unreadable(l_alert, 'severity',         r.severity)     THEN 'alert.severity'
+                WHEN unreadable(l_alert, 'throttle_seconds', r.throttle_sec) THEN 'alert.throttle_seconds'
+            END;
+            IF l_bad IS NOT NULL THEN
+                RETURN fail('"' || l_bad || '" is not a text or number, or longer than 4000');
+            END IF;
 
             -- Mandatory fields and lengths
             IF r.rule_id IS NULL OR length(r.rule_id) > 50 THEN
@@ -6077,12 +6295,14 @@ AS
             -- Operator: allowed triggers
             l_ok := CASE
                 WHEN l_op IN ('ON_START', 'ON_STOP', 'ON_EVENT', 'ON_UPDATE') THEN l_trig != C_LOGGING
-                WHEN l_op = 'SEVERITY' THEN l_trig = C_LOGGING
+                WHEN l_op IN ('SEVERITY', 'LOG_CONTAINS') THEN l_trig = C_LOGGING
                 WHEN l_op IN ('MAX_DURATION_MS', 'AVG_DEVIATION_PCT') THEN l_trig IN (C_MARK_EVENT, C_TRACE_STOP)
                 WHEN l_op = 'MAX_GAP_SECONDS' THEN l_trig IN (C_MARK_EVENT, C_TRACE_START)
                 WHEN l_op = 'MAX_OCCURRENCE' THEN l_trig IN (C_MARK_EVENT, C_TRACE_STOP, C_PROCESS_UPDATE, C_PROCESS_STOP)
+                -- No TRACE_STOP: the order is decided when the action starts;
+                -- at TRACE_STOP the predecessor is usually the own TRACE_START.
                 WHEN l_op IN ('PRECEDED_BY', 'PRECEDED_BY_WITHIN_SECS') THEN
-                     l_trig IN (C_MARK_EVENT, C_TRACE_START, C_TRACE_STOP, C_PROCESS_UPDATE, C_PROCESS_STOP)
+                     l_trig IN (C_MARK_EVENT, C_TRACE_START, C_PROCESS_UPDATE, C_PROCESS_STOP)
                 WHEN l_op = 'RUNTIME_EXCEEDED' THEN l_trig = C_PROCESS_UPDATE
                 WHEN l_op = 'MAX_RUNTIME_EXCEEDED' THEN l_trig = C_PROCESS_STOP
                 WHEN l_op IN ('STEPS_LEFT_HIGH', 'SUCCESS_RATE_LOW', 'STATUS_EQUALS', 'INFO_CONTAINS') THEN
@@ -6109,8 +6329,27 @@ AS
                     IF l_rule.cond_upper IS NULL OR length(l_rule.cond_upper) > 100 THEN
                         RETURN fail('INFO_CONTAINS needs a text (max. 100)');
                     END IF;
+                WHEN l_op = 'LOG_CONTAINS' THEN
+                    -- TEXT or LEVEL|TEXT; the first part is a level only if it is a known log level,
+                    -- otherwise the whole value is the text. Level in cond_context, text in cond_upper.
+                    l_parts := instr(r.value, '|');
+                    IF l_parts > 0
+                       AND upper(trim(substr(r.value, 1, l_parts - 1))) IN ('ERROR', 'WARN', 'MONITOR', 'INFO', 'DEBUG') THEN
+                        l_rule.cond_context := upper(trim(substr(r.value, 1, l_parts - 1)));
+                    ELSE
+                        l_parts := 0;
+                    END IF;
+                    -- check the length before the assignment (cond_upper holds 100)
+                    IF coalesce(length(substr(r.value, l_parts + 1)), 0) NOT BETWEEN 1 AND 100 THEN
+                        RETURN fail('LOG_CONTAINS needs TEXT or LEVEL|TEXT (text max. 100)');
+                    END IF;
+                    l_rule.cond_upper := upper(substr(r.value, l_parts + 1));
                 WHEN l_op IN ('PRECEDED_BY', 'PRECEDED_BY_WITHIN_SECS') THEN
                     -- PRECEDED_BY: ACTION[|CONTEXT]; PRECEDED_BY_WITHIN_SECS: ACTION[|CONTEXT]|SECONDS
+                    -- STABILITY: empty parts ('|C1', 'A|') would otherwise be skipped and change the meaning
+                    IF regexp_like(r.value, C_EMPTY_PART) THEN
+                        RETURN fail(l_op || ': empty part in "condition.value"');
+                    END IF;
                     l_parts := CASE WHEN r.value IS NULL THEN 0 ELSE regexp_count(r.value, '\|') + 1 END;
                     IF l_op = 'PRECEDED_BY_WITHIN_SECS' THEN
                         l_rule.cond_num := ruleNumber(r.value, l_parts);
@@ -6131,6 +6370,13 @@ AS
                     END IF;
                 ELSE
                     -- all other operators: number (AVG_DEVIATION_PCT: 'pct|warmup|alpha')
+                    -- STABILITY: no empty parts and no surplus parts, otherwise a value would be
+                    -- read from the wrong position ('20||0.3' => warmup 0.3, '|5' => 5)
+                    IF regexp_like(r.value, C_EMPTY_PART)
+                       OR regexp_count(r.value, '\|') > CASE WHEN l_op = 'AVG_DEVIATION_PCT' THEN 2 ELSE 0 END THEN
+                        RETURN fail(CASE WHEN l_op = 'AVG_DEVIATION_PCT' THEN 'AVG_DEVIATION_PCT needs PCT[|WARMUP[|ALPHA]]'
+                                         ELSE l_op || ' needs a number (decimal point ".")' END);
+                    END IF;
                     l_rule.cond_num := ruleNumber(r.value, 1);
                     IF l_rule.cond_num IS NULL THEN
                         RETURN fail(l_op || ' needs a number (decimal point ".")');
@@ -6183,6 +6429,7 @@ AS
         l_len    PLS_INTEGER  := length(p_group) + 1;
         l_key    VARCHAR2(300);
         l_next   VARCHAR2(300);
+        l_pid    PLS_INTEGER;
     begin
         l_key := g_rules_by_context.FIRST;
         WHILE l_key IS NOT NULL LOOP
@@ -6211,6 +6458,17 @@ AS
             l_next := g_alert_history.NEXT(l_key);
             IF substr(l_key, 1, l_len) = l_prefix THEN g_alert_history.DELETE(l_key); END IF;
             l_key := l_next;
+        END LOOP;
+
+        l_pid := g_alert_history_proc.FIRST;
+        WHILE l_pid IS NOT NULL LOOP
+            l_key := g_alert_history_proc(l_pid).FIRST;
+            WHILE l_key IS NOT NULL LOOP
+                l_next := g_alert_history_proc(l_pid).NEXT(l_key);
+                IF substr(l_key, 1, l_len) = l_prefix THEN g_alert_history_proc(l_pid).DELETE(l_key); END IF;
+                l_key := l_next;
+            END LOOP;
+            l_pid := g_alert_history_proc.NEXT(l_pid);
         END LOOP;
     end;
 
@@ -6250,6 +6508,7 @@ AS
     --------------------------------------------------------------------------
     -- Load the active rule set of a group from LILAM_RULES if it has changed.
     -- p_force: always reload (server start, UPDATE_RULE).
+    -- Without p_force (INSESSION rule check, server housekeeping) only a new name/version is loaded.
     -- Without an active rule set the group has no rules. STABILITY: an invalid rule set is
     -- rejected completely (logged once per version), the previous rules then remain active.
     -- Errors never reach the caller.
@@ -6336,6 +6595,33 @@ AS
     END;
 
     --------------------------------------------------------------------------
+    -- Own check of the server for a changed active rule set of its group (B7).
+    -- UPDATE_RULE from SERVER_UPDATE_RULES is only the immediate trigger: if a server missed it
+    -- (pipe full, send timeout), it would keep the old rules until its next start.
+    -- STABILITY: every server catches up within C_RULES_CHECK_INTERVAL_MS, as INSESSION does.
+    -- PERFORMANCE: at most one small indexed query per interval; the rule set is parsed only for a
+    -- new name/version (refreshGroupRules with p_force => FALSE). Errors never leave refreshGroupRules.
+    --------------------------------------------------------------------------
+    procedure checkServerRules
+    as
+        l_group varchar2(50);
+    begin
+        -- Dispatchers do not evaluate rules
+        if g_serverIsDispatcher then
+            return;
+        end if;
+        l_group := upper(trim(g_serverGroupName));
+        if l_group is null then
+            return;
+        end if;
+        -- ABS: on overflow of GET_TIME there is at most one additional check
+        if not g_rule_groups.EXISTS(l_group)
+           or abs(dbms_utility.get_time - g_rule_groups(l_group).last_check_cs) >= C_RULES_CHECK_INTERVAL_MS / 10 then
+            refreshGroupRules(l_group, p_force => FALSE);
+        end if;
+    end;
+
+    --------------------------------------------------------------------------
     -- Activate a rule set for a server group (autonomous, so that the servers see it immediately)
     --------------------------------------------------------------------------
     procedure activateGroupRules(p_groupName varchar2, p_ruleSetName varchar2, p_ruleSetVersion pls_integer)
@@ -6357,10 +6643,27 @@ AS
     end;
 
     --------------------------------------------------------------------------
+    -- Checks a rule set without storing or activating it (same check as SERVER_UPDATE_RULES).
+    -- Returns NULL if it is valid, otherwise the reason. STABILITY: never raises.
+    --------------------------------------------------------------------------
+    FUNCTION CHECK_RULE_SET(p_ruleSet CLOB) RETURN VARCHAR2
+    AS
+        l_byCtx    t_rule_map;
+        l_byAction t_rule_map;
+        l_avg      t_avg_params_map;
+    BEGIN
+        RETURN parseRuleSet(p_ruleSet, l_byCtx, l_byAction, l_avg);
+    EXCEPTION
+        WHEN OTHERS THEN
+            RETURN substr(sqlErrM, 1, 1000);
+    END;
+
+    --------------------------------------------------------------------------
     -- Activate a rule set for all servers of a group (dispatchers excluded).
     -- The rule set is checked here; an invalid or missing rule set changes nothing.
     -- Running servers receive UPDATE_RULE directly in their pipe (bypassing the dispatcher);
     -- servers that start later load the active rule set of their group themselves.
+    -- A server that misses UPDATE_RULE loads the active rule set itself within C_RULES_CHECK_INTERVAL_MS.
     --------------------------------------------------------------------------
     PROCEDURE SERVER_UPDATE_RULES(p_groupName VARCHAR2, p_ruleSetName VARCHAR2, p_ruleSetVersion PLS_INTEGER)
     AS
@@ -6401,7 +6704,7 @@ AS
             DBMS_PIPE.PACK_MESSAGE('{"header":{"msg_type":"API_CALL","request":"UPDATE_RULE"}}');
             l_status := DBMS_PIPE.SEND_MESSAGE(l_pipes(i), timeout => 1);
             IF l_status != 0 THEN
-                -- the rule set is active: the server loads it at the latest on its next start
+                -- the rule set is active: the server loads it itself within C_RULES_CHECK_INTERVAL_MS (checkServerRules)
                 logLilamErr(l_status, l_label || ': pipe ' || l_pipes(i) || ' not reachable', 'SERVER_UPDATE_RULES');
             END IF;
         END LOOP;
@@ -6779,6 +7082,8 @@ AS
             if l_windowMs >= C_SERVER_SYNC_INTERVAL_MS then
                 updateServerRegistry(TRUE, l_msgCnt, l_windowMs);
                 SYNC_ALL_DIRTY;
+                -- rule set of the group: own check at most every C_RULES_CHECK_INTERVAL_MS (B7)
+                checkServerRules;
                 l_lastSyncCs := dbms_utility.get_time;
                 l_msgCnt := 0;
             end if;

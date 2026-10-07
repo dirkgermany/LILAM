@@ -208,9 +208,9 @@ create or replace package lt authid definer as
     -- Baustein von t_rueckschreibung (laeuft als Job = fremde Session): Tabellenstand als Messwerte festhalten
     procedure rs_peek(p_run_id number, p_prefix varchar2, p_key varchar2);
 
-    -- Regeln (Rules Engine) im SERVER-Modus: Laden, Operatoren, Alerts. Nur einzeln (aendert das Rule Set von LT_S1)
+    -- Regeln (Rules Engine) im SERVER- und INSESSION-Modus: Laden, Operatoren, Alerts. Nur einzeln (aendert das Rule Set der Gruppe LT)
     function t_regeln(p_manage boolean default true, p_parent number default null) return number;
-    -- Kosten der Regelpruefung je Signaltyp (EVENT, TRACE, LOG, STEP) und Variante; nur einzeln
+    -- Kosten der Regelpruefung je Signaltyp (EVENT, TRACE, LOG, STEP) und Variante, SERVER und INSESSION; nur einzeln
     function t_regeln_last(p_n number default 2000, p_n_fire number default 200, p_reps number default 5,
                            p_manage boolean default true, p_parent number default null) return number;
 
@@ -1935,20 +1935,28 @@ create or replace package body lt as
     end;
 
     ----------------------------------------------------------------------
-    -- REGELN: Rules Engine im SERVER-Modus (Laden, Operatoren, Alerts)
-    -- Rule Set LT_REGELN, Versionen 1 (vollstaendig), 2 (klein), 3-5 ungueltig.
+    -- REGELN: Rules Engine im SERVER- und INSESSION-Modus (Laden, Operatoren, Alerts)
+    -- Rule Set LT_REGELN, Versionen 1 (vollstaendig), 2 (klein), 3-6 ungueltig.
     -- #P# wird durch den Prozess-Praefix des Laufs ersetzt (Prozess-Regeln haengen am Prozessnamen).
+    -- INSESSION nutzt eigene Gruppen je Lauf: die Session prueft nur Name und Version des aktiven
+    -- Rule Sets, ein zweiter Lauf in derselben DB-Session saehe sonst die Regeln mit dem alten Praefix.
     ----------------------------------------------------------------------
     function t_regeln(p_manage boolean default true, p_parent number default null) return number is
         c_set     constant varchar2(30) := 'LT_REGELN';
         c_handler constant varchar2(30) := 'LT_REGELN_ALERT';
         l_run     number;
         l_p       varchar2(60);   -- Prozess-Praefix, z.B. LT_700_RG
+        l_s       varchar2(10);   -- Zusatz im Prozessnamen je Modus: SERVER leer, INSESSION '_IS'
+        l_is_grp  varchar2(50);   -- INSESSION-Gruppe fuer die Szenarien (Rule Set v1 mit Praefix l_p || '_IS')
+        l_is_grp2 varchar2(50);   -- INSESSION-Gruppe fuer Versionswechsel, ungueltiges und fehlendes Rule Set
         l_pid     number;
         l_ok      boolean;
         l_msg     varchar2(1800);
         l_st      integer;
         l_n       number;
+        l_t       timestamp;
+        l_ts      timestamp;      -- feste Zeitstempel fuer AV-02
+        l_pipes   sys.odcivarchar2list;
 
         -- eine Regel als JSON
         function r(p_id varchar2, p_trig varchar2, p_action varchar2, p_op varchar2, p_val varchar2,
@@ -1962,14 +1970,15 @@ create or replace package body lt as
                 || '"severity":"WARN","throttle_seconds":' || p_thr || '}}';
         end;
 
-        function rule_set(p_ver number, p_rules clob) return clob is
+        function rule_set(p_ver number, p_rules clob, p_pp varchar2) return clob is
         begin
             return '{"header":{"rule_set":"' || c_set || '","rule_set_version":' || p_ver
-                || ',"description":"Test FEATURES/REGELN"},"rules":[' || replace(p_rules, '#P#', l_p) || ']}';
+                || ',"description":"Test FEATURES/REGELN"},"rules":[' || replace(p_rules, '#P#', p_pp) || ']}';
         end;
 
-        procedure ins(p_ver number, p_rules clob, p_group varchar2 default c_group) is
-            l_json clob := rule_set(p_ver, p_rules);
+        -- p_pp: Prozess-Praefix fuer #P# (INSESSION: l_p || '_IS')
+        procedure ins(p_ver number, p_rules clob, p_group varchar2 default c_group, p_pp varchar2 default null) is
+            l_json clob := rule_set(p_ver, p_rules, nvl(p_pp, l_p));
         begin
             execute immediate 'insert into lilam_rules(group_name, set_name, version, is_active, created, author, rule_set)
                                values (:1, :2, :3, 0, systimestamp, ''LT'', :4)' using p_group, c_set, p_ver, l_json;
@@ -1983,6 +1992,7 @@ create or replace package body lt as
             l := l || ',' || r('VG-02', 'MARK_EVENT',  'RG_B2', 'PRECEDED_BY', 'RG_A|C1');
             l := l || ',' || r('VG-03', 'MARK_EVENT',  'RG_D',  'PRECEDED_BY_WITHIN_SECS', 'RG_C|1');
             l := l || ',' || r('VG-04', 'TRACE_START', 'RG_T',  'PRECEDED_BY', 'RG_A');
+            l := l || ',' || r('VG-05', 'PROCESS_UPDATE', '#P#_VG5', 'PRECEDED_BY_WITHIN_SECS', 'RG_A|1');
             l := l || ',' || r('NF-01', 'MARK_EVENT',  'RG_NF_B', 'PRECEDED_BY_WITHIN_SECS', 'RG_NF_A|1');
             l := l || ',' || r('GP-01', 'MARK_EVENT',  'RG_G',  'MAX_GAP_SECONDS', '0.8');
             l := l || ',' || r('GP-02', 'TRACE_START', 'RG_GT', 'MAX_GAP_SECONDS', '0.8');
@@ -1990,6 +2000,7 @@ create or replace package body lt as
             l := l || ',' || r('DU-02', 'MARK_EVENT',  'RG_DE', 'MAX_DURATION_MS', '500');
             l := l || ',' || r('OC-01', 'MARK_EVENT',  'RG_OC', 'MAX_OCCURRENCE', '3');
             l := l || ',' || r('AV-01', 'TRACE_STOP',  'RG_AV', 'AVG_DEVIATION_PCT', '50|3|0.5');
+            l := l || ',' || r('AV-02', 'TRACE_STOP',  'RG_AV0', 'AVG_DEVIATION_PCT', '100|3|0.1');
             l := l || ',' || r('PR-01', 'PROCESS_START',  '#P#_PS', 'ON_START', '');
             l := l || ',' || r('PR-02', 'PROCESS_UPDATE', '#P#_ST', 'STATUS_EQUALS', '3');
             l := l || ',' || r('PR-03', 'PROCESS_UPDATE', '#P#_IN', 'INFO_CONTAINS', 'kaputt');
@@ -2000,6 +2011,8 @@ create or replace package body lt as
             l := l || ',' || r('PR-08', 'PROCESS_UPDATE', '#P#_RT', 'RUNTIME_EXCEEDED', '500');
             l := l || ',' || r('LG-01', 'LOGGING', 'LOGGING', 'SEVERITY', 'ERROR');
             l := l || ',' || r('LG-02', 'LOGGING', null, 'SEVERITY', 'WARN');
+            l := l || ',' || r('LC-01', 'LOGGING', null, 'LOG_CONTAINS', 'RG_LC_TEXT');
+            l := l || ',' || r('LC-02', 'LOGGING', null, 'LOG_CONTAINS', 'ERROR|RG_LC_LVL');
             l := l || ',' || r('KX-01', 'MARK_EVENT',  'RG_K',  'ON_EVENT', '', 'C1');
             l := l || ',' || r('KX-02', 'MARK_EVENT',  'RG_K',  'ON_EVENT', '');
             l := l || ',' || r('TF-01', 'TRACE_STOP',  'RG_TF', 'ON_STOP', '');
@@ -2011,12 +2024,31 @@ create or replace package body lt as
             ins(1, l);
             -- Version 2: klein, ersetzt Version 1 vollstaendig
             ins(2, r('V2-01', 'MARK_EVENT', 'RG_V2', 'ON_EVENT', ''));
-            -- Versionen 3-5: ungueltig (fehlender Handler, unbekannter Operator, Operator passt nicht zum Trigger)
+            -- Versionen 3-6: ungueltig (fehlender Handler, unbekannter Operator, Operator passt nicht zum Trigger, leere Action)
             ins(3, r('X3-01', 'MARK_EVENT', 'RG_V2', 'ON_EVENT', '', null, 0, null));
             ins(4, r('X4-01', 'MARK_EVENT', 'RG_V2', 'PRECEDED_BY_WITHIN_MS', 'RG_A|1000'));
             ins(5, r('X5-01', 'TRACE_STOP', 'RG_V2', 'MAX_GAP_SECONDS', '1'));
+            -- Version 6: ungueltig, leere "action" (Beispiel SEQ-009 der Analyse; r() laesst eine leere Action weg)
+            ins(6, '{"id":"X6-01","trigger_type":"MARK_EVENT","action":"","condition":{"operator":"ON_EVENT","value":""}'
+                || ',"alert":{"handler":"' || c_handler || '","severity":"WARN","throttle_seconds":0}}');
+            -- Versionen 7, 8, 10: ungueltig, leere Teile im Wert (C2; vorher still umgedeutet)
+            ins(7,  r('X7-01',  'MARK_EVENT', 'RG_V2', 'PRECEDED_BY', '|C1'));
+            ins(8,  r('X8-01',  'TRACE_STOP', 'RG_V2', 'AVG_DEVIATION_PCT', '20||0.3'));
+            ins(10, r('X10-01', 'TRACE_STOP', 'RG_V2', 'MAX_DURATION_MS', '|5'));
+            -- Versionen 11, 12: ungueltig, unbekannter Schluessel bzw. Objekt statt Text (C2, G6 = C+)
+            ins(11, replace(r('X11-01', 'MARK_EVENT', 'RG_V2', 'ON_EVENT', '', 'C1'), '"context"', '"contxt"'));
+            ins(12, replace(r('X12-01', 'MARK_EVENT', 'RG_V2', 'ON_EVENT', '', 'C1'), '"context":"C1"', '"context":{"name":"C1"}'));
+            -- Versionen 13, 14: ungueltig, PRECEDED_BY bei TRACE_STOP bzw. LOG_CONTAINS ohne Text (C4)
+            ins(13, r('X13-01', 'TRACE_STOP', 'RG_V2', 'PRECEDED_BY', 'RG_A'));
+            ins(14, r('X14-01', 'LOGGING', null, 'LOG_CONTAINS', 'ERROR|'));
             -- Gruppe ohne Server: Aktivieren ist kein Fehler
             ins(1, r('E1-01', 'MARK_EVENT', 'RG_E', 'ON_EVENT', ''), 'LT_LEER');
+            -- INSESSION: Szenarien (Version 1 mit Praefix der INSESSION-Prozesse) und IS-03..IS-05 (Versionen 1, 2, 6)
+            ins(1, l, l_is_grp, l_p || '_IS');
+            ins(1, l, l_is_grp2, l_p || '_IS');
+            ins(2, r('V2-01', 'MARK_EVENT', 'RG_V2', 'ON_EVENT', ''), l_is_grp2);
+            ins(6, '{"id":"X6-01","trigger_type":"MARK_EVENT","action":"","condition":{"operator":"ON_EVENT","value":""}'
+                || ',"alert":{"handler":"' || c_handler || '","severity":"WARN","throttle_seconds":0}}', l_is_grp2);
             commit;
         end;
 
@@ -2024,19 +2056,25 @@ create or replace package body lt as
             l_cnt number;
         begin
             execute immediate 'select count(*) from lilam_alerts where process_name = :1 and rule_id = :2 and rule_set_name = :3'
-               into l_cnt using l_p || p_proc, p_rule, c_set;
+               into l_cnt using l_p || l_s || p_proc, p_rule, c_set;
             return l_cnt;
         end;
 
         procedure expect(p_proc varchar2, p_rule varchar2, p_expected number, p_text varchar2) is
             l_cnt number := alerts(p_proc, p_rule);
         begin
-            check_that(l_run, p_rule || ' ' || p_text, l_cnt = p_expected, 'Alerts ' || l_cnt || ', erwartet ' || p_expected);
+            check_that(l_run, case when l_s is not null then 'IS ' end || p_rule || ' ' || p_text, l_cnt = p_expected,
+                       'Alerts ' || l_cnt || ', erwartet ' || p_expected);
         end;
 
+        -- SERVER: Server der Gruppe LT; INSESSION: Gruppe l_is_grp, bewusst klein geschrieben (IS-02)
         function proc(p_suffix varchar2, p_steps number default null) return number is
         begin
-            return lilam.server_new_session(l_p || p_suffix, c_group, lilam.logLevelInfo, p_procStepsToDo => p_steps);
+            if l_s is null then
+                return lilam.server_new_session(l_p || p_suffix, c_group, lilam.logLevelInfo, p_procStepsToDo => p_steps);
+            end if;
+            return lilam.new_session(p_processName => l_p || l_s || p_suffix, p_logLevel => lilam.logLevelInfo,
+                                     p_procStepsToDo => p_steps, p_groupName => lower(l_is_grp));
         end;
 
         -- aktives Rule Set einer Gruppe, z.B. 'LT_REGELN v1'
@@ -2077,8 +2115,10 @@ create or replace package body lt as
         end;
 
     begin
-        l_run := begin_run('REGELN', c_server, 'Rule Set ' || c_set || ', Server LT_S1 und LT_S2', p_parent);
+        l_run := begin_run('REGELN', 'SERVER+INSESSION', 'Rule Set ' || c_set || ', Server LT_S1 und LT_S2', p_parent);
         l_p   := 'LT_' || l_run || '_RG';
+        l_is_grp  := 'LT_RG_IS_' || l_run;
+        l_is_grp2 := 'LT_RG_IS2_' || l_run;
         put_rules;
         if p_manage then
             stop_all_servers;
@@ -2092,8 +2132,21 @@ create or replace package body lt as
         -- ob beide Server die Regeln geladen haben, zeigen die folgenden Szenarien (Prozesse verteilen sich auf beide)
         check_that(l_run, 'L1 SERVER_UPDATE_RULES: Rule Set fuer die Gruppe aktiv', active = c_set || ' v1', active);
 
+        -- INSESSION: Rule Set der Szenario-Gruppe aktivieren (Gruppe ohne Server ist kein Fehler)
+        lilam.server_update_rules(l_is_grp, c_set, 1);
+        -- IS-03: Versionswechsel-Gruppe startet mit Version 1
+        lilam.server_update_rules(l_is_grp2, c_set, 1);
+
         -- Alert-Signal: diese Session lauscht auf den Handler
         dbms_alert.register(c_handler);
+
+        -- ---------------------------------------------------------------
+        -- Szenarien bis einschliesslich Drosselung in beiden Modi:
+        -- 1. SERVER (Prozessnamen l_p || '_VG' ...), 2. INSESSION (l_p || '_IS_VG' ..., Pruefungen mit Praefix "IS").
+        -- Die Erwartungswerte sind in beiden Modi gleich. (Bloecke in der Schleife bewusst nicht eingerueckt.)
+        -- ---------------------------------------------------------------
+        for m in 1 .. 2 loop
+        l_s := case when m = 2 then '_IS' end;
 
         -- ---------------------------------------------------------------
         -- Vorgaenger (nur Events und Traces zaehlen)
@@ -2114,6 +2167,13 @@ create or replace package body lt as
         expect('_VG', 'VG-02', 1, 'PRECEDED_BY mit Kontext RG_A|C1');
         expect('_VG', 'VG-03', 2, 'PRECEDED_BY_WITHIN_SECS: zu spaet und falscher Vorgaenger');
         expect('_VG', 'VG-04', 1, 'PRECEDED_BY bei TRACE_START');
+
+        -- PRECEDED_BY_WITHIN_SECS bei PROCESS_UPDATE (C4/N1): Bezugszeit ist das Signal, nicht der Prozessstart
+        l_pid := proc('_VG5');
+        lilam.mark_event(l_pid, 'RG_A'); lilam.set_process_status(l_pid, 1);                          -- 0
+        lilam.mark_event(l_pid, 'RG_A'); dbms_session.sleep(1.3); lilam.set_process_status(l_pid, 1); -- 1: zu spaet
+        lilam.close_session(l_pid);
+        expect('_VG5', 'VG-05', 1, 'PRECEDED_BY_WITHIN_SECS bei PROCESS_UPDATE: Abstand zum Signal');
 
         -- ---------------------------------------------------------------
         -- Nachfolger: "B folgt A innerhalb 1 s" (Pruefung beim Eintreffen von B)
@@ -2151,6 +2211,18 @@ create or replace package body lt as
         expect('_MON', 'DU-02', 1, 'MAX_DURATION_MS bei Events (Abstand)');
         expect('_MON', 'OC-01', 2, 'MAX_OCCURRENCE 3 bei 5 Events');
         expect('_MON', 'AV-01', 1, 'AVG_DEVIATION_PCT 50 % nach Warm-up');
+
+        -- AVG_DEVIATION_PCT unter 1 ms (C4): feste Zeitstempel, Dauern 1, 0, 0 ms => Durchschnitt 1/3 ms,
+        -- dann 1 ms (+200 %, ueber 100 %) => keine Auswertung unter der Messaufloesung von 1 ms
+        l_pid := proc('_AV0');
+        l_ts  := systimestamp - interval '10' second;
+        for i in 1 .. 4 loop
+            lilam.trace_start(l_pid, 'RG_AV0', p_timestamp => l_ts + numtodsinterval(i, 'SECOND'));
+            lilam.trace_stop(l_pid, 'RG_AV0', p_timestamp => l_ts + numtodsinterval(i, 'SECOND')
+                             + numtodsinterval(case when i in (2, 3) then 0 else 0.001 end, 'SECOND'));
+        end loop;                                                                                       -- 0
+        lilam.close_session(l_pid);
+        expect('_AV0', 'AV-02', 0, 'AVG_DEVIATION_PCT: Durchschnitt unter 1 ms wird nicht ausgewertet');
 
         -- ---------------------------------------------------------------
         -- Prozess-Regeln (je ein Prozess, die Werte bleiben im Prozess stehen)
@@ -2192,6 +2264,17 @@ create or replace package body lt as
         expect('_LG', 'LG-01', 1, 'SEVERITY ERROR');
         expect('_LG', 'LG-02', 1, 'SEVERITY WARN als zweite Log-Regel (ohne "action")');
 
+        -- LOG_CONTAINS (C4): Text ohne Level (jeder Level) und mit Level ERROR
+        l_pid := proc('_LC');
+        lilam.info(l_pid, 'Start Rg_Lc_Text gemischt');                                            -- LC-01: 1
+        lilam.error(l_pid, 'Fehler rg_lc_TEXT');                                                   -- LC-01: 1
+        lilam.info(l_pid, 'ohne Suchtext');                                                        -- 0
+        lilam.info(l_pid, 'info rg_lc_lvl');                                                       -- LC-02: 0 (falscher Level)
+        lilam.error(l_pid, 'Fehler RG_LC_LVL');                                                    -- LC-02: 1
+        lilam.close_session(l_pid);
+        expect('_LC', 'LC-01', 2, 'LOG_CONTAINS ohne Level (INFO und ERROR, Gross/Klein egal)');
+        expect('_LC', 'LC-02', 1, 'LOG_CONTAINS ERROR|TEXT nur fuer ERROR');
+
         -- ---------------------------------------------------------------
         -- Kontext- und Action-Regel, Trigger-Filter, Drosselung
         -- ---------------------------------------------------------------
@@ -2205,6 +2288,9 @@ create or replace package body lt as
         expect('_KX', 'KX-02', 2, 'Action-Regel zusaetzlich fuer alle Kontexte');
         expect('_KX', 'TF-01', 1, 'Trigger-Filter: nur TRACE_STOP, kein MARK_EVENT');
         expect('_KX', 'TH-01', 2, 'Drosselung 2 s: 3 Events, Pause, 1 Event');
+
+        end loop;
+        l_s := null;
 
         -- ---------------------------------------------------------------
         -- Alert-Zeile und Signal
@@ -2254,9 +2340,12 @@ create or replace package body lt as
         -- ---------------------------------------------------------------
         -- L3: SERVER_UPDATE_RULES lehnt ungueltige/fehlende Rule Sets ab, nichts aendert sich
         -- ---------------------------------------------------------------
-        l_n := rejected(c_group, 3) + rejected(c_group, 4) + rejected(c_group, 5)
+        l_n := rejected(c_group, 3) + rejected(c_group, 4) + rejected(c_group, 5) + rejected(c_group, 6)
+             + rejected(c_group, 7) + rejected(c_group, 8) + rejected(c_group, 10)
+             + rejected(c_group, 11) + rejected(c_group, 12)
+             + rejected(c_group, 13) + rejected(c_group, 14)
              + rejected(c_group, 9);                -- Version 9 gibt es nicht
-        check_that(l_run, 'L3 SERVER_UPDATE_RULES lehnt 4 Faelle mit NUM_ERR_RULE_SET ab', l_n = 4, l_n);
+        check_that(l_run, 'L3 SERVER_UPDATE_RULES lehnt 12 Faelle mit NUM_ERR_RULE_SET ab', l_n = 12, l_n);
         check_that(l_run, 'L3 aktives Rule Set der Gruppe unveraendert', active = c_set || ' v1', active);
         l_pid := proc('_L3'); lilam.mark_event(l_pid, 'RG_L'); lilam.close_session(l_pid);
         expect('_L3', 'L-01', 1, 'L3 Regeln aus Version 1 bleiben aktiv');
@@ -2266,7 +2355,59 @@ create or replace package body lt as
         check_that(l_run, 'L3a Gruppe ohne Server: kein Fehler, Rule Set aktiv',
                    l_n = 0 and active('LT_LEER') = c_set || ' v1', active('LT_LEER'));
 
+        -- L3d: dieselbe Gruppe in anderer Schreibweise lehnt der Unique-Index ab (C2)
+        begin
+            ins(1, r('V2-01', 'MARK_EVENT', 'RG_V2', 'ON_EVENT', ''), lower(c_group));
+            execute immediate 'delete from lilam_rules where group_name = :1' using lower(c_group);
+            commit;
+            l_n := 0;
+        exception
+            when dup_val_on_index then l_n := 1;
+        end;
+        check_that(l_run, 'L3d Gruppe in anderer Schreibweise: Unique-Index lehnt ab', l_n = 1, l_n);
+
+        -- L3e: CHECK_RULE_SET prueft ohne zu speichern: gueltig => NULL, unbekannter Schluessel und kein JSON => Grund (C2)
+        l_n := case when lilam.check_rule_set(rule_set(2, r('V2-01', 'MARK_EVENT', 'RG_V2', 'ON_EVENT', ''), l_p)) is null then 1 else 0 end
+             + case when lilam.check_rule_set(rule_set(11, replace(r('X11-01', 'MARK_EVENT', 'RG_V2', 'ON_EVENT', '', 'C1'),
+                                                           '"context"', '"contxt"'), l_p)) like '%unknown key "contxt"%' then 1 else 0 end
+             + case when lilam.check_rule_set('kein JSON') is not null then 1 else 0 end;
+        check_that(l_run, 'L3e CHECK_RULE_SET: gueltig NULL, ungueltig mit Grund', l_n = 3, l_n);
+
+        -- L3c: laufende Server erhalten UPDATE_RULE fuer ein von Hand aktiviertes ungueltiges Rule Set (Version 6)
+        --      und behalten ihre bisherigen Regeln (Version 1). Die Nachricht geht wie bei SERVER_UPDATE_RULES
+        --      direkt in die Pipes der Server, weil die API das ungueltige Rule Set gar nicht erst aktiviert.
+        l_t := systimestamp;
+        execute immediate 'update lilam_rules set is_active = 0 where upper(group_name) = :1 and is_active = 1' using c_group;
+        execute immediate 'update lilam_rules set is_active = 1 where upper(group_name) = :1 and set_name = :2 and version = 6'
+           using c_group, c_set;
+        commit;
+        execute immediate 'select pipe_name from lilam_server_registry
+                            where upper(group_name) = :1 and nvl(is_dispatcher, 0) = 0 and is_active = 1'
+           bulk collect into l_pipes using c_group;
+        for i in 1 .. l_pipes.count loop
+            dbms_pipe.reset_buffer;
+            dbms_pipe.pack_message('{"header":{"msg_type":"API_CALL","request":"UPDATE_RULE"}}');
+            l_st := dbms_pipe.send_message(l_pipes(i), timeout => 1);
+        end loop;
+        dbms_session.sleep(1);
+        execute immediate 'select count(*) from lilam_log_internal where log_timestamp >= :1
+                              and module_name = ''refreshGroupRules'' and error_code = ''-20130'''
+           into l_n using l_t;
+        check_that(l_run, 'L3c laufende Server lehnen ungueltiges Rule Set ab (1 interner Fehler je Server)',
+                   l_pipes.count > 0 and l_n = l_pipes.count, l_n || ' von ' || l_pipes.count);
+        -- zwei Prozesse, damit mit hoher Wahrscheinlichkeit beide Server beteiligt sind
+        for i in 1 .. 2 loop
+            l_pid := proc('_L3C'); lilam.mark_event(l_pid, 'RG_L'); lilam.close_session(l_pid);
+        end loop;
+        expect('_L3C', 'L-01', 2, 'L3c Regeln aus Version 1 bleiben aktiv');
+        -- Version 1 wieder aktiv (die Server haben sie ohnehin noch geladen)
+        execute immediate 'update lilam_rules set is_active = 0 where upper(group_name) = :1 and is_active = 1' using c_group;
+        execute immediate 'update lilam_rules set is_active = 1 where upper(group_name) = :1 and set_name = :2 and version = 1'
+           using c_group, c_set;
+        commit;
+
         -- L3b: der Server selbst lehnt ein ungueltiges aktives Rule Set beim Start ab
+        l_t := systimestamp;
         if p_manage then
             l_ok := stop_server('LT_S1');
             execute immediate 'update lilam_rules set is_active = 0 where group_name = :1' using c_group;
@@ -2277,7 +2418,7 @@ create or replace package body lt as
             wait_servers_ready(sys.odcivarchar2list('LT_S1'));
             execute immediate 'select count(*) from lilam_log_internal where log_timestamp >= :1
                                   and module_name = ''refreshGroupRules'' and error_code = ''-20130'''
-               into l_n using run_started(l_run);
+               into l_n using l_t;
             check_that(l_run, 'L3b Server lehnt ungueltiges Rule Set beim Start ab (1 interner Fehler)', l_n = 1, l_n);
         end if;
 
@@ -2291,6 +2432,81 @@ create or replace package body lt as
         end loop;
         expect('_L4', 'L-01', 0, 'L4 Regel aus Version 1 entfernt');
         expect('_L4', 'V2-01', 2, 'L4 Regel aus Version 2 aktiv');
+
+        -- ---------------------------------------------------------------
+        -- L6: Server laden ein geaendertes Rule Set auch ohne UPDATE_RULE-Nachricht (B7)
+        --     Nur die Tabelle umschalten (Version 2 -> 1), keine Pipe-Nachricht; die Server
+        --     pruefen hoechstens alle 15 s selbst (Housekeeping, Eco-Stufe bis 5 s) => 21 s warten.
+        -- ---------------------------------------------------------------
+        execute immediate 'update lilam_rules set is_active = 0 where upper(group_name) = :1 and is_active = 1' using c_group;
+        execute immediate 'update lilam_rules set is_active = 1 where upper(group_name) = :1 and set_name = :2 and version = 1'
+           using c_group, c_set;
+        commit;
+        dbms_session.sleep(21);
+        -- vier Prozesse, damit beide Server beteiligt sind (Round Robin bei Gleichstand)
+        for i in 1 .. 4 loop
+            l_pid := proc('_L6'); lilam.mark_event(l_pid, 'RG_L'); lilam.close_session(l_pid);
+        end loop;
+        expect('_L6', 'L-01', 4, 'L6 Server laden Version 1 ohne UPDATE_RULE (eigene Pruefung)');
+
+        -- ---------------------------------------------------------------
+        -- IS: Besonderheiten des INSESSION-Modus (Pruefungen mit Praefix "IS")
+        -- ---------------------------------------------------------------
+        l_s := '_IS';
+
+        -- IS-01: Prozess ohne Gruppe hat keine Regeln
+        l_pid := lilam.new_session(p_processName => l_p || '_IS_NG', p_logLevel => lilam.logLevelInfo);
+        lilam.mark_event(l_pid, 'RG_L'); lilam.mark_event(l_pid, 'RG_K', 'C1'); lilam.error(l_pid, 'Fehler ohne Gruppe');
+        lilam.close_session(l_pid);
+        execute immediate 'select count(*) from lilam_alerts where process_name = :1' into l_n using l_p || '_IS_NG';
+        check_that(l_run, 'IS-01 Prozess ohne Gruppe: keine Alerts', l_n = 0, 'Alerts ' || l_n);
+
+        -- IS-02: Gruppe in NEW_SESSION klein geschrieben; GROUP_NAME im Alert wie angegeben
+        execute immediate 'select count(*) from lilam_alerts where process_name = :1 and rule_id = ''PR-02'' and group_name = :2'
+           into l_n using l_p || '_IS_ST', lower(l_is_grp);
+        check_that(l_run, 'IS-02 Gruppe klein geschrieben: Regeln greifen, GROUP_NAME wie angegeben', l_n = 1, 'Alerts ' || l_n);
+
+        -- IS-03: Versionswechsel per SERVER_UPDATE_RULES; die Session prueft hoechstens alle 15 s.
+        --        Der erste Prozess der Gruppe laedt Version 1 (PROCESS_START), das Update direkt danach wirkt noch nicht.
+        l_pid := lilam.new_session(p_processName => l_p || '_IS_3A', p_logLevel => lilam.logLevelInfo, p_groupName => l_is_grp2);
+        lilam.server_update_rules(l_is_grp2, c_set, 2);
+        lilam.mark_event(l_pid, 'RG_L'); lilam.mark_event(l_pid, 'RG_V2');
+        lilam.close_session(l_pid);
+        expect('_3A', 'L-01', 1, 'IS-03 direkt nach dem Update noch Version 1');
+        expect('_3A', 'V2-01', 0, 'IS-03 direkt nach dem Update Version 2 noch nicht aktiv');
+        dbms_session.sleep(16);
+        l_pid := lilam.new_session(p_processName => l_p || '_IS_3B', p_logLevel => lilam.logLevelInfo, p_groupName => l_is_grp2);
+        lilam.mark_event(l_pid, 'RG_L'); lilam.mark_event(l_pid, 'RG_V2');
+        lilam.close_session(l_pid);
+        expect('_3B', 'L-01', 0, 'IS-03 nach 16 s Regel aus Version 1 entfernt');
+        expect('_3B', 'V2-01', 1, 'IS-03 nach 16 s Version 2 aktiv');
+
+        -- IS-04: ungueltiges Rule Set (Version 6) von Hand aktiviert: abgelehnt, einmal protokolliert, Version 2 bleibt
+        l_t := systimestamp;
+        execute immediate 'update lilam_rules set is_active = 0 where upper(group_name) = :1 and is_active = 1' using l_is_grp2;
+        execute immediate 'update lilam_rules set is_active = 1 where upper(group_name) = :1 and set_name = :2 and version = 6'
+           using l_is_grp2, c_set;
+        commit;
+        dbms_session.sleep(16);
+        l_pid := lilam.new_session(p_processName => l_p || '_IS_4', p_logLevel => lilam.logLevelInfo, p_groupName => l_is_grp2);
+        lilam.mark_event(l_pid, 'RG_V2');
+        lilam.close_session(l_pid);
+        expect('_4', 'V2-01', 1, 'IS-04 ungueltiges Rule Set abgelehnt, Version 2 bleibt aktiv');
+        execute immediate 'select count(*) from lilam_log_internal where log_timestamp >= :1
+                              and module_name = ''refreshGroupRules'' and error_code = ''-20130'''
+           into l_n using l_t;
+        check_that(l_run, 'IS-04 Ablehnung einmal protokolliert (refreshGroupRules, -20130)', l_n = 1, l_n);
+
+        -- IS-05: kein aktives Rule Set: nach 16 s keine Regeln mehr
+        execute immediate 'update lilam_rules set is_active = 0 where upper(group_name) = :1' using l_is_grp2;
+        commit;
+        dbms_session.sleep(16);
+        l_pid := lilam.new_session(p_processName => l_p || '_IS_5', p_logLevel => lilam.logLevelInfo, p_groupName => l_is_grp2);
+        lilam.mark_event(l_pid, 'RG_V2'); lilam.mark_event(l_pid, 'RG_L');
+        lilam.close_session(l_pid);
+        execute immediate 'select count(*) from lilam_alerts where process_name = :1' into l_n using l_p || '_IS_5';
+        check_that(l_run, 'IS-05 kein aktives Rule Set: nach 16 s keine Alerts', l_n = 0, 'Alerts ' || l_n);
+        l_s := null;
 
         -- ---------------------------------------------------------------
         -- Abschluss
@@ -2316,10 +2532,12 @@ create or replace package body lt as
     end;
 
     ----------------------------------------------------------------------
-    -- REGELN_LAST: Kosten der Regelpruefung je Signaltyp im Server (LT_S1 ohne Drosselung)
+    -- REGELN_LAST: Kosten der Regelpruefung je Signaltyp im Server (LT_S1 ohne Drosselung) und INSESSION
     -- Signaltypen EVENT, TRACE (Start+Stop), LOG (INFO), STEP (PROC_STEP_DONE)
-    -- Varianten NONE, OTHER50, MATCH20, FIRE_THR, FIRE_ALL; gemessen wird bis zur Antwort einer
-    -- abschliessenden synchronen Abfrage (der Server hat dann alle Signale davor verarbeitet).
+    -- Varianten NONE, OTHER50, MATCH20, FIRE_THR, FIRE_ALL; gemessen wird im Server bis zur Antwort einer
+    -- abschliessenden synchronen Abfrage (der Server hat dann alle Signale davor verarbeitet),
+    -- INSESSION die Aufrufzeit in der Session. INSESSION hat jede Messung eine eigene Gruppe, damit die
+    -- erste Regelpruefung das Rule Set sofort laedt (die Session prueft sonst hoechstens alle 15 s).
     ----------------------------------------------------------------------
     function t_regeln_last(p_n number default 2000, p_n_fire number default 200, p_reps number default 5,
                            p_manage boolean default true, p_parent number default null) return number is
@@ -2334,6 +2552,8 @@ create or replace package body lt as
         l_base    number;
         l_val     number;
         l_n       number;
+        l_m       varchar2(10);   -- Praefix der Metriken je Modus: SERVER leer, INSESSION 'is_'
+        l_mt      varchar2(10);   -- Praefix der Pruefungen je Modus: SERVER leer, INSESSION 'IS '
 
         function r(p_id varchar2, p_trig varchar2, p_action varchar2, p_op varchar2, p_val varchar2, p_thr number default 3600) return varchar2 is
         begin
@@ -2397,13 +2617,13 @@ create or replace package body lt as
             return '{"header":{"rule_set":"' || c_set || '"},"rules":[' || l || ']}';
         end;
 
-        procedure activate(p_ver number, p_rules clob) is
+        procedure activate(p_ver number, p_rules clob, p_group varchar2 default c_group) is
         begin
-            execute immediate 'delete from lilam_rules where group_name = :1 and set_name = :2 and version = :3' using c_group, c_set, p_ver;
+            execute immediate 'delete from lilam_rules where group_name = :1 and set_name = :2 and version = :3' using p_group, c_set, p_ver;
             execute immediate 'insert into lilam_rules(group_name, set_name, version, is_active, created, author, rule_set)
-                               values (:1, :2, :3, 0, systimestamp, ''LT'', :4)' using c_group, c_set, p_ver, p_rules;
+                               values (:1, :2, :3, 0, systimestamp, ''LT'', :4)' using p_group, c_set, p_ver, p_rules;
             commit;
-            lilam.server_update_rules(c_group, c_set, p_ver);
+            lilam.server_update_rules(p_group, c_set, p_ver);
         end;
 
         procedure signals(p_pid number, p_type varchar2, p_count number) is
@@ -2418,7 +2638,13 @@ create or replace package body lt as
             end loop;
         end;
 
-        -- eine Messung: liefert Mikrosekunden je Signal (Server-Verarbeitung), -1 bei Zeitueberschreitung
+        -- INSESSION: eigene Gruppe je Messung
+        function is_group(p_ver number, p_rep number) return varchar2 is
+        begin
+            return 'LT_RL_IS_' || l_run || '_' || p_ver || '_' || p_rep;
+        end;
+
+        -- eine Messung im Server: liefert Mikrosekunden je Signal (Server-Verarbeitung), -1 bei Zeitueberschreitung
         function measure(p_type varchar2, p_var varchar2, p_rep number, p_ver number) return number is
             l_proc  varchar2(80) := l_p || '_' || p_type || '_' || p_var || '_' || p_rep;
             l_pid   number;
@@ -2444,6 +2670,27 @@ create or replace package body lt as
             return round(l_ms * 1000 / l_cnt, 1);
         end;
 
+        -- eine Messung INSESSION: liefert Mikrosekunden je Signal (Aufrufzeit in der Session)
+        function measure_is(p_type varchar2, p_var varchar2, p_rep number, p_ver number) return number is
+            l_proc  varchar2(80) := l_p || '_IS_' || p_type || '_' || p_var || '_' || p_rep;
+            l_pid   number;
+            l_cnt   number := case when p_var = 'FIRE_ALL' then p_n_fire else p_n end;
+            l_t0    timestamp;
+            l_ms    number;
+        begin
+            activate(p_ver, rules_for(p_type, p_var, l_proc), is_group(p_ver, p_rep));
+            -- PROCESS_START laedt das Rule Set der (neuen) Gruppe
+            l_pid := lilam.new_session(p_processName => l_proc, p_logLevel => lilam.logLevelInfo,
+                                       p_groupName => is_group(p_ver, p_rep));
+            -- Aufwaermen (Baseline, Caches)
+            signals(l_pid, p_type, 100);
+            l_t0 := systimestamp;
+            signals(l_pid, p_type, l_cnt);
+            l_ms := ms_since(l_t0);
+            lilam.close_session(l_pid);
+            return round(l_ms * 1000 / l_cnt, 1);
+        end;
+
         function med(p_name varchar2) return number is
             l number;
         begin
@@ -2459,7 +2706,7 @@ create or replace package body lt as
         end;
 
     begin
-        l_run := begin_run('REGELN_LAST', c_server, 'n=' || p_n || ' n_fire=' || p_n_fire || ' reps=' || p_reps
+        l_run := begin_run('REGELN_LAST', 'SERVER+INSESSION', 'n=' || p_n || ' n_fire=' || p_n_fire || ' reps=' || p_reps
                            || ', LT_S1 ohne Drosselung', p_parent);
         l_p   := 'LT_' || l_run || '_RL';
         if p_manage then
@@ -2476,32 +2723,40 @@ create or replace package body lt as
                 for v in 1 .. l_vars.count loop
                     l_val := measure(l_types(t), l_vars(v), rep, t * 10 + v);
                     metric(l_run, lower(l_types(t) || '_' || l_vars(v)), l_val, 'us/Signal');
+                    l_val := measure_is(l_types(t), l_vars(v), rep, t * 10 + v);
+                    metric(l_run, lower('is_' || l_types(t) || '_' || l_vars(v)), l_val, 'us/Signal');
                 end loop;
             end loop;
         end loop;
 
-        -- Auswertung je Signaltyp: Median im Verhaeltnis zu NONE; kleine absolute Unterschiede (< 100 us) gelten als gleich
+        -- Auswertung je Modus und Signaltyp: Median im Verhaeltnis zu NONE; kleine absolute Unterschiede (< 100 us) gelten als gleich.
+        -- Metriken und Pruefungen INSESSION mit Praefix is_ bzw. "IS". (Block in der Schleife bewusst nicht eingerueckt.)
+        for md in 1 .. 2 loop
+        l_m  := case when md = 2 then 'is_' end;
+        l_mt := case when md = 2 then 'IS ' end;
         for t in 1 .. l_types.count loop
-            l_base := med(lower(l_types(t)) || '_none');
-            dbms_output.put_line('    ' || rpad(l_types(t), 6) || ' NONE ' || l_base || ' us, OTHER50 ' || med(lower(l_types(t)) || '_other50')
-                                 || ', MATCH20 ' || med(lower(l_types(t)) || '_match20') || ', FIRE_THR ' || med(lower(l_types(t)) || '_fire_thr')
-                                 || ', FIRE_ALL ' || med(lower(l_types(t)) || '_fire_all') || ' us/Signal');
-            l_val := med(lower(l_types(t)) || '_other50');
-            check_that(l_run, l_types(t) || ' 50 Regeln auf andere Actions: hoechstens 1,5 x ohne Regeln',
+            l_base := med(l_m || lower(l_types(t)) || '_none');
+            dbms_output.put_line('    ' || rpad(l_mt || l_types(t), 9) || ' NONE ' || l_base || ' us, OTHER50 ' || med(l_m || lower(l_types(t)) || '_other50')
+                                 || ', MATCH20 ' || med(l_m || lower(l_types(t)) || '_match20') || ', FIRE_THR ' || med(l_m || lower(l_types(t)) || '_fire_thr')
+                                 || ', FIRE_ALL ' || med(l_m || lower(l_types(t)) || '_fire_all') || ' us/Signal');
+            l_val := med(l_m || lower(l_types(t)) || '_other50');
+            check_that(l_run, l_mt || l_types(t) || ' 50 Regeln auf andere Actions: hoechstens 1,5 x ohne Regeln',
                        l_val <= greatest(1.5 * l_base, l_base + 100), l_val || ' / ' || l_base || ' us');
-            l_val := med(lower(l_types(t)) || '_match20');
-            check_that(l_run, l_types(t) || ' 20 passende Regeln ohne Alarm: hoechstens 2 x ohne Regeln',
+            l_val := med(l_m || lower(l_types(t)) || '_match20');
+            check_that(l_run, l_mt || l_types(t) || ' 20 passende Regeln ohne Alarm: hoechstens 2 x ohne Regeln',
                        l_val <= greatest(2 * l_base, l_base + 100), l_val || ' / ' || l_base || ' us');
-            l_val := med(lower(l_types(t)) || '_fire_thr');
-            check_that(l_run, l_types(t) || ' Regel schlaegt immer an, gedrosselt: hoechstens 1,5 x ohne Regeln',
+            l_val := med(l_m || lower(l_types(t)) || '_fire_thr');
+            check_that(l_run, l_mt || l_types(t) || ' Regel schlaegt immer an, gedrosselt: hoechstens 1,5 x ohne Regeln',
                        l_val <= greatest(1.5 * l_base, l_base + 100), l_val || ' / ' || l_base || ' us');
             -- ungedrosselt: Korrektheit pruefen, Kosten nur messen
             execute immediate 'select count(*) from lilam_alerts where process_name like :1 and rule_id = ''F1'''
-               into l_n using l_p || '_' || l_types(t) || '_FIRE_ALL_%';
-            check_that(l_run, l_types(t) || ' ungedrosselt: ein Alert je Signal inkl. Aufwaermen',
+               into l_n using l_p || '_' || upper(l_m) || l_types(t) || '_FIRE_ALL_%';
+            check_that(l_run, l_mt || l_types(t) || ' ungedrosselt: ein Alert je Signal inkl. Aufwaermen',
                        l_n = p_reps * (p_n_fire + 100)
                             / case when l_types(t) = 'TRACE' then 2 else 1 end,
                        l_n || ' Alerts');
+        end loop;
+
         end loop;
 
         select count(*) into l_n from lt_metric where run_id = l_run and value < 0;

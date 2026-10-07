@@ -191,7 +191,7 @@ Rules are organized into **Rule Sets**, structured as JSON objects. The central 
 INSESSION processes evaluate rules too if `NEW_SESSION` receives a group (`p_groupName` or `t_session_init.groupName`); without a group they have no rules. They use the same active rule set of the group as the servers.
 
 *   **Loading:** the first rule check of a process loads the group's active rule set into the memory of the database session. Further processes of the group in that session share it. Several groups in one session are kept apart: internally every key is prefixed with the group (`GROUP|Action|Context`); the rule set itself is unchanged.
-*   **Changes:** there is no timer. At most every 15 seconds (`C_RULES_CHECK_INTERVAL_MS`) an API call checks name and version of the active rule set with one small indexed query and reloads only if they changed. Servers keep being notified by `SERVER_UPDATE_RULES`.
+*   **Changes:** there is no timer. At most every 15 seconds (`C_RULES_CHECK_INTERVAL_MS`) an API call checks name and version of the active rule set with one small indexed query and reloads only if they changed. Servers are notified by `SERVER_UPDATE_RULES` and, in addition, run the same check in their housekeeping, so a server that missed the notification (e.g. full pipe) catches up within about 20 seconds.
 *   **Invalid rule sets** are rejected, logged once per version in `LILAM_LOG_INTERNAL`, and the previous rules stay active. Errors never reach the application.
 *   **Latency:** without a match a rule check is a few lookups in associative arrays; actions without rules cost one `EXISTS`, processes without a group nothing. A fired alert is written synchronously (`LILAM_ALERTS`, `DBMS_ALERT` signal, autonomous transaction), which costs the application one commit per alert. `throttle_seconds` limits how often this happens.
 *   **Session-local state:** throttling and the predecessor for `PRECEDED_BY` live in the database session. With connection pools (e.g. APEX) the same alert can therefore fire once per pooled connection.
@@ -208,8 +208,10 @@ Each rule is assigned to a **Trigger Type**, which defines the signal that start
 *   **`TRACE_STOP`**: a transaction is completed. Ideal for execution-time analysis.
 *   **`LOGGING`**: a log message arrives (`ERROR`, `WARN`, `INFO`, ...).
 
+`MARK_EVENT` and `TRACE_STOP` rules need log level `logLevelMonitor` or higher; `TRACE_START` and `LOGGING` rules work at every log level.
+
 #### Filtering Mechanism
-The server keeps the rules in associative arrays in memory and evaluates them in two steps:
+The server, and in INSESSION mode the database session, keeps the rules in associative arrays in memory and evaluates them in two steps:
 1.  **Context rules (`Action|Context`):** rules for the exact combination of action and context (e.g., `STATION_EXIT` at station `Moulin Rouge`).
 2.  **Action rules (`Action`):** rules without context apply to **all** contexts of the action and are evaluated in addition.
 
@@ -239,16 +241,23 @@ Rules for other actions cost nothing. Multiple rules can be assigned to the same
 | :-------------- | :-------------------- | :---------------------------------------------- | :-------------------------------------------- |
 | **Execution**   | `ON_EVENT`, `ON_START`, `ON_STOP` | trigger fired                       | Trigger an orchestrator as soon as the signal hits. |
 | **Duration**    | `MAX_DURATION_MS`     | `used_time > value` (MARK_EVENT, TRACE_STOP)    | Absolute time limit for a specific action.    |
-| **Variance**    | `AVG_DEVIATION_PCT`   | `used_time > avg_time * (1 + value/100)` (MARK_EVENT, TRACE_STOP) | Relative deviation from moving average. |
+| **Variance**    | `AVG_DEVIATION_PCT`   | `used_time > avg_time * (1 + value/100)` (MARK_EVENT, TRACE_STOP); not evaluated while `avg_time` < 1 ms | Relative deviation from moving average. |
 | **Frequency**   | `MAX_OCCURRENCE`      | `action_count > value` (MARK_EVENT, TRACE_STOP) | Flood protection / infinite loop detection.   |
 | **Interval**    | `MAX_GAP_SECONDS`     | time since previous event (MARK_EVENT) or end of previous trace (TRACE_START) > value | Detect stall between two signals. |
-| **Dependency**  | `PRECEDED_BY`         | last event/trace of the process ≠ `ACTION[\|CONTEXT]` | Validates predecessor.                  |
+| **Dependency**  | `PRECEDED_BY`         | last event/trace of the process ≠ `ACTION[\|CONTEXT]` (MARK_EVENT, TRACE_START; not TRACE_STOP) | Validates predecessor.                  |
 | **Dependency**  | `PRECEDED_BY_WITHIN_SECS` | like `PRECEDED_BY`, plus maximum delay in seconds | Validates predecessor and max. delay.   |
 
 #### Logging
-**Trigger:** LOGGING. Operator `SEVERITY` with the value `ERROR`, `WARN`, `MONITOR`, `INFO` or `DEBUG` fires for log messages of exactly this level.
+**Trigger:** LOGGING.
 
-Only events and traces count as predecessors for `PRECEDED_BY`, not log messages. Rules are evaluated when a signal arrives; there is no timer-based evaluation.
+| Metric          | Operator Name (JSON)  | Technical Condition                             | Use Case                                      |
+| :-------------- | :-------------------- | :---------------------------------------------- | :-------------------------------------------- |
+| **Level**       | `SEVERITY`            | level = `value` (`ERROR`, `WARN`, `MONITOR`, `INFO`, `DEBUG`) | React to every message of a level. |
+| **Log Text**    | `LOG_CONTAINS`        | `UPPER(log text)` contains `UPPER(TEXT)`; with `LEVEL\|TEXT` only for this level | Search log messages for keywords. |
+
+For `LOG_CONTAINS` the first part of the value counts as a level only if it is one of the five levels; otherwise the whole value is the text (max. 100 characters).
+
+Only events and traces count as predecessors for `PRECEDED_BY`, not log messages. The order is checked when an action starts; `PRECEDED_BY*` with `TRACE_STOP` is rejected at load time, because there the predecessor would usually be the trace's own `TRACE_START`. Rules are evaluated when a signal arrives; there is no timer-based evaluation, so missing signals (a hanging process, an event that never arrives) are not detected.
 
 ### JSON Structure
 The JSON object is divided into a header for metadata and an array of individual rules. Alert throttling is managed in seconds:
@@ -280,7 +289,7 @@ The JSON object is divided into a header for metadata and an array of individual
 }
 ```
 
-A server checks a rule set completely before it uses it. If one rule is invalid, the whole rule set is rejected and the previously loaded rules stay active.
+A server checks a rule set completely before it uses it. If one rule is invalid, the whole rule set is rejected and the previously loaded rules stay active. Values made of several parts separated by `|` must not contain empty parts (`|C1`, `A|`, `20||0.3`); unknown properties (except those starting with `_`) and fields that are objects, arrays or texts over 4000 characters are rejected. `CHECK_RULE_SET` performs the same check without storing or activating the rule set.
 
 ---
 ## Operating Modes
@@ -476,7 +485,7 @@ In addition to the process-specific tables, LILAM uses internal tables whose nam
 | Table | Purpose |
 | --- | --- |
 | `LILAM_SERVER_REGISTRY` | Maintains server registration, availability, heartbeat, load, and currently active Rule Set information. |
-| `LILAM_RULES` | Stores versioned Rule Sets per server group, one of them active per group. |
+| `LILAM_RULES` | Stores versioned Rule Sets per group (servers and INSESSION processes), one of them active per group. |
 | `LILAM_LOG_INTERNAL` | Provides independent fallback logging for internal LILAM framework errors. |
 
 > [!NOTE]
@@ -597,13 +606,13 @@ Rule Sets are stored as JSON documents and identified by group, name and version
 | --- | --- | --- |
 | `RULE_SET` | `CLOB` | Contains the Rule Set as a JSON document (`IS JSON`). |
 | `GROUP_NAME` | `VARCHAR2(50)` | Group the Rule Set belongs to: `GROUP_NAME` of the registry (servers) or `p_groupName` of `NEW_SESSION` (INSESSION). |
-| `SET_NAME` | `VARCHAR2(30)` | Name identifying the Rule Set. |
-| `VERSION` | `NUMBER` | Version of the Rule Set. |
-| `IS_ACTIVE` | `NUMBER(1)` | `1` for the Rule Set the group uses (servers and INSESSION processes); at most one per group. |
+| `SET_NAME` | `VARCHAR2(30)` | Name identifying the Rule Set (required). |
+| `VERSION` | `NUMBER` | Whole-number version of the Rule Set (required). |
+| `IS_ACTIVE` | `NUMBER(1)` | `1` for the Rule Set the group uses (servers and INSESSION processes); at most one per group. Otherwise `0`. |
 | `CREATED` | `TIMESTAMP(6)` | Timestamp at which the Rule Set was created. |
 | `AUTHOR` | `VARCHAR2(50)` | Author associated with the Rule Set. |
 
-`GROUP_NAME`, `SET_NAME` and `VERSION` together are unique. Alerts (`LILAM_ALERTS`) refer to a rule by `GROUP_NAME`, `RULE_SET_NAME`, `RULE_SET_VERSION` and `RULE_ID`.
+`GROUP_NAME` (required, without regard to case), `SET_NAME` and `VERSION` together are unique. Alerts (`LILAM_ALERTS`) refer to a rule by `GROUP_NAME`, `RULE_SET_NAME`, `RULE_SET_VERSION` and `RULE_ID`.
 
 ### Internal Log Table
 **Table Category:** Fixed Internal Table
@@ -681,4 +690,5 @@ The LILAM API consists of approximately 35 procedures and functions, some of whi
 * **SERVER_SHUTDOWN:** Shuts down a LILAM server.
 * **GET_SERVER_PIPE:** Returns the name of the pipe used to communicate with the server.
 * **SERVER_UPDATE_RULES:** Implements or changes the used rule set
+* **CHECK_RULE_SET:** Checks a rule set without storing or activating it (`NULL` = valid, otherwise the reason)
 

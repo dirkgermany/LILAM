@@ -16,7 +16,7 @@ All necessary metadata is transmitted as a JSON payload during the alerting proc
 ```sql
 
 -- Sample: Waiting for an alert (Email Consumer)
-DBMS_ALERT.REGISTER(LILAM_CONSUMER.C_ALERT_MAIL_LOG);
+DBMS_ALERT.REGISTER(LILAM_MAILER.C_ALERT_MAIL_LOG);
 DBMS_OUTPUT.PUT_LINE('LILAM Mail-Log Consumer started...');
 
 LOOP
@@ -24,7 +24,7 @@ LOOP
     
     -- Wait for the specific signal (C_ALERT_MAIL_LOG)
     -- v_msg_payload contains the JSON metadata
-    DBMS_ALERT.WAITONE(LILAM_CONSUMER.C_ALERT_MAIL_LOG, v_msg_payload, v_status, 60);
+    DBMS_ALERT.WAITONE(LILAM_MAILER.C_ALERT_MAIL_LOG, v_msg_payload, v_status, 60);
     
     IF v_status = 0 THEN
       -- Incoming ALERT detected - wake up and process!
@@ -34,6 +34,8 @@ END LOOP;
 
 ```
 
+The channel name is the `alert.handler` of a rule (e.g. `"handler": "LILAM_ALERT_MAIL_LOG"`, max. 30 characters); LILAM also stores it as `HANDLER_TYPE` in `LILAM_ALERTS`. The sample mailer `LILAM_MAILER` also processes pending alerts at start-up and after each timeout, not only after a signal.
+
 ## JSON Alert Payload
 The following metadata is transmitted to the consumer as a JSON object. Since LILAM supports dynamic table structures, the `reference` column explains how the payload maps to the database:
 
@@ -42,13 +44,15 @@ The following metadata is transmitted to the consumer as a JSON object. Since LI
 
 | Property | Type | Reference | Description |
 | :--- | :--- | :--- | :--- |
-| `alert_id` | number | `LILAM_ALERTS.ID` | Unique identifier for the specific alert. |
+| `alert_id` | number | `LILAM_ALERTS.ALERT_ID` | Unique identifier for the specific alert. |
 | `process_id` | number | Process ID | Maps to `PROC.ID` and `MON.PROCESS_ID`. |
 | `tab_name_process` | string | Table Name | The specific process table name (e.g., `LILAM_PROC`). |
 | `tab_name_monitor` | string | Table Name | The specific monitoring table name (e.g., `LILAM_MON`). |
+| `tab_name_logging` | string | Table Name | The specific logging table name (e.g., `LILAM_LOG`). |
 | `action_name` | string | `MON.ACTION` | The name of the process or the specific action. |
 | `context_name` | string | `MON.CONTEXT` | Optional granular detail (e.g., a specific track segment). |
 | `action_count` | number | `MON.ACTION_COUNT` | The specific occurrence ID of the triggered event. |
+| `group_name` | string | `LILAM_RULES.GROUP_NAME` | Rule group of the process (from `NEW_SESSION`). |
 | `rule_set_name` | string | `LILAM_RULES.SET_NAME` | The name of the active rule set. |
 | `rule_set_version` | number | `LILAM_RULES.VERSION` | The specific version of the applied rule set. |
 | `rule_id` | string | `rules.id` | The unique ID of the triggered rule within the JSON set. |
@@ -75,16 +79,18 @@ The `LILAM_ALERTS` table acts as the persistent "Source of Truth" for all detect
 | **PROCESS_NAME** | `VARCHAR2` | `action_name`¹ | The high-level name of the process. |
 | **MASTER_TABLE_NAME** | `VARCHAR2` | `tab_name_process` | The table storing the process metadata. |
 | **MONITOR_TABLE_NAME** | `VARCHAR2` | `tab_name_monitor` | The table storing the specific event data. |
+| **LOGGING_TABLE_NAME** | `VARCHAR2` | `tab_name_logging` | The table storing the log entries. |
 | **ACTION_NAME** | `VARCHAR2` | `action_name`¹ | The specific action/event that triggered the rule. |
 | **CONTEXT_NAME** | `VARCHAR2` | `context_name` | Optional granular detail (e.g., Segment ID). |
+| **GROUP_NAME** | `VARCHAR2` | `group_name` | Rule group of the process. |
 | **ACTION_COUNT** | `NUMBER` | `action_count` | Exact occurrence count of the action. |
 | **RULE_SET_NAME** | `VARCHAR2` | `rule_set_name` | Name of the active rule set. |
 | **RULE_ID** | `VARCHAR2` | `rule_id` | The specific rule triggered (from the JSON set). |
 | **RULE_SET_VERSION** | `NUMBER` | `rule_set_version`| Version of the rule set used. |
 | **ALERT_SEVERITY** | `VARCHAR2` | `alert_severity` | Severity level (e.g., INFO, WARN, CRITICAL). |
-| **HANDLER_TYPE** | `VARCHAR2` | - | Intended handler (e.g., MAIL, REST, LOG). |
-| **STATUS** | `VARCHAR2` | - | Current state (e.g., PENDING, PROCESSED). |
-| **ERROR_MESSAGE** | `VARCHAR2` | - | Capture for errors during alert dispatch. |
+| **HANDLER_TYPE** | `VARCHAR2` | - | Value of `rules.alert.handler`: the name of the `DBMS_ALERT` signal (e.g. `LILAM_ALERT_MAIL_LOG`). |
+| **STATUS** | `VARCHAR2` | - | Current state (PENDING, PROCESSED, ERROR). |
+| **ERROR_MESSAGE** | `CLOB` | - | Capture for errors during alert dispatch. |
 | **CREATED_AT** | `TIMESTAMP` | `timestamp` | Audit timestamp when the alert was generated. |
 | **PROCESSED_AT** | `TIMESTAMP` | - | Timestamp when the consumer finished handling. |
 

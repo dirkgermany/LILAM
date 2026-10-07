@@ -30,7 +30,7 @@
 </details>
 
 > [!TIP]
-> Dieses Dokument dient als LILAM API-Referenz. Wenn Du neu bei LILAM bist, empfiehlt es sich, zunächst [architecture and concepts.md](architecture%20and%20concepts.md) zu lesen, um die zugrunde liegenden Konzepte kennenzulernen. Die Beispiele im Ordner `demo` zeigen, wie sich die LILAM API in Anwendungen integrieren lässt.
+> Dieses Dokument dient als LILAM API-Referenz. Wenn Du neu bei LILAM bist, empfiehlt es sich, zunächst [Architektur und Konzepte.md](Architektur%20und%20Konzepte.md) zu lesen, um die zugrunde liegenden Konzepte kennenzulernen. Die Beispiele im Ordner `demo` zeigen, wie sich die LILAM API in Anwendungen integrieren lässt.
 
 ---
 
@@ -320,7 +320,7 @@ end if;
 
 > [!NOTE]
 > Durch den Baseline-Scope baut auch eine Anwendung, die häufig neu gestartet wird, eine stabile Vergleichsbasis für ihre Laufzeiten auf. Die Durchschnittswerte werden in den Tabellen `LILAM_SCOPES` und `LILAM_BASELINES` gespeichert.
-> Den Ablauf (Auflösung des Scopes, Laden und Abgleich mit `LILAM_BASELINES`) zeigt ein Diagramm in [architecture and concepts.md](architecture%20and%20concepts.md#baseline-scope).
+> Den Ablauf (Auflösung des Scopes, Laden und Abgleich mit `LILAM_BASELINES`) zeigt ein Diagramm in [Architektur und Konzepte.md](Architektur%20und%20Konzepte.md#baseline-scope).
 
 #### Beispiele
 
@@ -654,7 +654,7 @@ Ein synchron geschriebener Eintrag übersteht damit auch einen Abbruch der Sessi
 > [!NOTE]
 > Im entkoppelten Modus stehen synchrone Einträge normalerweise zweimal in der Datenbank: in der Arbeitstabelle (vom Server geschrieben) und in `LILAM_LOG` im Schema des Clients (`NO = -1`). Fällt der LILAM-Server aus, findet man den Eintrag weiterhin in `LILAM_LOG`. `LILAM_LOG` wird verwendet, weil die Arbeitstabelle im Schema des Servers liegen kann, auf das der Client keinen Zugriff hat.
 
-Ein synchroner Aufruf kostet auf dem Testsystem etwa 1,5 bis 3,5 ms statt rund 0,1 ms, vor allem für den Commit. Details, Messwerte und Ausfallszenarien stehen in [Architecture and Concepts](architecture%20and%20concepts.md#when-is-a-log-entry-stored-sync-level).
+Ein synchroner Aufruf kostet auf dem Testsystem etwa 1,5 bis 3,5 ms statt rund 0,1 ms, vor allem für den Commit. Details, Messwerte und Ausfallszenarien stehen in [Architektur und Konzepte](Architektur%20und%20Konzepte.md#wann-wird-ein-log-eintrag-gespeichert-sync-level).
 
 ### Function GET_COUNTER_WARN / GET_COUNTER_ERROR
 
@@ -797,6 +797,7 @@ Sind die ersten beiden Kriterien gleich, wechselt der Aufrufer zwischen den Serv
 | `SERVER_SHUTDOWN` | Beendet einen Server |
 | `GET_SERVER_PIPE` | Liefert die Server-Pipe eines verbundenen Clients |
 | `SERVER_UPDATE_RULES` | Aktiviert ein aktualisiertes Rule Set |
+| `CHECK_RULE_SET` | Prüft ein Rule Set, ohne es zu speichern oder zu aktivieren |
 | `SET_DISPATCHER_PIPE` | Konfiguriert einen Dispatcher für automatisches Routing und Reconnect |
 
 ### Procedure START_SERVER
@@ -880,8 +881,21 @@ FUNCTION GET_SERVER_PIPE(
 ) RETURN VARCHAR2
 ```
 
+### Function CHECK_RULE_SET
+Prüft ein Rule Set genauso wie `SERVER_UPDATE_RULES`, ohne es zu speichern oder zu aktivieren. Liefert `NULL`, wenn es gültig ist, sonst die Begründung; die Funktion wirft keine Exception.
+
+```sql
+FUNCTION CHECK_RULE_SET(
+  p_ruleSet CLOB
+) RETURN VARCHAR2
+```
+
+```sql
+SELECT LILAM.CHECK_RULE_SET('{"rules":[ ... ]}') FROM dual;
+```
+
 ### Procedure SERVER_UPDATE_RULES
-Rule Sets werden als JSON-Objekte in `LILAM_RULES` gespeichert, jeweils für eine Gruppe (`GROUP_NAME`, Name, Version). Dasselbe Rule Set kann für mehrere Gruppen eingetragen sein. Je Gruppe ist genau ein Rule Set aktiv (`IS_ACTIVE = 1`); es gilt für alle Server der Gruppe und für alle INSESSION-Prozesse, die mit dieser Gruppe gestartet wurden.
+Rule Sets werden als JSON-Objekte in `LILAM_RULES` gespeichert, jeweils für eine Gruppe (`GROUP_NAME`, Name, Version). Dasselbe Rule Set kann für mehrere Gruppen eingetragen sein. Je Gruppe ist genau ein Rule Set aktiv (`IS_ACTIVE = 1`); es gilt für alle Server der Gruppe und für alle INSESSION-Prozesse, die mit dieser Gruppe gestartet wurden. Gruppe, Name und Version sind Pflicht und zusammen eindeutig, die Gruppe ohne Unterscheidung von Groß- und Kleinschreibung; die Version ist ganzzahlig, `IS_ACTIVE` ist 0 oder 1.
 
 ```sql
 PROCEDURE SERVER_UPDATE_RULES(
@@ -892,9 +906,9 @@ PROCEDURE SERVER_UPDATE_RULES(
 ```
 
 Ablauf:
-1. Das Rule Set der Gruppe wird in der aufrufenden Session vollständig geprüft. Fehlt es für die Gruppe oder ist eine Regel ungültig, endet der Aufruf mit der Exception `NUM_ERR_RULE_SET` (-20130) und einer Begründung; es ändert sich nichts.
+1. Das Rule Set der Gruppe wird in der aufrufenden Session vollständig geprüft. Fehlt es für die Gruppe oder ist eine Regel ungültig, endet der Aufruf mit der Exception `NUM_ERR_RULE_SET` (-20130) und einer Begründung; es ändert sich nichts. Werte aus mehreren durch `|` getrennten Teilen dürfen keine leeren Teile enthalten (`|C1`, `A|`, `20||0.3` werden abgelehnt). Unbekannte Schlüssel einer Regel, in `condition` oder `alert` werden abgelehnt (außer solchen, die mit `_` beginnen, z. B. `_comment`), ebenso Felder, die Objekte, Arrays oder Texte über 4000 Zeichen sind.
 2. Das Rule Set wird für die Gruppe aktiv, das bisher aktive inaktiv.
-3. Laufende Server der Gruppe erhalten die Anweisung zum Neuladen direkt in ihre Pipe, also auch ohne laufenden Prozess und am Dispatcher vorbei. Dispatcher werten keine Regeln aus.
+3. Laufende Server der Gruppe erhalten die Anweisung zum Neuladen direkt in ihre Pipe, also auch ohne laufenden Prozess und am Dispatcher vorbei. Dispatcher werten keine Regeln aus. Zusätzlich prüft jeder Server höchstens alle 15 Sekunden selbst, ob sich das aktive Rule Set seiner Gruppe geändert hat; ein Server, der die Anweisung verpasst (z. B. volle Pipe), lädt das neue Rule Set so spätestens nach etwa 20 Sekunden.
 4. INSESSION-Prozesse der Gruppe laden das neue Rule Set selbst, spätestens beim ersten API-Aufruf nach 15 Sekunden (siehe [Regeln im INSESSION-Modus](#regeln-im-insession-modus)).
 
 Eine Gruppe ohne laufende Server ist kein Fehler: Jeder Server lädt beim Start das aktive Rule Set seiner Gruppe, auch ein neu hinzukommender. Lehnt ein Server ein Rule Set beim Start ab (z. B. weil es inzwischen direkt in der Tabelle geändert wurde), behält er die bisherigen Regeln (beim Start: keine) und protokolliert den Grund in `LILAM_LOG_INTERNAL` und im Log des Serverprozesses.
@@ -906,7 +920,13 @@ VALUES ('METRO', 'METRO_RULES', 2, systimestamp, 'Dirk', '{"rules":[ ... ]}');
 exec LILAM.SERVER_UPDATE_RULES('METRO', 'METRO_RULES', 2);
 ```
 
-Aufbau der Rule Sets und Operatoren: [Rules Engine](../rules/README.md).
+Aufbau der Rule Sets und Operatoren: [Rules Engine](../rules/README.md). Einige Punkte vorab:
+
+- **Kontext-Regeln:** Regeln mit Kontext (`Action|Context`) wirken zusätzlich zu den Regeln ohne Kontext derselben Action; LILAM prüft beide.
+- **Logging-Regeln:** Trigger `LOGGING` kennt `SEVERITY` (genau dieser Level) und `LOG_CONTAINS` mit dem Wert `TEXT` oder `LEVEL|TEXT`: Die Log-Meldung enthält den Text (ohne Unterscheidung von Groß-/Kleinschreibung), wahlweise nur für diesen Level. Der erste Teil gilt nur als Level, wenn er `ERROR`, `WARN`, `MONITOR`, `INFO` oder `DEBUG` ist; sonst ist der ganze Wert der Text (max. 100 Zeichen).
+- **`PRECEDED_BY`, `PRECEDED_BY_WITHIN_SECS`:** Die Reihenfolge wird beim Start einer Aktion geprüft (`MARK_EVENT`, `TRACE_START`, `PROCESS_UPDATE`, `PROCESS_STOP`). Mit `TRACE_STOP` wird die Regel beim Laden abgelehnt, denn dort wäre der Vorgänger meist das eigene `TRACE_START`.
+- **`AVG_DEVIATION_PCT`:** Solange der Durchschnitt unter 1 ms liegt (Messauflösung), wird nicht ausgewertet.
+- **Keine zeitgesteuerte Prüfung:** Regeln werden ausgewertet, wenn ein Signal eintrifft. Ausbleibende Signale (ein hängender Prozess, ein Event, das nie kommt) werden nicht erkannt.
 
 ### Regeln im INSESSION-Modus
 Auch Prozesse im INSESSION-Modus werten Regeln aus, wenn `NEW_SESSION` eine Gruppe erhält (`p_groupName` bzw. `t_session_init.groupName`). Sie nutzen dann dasselbe aktive Rule Set der Gruppe aus `LILAM_RULES` wie die Server dieser Gruppe. Ohne Gruppe gibt es keine Regeln.
@@ -928,7 +948,7 @@ Ein mit p_isDispatcher => 1 gestarteter Server (Dispatcher) verarbeitet keine An
 Für NEW_SESSION/SERVER_NEW_SESSION wählt der Dispatcher dabei denselben lastbasierten Mechanismus wie die reguläre Serverauswahl und reicht die Anfrage an die Steuer-Pipe des gewählten Servers weiter;
 für alle anderen Anfragen ermittelt er anhand der bereits vergebenen process_id den Server, der für den Prozess der Anwendung zuständig ist und leitet dorthin weiter.
 
-Die Antwort des zuständigen Servers geht direkt an den Client zurück, nicht über den Dispatcher. Ein Sequenzdiagramm des Ablaufs steht in [architecture and concepts.md](architecture%20and%20concepts.md#dispatcher-flow).
+Die Antwort des zuständigen Servers geht direkt an den Client zurück, nicht über den Dispatcher. Ein Sequenzdiagramm des Ablaufs steht in [Architektur und Konzepte.md](Architektur%20und%20Konzepte.md#ablauf-im-dispatcher).
 
 Ein Dispatcher ist in der Server-Registry gekennzeichnet (`IS_DISPATCHER = 1`) und wird bei der Serverauswahl nie als Ziel gewählt. Worker und Dispatcher können daher in derselben Gruppe laufen: Clients ohne Dispatcher-Konfiguration erhalten immer direkt einen Worker.
 

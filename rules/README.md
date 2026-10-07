@@ -93,10 +93,12 @@ Rules are organized into Rule Sets, stored as JSON documents in the `LILAM_RULES
     }
 ```
 
-Unknown properties (e.g. `_comment`) are ignored.
+Properties whose name starts with `_` (e.g. `_comment`) are ignored. Any other unknown property of a rule, of `condition` or of `alert` is rejected, so that a typo such as `contxt` or `throttle` does not go unnoticed (the header is not checked).
 
 ### Validation when loading
-A server checks a rule set completely before it uses it: required fields, lengths, unique ids, known trigger types and operators, operators allowed for the trigger, and the format of `condition.value`. If a single rule is invalid, the **whole** rule set is rejected and the previously loaded rules stay active. `SERVER_UPDATE_RULES` performs the same check before it activates a rule set and raises an exception with the reason; a server that rejects a rule set at startup writes the reason to `LILAM_LOG_INTERNAL` and to the log of the server process.
+A server checks a rule set completely before it uses it: required fields, lengths, unique ids, known trigger types and operators, operators allowed for the trigger, and the format of `condition.value`. Values made of several parts separated by `|` must not contain empty parts: `|C1`, `A|` and `20||0.3` are rejected instead of being read differently, and operators that expect a single number reject additional parts (`|5`, `5|x`). Fields must be texts or numbers: an object, an array or a text longer than 4000 characters is rejected, unknown properties as well (see above). If a single rule is invalid, the **whole** rule set is rejected and the previously loaded rules stay active. `SERVER_UPDATE_RULES` performs the same check before it activates a rule set and raises an exception with the reason; a server that rejects a rule set at startup writes the reason to `LILAM_LOG_INTERNAL` and to the log of the server process.
+
+To check a rule set before storing or activating it, call `LILAM.CHECK_RULE_SET(p_ruleSet)`. It performs the same check and returns `NULL` if the rule set is valid, otherwise the reason (it never raises an exception).
 
 ### Hooks / Trigger Types
 | hook | scope | API call
@@ -108,16 +110,19 @@ A server checks a rule set completely before it uses it: required fields, length
 | TRACE_START, TRACE_STOP | Transaction | `TRACE_START`, `TRACE_STOP`
 | LOGGING | Logging | `ERROR`, `WARN`, `INFO`, `DEBUG`, ...
 
+Rules on `MARK_EVENT` and `TRACE_STOP` are only evaluated if the log level of the process is at least `logLevelMonitor`; with a lower level (e.g. `logLevelWarn`) these signals are ignored, rules included. `TRACE_START` and `LOGGING` rules are evaluated regardless of the log level; a `LOGGING` rule also fires for messages that are not written to the log because of the log level.
+
 ### Operators
 | operator | value | allowed triggers | fires when
 | :-- | :-- | :-- | :--
 | ON_START, ON_STOP, ON_EVENT, ON_UPDATE | – | all except LOGGING | always (the trigger itself is the condition)
 | SEVERITY | `ERROR`, `WARN`, `MONITOR`, `INFO`, `DEBUG` | LOGGING | a log message with exactly this level arrives
+| LOG_CONTAINS | `TEXT` or `LEVEL\|TEXT` | LOGGING | a log message contains the text (case-insensitive), optionally only for this level (`ERROR`, `WARN`, `MONITOR`, `INFO`, `DEBUG`; otherwise the whole value is the text)
 | MAX_DURATION_MS | milliseconds | MARK_EVENT, TRACE_STOP | duration of the trace, or for events the time since the previous event of the same action, is greater than the value
-| AVG_DEVIATION_PCT | `pct[\|warmup[\|alpha]]` | MARK_EVENT, TRACE_STOP | duration is more than `pct` percent above the moving average (EWMA), see below
+| AVG_DEVIATION_PCT | `pct[\|warmup[\|alpha]]` | MARK_EVENT, TRACE_STOP | duration is more than `pct` percent above the moving average (EWMA); no evaluation while the average is below 1 ms (measurement resolution), see below
 | MAX_OCCURRENCE | count | MARK_EVENT, TRACE_STOP, PROCESS_UPDATE, PROCESS_STOP | the action occurred more often than the value within the process (`ACTION_COUNT`); for processes: `STEPS_DONE` > value
 | MAX_GAP_SECONDS | seconds | MARK_EVENT, TRACE_START | time since the previous event (MARK_EVENT) or since the end of the previous trace (TRACE_START) of the same action is greater than the value
-| PRECEDED_BY | `ACTION` or `ACTION\|CONTEXT` | MARK_EVENT, TRACE_START, TRACE_STOP, PROCESS_UPDATE, PROCESS_STOP | the previous signal of the process was **not** the expected action (and context, if given)⁴
+| PRECEDED_BY | `ACTION` or `ACTION\|CONTEXT` | MARK_EVENT, TRACE_START, PROCESS_UPDATE, PROCESS_STOP | the previous signal of the process was **not** the expected action (and context, if given)⁴
 | PRECEDED_BY_WITHIN_SECS | `ACTION\|SECONDS` or `ACTION\|CONTEXT\|SECONDS` | like PRECEDED_BY | like PRECEDED_BY, or the expected predecessor ended more than the given seconds ago
 | RUNTIME_EXCEEDED | milliseconds | PROCESS_UPDATE | the running process is older than the value
 | MAX_RUNTIME_EXCEEDED | milliseconds | PROCESS_STOP | the total runtime of the process is greater than the value
@@ -126,21 +131,21 @@ A server checks a rule set completely before it uses it: required fields, length
 | STATUS_EQUALS | number | PROCESS_START, PROCESS_UPDATE, PROCESS_STOP | process status = value
 | INFO_CONTAINS | text | PROCESS_START, PROCESS_UPDATE, PROCESS_STOP | process info contains the text (case-insensitive)
 
-⁴ Only events and traces (start and stop) count as predecessors, log messages do not. Without a context in the value, any context of the expected action is accepted.
+⁴ Only events and traces (start and stop) count as predecessors, log messages do not. Without a context in the value, any context of the expected action is accepted. The order is checked when the action starts, not at TRACE_STOP (there the predecessor would usually be the own TRACE_START); loading rejects `PRECEDED_BY*` with TRACE_STOP.
 
 > [!NOTE]
 > Rules are evaluated when a signal arrives. LILAM has no timer-based evaluation: a process that hangs without sending signals, or an event that never arrives ("B must follow A within X seconds" when B never comes), is not detected. The order "B follows A within X seconds" can be checked when B arrives, with `PRECEDED_BY_WITHIN_SECS` on B.
 
 ---
 ## Table: LILAM_RULES
-This table serves as the central repository for all rule sets. Each rule set is stored as a versioned JSON document for a **server group**; the same rule set may be stored for several groups. Per group exactly one row is active.
+This table serves as the central repository for all rule sets. Each rule set is stored as a versioned JSON document for a **group** (server group or `p_groupName` of `NEW_SESSION`); the same rule set may be stored for several groups. Per group exactly one row is active.
 
 | Column | Type | Description |
 | :--- | :--- | :--- |
-| **GROUP_NAME** | `VARCHAR2(50)` | Server group the rule set belongs to. |
-| **SET_NAME** | `VARCHAR2(30)` | Name of the rule set. `GROUP_NAME`, `SET_NAME` and `VERSION` together are unique. |
-| **VERSION** | `NUMBER` | Version number to support testing, staging, and rollbacks. |
-| **IS_ACTIVE** | `NUMBER(1)` | `1` for the rule set the servers of the group use (at most one per group). |
+| **GROUP_NAME** | `VARCHAR2(50)` | Group the rule set belongs to (server group or `p_groupName` of `NEW_SESSION`); required. |
+| **SET_NAME** | `VARCHAR2(30)` | Name of the rule set; required. `GROUP_NAME` (without regard to case), `SET_NAME` and `VERSION` together are unique. |
+| **VERSION** | `NUMBER` | Whole-number version to support testing, staging, and rollbacks; required. |
+| **IS_ACTIVE** | `NUMBER(1)` | `1` for the rule set the servers and INSESSION processes of the group use (at most one per group), otherwise `0`. |
 | **RULE_SET** | `CLOB` | The JSON document (header and rules); checked by `IS JSON`. |
 | **CREATED** | `TIMESTAMP` | When this version was created. |
 | **AUTHOR** | `VARCHAR2(50)` | The developer or architect who defined the rule set. |
@@ -148,12 +153,12 @@ This table serves as the central repository for all rule sets. Each rule set is 
 Alerts and the consumer refer to a rule by `GROUP_NAME`, `SET_NAME`, `VERSION` and `rules.id`.
 
 > **Implementation Note**
-> The LILAM servers load the active rule set of their group into RAM at startup (or when `SERVER_UPDATE_RULES` is called). All rule evaluations work on this cached structure, without database access. Only a firing rule writes to `LILAM_ALERTS`.
+> The LILAM servers load the active rule set of their group into RAM at startup (or when `SERVER_UPDATE_RULES` is called). INSESSION processes with a group load it at their first rule check and then look for a new active rule set at most every 15 seconds. All rule evaluations work on this cached structure, without database access. Only a firing rule writes to `LILAM_ALERTS`.
 
 ---
 ## Loading a Rule Set
 
-`SERVER_UPDATE_RULES` checks the rule set of the group, makes it the active one and tells every running server of the group (dispatchers excluded) to reload it. A group without running servers is not an error: every server loads the active rule set of its group at startup, including newly added servers.
+`SERVER_UPDATE_RULES` checks the rule set of the group, makes it the active one and tells every running server of the group (dispatchers excluded) to reload it. A group without running servers is not an error: every server loads the active rule set of its group at startup, including newly added servers. INSESSION processes of the group pick up the change at their first API call after at most 15 seconds.
 
 ```sql
 INSERT INTO LILAM_RULES (group_name, set_name, version, created, author, rule_set)

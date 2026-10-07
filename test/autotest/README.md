@@ -30,6 +30,9 @@ DAUERTEST/                  Dauertest über alle Modi gleichzeitig (Kombination 
 
 BELASTUNG/                  Belastungstests: Laststufen bis zur Grenze (Konzept in BELASTUNG/README.md)
   KAPAZITAET_SERVER/  SKALIERUNG/  DAUERLAST_MIX/  DISPATCHER_ENGPASS/  APEX_STURM/  BATCHSTART/  FEHLERKASKADE/
+
+REGELN_FEHLER/              Projekt zu den Fehlern der Regel-Engine (Arbeitsprotokolle, kein Test; vorläufig)
+  PROJEKT_KONTEXT.md, je Fall ein Ordner mit FALL.md (B1–B8, C1–C4, G_Grundsatzfragen)
 ```
 
 Jeder Testordner enthält das Skript `test_*.sql` und einen Ordner `results/` für die Auswertungen.
@@ -63,8 +66,8 @@ So kann der Dauertest dieselben Tests wiederverwenden. FEHLERFAELLE und DISPATCH
 | FEATURES/FEHLERFAELLE | Störungen ohne Wirkung auf die Anwendung: kein Server, negative/veraltete ID, Handshake über Dispatcher, verfallene NEW_SESSION | 6 Fälle |
 | FEATURES/SERVERAUSWAHL | Dispatcher wird nie als Ziel der Serverauswahl gewählt; Last verteilt sich auf die Worker (je Worker mind. 30 %), ohne und mit Dispatcher | 2 Clients × 20 Prozesse |
 | FEATURES/SPEICHER | kein Speicherverlust: PGA-Wachstum je Prozess von Session/Client, Workern und Dispatcher (Median aus 5 Messblöcken, max. 100 Byte); Fallback beim Schreiben (fehlerhafte Zeile übersprungen und protokolliert, übrige geschrieben); INSESSION, SERVER, DISPATCHER. Benötigt `00_grants_als_sys.sql` | je Modus 2.000 + 5 × 1.000 Prozesse, ca. 7 min |
-| FEATURES/REGELN | Rules Engine im SERVER-Modus mit eigenem Rule Set `LT_REGELN`: Laden per API und nach Neustart, Ablehnung ungültiger Rule Sets, Vorgänger/Nachfolger, Abstand, Dauer, Häufigkeit, Abweichung, Prozess- und Log-Regeln, Kontext-/Action-Regel, Drosselung, Alert-Zeile und Signal. Nur einzeln (ändert das Rule Set der Gruppe LT) | ca. 20 Prozesse, 2–3 Server, ca. 1 min |
-| FEATURES/REGELN_LAST | Kosten der Regelprüfung im Server je Signaltyp (Event, Trace, Log, Prozessschritt): keine Regeln, 50 Regeln auf andere Actions, 20 passende Regeln ohne Alarm, eine anschlagende Regel gedrosselt und ungedrosselt; Median aus 5 Läufen, Grenzen relativ zu „keine Regeln“ (Unterschiede unter 100 µs gelten als gleich). Nur einzeln | 4 × 5 Varianten × 5 Läufe, ca. 2 min |
+| FEATURES/REGELN | Rules Engine im SERVER- und INSESSION-Modus mit eigenem Rule Set `LT_REGELN`: Laden per API und nach Neustart, Server laden ein geändertes Rule Set auch ohne UPDATE_RULE-Nachricht (L6), Ablehnung ungültiger Rule Sets, Vorgänger/Nachfolger, Abstand, Dauer, Häufigkeit, Abweichung, Prozess- und Log-Regeln, Kontext-/Action-Regel, Drosselung, Alert-Zeile und Signal; INSESSION zusätzlich ohne Gruppe, Groß-/Kleinschreibung der Gruppe, Versionswechsel nach der 15-s-Prüfung, ungültiges und fehlendes Rule Set. Nur einzeln (ändert das Rule Set der Gruppe LT) | ca. 45 Prozesse, 2–3 Server, ca. 2,5 min |
+| FEATURES/REGELN_LAST | Kosten der Regelprüfung im Server und INSESSION je Signaltyp (Event, Trace, Log, Prozessschritt): keine Regeln, 50 Regeln auf andere Actions, 20 passende Regeln ohne Alarm, eine anschlagende Regel gedrosselt und ungedrosselt; Median aus 5 Läufen, Grenzen relativ zu „keine Regeln“ (Unterschiede unter 100 µs gelten als gleich), je Modus. Nur einzeln | 2 Modi × 4 × 5 Varianten × 5 Läufe, ca. 4 min |
 
 Eine Operation besteht aus fünf API-Aufrufen: `INFO`, `TRACE_START`, `TRACE_STOP`, `MARK_EVENT`, `PROC_STEP_DONE`.
 Die Standard-Prüfung kontrolliert danach Vollständigkeit (Logs, Traces, Events, Steps), geschlossene Prozesse,

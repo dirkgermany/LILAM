@@ -211,6 +211,8 @@ create or replace PACKAGE LILAM AS
     FUNCTION  GET_SERVER_PIPE(p_processId NUMBER) RETURN VARCHAR2;
     -- Activate a rule set for all servers of the group (dispatchers excluded); error => exception NUM_ERR_RULE_SET
     PROCEDURE SERVER_UPDATE_RULES(p_groupName VARCHAR2, p_ruleSetName VARCHAR2, p_ruleSetVersion PLS_INTEGER);
+    -- Check a rule set without storing or activating it: NULL = valid, otherwise the reason (never raises)
+    FUNCTION CHECK_RULE_SET(p_ruleSet CLOB) RETURN VARCHAR2;
     PROCEDURE SET_DISPATCHER_PIPE(p_pipeName varchar2, p_groupName varchar2 DEFAULT 'DEFAULT_DISPATCHER', p_processId number DEFAULT null);
 
 

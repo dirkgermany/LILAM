@@ -1,6 +1,3 @@
-
-```json
-
 {
   "header": {
     "rule_set": "TEST_SUITE_METRO",
@@ -17,7 +14,7 @@
         "operator": "PRECEDED_BY_WITHIN_SECS",
         "value": "CLOSE_DOOR|10"
       },
-      "alert": { "handler": "MAIL_LOG", "severity": "INFO" }
+      "alert": { "handler": "LILAM_ALERT_MAIL_LOG", "severity": "INFO" }
     },
 	{
       "id": "SEQ-002",
@@ -28,7 +25,7 @@
         "operator": "PRECEDED_BY",
         "value": "LEAVE_STATION"
       },
-      "alert": { "handler": "MAIL_LOG", "severity": "WARN" }
+      "alert": { "handler": "LILAM_ALERT_MAIL_LOG", "severity": "WARN" }
     },
     {
       "id": "SEQ-003",
@@ -40,7 +37,7 @@
         "operator": "MAX_DURATION_MS",
         "value": "25000"
       },
-      "alert": { "handler": "MAIL_LOG", "severity": "WARN", "throttle_seconds": 0 }
+      "alert": { "handler": "LILAM_ALERT_MAIL_LOG", "severity": "WARN", "throttle_seconds": 0 }
     },
     {
       "id": "SEQ-004",
@@ -51,7 +48,7 @@
         "operator": "PRECEDED_BY",
         "value": "OPEN_DOOR"
       },
-      "alert": { "handler": "MAIL_LOG", "severity": "WARN", "throttle_seconds": 10 }
+      "alert": { "handler": "LILAM_ALERT_MAIL_LOG", "severity": "WARN", "throttle_seconds": 10 }
     },
     {
       "id": "SEQ-005",
@@ -62,7 +59,7 @@
         "operator": "ON_EVENT",
         "value": ""
       },
-      "alert": { "handler": "MAIL_LOG", "severity": "INFO", "throttle_seconds": 10 }
+      "alert": { "handler": "LILAM_ALERT_MAIL_LOG", "severity": "INFO", "throttle_seconds": 10 }
     },
     {
       "id": "SEQ-006",
@@ -73,7 +70,7 @@
         "operator": "ON_START",
         "value": ""
       },
-      "alert": { "handler": "MAIL_LOG", "severity": "INFO", "throttle_seconds": 0 }
+      "alert": { "handler": "LILAM_ALERT_MAIL_LOG", "severity": "INFO", "throttle_seconds": 0 }
     },
     {
       "id": "SEQ-007",
@@ -84,7 +81,7 @@
         "operator": "PRECEDED_BY",
         "value": "ARRIVE_STATION"
       },
-      "alert": { "handler": "MAIL_LOG", "severity": "INFO", "throttle_seconds": 0 }
+      "alert": { "handler": "LILAM_ALERT_MAIL_LOG", "severity": "INFO", "throttle_seconds": 0 }
     },
     {
       "id": "SEQ-008",
@@ -95,7 +92,7 @@
         "operator": "AVG_DEVIATION_PCT",
         "value": "20|100|0.1" 
       },
-      "alert": { "handler": "MAIL_LOG", "severity": "WARN", "throttle_seconds": 60 }
+      "alert": { "handler": "LILAM_ALERT_MAIL_LOG", "severity": "WARN", "throttle_seconds": 60 }
     },
     {
       "id": "SEQ-009",
@@ -106,9 +103,7 @@
         "operator": "SEVERITY",
         "value": "ERROR" 
       },
-      "alert": { "handler": "MAIL_LOG", "severity": "ERROR", "throttle_seconds": 0 }
+      "alert": { "handler": "LILAM_ALERT_MAIL_LOG", "severity": "ERROR", "throttle_seconds": 0 }
     }
    ]
 }
-
-```
