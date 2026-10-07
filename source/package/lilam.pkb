@@ -1311,7 +1311,13 @@ AS
 
                         WHEN 'PRECEDED_BY_WITHIN_SECS' THEN
                             IF g_last_action_per_process.EXISTS(p_ctx.process_id) AND predecessorMatches(p_list(i)) THEN
-                                l_diff_ms := get_ms_diff(g_last_action_per_process(p_ctx.process_id).stop_time, p_ctx.start_time);
+                                -- For process triggers start_time is the process start; use the time of the signal
+                                -- (PROCESS_STOP: process_end, PROCESS_UPDATE: signal time in last_update).
+                                -- PERFORMANCE: SYSTIMESTAMP only as fallback.
+                                l_diff_ms := get_ms_diff(g_last_action_per_process(p_ctx.process_id).stop_time,
+                                    CASE WHEN p_trigger IN (C_PROCESS_UPDATE, C_PROCESS_STOP)
+                                         THEN coalesce(p_ctx.process_end, p_ctx.last_update, systimestamp)
+                                         ELSE p_ctx.start_time END);
                                 fire := l_diff_ms / 1000 > p_list(i).cond_num;
                             ELSE
                                 fire := TRUE;
@@ -1490,10 +1496,14 @@ AS
     END evaluateRules;
 
     -- Method used for mapping to the central evaluate method
-    PROCEDURE evaluateRules(p_processRec t_process_rec, p_trigger VARCHAR2)
+    -- p_signalTime: time of the signal (PROCESS_UPDATE), reference time for PRECEDED_BY_WITHIN_SECS
+    PROCEDURE evaluateRules(p_processRec t_process_rec, p_trigger VARCHAR2, p_signalTime TIMESTAMP := NULL)
     AS
+        l_ctx t_eval_context_rec;
     BEGIN
-        evaluateRules_internal(mapProcessRecToContextRec(p_processRec), p_trigger, p_check_context => FALSE);
+        l_ctx := mapProcessRecToContextRec(p_processRec);
+        l_ctx.last_update := coalesce(p_signalTime, l_ctx.last_update);
+        evaluateRules_internal(l_ctx, p_trigger, p_check_context => FALSE);
     END evaluateRules;
 
     --------------------------------------------------------------------------
@@ -4613,7 +4623,7 @@ AS
             g_sessionList(v_indexSession(p_processId)).process_is_dirty := TRUE;
             g_dirty_queue(p_processId) := TRUE; -- So that SYNC_ALL_DIRTY sees the session
 
-            evaluateRules(g_process_cache(p_processId), C_PROCESS_UPDATE);                
+            evaluateRules(g_process_cache(p_processId), C_PROCESS_UPDATE, p_timestamp);
         end if ;
 
     exception

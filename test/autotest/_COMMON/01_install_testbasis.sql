@@ -1992,6 +1992,7 @@ create or replace package body lt as
             l := l || ',' || r('VG-02', 'MARK_EVENT',  'RG_B2', 'PRECEDED_BY', 'RG_A|C1');
             l := l || ',' || r('VG-03', 'MARK_EVENT',  'RG_D',  'PRECEDED_BY_WITHIN_SECS', 'RG_C|1');
             l := l || ',' || r('VG-04', 'TRACE_START', 'RG_T',  'PRECEDED_BY', 'RG_A');
+            l := l || ',' || r('VG-05', 'PROCESS_UPDATE', '#P#_VG5', 'PRECEDED_BY_WITHIN_SECS', 'RG_A|1');
             l := l || ',' || r('NF-01', 'MARK_EVENT',  'RG_NF_B', 'PRECEDED_BY_WITHIN_SECS', 'RG_NF_A|1');
             l := l || ',' || r('GP-01', 'MARK_EVENT',  'RG_G',  'MAX_GAP_SECONDS', '0.8');
             l := l || ',' || r('GP-02', 'TRACE_START', 'RG_GT', 'MAX_GAP_SECONDS', '0.8');
@@ -2164,6 +2165,13 @@ create or replace package body lt as
         expect('_VG', 'VG-02', 1, 'PRECEDED_BY mit Kontext RG_A|C1');
         expect('_VG', 'VG-03', 2, 'PRECEDED_BY_WITHIN_SECS: zu spaet und falscher Vorgaenger');
         expect('_VG', 'VG-04', 1, 'PRECEDED_BY bei TRACE_START');
+
+        -- PRECEDED_BY_WITHIN_SECS bei PROCESS_UPDATE (C4/N1): Bezugszeit ist das Signal, nicht der Prozessstart
+        l_pid := proc('_VG5');
+        lilam.mark_event(l_pid, 'RG_A'); lilam.set_process_status(l_pid, 1);                          -- 0
+        lilam.mark_event(l_pid, 'RG_A'); dbms_session.sleep(1.3); lilam.set_process_status(l_pid, 1); -- 1: zu spaet
+        lilam.close_session(l_pid);
+        expect('_VG5', 'VG-05', 1, 'PRECEDED_BY_WITHIN_SECS bei PROCESS_UPDATE: Abstand zum Signal');
 
         -- ---------------------------------------------------------------
         -- Nachfolger: "B folgt A innerhalb 1 s" (Pruefung beim Eintreffen von B)
