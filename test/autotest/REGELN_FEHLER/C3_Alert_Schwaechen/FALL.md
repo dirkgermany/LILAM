@@ -3,7 +3,7 @@
 - **Projekt:** REGELN_FEHLER (Kontext: `../PROJEKT_KONTEXT.md`)
 - **Quelle:** Analyse `FEATURES\REGELN\results\2026-10-04_regeln_analyse.md`, Abschnitt 6 (Schwächen)
 - **Schwere:** mittel
-- **Status:** Umsetzung (V2, V4 committet 35ae13d; V3, V5, V6 umgesetzt, nicht committet)
+- **Status:** Umsetzung (V2, V4 committet 35ae13d; V3, V5, V6 committet 2698909; nicht kompiliert, nicht getestet)
 
 ## Befund (laut Analyse vom 04.10.2026)
 
@@ -31,7 +31,7 @@ Robustheit in `fire_alert` (Prüfung vor dem Insert bzw. Rollback), `extractRule
 
 - [x] 1. Jeden Punkt gegen den aktuellen Code prüfen (ggf. Messung mit Diagnoseskript); Ergebnis unten protokollieren
 - [x] 2. Vorschlag Dirk vorlegen
-- [ ] 3. Freigabe durch Dirk
+- [x] 3. Freigabe durch Dirk
 - [ ] 4. Umsetzung im Klon (Branch `claude`), Test erweitern; testen nur auf Dirks Anweisung
 - [ ] 5. Doku angleichen
 - [ ] 6. Bericht, Commit nach Freigabe, Pull Request durch Dirk
@@ -48,3 +48,4 @@ _(Datum, Schritt, Ergebnis; neueste zuletzt.)_
 - **07.10.2026, Schritt 6 (teilweise):** V2 und V4 committet (35ae13d) und nach origin/claude gepusht. Offen: V3, V5, V6; Kompilieren/Test nur auf Dirks Anweisung.
 - **07.10.2026, Schritt 4:** Dirk gibt V3, V5 und V6 frei. V3 (Consumer: Spalten `steps_todo/_done`, Kontext im Join, neuer Parameter `p_context`, Typen auf 100/250; Mailer übergibt den Kontext) und V6 (`consumer\README.md`) umgesetzt. Die Zeile `HANDLER_TYPE` im README hatte schon die neue Bedeutung (C1) und blieb unverändert. Nicht kompiliert, nicht getestet, nicht committet. V5 wartet auf die `lilam.pkb`-Sperre.
 - **07.10.2026, Schritt 4 (V5):** V5 umgesetzt in `lilam.pkb` (`g_alert_history_proc` je Prozess, gelöscht in `clearAllSessionData`, `removeGroupRules`, `clearServerData`). Nicht kompiliert, nicht getestet, nicht committet.
+- **07.10.2026, Schritt 6 (teilweise):** V3, V5 und V6 committet (2698909) und nach origin/claude gepusht. Alle Vorschläge V1–V6 sind damit umgesetzt. Offen: Kompilieren und Test (Consumer und Mailer sind in LILAM_TEST nicht installiert) nur auf Dirks Anweisung; Pull Request durch Dirk.
