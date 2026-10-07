@@ -15,7 +15,7 @@
 --   F2  keine weiteren internen LILAM-Fehler
 --
 -- Hintergrund: Dynamisches FORALL ... SAVE EXCEPTIONS gab in Oracle bei jedem Aufruf PGA nicht frei
--- (Dauertest run 103: Server-PGA 25 -> 95 MB in 4 h). Siehe results/2026-10-04_speicherwachstum.md.
+-- (Dauertest run 103: Server-PGA 25 -> 95 MB in 4 h).
 --
 -- Der Test startet und stoppt seine Server selbst (LT_S1, LT_S2, LT_DISP).
 -- Voraussetzungen: LILAM installiert, _COMMON/00_grants_als_sys.sql (v$process, v$session),
