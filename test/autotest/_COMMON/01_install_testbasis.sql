@@ -2134,6 +2134,8 @@ create or replace package body lt as
 
         -- INSESSION: Rule Set der Szenario-Gruppe aktivieren (Gruppe ohne Server ist kein Fehler)
         lilam.server_update_rules(l_is_grp, c_set, 1);
+        -- IS-03: Versionswechsel-Gruppe startet mit Version 1
+        lilam.server_update_rules(l_is_grp2, c_set, 1);
 
         -- Alert-Signal: diese Session lauscht auf den Handler
         dbms_alert.register(c_handler);

@@ -6159,7 +6159,7 @@ AS
             END IF;
             l_val := p_obj.get(p_key);
             RETURN l_val IS NOT NULL AND NOT l_val.is_null
-                   AND NOT (l_val.is_string AND dbms_lob.getlength(l_val.to_clob) = 2); -- "" counts as missing
+                   AND NOT (l_val.is_string AND nvl(dbms_lob.getlength(l_val.to_clob), 0) IN (0, 2)); -- "" counts as missing
         END;
     BEGIN
         BEGIN
