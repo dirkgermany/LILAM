@@ -3,7 +3,7 @@
 - **Projekt:** REGELN_FEHLER (Kontext: `../PROJEKT_KONTEXT.md`)
 - **Quelle:** Analyse `FEATURES\REGELN\results\2026-10-04_regeln_analyse.md`, Kurzfassung B3, Abschnitt 8 (Gruppe Vorgänger)
 - **Schwere:** mittel (Fehlalarm)
-- **Status:** geprüft 06.10.2026: behoben in fe863f1; Vorschlag: schließen
+- **Status:** **erledigt** 07.10.2026 (behoben in fe863f1; von Dirk geschlossen)
 
 ## Befund (laut Analyse vom 04.10.2026)
 
@@ -25,10 +25,10 @@ Vergleichsschlüssel mit Trennzeichen bilden wie beim gespeicherten Vorgänger. 
 
 - [x] 1. Befund gegen aktuellen Code prüfen; Ergebnis unten protokollieren
 - [x] 2. Vorschlag Dirk vorlegen
-- [ ] 3. Freigabe durch Dirk
-- [ ] 4. Umsetzung im Klon (Branch `claude`), Test erweitern; testen nur auf Dirks Anweisung
-- [ ] 5. Doku angleichen
-- [ ] 6. Bericht in `FEATURES\REGELN\results\`, Commit nach Freigabe, Pull Request durch Dirk
+- [x] 3. Freigabe durch Dirk: geschlossen 07.10.2026
+- [x] 4. Umsetzung im Klon (entfällt, behoben in fe863f1; Test VG-02 vorhanden)
+- [x] 5. Doku angleichen (entfällt, Doku entspricht dem Code)
+- [x] 6. Bericht entfällt (Lauf 1569); Eintrag committet, Pull Request durch Dirk
 
 ## Protokoll
 
@@ -43,4 +43,6 @@ _(Datum, Schritt, Ergebnis; neueste zuletzt.)_
 
 **Vorschlag an Dirk:** B3 als erledigt schließen (wie B1/B2); keine Codeänderung nötig.
 
-**Nächster Schritt:** Dirk entscheidet, ob B3 geschlossen wird.
+**07.10.2026, Schritt 3:** Dirk schließt B3 als erledigt (behoben in fe863f1). Keine Codeänderung.
+
+**Nächster Schritt:** keiner.

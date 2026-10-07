@@ -90,8 +90,8 @@ Status: **offen** = noch nicht gegen den aktuellen Code geprüft; **geprüft** =
 |---|---|---|---|
 | `B1_CASE_ohne_ELSE` | `CASE` ohne `ELSE` in `evaluateRules_internal` ⇒ ORA-06592 je nicht zutreffender `SEVERITY`-Regel / unbekanntem Operator; Server 3–6× langsamer | hoch | **erledigt** 06.10.2026 (behoben in fe863f1, Tests 1569/1570) |
 | `B2_Folgeregeln_uebersprungen` | Nach einer `SEVERITY=ERROR`-Regel greift eine nachfolgende Regel (z. B. `WARN`) nie (Folge von B1; ein `EXCEPTION`-Block um alle Regeln) | hoch | **erledigt** 06.10.2026 (behoben in fe863f1, Test LG-01/LG-02) |
-| `B3_PRECEDED_BY_Kontext` | `PRECEDED_BY` mit Kontext des Vorgängers schlägt fälschlich an (`full_key` ohne `\|`) | mittel (Fehlalarm) | **geprüft** 06.10.2026: behoben in fe863f1 (Test VG-02, Lauf 1569); Vorschlag: schließen |
-| `B4_Log_ueberschreibt_Vorgaenger` | Jeder Log-Aufruf überschreibt den „letzten Vorgänger“ (`LOGGING\|<Level>`) | mittel (Fehlalarm) | **geprüft** 06.10.2026: behoben in fe863f1 (Test VG-01, Lauf 1569); Vorschlag: schließen; Rest in C4 |
+| `B3_PRECEDED_BY_Kontext` | `PRECEDED_BY` mit Kontext des Vorgängers schlägt fälschlich an (`full_key` ohne `\|`) | mittel (Fehlalarm) | **erledigt** 07.10.2026 (behoben in fe863f1, Test VG-02, Lauf 1569) |
+| `B4_Log_ueberschreibt_Vorgaenger` | Jeder Log-Aufruf überschreibt den „letzten Vorgänger“ (`LOGGING\|<Level>`) | mittel (Fehlalarm) | **erledigt** 07.10.2026 (behoben in fe863f1, Test VG-01, Lauf 1569); Rest in C4 |
 | `B5_Laden_nicht_atomar` | Rule Set mit `"action": ""` bricht das Laden ab; Server ohne Regeln, Registry zeigt die neue Version; nicht existierende Version ebenso | hoch | **erledigt** 06.10.2026 (behoben in fe863f1, Lauf 1569); Testergänzung v6/L3c im Klon, noch nicht gelaufen |
 | `B6_INSESSION_Regeln` | Regeln wirkten nur im SERVER-Modus. **Inzwischen weitgehend umgesetzt** (Branch `IN-SESSION-Rules`, PR #13, 05.10.2026, Gruppe aus `NEW_SESSION`); Rest: Doku und Abgleich | mittel | **committet** 06.10.2026 (b91a9aa, `claude`, nicht gepusht): Testergänzung REGELN/REGELN_LAST (INSESSION) und Doku-Reste; Testlauf durch Dirk offen; siehe `B6_INSESSION_Regeln\FALL.md` |
 | `B7_SERVER_UPDATE_RULES_Ziel` | `SERVER_UPDATE_RULES` erreicht nur einen Server, über Dispatcher keinen; kein Weg ohne laufenden Prozess. **Nach der Analyse umgebaut** (je Servergruppe, de1c57e/fe4c21e) | hoch | **umgesetzt**, gepusht ec71648 07.10.2026 (nicht getestet) |
@@ -139,5 +139,7 @@ Zusammenhänge: B1 und B2 gemeinsam angehen (eine Ursache: `CASE` ohne `ELSE` pl
 6. B5 von Dirk geschlossen (behoben in fe863f1); Testergänzung Version 6 / L3c im Klon.
 7. **Tests laufen erst am Ende**, wenn alle Befunde behoben oder als behoben markiert sind; Dirk startet sie selbst. Fall-Fenster lassen keine Tests laufen und fragen auch nicht danach; Testergänzungen werden nur eingebaut und im Fall protokolliert.
 8. Projektordner von `C:\Users\dirk\Documents\LILAM\REGELN_FEHLER` nach `lilam\test\autotest\REGELN_FEHLER` verschoben (Dirk: Protokolle vorläufig im Repository). Verweise in dieser Datei, in `CLAUDE_ANWEISUNGEN.md` und in `test\autotest\README.md` angepasst.
+
+9. B3 und B4 von Dirk geschlossen (behoben in fe863f1).
 
 **Nächster Schritt (Vorschlag):** In einem neuen Fenster B3/B4 (Vorgängerlogik, gemeinsam) gegen den aktuellen Code und fe863f1 prüfen, danach B5.

@@ -3,7 +3,7 @@
 - **Projekt:** REGELN_FEHLER (Kontext: `../PROJEKT_KONTEXT.md`)
 - **Quelle:** Analyse `FEATURES\REGELN\results\2026-10-04_regeln_analyse.md`, Kurzfassung B4, Abschnitt 7 Punkt 4
 - **Schwere:** mittel (Fehlalarm)
-- **Status:** geprüft 06.10.2026: behoben in fe863f1; Vorschlag: schließen
+- **Status:** **erledigt** 07.10.2026 (behoben in fe863f1; von Dirk geschlossen; Rest „letztes Signal“ in C4)
 
 ## Befund (laut Analyse vom 04.10.2026)
 
@@ -25,10 +25,10 @@ Abhängig von Grundsatzfrage 3 (`../G_Grundsatzfragen`): Logs als Vorgänger aus
 
 - [x] 1. Befund gegen aktuellen Code prüfen; Ergebnis unten protokollieren
 - [x] 2. Vorschlag Dirk vorlegen (nach Grundsatzfrage 3)
-- [ ] 3. Freigabe durch Dirk
-- [ ] 4. Umsetzung im Klon (Branch `claude`), Test erweitern; testen nur auf Dirks Anweisung
-- [ ] 5. Doku angleichen
-- [ ] 6. Bericht in `FEATURES\REGELN\results\`, Commit nach Freigabe, Pull Request durch Dirk
+- [x] 3. Freigabe durch Dirk: geschlossen 07.10.2026
+- [x] 4. Umsetzung im Klon (entfällt, behoben in fe863f1; Test VG-01 vorhanden)
+- [x] 5. Doku angleichen (entfällt, Doku entspricht dem Code)
+- [x] 6. Bericht entfällt (Lauf 1569); Eintrag committet, Pull Request durch Dirk
 
 ## Protokoll
 
@@ -42,4 +42,6 @@ _(Datum, Schritt, Ergebnis; neueste zuletzt.)_
 
 **Vorschlag an Dirk:** B4 als erledigt schließen; über „nur letztes Signal / TRACE_STOP sieht eigenes TRACE_START“ in C4 entscheiden.
 
-**Nächster Schritt:** Dirk entscheidet, ob B4 geschlossen wird.
+**07.10.2026, Schritt 3:** Dirk schließt B4 als erledigt (behoben in fe863f1). Keine Codeänderung; der Rest (TRACE_STOP sieht eigenes TRACE_START) wurde in C4 behandelt (N1, Commit 42e6731).
+
+**Nächster Schritt:** keiner.
