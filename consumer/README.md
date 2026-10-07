@@ -82,7 +82,7 @@ The `LILAM_ALERTS` table acts as the persistent "Source of Truth" for all detect
 | **RULE_ID** | `VARCHAR2` | `rule_id` | The specific rule triggered (from the JSON set). |
 | **RULE_SET_VERSION** | `NUMBER` | `rule_set_version`| Version of the rule set used. |
 | **ALERT_SEVERITY** | `VARCHAR2` | `alert_severity` | Severity level (e.g., INFO, WARN, CRITICAL). |
-| **HANDLER_TYPE** | `VARCHAR2` | - | Intended handler (e.g., MAIL, REST, LOG). |
+| **HANDLER_TYPE** | `VARCHAR2` | - | Value of `rules.alert.handler`: the name of the `DBMS_ALERT` signal (e.g. `LILAM_ALERT_MAIL_LOG`). |
 | **STATUS** | `VARCHAR2` | - | Current state (e.g., PENDING, PROCESSED). |
 | **ERROR_MESSAGE** | `VARCHAR2` | - | Capture for errors during alert dispatch. |
 | **CREATED_AT** | `TIMESTAMP` | `timestamp` | Audit timestamp when the alert was generated. |

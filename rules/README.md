@@ -110,6 +110,8 @@ To check a rule set before storing or activating it, call `LILAM.CHECK_RULE_SET(
 | TRACE_START, TRACE_STOP | Transaction | `TRACE_START`, `TRACE_STOP`
 | LOGGING | Logging | `ERROR`, `WARN`, `INFO`, `DEBUG`, ...
 
+Rules on `MARK_EVENT` and `TRACE_STOP` are only evaluated if the log level of the process is at least `logLevelMonitor`; with a lower level (e.g. `logLevelWarn`) these signals are ignored, rules included. `TRACE_START` and `LOGGING` rules are evaluated regardless of the log level; a `LOGGING` rule also fires for messages that are not written to the log because of the log level.
+
 ### Operators
 | operator | value | allowed triggers | fires when
 | :-- | :-- | :-- | :--

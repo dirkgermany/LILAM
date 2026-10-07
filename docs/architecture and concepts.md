@@ -208,8 +208,10 @@ Each rule is assigned to a **Trigger Type**, which defines the signal that start
 *   **`TRACE_STOP`**: a transaction is completed. Ideal for execution-time analysis.
 *   **`LOGGING`**: a log message arrives (`ERROR`, `WARN`, `INFO`, ...).
 
+`MARK_EVENT` and `TRACE_STOP` rules need log level `logLevelMonitor` or higher; `TRACE_START` and `LOGGING` rules work at every log level.
+
 #### Filtering Mechanism
-The server keeps the rules in associative arrays in memory and evaluates them in two steps:
+The server, and in INSESSION mode the database session, keeps the rules in associative arrays in memory and evaluates them in two steps:
 1.  **Context rules (`Action|Context`):** rules for the exact combination of action and context (e.g., `STATION_EXIT` at station `Moulin Rouge`).
 2.  **Action rules (`Action`):** rules without context apply to **all** contexts of the action and are evaluated in addition.
 

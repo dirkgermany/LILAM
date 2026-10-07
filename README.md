@@ -252,7 +252,7 @@ To illustrate how LILAM works, imagine monitoring a subway system:
 
 **Process (TRACK_LINE_4):** The overall mission or service run of a specific line.
 
-**Event (CLOSE_DOOR):** A discrete point in time. We mark this event at a specific station (STATION_ID_400). If a mandatory event is missing, LILAM can trigger an alert.
+**Event (CLOSE_DOOR):** A discrete point in time. We mark this event at a specific station (STATION_ID_400). If a mandatory event did not happen before the next one, LILAM can trigger an alert (PRECEDED_BY).
 
 **Trace/Transaction (TRACK_SECTION):** A time-based segment representing the travel between two points (e.g. SECTION_ID_402). By using trace_start and trace_stop, we automatically measure the travel time (latency).
 

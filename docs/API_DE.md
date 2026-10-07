@@ -922,6 +922,7 @@ exec LILAM.SERVER_UPDATE_RULES('METRO', 'METRO_RULES', 2);
 
 Aufbau der Rule Sets und Operatoren: [Rules Engine](../rules/README.md). Einige Punkte vorab:
 
+- **Kontext-Regeln:** Regeln mit Kontext (`Action|Context`) wirken zusätzlich zu den Regeln ohne Kontext derselben Action; LILAM prüft beide.
 - **Logging-Regeln:** Trigger `LOGGING` kennt `SEVERITY` (genau dieser Level) und `LOG_CONTAINS` mit dem Wert `TEXT` oder `LEVEL|TEXT`: Die Log-Meldung enthält den Text (ohne Unterscheidung von Groß-/Kleinschreibung), wahlweise nur für diesen Level. Der erste Teil gilt nur als Level, wenn er `ERROR`, `WARN`, `MONITOR`, `INFO` oder `DEBUG` ist; sonst ist der ganze Wert der Text (max. 100 Zeichen).
 - **`PRECEDED_BY`, `PRECEDED_BY_WITHIN_SECS`:** Die Reihenfolge wird beim Start einer Aktion geprüft (`MARK_EVENT`, `TRACE_START`, `PROCESS_UPDATE`, `PROCESS_STOP`). Mit `TRACE_STOP` wird die Regel beim Laden abgelehnt, denn dort wäre der Vorgänger meist das eigene `TRACE_START`.
 - **`AVG_DEVIATION_PCT`:** Solange der Durchschnitt unter 1 ms liegt (Messauflösung), wird nicht ausgewertet.
