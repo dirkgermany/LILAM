@@ -914,7 +914,47 @@ AS
     end;
 
     --------------------------------------------------------------------------
-    -- Look for free Server-Pipe 
+    -- Dispatcher configured for the requested group (SET_DISPATCHER_PIPE), NULL = none.
+    -- 1. a dispatcher set explicitly for this group (p_groupName of SET_DISPATCHER_PIPE)
+    -- 2. the default dispatcher, if no group is requested or it serves the requested group
+    --    (group of the dispatcher from the registry; unknown group: use it as before)
+    -- STABILITY: A default dispatcher only routes to the workers of its own group. Without this check a
+    -- process of another group ended up at a worker of the dispatcher's group (wrong rule set and
+    -- baselines), or every NEW_SESSION of the session timed out once that dispatcher was stopped.
+    --------------------------------------------------------------------------
+    function getDispatcherForGroup(p_groupName varchar2) return varchar2
+    as
+        l_pipe      varchar2(100);
+        l_dispGroup varchar2(100);
+    begin
+        if p_groupName is not null and g_dispatcher_config.EXISTS(upper(p_groupName)) then
+            return g_dispatcher_config(upper(p_groupName));
+        end if;
+        if not g_dispatcher_config.EXISTS('DEFAULT_DISPATCHER') then
+            return null;
+        end if;
+        l_pipe := g_dispatcher_config('DEFAULT_DISPATCHER');
+        if p_groupName is null then
+            return l_pipe;
+        end if;
+
+        begin
+            execute immediate 'SELECT max(group_name) FROM ' || C_LILAM_SERVER_REGISTRY || ' WHERE upper(pipe_name) = upper(:1)'
+                into l_dispGroup using l_pipe;
+        exception
+            when others then
+                logLilamErr(sqlCode, sqlErrM, 'getDispatcherForGroup', 'EXECUTE IMMEDIATE');
+                l_dispGroup := null;
+        end;
+
+        if l_dispGroup is null or upper(l_dispGroup) = upper(p_groupName) then
+            return l_pipe;
+        end if;
+        return null;   -- other group: registry search instead of the dispatcher
+    end;
+
+    --------------------------------------------------------------------------
+    -- Look for free Server-Pipe
     --------------------------------------------------------------------------
     function getServerPipeForSession(p_processId number, p_groupName varchar2) return varchar2
     as
@@ -927,10 +967,9 @@ AS
             RETURN g_client_pipes(p_processId);
         END IF;
     
-        -- 2. Dispatcher takes precedence over the registry search, if configured
-        IF g_dispatcher_config.EXISTS('DEFAULT_DISPATCHER') THEN
-            l_serverPipe := g_dispatcher_config('DEFAULT_DISPATCHER');
-        ELSE
+        -- 2. Dispatcher takes precedence over the registry search, if configured for the requested group
+        l_serverPipe := getDispatcherForGroup(p_groupName);
+        IF l_serverPipe IS NULL THEN
             l_serverPipe := getServerPipeAvailable(p_groupName);
         END IF;
     
@@ -5162,8 +5201,13 @@ AS
     AS
         l_result number;
     BEGIN
+        -- NULL removes the setting (otherwise every NEW_SESSION would find an empty dispatcher entry)
+        if p_pipeName is null then
+            g_dispatcher_config.DELETE(nvl(upper(p_groupName), 'DEFAULT_DISPATCHER'));
+            return;
+        end if;
         g_dispatcher_config(nvl(upper(p_groupName), 'DEFAULT_DISPATCHER')) := p_pipeName;
-    
+
         -- Pre-warm only if a process_id was passed
         if p_processId is not null then
             l_result := SERVER_LINK(p_processId, p_pipeName);

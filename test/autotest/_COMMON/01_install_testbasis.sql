@@ -1804,6 +1804,9 @@ create or replace package body lt as
         run_mem(c_server, 'SV');
         run_fallback(c_server, 'SV');
         run_mem(c_dispatcher, 'DP');   -- zuletzt: setzt den Dispatcher fuer diese Session
+        -- Dispatcher-Einstellung der Session aufheben: sonst gehen spaetere NEW_SESSION dieser Session
+        -- an den gleich gestoppten LT_DISP (Ausfall U-Bahn-Simulation run 2034)
+        lilam.set_dispatcher_pipe(null);
         if p_manage then stop_all_servers; end if;
 
         -- erwartet: genau die zwei Fallback-Eintraege, sonst nichts

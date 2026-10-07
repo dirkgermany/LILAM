@@ -976,6 +976,8 @@ If p_processId is passed, this round trip already takes place when SET_DISPATCHE
 ### Procedure SET_DISPATCHER_PIPE
 Tells LILAM via which pipe a dispatcher can be reached. This information is held exclusively in the memory of the current physical database session.
 
+A dispatcher only forwards to the servers of its own group. Therefore `SERVER_NEW_SESSION` uses the default dispatcher only if no group is given or the dispatcher's group (according to `LILAM_SERVER_REGISTRY`) matches the given group. Processes of other groups get a server of their group directly, as without a dispatcher. A dispatcher set with `p_groupName` applies only to `SERVER_NEW_SESSION` of this group. `SET_DISPATCHER_PIPE(NULL)` removes the setting again.
+
 > [!IMPORTANT]
 > Since the configuration only applies to the current physical session, SET_DISPATCHER_PIPE must be called again every time a new connection is established – with connection pooling, potentially on every page, not just once on the first page call.
 
@@ -991,8 +993,8 @@ PROCEDURE SET_DISPATCHER_PIPE(
 #### Parameters
 | Parameter | Type | Meaning |
 | --------- | --- | --------- |
-| p_pipeName | varchar2 | Pipe name of the dispatcher |
-| p_groupName | varchar2 | Optional identifier in case several dispatchers are used in parallel. [Automatic Reconnect](#automatic-reconnect) uses only the default identifier 'DEFAULT_DISPATCHER' |
+| p_pipeName | varchar2 | Pipe name of the dispatcher. `NULL` removes the setting for the given identifier |
+| p_groupName | varchar2 | Optional. Name of a server group in case several dispatchers are used in parallel: the dispatcher then applies only to `SERVER_NEW_SESSION` of this group. [Automatic Reconnect](#automatic-reconnect) uses only the default identifier 'DEFAULT_DISPATCHER' |
 | p_processId | number | Optional. If a process_id is already known, LILAM restores the connection to it immediately (see [Prewarming](#prewarming)) instead of only at the next API call |
 
 ```sql
