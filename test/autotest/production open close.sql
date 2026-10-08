@@ -7,7 +7,7 @@ declare
 	l_counter number := 0;
 begin
     
-    l_procIdProduction := lilam.server_new_session('PRODUCTION_PROC', lilam.logLevelDebug, 300, 999, 'REGISTRY_TEST');
+    l_procIdProduction := lilam.server_new_process('PRODUCTION_PROC', null, lilam.logLevelDebug, 300, 999, 'REGISTRY_TEST');
     
 	for i in 1..28800 loop -- 8 Stunden        
         lilam.info(l_procIdProduction, 'PRODUCTION_PROC Logging');
@@ -29,15 +29,15 @@ begin
 		
 		l_counter:= l_counter +1;
 		if (l_counter = 50) then
-			lilam.close_session(l_procIdProduction);
+			lilam.close_process(l_procIdProduction);
 
             dbms_session.sleep(300);
-			l_procIdProduction := lilam.server_new_session('PRODUCTION_PROC', lilam.logLevelDebug, 300, 999, 'REGISTRY_TEST');
+			l_procIdProduction := lilam.server_new_process('PRODUCTION_PROC', null, lilam.logLevelDebug, 300, 999, 'REGISTRY_TEST');
 			l_counter := 0;
 		end if;
 				
     end loop;        
-	lilam.close_session(l_procIdProduction);
+	lilam.close_process(l_procIdProduction);
 
 end;
 /

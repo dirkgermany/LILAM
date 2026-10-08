@@ -8,8 +8,8 @@ declare
     l_toggle number := 1;
 begin    
     loop
-        l_procIdSales_1 := lilam.server_new_session('SALES_PROC_1', 'SALES_GROUP', lilam.logLevelDebug, 60000, 999, 'REGISTRY_TEST');
-        l_procIdSales_2 := lilam.server_new_session('SALES_PROC_2', 'SALES_GROUP', lilam.logLevelDebug, 60000, 999, 'REGISTRY_TEST');
+        l_procIdSales_1 := lilam.server_new_process('SALES_PROC_1', 'SALES_GROUP', lilam.logLevelDebug, 60000, 999, 'REGISTRY_TEST');
+        l_procIdSales_2 := lilam.server_new_process('SALES_PROC_2', 'SALES_GROUP', lilam.logLevelDebug, 60000, 999, 'REGISTRY_TEST');
         for i in 1..10000 loop
             lilam.info(l_procIdSales_1, 'SALES_PROC_1 Logging');
             lilam.proc_step_done(l_procIdSales_1);
@@ -39,8 +39,8 @@ begin
             lilam.trace_stop(l_procIdSales_2, 'SALES_PROC_2 Trace ohne Context');
             lilam.proc_step_done(l_procIdSales_2);
         end loop;    
-        lilam.close_session(l_procIdSales_1);
-        lilam.close_session(l_procIdSales_2);
+        lilam.close_process(l_procIdSales_1);
+        lilam.close_process(l_procIdSales_2);
         dbms_session.sleep(300);
     end loop;
     

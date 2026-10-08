@@ -4,8 +4,8 @@
 -- Szenario: Nachtverarbeitung um 02:00. Der Orchestrator startet alle Ketten gleichzeitig; jede Kette
 -- oeffnet sofort mehrere Prozesse (Teilschritte) und arbeitet dann gleichmaessig.
 -- Alle Clients einer Stufe starten zum selben Zeitpunkt und oeffnen n Prozesse ohne Pause:
---   8 Clients x 10, 16 x 20, 16 x 50 Prozesse (bis 800 NEW_SESSION in wenigen Sekunden).
--- Gemessen: Dauer von NEW_SESSION (max), NEW_SESSION ohne Prozess (Timeout 3 s, -20110),
+--   8 Clients x 10, 16 x 20, 16 x 50 Prozesse (bis 800 NEW_PROCESS in wenigen Sekunden).
+-- Gemessen: Dauer von NEW_PROCESS (max), NEW_PROCESS ohne Prozess (Timeout 3 s, -20110),
 -- Verteilung auf die Worker, Erholung danach. Erst SERVER, dann DISPATCHER (je 2 Worker).
 --
 -- Laufzeit: je Modus ca. 2 min

@@ -45,17 +45,17 @@ BEGIN
     -- 2. Der PL/SQL-Code für die Worker-Jobs (ohne Truncates!)
     v_plsql := '
     DECLARE
-        lSessionId NUMBER;
+        l_processId NUMBER;
     BEGIN
-        lSessionId := lilam.server_new_session(''ParallelJob'', ''testGroup'', lilam.logLevelMonitor, 100, 100, ''lilamtest'');
+        l_processId := lilam.server_new_process(''ParallelJob'', ''testGroup'', lilam.logLevelMonitor, 100, 100, ''lilamtest'');
         FOR i IN 1..10000 LOOP
-            lilam.TRACE_START(lSessionId, ''Action '' || i, ''context'');
-            lilam.mark_event(lSessionId, ''Event '' || i, ''context'');
-            lilam.info(lSessionId, ''Info '' || i);
-            lilam.PROC_STEP_DONE(lSessionId);
-            lilam.TRACE_STOP(lSessionId, ''Action '' || i, ''context'');
+            lilam.TRACE_START(l_processId, ''Action '' || i, ''context'');
+            lilam.mark_event(l_processId, ''Event '' || i, ''context'');
+            lilam.info(l_processId, ''Info '' || i);
+            lilam.PROC_STEP_DONE(l_processId);
+            lilam.TRACE_STOP(l_processId, ''Action '' || i, ''context'');
         END LOOP;
-        lilam.close_session(lSessionId);
+        lilam.close_process(l_processId);
     EXCEPTION
         WHEN OTHERS THEN
             NULL; -- Fehler im Job unterdrücken, um Test nicht zu stoppen

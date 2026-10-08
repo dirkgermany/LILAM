@@ -52,7 +52,7 @@ The following metadata is transmitted to the consumer as a JSON object. Since LI
 | `action_name` | string | `MON.ACTION` | The name of the process or the specific action. |
 | `context_name` | string | `MON.CONTEXT` | Optional granular detail (e.g., a specific track segment). |
 | `action_count` | number | `MON.ACTION_COUNT` | The specific occurrence ID of the triggered event. |
-| `group_name` | string | `LILAM_RULES.GROUP_NAME` | Rule group of the process (from `NEW_SESSION`). |
+| `group_name` | string | `LILAM_RULES.GROUP_NAME` | Rule group of the process (from `NEW_PROCESS`). |
 | `rule_set_name` | string | `LILAM_RULES.SET_NAME` | The name of the active rule set. |
 | `rule_set_version` | number | `LILAM_RULES.VERSION` | The specific version of the applied rule set. |
 | `rule_id` | string | `rules.id` | The unique ID of the triggered rule within the JSON set. |

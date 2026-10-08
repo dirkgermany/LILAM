@@ -43,18 +43,18 @@ begin
       backlog_slope   number,            -- Steigung des Rueckstaus in der 2. Haelfte (Logs/s)
       lag_max_ms      number,            -- max. Sichtbarkeitsverzug der Probe-Logs
       lag_avg_ms      number,
-      call_avg_us     number,            -- mittlere Dauer je Aufruf ohne ERROR und NEW_SESSION
+      call_avg_us     number,            -- mittlere Dauer je Aufruf ohne ERROR und NEW_PROCESS
       call_max_ms     number,
-      calls_gt100ms   number,            -- Aufrufe > 100 ms ohne ERROR und CLOSE_SESSION (LILAM bremst die Anwendung)
+      calls_gt100ms   number,            -- Aufrufe > 100 ms ohne ERROR und CLOSE_PROCESS (LILAM bremst die Anwendung)
       err_avg_us      number,            -- mittlere Dauer eines ERROR-Aufrufs (inkl. Direktschreiben)
       err_max_ms      number,
-      ns_count        number,            -- NEW_SESSION-Aufrufe
+      ns_count        number,            -- NEW_PROCESS-Aufrufe
       ns_avg_ms       number,
       ns_max_ms       number,
-      ns_fail         number,            -- NEW_SESSION mit negativer ID
-      cl_avg_ms       number,            -- CLOSE_SESSION (wartet decoupled auf die Antwort des Servers, max. 1 s)
+      ns_fail         number,            -- NEW_PROCESS mit negativer ID
+      cl_avg_ms       number,            -- CLOSE_PROCESS (wartet decoupled auf die Antwort des Servers, max. 1 s)
       cl_max_ms       number,
-      cl_timeouts     number,            -- CLOSE_SESSION mit >= 1 s (Antwort des Servers nicht abgewartet)
+      cl_timeouts     number,            -- CLOSE_PROCESS mit >= 1 s (Antwort des Servers nicht abgewartet)
       drain_ms        number,            -- Zeit nach Lastende bis alles persistiert ist
       missing_log     number,
       missing_mon     number,
@@ -148,7 +148,7 @@ create or replace package ltb authid definer as
     --   rate     API-Aufrufe je Sekunde und Client (gleichmaessig verteilt, offene Schleife)
     --   e        Anteil ERROR in % der Aufrufe (0..45), sonst p_err_pct
     --   n        gleichzeitig offene Prozesse je Client, sonst p_procs
-    --   p        Aufrufe je Prozess, danach CLOSE_SESSION und NEW_SESSION (0 = kein Wechsel), sonst p_proc_ops
+    --   p        Aufrufe je Prozess, danach CLOSE_PROCESS und NEW_PROCESS (0 = kein Wechsel), sonst p_proc_ops
     --   Beispiel: '2x200,4x200,8x200e5,8x200p50,16x50n20'
     --
     -- Aufrufmix je 100 Aufrufe: 4 WARN, e ERROR, 45-e INFO, 10 TRACE_START + 10 TRACE_STOP,
@@ -264,12 +264,12 @@ create or replace package body ltb as
     function open_proc(p_mode varchar2, p_name varchar2) return number is
     begin
         if p_mode = lt.c_insession then
-            return lilam.new_session(p_name, lilam.logLevelInfo);
+            return lilam.new_process(p_name, lilam.logLevelInfo);
         end if;
         if p_mode = lt.c_dispatcher then
             lilam.set_dispatcher_pipe(lt.c_disp_pipe);
         end if;
-        return lilam.server_new_session(p_name, lt.c_group, lilam.logLevelInfo);
+        return lilam.server_new_process(p_name, lt.c_group, lilam.logLevelInfo);
     end;
 
     -- Zaehlen in den LILAM-Tabellen ueber den Namenspraefix der Prozesse
@@ -357,7 +357,7 @@ create or replace package body ltb as
         l_name    varchar2(100) := p_prefix || '_C' || p_client;
         l_pad     varchar2(4000) := rpad(' ', greatest(nvl(p_text_len, 120) - 30, 0), 'x');
         l_pids    t_num_tab;
-        l_pops    t_num_tab;            -- Aufrufe je Prozess-Slot seit NEW_SESSION
+        l_pops    t_num_tab;            -- Aufrufe je Prozess-Slot seit NEW_PROCESS
         l_k       pls_integer := 0;     -- Operationszaehler
         l_slot    pls_integer;
         l_r       pls_integer;
@@ -417,12 +417,12 @@ create or replace package body ltb as
             l_ms number;
         begin
             l_t0 := systimestamp;
-            lilam.close_session(l_pids(p_slot), 'LTB fertig', 2);
+            lilam.close_process(l_pids(p_slot), 'LTB fertig', 2);
             l_ms := us_diff(l_t0, systimestamp) / 1000;
             c_cl := c_cl + 1;
             c_clsum := c_clsum + l_ms;
             if l_ms > c_clmax then c_clmax := l_ms; end if;
-            -- der Client wartet hoechstens 1 s auf die Antwort des Servers (close_sessionRemote)
+            -- der Client wartet hoechstens 1 s auf die Antwort des Servers (close_processRemote)
             if l_ms >= 990 then c_clto := c_clto + 1; end if;
         end;
 
@@ -635,7 +635,7 @@ create or replace package body ltb as
             dbms_session.sleep(0.1);
         end loop;
         sample;
-        if l_probe then lilam.close_session(l_pid); end if;
+        if l_probe then lilam.close_process(l_pid); end if;
     exception
         when others then
             lt.joblog(p_run, 0, 'ERROR', 'Beobachter Stufe ' || p_stage || ': ' || sqlerrm || ' | ' || dbms_utility.format_error_backtrace);
@@ -741,13 +741,13 @@ create or replace package body ltb as
         end if;
         if l_tmax / 1000 > c_call_hard_ms then reason('Aufruf bis ' || round(l_tmax / 1000) || ' ms'); end if;
         if l_emax / 1000 > p_max_err_ms then reason('ERROR bis ' || round(l_emax / 1000) || ' ms'); end if;
-        if l_clto > 0 then reason(l_clto || ' CLOSE_SESSION ohne Antwort in 1 s'); end if;
+        if l_clto > 0 then reason(l_clto || ' CLOSE_PROCESS ohne Antwort in 1 s'); end if;
         if nvl(l_st.backlog_slope, 0) > 0.05 * l_st.offered_cps * l_logs / greatest(l_calls, 1)
            and nvl(l_st.backlog_end, 0) > l_st.offered_cps * l_logs / greatest(l_calls, 1) then
             reason('Rueckstau waechst (' || l_st.backlog_slope || ' Logs/s, Ende ' || l_st.backlog_end || ')');
         end if;
         if nvl(l_st.lag_max_ms, 0) > p_max_lag_ms then reason('Verzug ' || round(l_st.lag_max_ms / 1000, 1) || ' s'); end if;
-        if l_nsfail > 0 then reason(l_nsfail || ' NEW_SESSION ohne Prozess'); end if;
+        if l_nsfail > 0 then reason(l_nsfail || ' NEW_PROCESS ohne Prozess'); end if;
         if l_st.missing_log + l_st.missing_mon + l_st.missing_direct > 0 then
             reason('fehlend nach ' || p_drain_max || ' s: ' || l_st.missing_log || ' Logs, ' || l_st.missing_mon || ' Monitor, '
                    || l_st.missing_direct || ' direkte ERROR');
@@ -770,7 +770,7 @@ create or replace package body ltb as
             dbms_output.put_line('    Stufe ' || s.stage_no || ' [' || s.spec || ']: ' || s.verdict
                 || '  Angebot ' || s.offered_cps || '/s, erreicht ' || s.achieved_cps || '/s, persistiert ' || s.persisted_lps
                 || ' Logs/s, Rueckstau max ' || s.backlog_max || ', Verzug max ' || s.lag_max_ms || ' ms, Aufruf '
-                || s.call_avg_us || ' us (max ' || s.call_max_ms || ' ms), ERROR ' || s.err_avg_us || ' us, NEW_SESSION '
+                || s.call_avg_us || ' us (max ' || s.call_max_ms || ' ms), ERROR ' || s.err_avg_us || ' us, NEW_PROCESS '
                 || s.ns_avg_ms || ' ms (max ' || s.ns_max_ms || '), CPU max ' || s.cpu_max_pct || ' %, Drain ' || s.drain_ms || ' ms'
                 || case when s.reasons is not null then chr(10) || '      Gruende: ' || s.reasons end);
         end loop;
@@ -896,7 +896,7 @@ create or replace package body ltb as
         -- Ruhende Prozesse schliessen
         if p_open_procs > 0 then
             for i in 1 .. p_open_procs loop
-                if l_bg(i) > 0 then lilam.close_session(l_bg(i)); end if;
+                if l_bg(i) > 0 then lilam.close_process(l_bg(i)); end if;
             end loop;
             l_n := lt.wait_count(l_bg_name, 'PROC_CLOSED', p_open_procs, 120);
             lt.check_that(l_run, 'Ruhende Prozesse geschlossen', l_n >= 0, l_n || ' ms');
@@ -1140,7 +1140,7 @@ create or replace package body ltb as
         end loop;
 
         for i in 1 .. p_procs loop
-            if l_pids(i) > 0 then lilam.close_session(l_pids(i)); end if;
+            if l_pids(i) > 0 then lilam.close_process(l_pids(i)); end if;
         end loop;
         l_n := lt.wait_count(l_prefix, 'PROC_CLOSED', p_procs, 60);
         lt.check_that(l_run, 'APEX-Prozesse geschlossen', l_n >= 0, l_n || ' ms');
@@ -1229,7 +1229,7 @@ create or replace package body ltb as
                 end loop;
             elsif c.n > 0 then
                 p(' ');
-                p('| Stufe | Spez. | Angebot/s | erreicht/s | pers. Logs/s | Rueckstau max/Ende | Verzug max ms | Aufruf Ø µs | Aufruf max ms | ERROR Ø µs / max ms | NEW_SESSION Ø/max ms (Fehler) | CLOSE Ø/max ms (Timeout) | Drain ms | CPU max % | Commits/s max | Worker-/Disp.-Rate | Bewertung |');
+                p('| Stufe | Spez. | Angebot/s | erreicht/s | pers. Logs/s | Rueckstau max/Ende | Verzug max ms | Aufruf Ø µs | Aufruf max ms | ERROR Ø µs / max ms | NEW_PROCESS Ø/max ms (Fehler) | CLOSE Ø/max ms (Timeout) | Drain ms | CPU max % | Commits/s max | Worker-/Disp.-Rate | Bewertung |');
                 p('|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|');
                 for s in (select * from ltb_stage where run_id = p_run_id order by stage_no) loop
                     p('| ' || s.stage_no || ' | ' || s.spec || ' | ' || f(s.offered_cps) || ' | ' || f(s.achieved_cps) || ' | '

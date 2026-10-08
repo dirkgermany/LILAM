@@ -47,12 +47,17 @@ create or replace PACKAGE LILAM AS
     NUM_ACK_SERVER_PROC CONSTANT PLS_INTEGER  := 220;
     TXT_ERR_SERVER_PROC CONSTANT VARCHAR2(30) := 'PROCESS_AT_SERVER_INVALID';
     NUM_ERR_SERVER_PROC CONSTANT PLS_INTEGER  := -20021;
-    -- Return values of SERVER_NEW_SESSION / SERVER_NEW_SESSION_JSON if no process could be created.
+    -- Return values of SERVER_NEW_PROCESS / SERVER_NEW_PROCESS_JSON if no process could be created.
     -- No exception is raised; all further API calls with this ID are silently ignored.
-    TXT_ERR_SESSION_TIMEOUT   CONSTANT VARCHAR2(30) := 'SESSION_TIMEOUT';
-    NUM_ERR_SESSION_TIMEOUT   CONSTANT PLS_INTEGER  := -20110;  -- Server did not respond in time
-    TXT_ERR_SESSION_THROTTLED CONSTANT VARCHAR2(30) := 'SESSION_THROTTLED';
-    NUM_ERR_SESSION_THROTTLED CONSTANT PLS_INTEGER  := -20120;  -- Server rejected (overload)
+    TXT_ERR_PROCESS_TIMEOUT   CONSTANT VARCHAR2(30) := 'PROCESS_TIMEOUT';
+    NUM_ERR_PROCESS_TIMEOUT   CONSTANT PLS_INTEGER  := -20110;  -- Server did not respond in time
+    TXT_ERR_PROCESS_THROTTLED CONSTANT VARCHAR2(30) := 'PROCESS_THROTTLED';
+    NUM_ERR_PROCESS_THROTTLED CONSTANT PLS_INTEGER  := -20120;  -- Server rejected (overload)
+    -- Former names (compatibility)
+    TXT_ERR_SESSION_TIMEOUT   CONSTANT VARCHAR2(30) := TXT_ERR_PROCESS_TIMEOUT;
+    NUM_ERR_SESSION_TIMEOUT   CONSTANT PLS_INTEGER  := NUM_ERR_PROCESS_TIMEOUT;
+    TXT_ERR_SESSION_THROTTLED CONSTANT VARCHAR2(30) := TXT_ERR_PROCESS_THROTTLED;
+    NUM_ERR_SESSION_THROTTLED CONSTANT PLS_INTEGER  := NUM_ERR_PROCESS_THROTTLED;
     -- SERVER_UPDATE_RULES: rule set is missing for the group or is invalid (exception with reason)
     TXT_ERR_RULE_SET          CONSTANT VARCHAR2(30) := 'RULE_SET_REJECTED';
     NUM_ERR_RULE_SET          CONSTANT PLS_INTEGER  := -20130;
@@ -90,10 +95,10 @@ create or replace PACKAGE LILAM AS
         tabNameMaster  VARCHAR2(100)
     );
 
-    -- ================================
-    -- Record representing session data
-    -- ================================
-    TYPE t_session_init IS RECORD (
+    -- =========================================
+    -- Record with the settings of a new process
+    -- =========================================
+    TYPE t_process_init IS RECORD (
         processName     VARCHAR2(100),
         logLevel        PLS_INTEGER := logLevelMonitor,
         stepsToDo       PLS_INTEGER,
@@ -104,6 +109,7 @@ create or replace PACKAGE LILAM AS
         groupName       VARCHAR2(50),   -- INSESSION: group for the active rule set from LILAM_RULES; NULL = no rules
         syncLevel       PLS_INTEGER := logLevelError  -- Entries up to this level are written synchronously (logLevelSilent = none)
     );
+    SUBTYPE t_session_init IS t_process_init;  -- former name (compatibility)
 
     -- ==============================
     -- Structure of table LILAM_ALERTS
@@ -128,9 +134,39 @@ create or replace PACKAGE LILAM AS
     C_ALERT_MAIL_LOG CONSTANT VARCHAR2(30) := 'LILAM_ALERT_MAIL_LOG';
 
 
-    ------------------------------
-    -- Life cycle of a log session
-    ------------------------------
+    -----------------------------
+    -- Life cycle of a process
+    -----------------------------
+    FUNCTION  NEW_PROCESS(p_process_init t_process_init) RETURN NUMBER;
+    FUNCTION  NEW_PROCESS(
+        p_processName   VARCHAR2,
+        p_logLevel      PLS_INTEGER DEFAULT logLevelMonitor,
+        p_procStepsToDo PLS_INTEGER DEFAULT NULL,
+        p_daysToKeep    PLS_INTEGER DEFAULT NULL,
+        p_tabNameMaster VARCHAR2    DEFAULT 'LILAM',
+        p_baselineScope VARCHAR2    DEFAULT NULL,
+        p_groupName     VARCHAR2    DEFAULT NULL,
+        p_syncLevel     PLS_INTEGER DEFAULT logLevelError) RETURN NUMBER;
+
+    FUNCTION  SERVER_NEW_PROCESS(
+        p_processName   VARCHAR2,
+        p_groupName     VARCHAR2    DEFAULT NULL,
+        p_logLevel      PLS_INTEGER DEFAULT logLevelMonitor,
+        p_procStepsToDo PLS_INTEGER DEFAULT NULL,
+        p_daysToKeep    PLS_INTEGER DEFAULT NULL,
+        p_tabNameMaster VARCHAR2    DEFAULT 'LILAM',
+        p_baselineScope VARCHAR2    DEFAULT NULL,
+        p_syncLevel     PLS_INTEGER DEFAULT logLevelError) RETURN NUMBER;
+    FUNCTION  SERVER_NEW_PROCESS_JSON(p_jsonObject JSON_OBJ_LILAM) RETURN NUMBER;
+
+    PROCEDURE CLOSE_PROCESS(
+        p_processId     NUMBER,
+        p_processInfo   VARCHAR2    DEFAULT NULL,
+        p_processStatus PLS_INTEGER DEFAULT NULL,
+        p_procStepsDone PLS_INTEGER DEFAULT NULL,
+        p_procStepsToDo PLS_INTEGER DEFAULT NULL);
+
+    -- Former names (compatibility): same behaviour as NEW_PROCESS, SERVER_NEW_PROCESS(_JSON), CLOSE_PROCESS
     FUNCTION  NEW_SESSION(p_session_init t_session_init) RETURN NUMBER;
     FUNCTION  NEW_SESSION(
         p_processName   VARCHAR2,
@@ -141,7 +177,6 @@ create or replace PACKAGE LILAM AS
         p_baselineScope VARCHAR2    DEFAULT NULL,
         p_groupName     VARCHAR2    DEFAULT NULL,
         p_syncLevel     PLS_INTEGER DEFAULT logLevelError) RETURN NUMBER;
-
     FUNCTION  SERVER_NEW_SESSION(
         p_processName   VARCHAR2,
         p_groupName     VARCHAR2    DEFAULT NULL,
@@ -152,7 +187,6 @@ create or replace PACKAGE LILAM AS
         p_baselineScope VARCHAR2    DEFAULT NULL,
         p_syncLevel     PLS_INTEGER DEFAULT logLevelError) RETURN NUMBER;
     FUNCTION  SERVER_NEW_SESSION_JSON(p_jsonObject JSON_OBJ_LILAM) RETURN NUMBER;
-
     PROCEDURE CLOSE_SESSION(
         p_processId     NUMBER,
         p_processInfo   VARCHAR2    DEFAULT NULL,
@@ -213,8 +247,8 @@ create or replace PACKAGE LILAM AS
     PROCEDURE SERVER_UPDATE_RULES(p_groupName VARCHAR2, p_ruleSetName VARCHAR2, p_ruleSetVersion PLS_INTEGER);
     -- Check a rule set without storing or activating it: NULL = valid, otherwise the reason (never raises)
     FUNCTION CHECK_RULE_SET(p_ruleSet CLOB) RETURN VARCHAR2;
-    -- Dispatcher of this session. Default: used for NEW_SESSION without group or of the dispatcher's group (registry),
-    -- other groups go to their own servers; p_groupName = group: only for NEW_SESSION of this group; p_pipeName NULL removes it
+    -- Dispatcher of this session. Default: used for NEW_PROCESS without group or of the dispatcher's group (registry),
+    -- other groups go to their own servers; p_groupName = group: only for NEW_PROCESS of this group; p_pipeName NULL removes it
     PROCEDURE SET_DISPATCHER_PIPE(p_pipeName varchar2, p_groupName varchar2 DEFAULT 'DEFAULT_DISPATCHER', p_processId number DEFAULT null);
 
 

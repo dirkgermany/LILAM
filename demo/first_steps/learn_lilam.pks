@@ -2,13 +2,13 @@ create or replace PACKAGE LEARN_LILAM as
 
     -- First steps
     procedure simple_sample;
-    -- Start session, stop session
+    -- Start process, close process
     procedure begin_and_end_with_steps;
-    -- Start session, increment steps, write number of completed steps to dbms_output, stop session
+    -- Start process, increment steps, write number of completed steps to dbms_output, close process
     procedure increment_steps_and_monitor;
-    -- Start session with initial data, return data, stop session
+    -- Start process with initial data, return data, close process
     -- This function can be used within a select statement:
-    -- "select learn_lila.print_process_infos from dual;"
+    -- "select learn_lilam.print_process_infos from dual;"
     function print_process_infos return varchar2;
     
 end LEARN_LILAM;

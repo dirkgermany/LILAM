@@ -26,7 +26,7 @@ declare
     function run(p_group varchar2, p_action varchar2, p_n pls_integer) return number is
         l_p number; l_s timestamp; l_r number;
     begin
-        l_p := lilam.new_session('LT_INS_LAT', p_baselineScope => '#NONE', p_groupName => p_group);
+        l_p := lilam.new_process('LT_INS_LAT', p_baselineScope => '#NONE', p_groupName => p_group);
         lilam.trace_start(l_p, p_action); lilam.trace_stop(l_p, p_action);
         l_s := systimestamp;
         for i in 1 .. p_n loop
@@ -34,7 +34,7 @@ declare
             lilam.trace_stop(l_p, p_action);
         end loop;
         l_r := us(l_s) / p_n;
-        lilam.close_session(l_p);
+        lilam.close_process(l_p);
         return l_r;
     end;
     procedure add(p in out t_num, v number) is begin p.extend; p(p.last) := v; end;
@@ -59,22 +59,22 @@ begin
 
     -- erstes Laden einer neuen Gruppe (LT_INS_Q) in dieser DB-Session
     l_t0 := systimestamp;
-    l_p  := lilam.new_session('LT_INS_LOAD', p_baselineScope => '#NONE', p_groupName => 'LT_INS_Q');
-    dbms_output.put_line('NEW_SESSION mit erstem Laden (52 Regeln): ' || round(us(l_t0)) || ' us');
-    lilam.close_session(l_p);
+    l_p  := lilam.new_process('LT_INS_LOAD', p_baselineScope => '#NONE', p_groupName => 'LT_INS_Q');
+    dbms_output.put_line('NEW_PROCESS mit erstem Laden (52 Regeln): ' || round(us(l_t0)) || ' us');
+    lilam.close_process(l_p);
 
-    -- NEW_SESSION ohne/mit (geladener) Gruppe, je 20 abwechselnd
+    -- NEW_PROCESS ohne/mit (geladener) Gruppe, je 20 abwechselnd
     for i in 1 .. 20 loop
         l_t0 := systimestamp;
-        l_p  := lilam.new_session('LT_INS_LOAD', p_baselineScope => '#NONE');
+        l_p  := lilam.new_process('LT_INS_LOAD', p_baselineScope => '#NONE');
         add(v_s0, us(l_t0));
-        lilam.close_session(l_p);
+        lilam.close_process(l_p);
         l_t0 := systimestamp;
-        l_p  := lilam.new_session('LT_INS_LOAD', p_baselineScope => '#NONE', p_groupName => 'LT_INS_Q');
+        l_p  := lilam.new_process('LT_INS_LOAD', p_baselineScope => '#NONE', p_groupName => 'LT_INS_Q');
         add(v_s1, us(l_t0));
-        lilam.close_session(l_p);
+        lilam.close_process(l_p);
     end loop;
-    dbms_output.put_line('NEW_SESSION Median: ohne Gruppe ' || med(v_s0) || ' us | mit geladener Gruppe ' || med(v_s1) || ' us');
+    dbms_output.put_line('NEW_PROCESS Median: ohne Gruppe ' || med(v_s0) || ' us | mit geladener Gruppe ' || med(v_s1) || ' us');
 
     select count(*) into l_alerts0 from lilam_alerts where group_name = 'LT_INS_P' and rule_id = 'F1';
     for i_r in 1 .. R loop

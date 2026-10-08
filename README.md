@@ -24,11 +24,11 @@ LILAM is developed by a developer who hates over-engineered tools. Focus: 5 minu
   DECLARE
     l_pid NUMBER;
   BEGIN
-    l_pid := lilam.new_session('IMPORT_CUSTOMERS', lilam.logLevelInfo);
+    l_pid := lilam.new_process('IMPORT_CUSTOMERS', lilam.logLevelInfo);
     lilam.info(l_pid, 'Import started');
     -- your business logic
     lilam.info(l_pid, 'Import finished');
-    lilam.close_session(l_pid);
+    lilam.close_process(l_pid);
   END;
   /
 
@@ -63,9 +63,9 @@ LILAM is developed by a developer who hates over-engineered tools. Focus: 5 minu
     DECLARE
       l_pid NUMBER;
     BEGIN
-      l_pid := lilam.new_session('MY_PROCESS');
+      l_pid := lilam.new_process('MY_PROCESS');
       lilam.warn(l_pid, 'Hello LILAM');
-      lilam.close_session(l_pid);
+      lilam.close_process(l_pid);
     END;
     /
     ```
@@ -162,16 +162,16 @@ LILAM introduces a high-performance Client-Server architecture using **Oracle Pi
 
 #### How it works
 LILAM offers two execution models that can be used interchangeably:
-1. **In-Session Mode (Direct):** Initiated by `lilam.new_session`. LILAM acts as embedded library, Log and Metric calls are executed immediately within your current database session. This is ideal for straightforward debugging and ensuring data is persisted synchronously.
+1. **In-Session Mode (Direct):** Initiated by `lilam.new_process`. LILAM acts as embedded library, Log and Metric calls are executed immediately within your current database session. This is ideal for straightforward debugging and ensuring data is persisted synchronously.
 2. **Decoupled Mode (Server-based):**
    In this mode, LILAM decouples the request from the execution. It acts as a proxy within the application session, offloading the heavy lifting to dedicated background worker processes. 
    * **Server Side:** Launch one or more LILAM servers using `lilam.start_server('PIPE_NAME', 'GROUP_NAME', 'PASSWORD');` (or `lilam.create_server(...)` to run them as scheduler jobs). Each server listens on its own pipe and registers under a group name. You can scale by running multiple servers in the same group or use different groups for logical separation.
-   * **Client Side:** Register via `lilam.server_new_session('PROCESS_NAME', 'GROUP_NAME');`. LILAM automatically selects an available server of that group (or any available server if no group is given).
+   * **Client Side:** Register via `lilam.server_new_process('PROCESS_NAME', 'GROUP_NAME');`. LILAM automatically selects an available server of that group (or any available server if no group is given).
    * **Execution:** Log calls are serialized into a pipe and processed by the background server, minimizing the impact on your transaction time.
   
 > [!IMPORTANT]
 > **Unified API:** Regardless of the chosen mode, the logging API remains **identical**. You use the same `lilam.log(...)` calls throughout your application.
-> The only difference is the initial setup (`lilam.new_session` for In-Session mode vs. `lilam.server_new_session` for Decoupled mode).
+> The only difference is the initial setup (`lilam.new_process` for In-Session mode vs. `lilam.server_new_process` for Decoupled mode).
 
 ### Performance & Safety
 LILAM prioritizes the stability of your application. It uses a Hybrid Model to balance speed and system integrity:
@@ -180,7 +180,7 @@ LILAM prioritizes the stability of your application. It uses a Hybrid Model to b
 * As an optional safeguard, LILAM rate-limits hyperactive clients during load peaks to prevent pipe flooding until the bottleneck is cleared.
 
 > [!IMPORTANT]
-> **Buffering means write latency.** Only entries up to the **sync level** of a process (`p_syncLevel`, default `ERROR`) are written synchronously: they are committed before the call returns, in In-Session and in Decoupled mode (there the client additionally writes them into `LILAM_LOG` of its schema as a safety net). All other entries, metrics and status updates stay in memory for up to about 1.5 seconds (longer if the session makes no further LILAM call). If a session dies without `CLOSE_SESSION` or `FLUSH`, these entries are lost.
+> **Buffering means write latency.** Only entries up to the **sync level** of a process (`p_syncLevel`, default `ERROR`) are written synchronously: they are committed before the call returns, in In-Session and in Decoupled mode (there the client additionally writes them into `LILAM_LOG` of its schema as a safety net). All other entries, metrics and status updates stay in memory for up to about 1.5 seconds (longer if the session makes no further LILAM call). If a session dies without `CLOSE_PROCESS` or `FLUSH`, these entries are lost.
 > Details, measurements and failure scenarios: [When Is a Log Entry Stored?](docs/architecture%20and%20concepts.md#when-is-a-log-entry-stored-sync-level)
 
 ### Technology
@@ -260,25 +260,25 @@ To illustrate how LILAM works, imagine monitoring a subway system:
 ```sql
   l_processId NUMBER;
 ```
-#### Open Session (begin Process) and set Session values
+#### Start the Process and set Process values
 ```sql
-  -- Start the mission (as a new Process/Session.
+  -- Start the mission as a new process.
   -- This and all other calls return in microseconds, as the LILAM proxy instantly offloads the workload to the asynchronous worker.
   -- Optional group-based isolation: LILAM servers can be assigned to specific groups to ensure strict workload isolation
-  l_processId := lilam.server_new_session(p_processName => 'TRACK_LINE_4', p_groupName => 'UNDERGROUND_MONITORING', p_logLevel => lilam.logLevelMonitor);
+  l_processId := lilam.server_new_process(p_processName => 'TRACK_LINE_4', p_groupName => 'UNDERGROUND_MONITORING', p_logLevel => lilam.logLevelMonitor);
 
   -- set number of steps this mission needs to be finished correctly
   -- in our sample there are only two steps: leaving station and arriving station
-  lilam.set_steps_todo(p_processId => l_processId, p_stepsToDo => 2);
+  lilam.set_proc_steps_todo(p_processId => l_processId, p_procStepsToDo => 2);
   
   -- leave station
-  lilam.step_done(p_processId => l_processId); -- increments step-counter into `1`
+  lilam.proc_step_done(p_processId => l_processId); -- increments step-counter into `1`
 ```
 
 #### Monitor Action (Metric) and Log
 ```sql
   -- doors must be closed (Event)
-  lilam.mark_event(p_processId => l_processId, p_actionName => 'CLOSE_DOOR', p_contextName => 'STATION_ID_400);
+  lilam.mark_event(p_processId => l_processId, p_actionName => 'CLOSE_DOOR', p_contextName => 'STATION_ID_400');
 
   -- log travel start
   lilam.info(p_processId => l_processId, p_logText => 'Line 4 leaving base');
@@ -291,12 +291,12 @@ To illustrate how LILAM works, imagine monitoring a subway system:
   dbms_session.sleep(30); -- the train needed 30 seconds
   lilam.trace_stop(p_processId => l_processId, p_actionName => 'TRACK_SECTION', p_contextName => 'SECTION_ID_402');
 ```
-#### Close Session (end Process)
+#### Close the Process
 ```sql
   -- the mission of line is very! short - only one section; so the mission ends here
-  --   !  missed code: lilam.step_done(p_processId => l_processId); -- increments step-counter into `2`
+  --   !  missed code: lilam.proc_step_done(p_processId => l_processId); -- increments step-counter into `2`
   lilam.info(p_processId => l_processId, p_logText => 'Line 4 is back');
-  lilam.close_session(p_processId => l_processId);
+  lilam.close_process(p_processId => l_processId);
 
   -- the step-counter still is `1`. If there was an implemented rule-set which awaits 2 steps
   -- at the end of mission, LILAM would raise an `ALERT`
@@ -392,7 +392,7 @@ This project is dual-licensed:
     * switch to the next available server or
     * graceful degradation from Decoupled to  mode
 - [ ] **Process Resumption:** Reconnect to aborted processes via `process_id`
-- [X] **Retention:** Session data can be protected from deletion using the 'immortal' flag
+- [X] **Retention:** Process data can be protected from deletion using the 'immortal' flag
 - [ ] **Adaptive Batching:** Dynamically adjust buffer sizes and flush intervals based on server load to ensure near real-time visibility during low traffic and maximum throughput during peaks
 - [ ] **Zombie Session Handling:** Detect inactive clients, release allocated memory, and update process statuses automatically
 - [ ] **Singleton Server Enforcement:** Prevent multiple servers from registering under the same name to ensure message integrity and avoid process contention

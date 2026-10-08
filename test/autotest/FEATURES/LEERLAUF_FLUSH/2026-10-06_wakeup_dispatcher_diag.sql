@@ -50,7 +50,7 @@ begin
     -- Prozess anlegen (frische Session, ueber den Dispatcher)
     lt.run_job('LT_CWK_' || l_run || '_A' || rep,
       'declare l_pid number; begin lilam.set_dispatcher_pipe(''' || lt.c_disp_pipe || '''); '
-      || 'l_pid := lilam.server_new_session(p_processName => ''LT_' || l_run || '_WK'', p_groupName => ''' || lt.c_group || ''', '
+      || 'l_pid := lilam.server_new_process(p_processName => ''LT_' || l_run || '_WK'', p_groupName => ''' || lt.c_group || ''', '
       || 'p_logLevel => lilam.logLevelInfo); lilam.info(l_pid, ''start''); '
       || 'lt.metric(' || l_run || ', ''wk_pid_' || rep || ''', l_pid); end;');
     l_ok := lt.wait_jobs('LT_CWK_' || l_run || '_A' || rep, 60);
@@ -90,7 +90,7 @@ begin
 
     l_ok := lt.wait_jobs('LT_CWK_' || l_run || '_B' || rep, 30);
     lt.run_job('LT_CWK_' || l_run || '_C' || rep,
-      'begin lilam.set_dispatcher_pipe(''' || lt.c_disp_pipe || '''); lilam.close_session(' || l_pid || '); end;');
+      'begin lilam.set_dispatcher_pipe(''' || lt.c_disp_pipe || '''); lilam.close_process(' || l_pid || '); end;');
     l_ok := lt.wait_jobs('LT_CWK_' || l_run || '_C' || rep, 30);
     dbms_session.sleep(2);
   end loop;

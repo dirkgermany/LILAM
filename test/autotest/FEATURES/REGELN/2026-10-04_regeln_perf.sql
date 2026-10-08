@@ -104,7 +104,7 @@ begin
         l_prefix varchar2(30) := 'LT_RP_' || l_names(v) || '_' || r;
         l_alerts number;
       begin
-        l_pid := lilam.server_new_session(l_prefix, 'LT', lilam.logLevelInfo);
+        l_pid := lilam.server_new_process(l_prefix, 'LT', lilam.logLevelInfo);
         lilam.server_update_rules(l_pid, c_set, v);
         dbms_session.sleep(1);
         l_int0 := systimestamp;
@@ -117,7 +117,7 @@ begin
           l_ms := lt.wait_count(l_prefix, 'EVENT', c_n, 180);
         end if;
         if l_ms >= 0 then l_ms := lt.ms_since(l_t0); end if;
-        lilam.close_session(l_pid);
+        lilam.close_process(l_pid);
         select count(*) into l_alerts from lilam_alerts where process_name = l_prefix;
         dbms_output.put_line(rpad(l_names(v), 12) || rpad(r, 6) || lpad(round(l_ms), 9)
                              || lpad(case when l_ms > 0 then round(l_ms * 1000 / c_n, 1) end, 11)

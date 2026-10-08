@@ -9,7 +9,7 @@
 --   GP/DU/OC/AV  MAX_GAP_SECONDS (Events, TRACE_START, Dezimalwert), MAX_DURATION_MS, MAX_OCCURRENCE,
 --          AVG_DEVIATION_PCT nach Warm-up; AV-02 Durchschnitt unter 1 ms wird nicht ausgewertet (feste Zeitstempel)
 --   PR     Prozess-Regeln: ON_START, STATUS_EQUALS, INFO_CONTAINS, MAX_OCCURRENCE, STEPS_LEFT_HIGH,
---          SUCCESS_RATE_LOW (Endstand aus CLOSE_SESSION), RUNTIME_EXCEEDED, MAX_RUNTIME_EXCEEDED
+--          SUCCESS_RATE_LOW (Endstand aus CLOSE_PROCESS), RUNTIME_EXCEEDED, MAX_RUNTIME_EXCEEDED
 --   LG     zwei SEVERITY-Regeln, viele nicht passende Logs
 --   LC     LOG_CONTAINS ohne Level (LC-01) und mit Level ERROR|TEXT (LC-02)
 --   KX/TF/TH  Kontext- und Action-Regel, Trigger-Filter, Drosselung

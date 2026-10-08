@@ -9,14 +9,14 @@ declare
 
     procedure run_app(p_runs pls_integer, p_sleep number) is
     begin
-        l_pid := LILAM.NEW_SESSION('App 1');                -- Scope = 'APP 1' (Default)
+        l_pid := LILAM.NEW_PROCESS('App 1');                -- Scope = 'APP 1' (Default)
         for i in 1 .. p_runs loop
             LILAM.TRACE_START(l_pid, 'TOR 1 BEWEGEN');
             dbms_session.sleep(p_sleep);
             LILAM.TRACE_STOP(l_pid, 'TOR 1 BEWEGEN');
         end loop;
         dbms_output.put_line('pid=' || l_pid || ' avg=' || LILAM.GET_METRIC_AVG_DURATION(l_pid, 'TOR 1 BEWEGEN'));
-        LILAM.CLOSE_SESSION(l_pid);                         -- erzwingt Abgleich mit LILAM_BASELINES
+        LILAM.CLOSE_PROCESS(l_pid);                         -- erzwingt Abgleich mit LILAM_BASELINES
     end;
 begin
     -- drei Neustarts mit je zwei Messungen => Baseline zählt 6 Messungen
@@ -26,14 +26,14 @@ begin
 
     -- Gegenprobe: ohne Scope
     declare
-        l_init LILAM.t_session_init;
+        l_init LILAM.t_process_init;
     begin
         l_init.processName   := 'App 1';
         l_init.baselineScope := '#NONE';
-        l_pid := LILAM.NEW_SESSION(l_init);
+        l_pid := LILAM.NEW_PROCESS(l_init);
         LILAM.TRACE_START(l_pid, 'TOR 1 BEWEGEN');
         LILAM.TRACE_STOP(l_pid, 'TOR 1 BEWEGEN');
-        LILAM.CLOSE_SESSION(l_pid);
+        LILAM.CLOSE_PROCESS(l_pid);
     end;
 end;
 /

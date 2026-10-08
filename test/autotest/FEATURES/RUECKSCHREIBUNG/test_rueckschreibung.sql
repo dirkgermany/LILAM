@@ -1,7 +1,7 @@
 -- =====================================================================
 -- LILAM Test: FEATURES / RUECKSCHREIBUNG
 --
--- Prueft, dass Daten reiner Monitoring-Prozesse (ohne Log-Aufruf) schon vor CLOSE_SESSION in den
+-- Prueft, dass Daten reiner Monitoring-Prozesse (ohne Log-Aufruf) schon vor CLOSE_PROCESS in den
 -- Tabellen stehen. Je Modus (INSESSION, SERVER) vier Prozesse: ein Aufruf, Pause 2 s, ein weiterer Aufruf;
 -- danach liest ein Job aus fremder Session den Tabellenstand:
 --   R1  nur Traces (TRACE_START/TRACE_STOP): beide Traces in LILAM_MON
@@ -12,7 +12,7 @@
 --       im Puffer - es gibt keinen Timer
 --   R6  INSESSION: FLUSH schreibt sofort (auch in der 500-ms-Sperre), der Prozess bleibt offen
 --   R7  INSESSION: FLUSH per CALL_BY_JSON; der Prozess zaehlt nach dem FLUSH weiter (ACTION_COUNT)
---   R8  INSESSION: nach CLOSE_SESSION sind alle Traces geschrieben, der Prozess ist geschlossen
+--   R8  INSESSION: nach CLOSE_PROCESS sind alle Traces geschrieben, der Prozess ist geschlossen
 --   R9  keine internen LILAM-Fehler
 -- Der Test startet und stoppt seinen Server selbst (LT_S1). Bei Erfolg werden die Testdaten geloescht.
 --

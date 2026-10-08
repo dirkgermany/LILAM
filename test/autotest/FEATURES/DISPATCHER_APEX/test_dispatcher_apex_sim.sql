@@ -7,13 +7,13 @@
 -- (Ersatz fuer ein APEX Application Item).
 --
 -- Ablauf (2 Worker LT_S1/LT_S2 + Dispatcher LT_DISP, Gruppe LT):
---   R0      Seitenaufbau: SERVER_NEW_SESSION ueber den Dispatcher
+--   R0      Seitenaufbau: SERVER_NEW_PROCESS ueber den Dispatcher
 --   R1/R2   TRACE_START und TRACE_STOP in zwei verschiedenen Requests (1 s Abstand)
 --   R3-R8   6 parallele AJAX-Requests (Event, Trace, PROC_STEP_DONE, INFO)
 --   RNEG    Request ohne Dispatcher-Konfiguration -> muss still ignoriert werden
 --   RLONG   Logtext mit 1.500 Zeichen ueber Dispatcher
---   R9      CLOSE_SESSION
---   RSTALE  Request mit der veralteten process_id nach CLOSE_SESSION (mit Dispatcher)
+--   R9      CLOSE_PROCESS
+--   RSTALE  Request mit der veralteten process_id nach CLOSE_PROCESS (mit Dispatcher)
 --           -> still ignoriert, ohne Wartezeit, keine weiteren Daten
 --
 -- Voraussetzungen: LILAM installiert, _COMMON/01_install_testbasis.sql
@@ -57,7 +57,7 @@ begin
     end if;
 
     if p_kind = 'PAGE_LOAD' then
-        l_pid := lilam.server_new_session(p_processName => 'LT_' || l_run || '_APEX', p_groupName => 'LT',
+        l_pid := lilam.server_new_process(p_processName => 'LT_' || l_run || '_APEX', p_groupName => 'LT',
                                           p_logLevel => lilam.logLevelDebug);
         merge into lt_sim_ctx c using (select 'PID' k, l_pid v from dual) s
            on (c.ctx_key = s.k)
@@ -85,7 +85,7 @@ begin
                 lilam.info(l_pid, p_step || ': ' || rpad('x', 1500, 'x'));
             when 'CLOSE' then
                 lilam.info(l_pid, p_step || ': close');
-                lilam.close_session(l_pid, 'closed by ' || p_step, 1);
+                lilam.close_process(l_pid, 'closed by ' || p_step, 1);
         end case;
     end if;
 
@@ -183,7 +183,7 @@ begin
   select count(*) into l_cnt from lilam_process_route where process_id = l_pid;
   lt.check_that(l_run, 'Route nach CLOSE entfernt', l_cnt = 0, l_cnt);
 
-  -- veraltete process_id nach CLOSE_SESSION
+  -- veraltete process_id nach CLOSE_PROCESS
   select count(*) into l_cnt from lilam_log where process_id = l_pid and info like 'RSTALE%';
   lt.check_that(l_run, 'Veraltete ID nach CLOSE: keine weiteren Daten', l_cnt = 0, l_cnt);
   select round(extract(second from (ts_end - ts_start)) * 1000 + extract(minute from (ts_end - ts_start)) * 60000)

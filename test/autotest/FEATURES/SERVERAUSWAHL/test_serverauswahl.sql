@@ -29,14 +29,14 @@ declare
     return 'declare l_pid number; l_route varchar2(100); begin '
       || case when p_dispatcher then 'lilam.set_dispatcher_pipe(''' || lt.c_disp_pipe || '''); ' end
       || 'for i in 1 .. ' || c_procs || ' loop '
-      || '  l_pid := lilam.server_new_session(p_processName => ''' || l_prefix || '_' || p_tag || ''', '
+      || '  l_pid := lilam.server_new_process(p_processName => ''' || l_prefix || '_' || p_tag || ''', '
       || '                                    p_groupName => ''' || lt.c_group || ''', p_logLevel => lilam.logLevelInfo); '
       || '  lt.joblog(' || l_run || ', i, ''PIPE_' || p_tag || ''', lilam.get_server_pipe(l_pid)); '
       || '  begin select pipe_name into l_route from lilam_process_route where process_id = l_pid; '
       || '  exception when no_data_found then l_route := ''(keine)''; end; '
       || '  lt.joblog(' || l_run || ', i, ''ROUTE_' || p_tag || ''', l_route); '
       || '  lilam.info(l_pid, ''' || p_tag || ' '' || i); '
-      || '  lilam.close_session(l_pid); '
+      || '  lilam.close_process(l_pid); '
       || 'end loop; '
       || 'exception when others then lt.joblog(' || l_run || ', 0, ''ERROR'', sqlerrm || '' | '' || dbms_utility.format_error_backtrace); '
       || 'end;';

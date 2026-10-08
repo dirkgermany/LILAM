@@ -51,7 +51,7 @@ Rules define how LILAM validates incoming signals. Each rule names the signal ty
 Rules are organized into Rule Sets, stored as JSON documents in the `LILAM_RULES` table. A rule set consists of a header and an array of rules.
 
 > [!IMPORTANT]
-> Rules are evaluated by LILAM **servers** of the group (dispatchers do not evaluate rules) and by INSESSION processes started with `NEW_SESSION(..., p_groupName => ...)`. INSESSION processes without a group have no rules. See [Rules in INSESSION Mode](../docs/architecture%20and%20concepts.md#rules-in-insession-mode).
+> Rules are evaluated by LILAM **servers** of the group (dispatchers do not evaluate rules) and by INSESSION processes started with `NEW_PROCESS(..., p_groupName => ...)`. INSESSION processes without a group have no rules. See [Rules in INSESSION Mode](../docs/architecture%20and%20concepts.md#rules-in-insession-mode).
 
 ### Rule Set Structure
 | Property | Type | Required | Description
@@ -103,9 +103,9 @@ To check a rule set before storing or activating it, call `LILAM.CHECK_RULE_SET(
 ### Hooks / Trigger Types
 | hook | scope | API call
 | :-- | :-- | :--
-| PROCESS_START | Process | `NEW_SESSION` / `SERVER_NEW_SESSION`
+| PROCESS_START | Process | `NEW_PROCESS` / `SERVER_NEW_PROCESS`
 | PROCESS_UPDATE | Process | `SET_PROCESS_STATUS`, `SET_PROC_STEPS_TODO`, `SET_PROC_STEPS_DONE`, `PROC_STEP_DONE`, ...
-| PROCESS_STOP | Process | `CLOSE_SESSION` (sees the values passed to `CLOSE_SESSION`)
+| PROCESS_STOP | Process | `CLOSE_PROCESS` (sees the values passed to `CLOSE_PROCESS`)
 | MARK_EVENT | Event | `MARK_EVENT`
 | TRACE_START, TRACE_STOP | Transaction | `TRACE_START`, `TRACE_STOP`
 | LOGGING | Logging | `ERROR`, `WARN`, `INFO`, `DEBUG`, ...
@@ -138,11 +138,11 @@ Rules on `MARK_EVENT` and `TRACE_STOP` are only evaluated if the log level of th
 
 ---
 ## Table: LILAM_RULES
-This table serves as the central repository for all rule sets. Each rule set is stored as a versioned JSON document for a **group** (server group or `p_groupName` of `NEW_SESSION`); the same rule set may be stored for several groups. Per group exactly one row is active.
+This table serves as the central repository for all rule sets. Each rule set is stored as a versioned JSON document for a **group** (server group or `p_groupName` of `NEW_PROCESS`); the same rule set may be stored for several groups. Per group exactly one row is active.
 
 | Column | Type | Description |
 | :--- | :--- | :--- |
-| **GROUP_NAME** | `VARCHAR2(50)` | Group the rule set belongs to (server group or `p_groupName` of `NEW_SESSION`); required. |
+| **GROUP_NAME** | `VARCHAR2(50)` | Group the rule set belongs to (server group or `p_groupName` of `NEW_PROCESS`); required. |
 | **SET_NAME** | `VARCHAR2(30)` | Name of the rule set; required. `GROUP_NAME` (without regard to case), `SET_NAME` and `VERSION` together are unique. |
 | **VERSION** | `NUMBER` | Whole-number version to support testing, staging, and rollbacks; required. |
 | **IS_ACTIVE** | `NUMBER(1)` | `1` for the rule set the servers and INSESSION processes of the group use (at most one per group), otherwise `0`. |
