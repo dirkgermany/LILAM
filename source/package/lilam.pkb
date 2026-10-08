@@ -239,6 +239,8 @@ AS
         wm_proc  sys.odcinumberlist   := sys.odcinumberlist()
     );
     g_watermark_batch t_watermark_batch_rec;
+    -- Failover fencing: processes of this worker that another worker has taken over (see fenceBatches)
+    TYPE t_lost_pids IS TABLE OF BOOLEAN INDEX BY PLS_INTEGER;
 
     TYPE t_throttle_stat IS RECORD (
         msg_count  PLS_INTEGER := 0,
@@ -555,6 +557,7 @@ AS
     function serverFailed(p_processId number) return boolean;
     procedure checkServerAfterTimeout(p_processId number);
     function failoverProcess(p_processId number) return boolean;
+    PROCEDURE clearAllSessionData(p_processId NUMBER);
     ------------------------------------------------------------------------
     
     ---------------------------------------------------------------
@@ -4540,6 +4543,196 @@ AS
     end;
 
     --------------------------------------------------------------------------
+    -- Failover fencing: a worker that was considered failed (e.g. only stalled) must not write
+    -- processes another worker has taken over; the new worker writes them from the clients' replay.
+    -- flushBatch locks the routes of the processes in the batch. claimRoute (ADOPT_PROCESS) waits for
+    -- this lock, so data and watermarks of the old worker are either committed before the takeover
+    -- (and the new worker loads these watermarks) or not written at all.
+    --------------------------------------------------------------------------
+    procedure fenceBatches(p_lost out t_lost_pids)
+    as
+        l_pids   sys.odcinumberlist := sys.odcinumberlist();
+        l_seen   t_lost_pids;
+        l_route  sys.odcinumberlist;
+        l_pipes  sys.odcivarchar2list;
+        l_key    varchar2(150);
+        l_log    t_log_batch_rec;
+        l_mon    t_mon_batch_rec;
+        l_proc   t_proc_batch_rec;
+        l_wm     t_watermark_batch_rec;
+
+        procedure addPid(p_pid number) is
+        begin
+            if p_pid is not null and not l_seen.EXISTS(p_pid) then
+                l_seen(p_pid) := TRUE;
+                l_pids.EXTEND;
+                l_pids(l_pids.LAST) := p_pid;
+            end if;
+        end;
+    begin
+        -- Only workers: INSESSION has no routes, the dispatcher writes no process data
+        if g_serverPipeName is null or g_serverIsDispatcher then
+            return;
+        end if;
+
+        l_key := g_log_batches.FIRST;
+        while l_key is not null loop
+            for i in 1 .. g_log_batches(l_key).pids.COUNT loop addPid(g_log_batches(l_key).pids(i)); end loop;
+            l_key := g_log_batches.NEXT(l_key);
+        end loop;
+        l_key := g_mon_batches.FIRST;
+        while l_key is not null loop
+            for i in 1 .. g_mon_batches(l_key).pids.COUNT loop addPid(g_mon_batches(l_key).pids(i)); end loop;
+            l_key := g_mon_batches.NEXT(l_key);
+        end loop;
+        l_key := g_proc_batches.FIRST;
+        while l_key is not null loop
+            for i in 1 .. g_proc_batches(l_key).ids.COUNT loop addPid(g_proc_batches(l_key).ids(i)); end loop;
+            l_key := g_proc_batches.NEXT(l_key);
+        end loop;
+        for i in 1 .. g_watermark_batch.pids.COUNT loop addPid(g_watermark_batch.pids(i)); end loop;
+        if l_pids.COUNT = 0 then
+            return;
+        end if;
+
+        -- PERFORMANCE: one statement per flush (primary key); the lock is released by the flush commit.
+        -- A process without a route (already closed) still belongs to this worker.
+        begin
+            execute immediate 'select process_id, pipe_name from ' || C_LILAM_PROCESS_ROUTE || '
+                               where process_id in (select column_value from table(:1))
+                               for update'
+                bulk collect into l_route, l_pipes using l_pids;
+        exception
+            when others then
+                if sqlcode != -942 then   -- no route table: no failover possible
+                    logLilamErr(sqlCode, sqlErrM, 'fenceBatches');
+                end if;
+                return;
+        end;
+        for i in 1 .. l_route.COUNT loop
+            if upper(l_pipes(i)) != upper(g_serverPipeName) then
+                p_lost(l_route(i)) := TRUE;
+            end if;
+        end loop;
+        if p_lost.COUNT = 0 then
+            return;   -- normal case
+        end if;
+
+        -- Rare: rebuild the batches without the lost processes
+        l_key := g_log_batches.FIRST;
+        while l_key is not null loop
+            l_log := null;
+            l_log.pids := sys.odcinumberlist(); l_log.seqs := sys.odcinumberlist(); l_log.levels := sys.odcinumberlist();
+            l_log.levelsC := sys.odcivarchar2list(); l_log.texts := sys.odcivarchar2list(); l_log.times := t_timestamp_list_t();
+            l_log.callers := sys.odcivarchar2list(); l_log.stacks := sys.odcivarchar2list();
+            l_log.backtraces := sys.odcivarchar2list(); l_log.callstacks := sys.odcivarchar2list();
+            for i in 1 .. g_log_batches(l_key).pids.COUNT loop
+                if not p_lost.EXISTS(g_log_batches(l_key).pids(i)) then
+                    l_log.pids.EXTEND;       l_log.pids(l_log.pids.LAST)             := g_log_batches(l_key).pids(i);
+                    l_log.seqs.EXTEND;       l_log.seqs(l_log.seqs.LAST)             := g_log_batches(l_key).seqs(i);
+                    l_log.levels.EXTEND;     l_log.levels(l_log.levels.LAST)         := g_log_batches(l_key).levels(i);
+                    l_log.levelsC.EXTEND;    l_log.levelsC(l_log.levelsC.LAST)       := g_log_batches(l_key).levelsC(i);
+                    l_log.texts.EXTEND;      l_log.texts(l_log.texts.LAST)           := g_log_batches(l_key).texts(i);
+                    l_log.times.EXTEND;      l_log.times(l_log.times.LAST)           := g_log_batches(l_key).times(i);
+                    l_log.callers.EXTEND;    l_log.callers(l_log.callers.LAST)       := g_log_batches(l_key).callers(i);
+                    l_log.stacks.EXTEND;     l_log.stacks(l_log.stacks.LAST)         := g_log_batches(l_key).stacks(i);
+                    l_log.backtraces.EXTEND; l_log.backtraces(l_log.backtraces.LAST) := g_log_batches(l_key).backtraces(i);
+                    l_log.callstacks.EXTEND; l_log.callstacks(l_log.callstacks.LAST) := g_log_batches(l_key).callstacks(i);
+                end if;
+            end loop;
+            g_log_batches(l_key) := l_log;
+            l_key := g_log_batches.NEXT(l_key);
+        end loop;
+
+        l_key := g_mon_batches.FIRST;
+        while l_key is not null loop
+            l_mon := null;
+            l_mon.pids := sys.odcinumberlist(); l_mon.actions := sys.odcivarchar2list(); l_mon.contexts := sys.odcivarchar2list();
+            l_mon.mon_types := sys.odcinumberlist(); l_mon.action_count := sys.odcinumberlist(); l_mon.used := sys.odcinumberlist();
+            l_mon.avgs := sys.odcinumberlist(); l_mon.timesStart := t_timestamp_list_t(); l_mon.timesStop := t_timestamp_list_t();
+            for i in 1 .. g_mon_batches(l_key).pids.COUNT loop
+                if not p_lost.EXISTS(g_mon_batches(l_key).pids(i)) then
+                    l_mon.pids.EXTEND;         l_mon.pids(l_mon.pids.LAST)                 := g_mon_batches(l_key).pids(i);
+                    l_mon.actions.EXTEND;      l_mon.actions(l_mon.actions.LAST)           := g_mon_batches(l_key).actions(i);
+                    l_mon.contexts.EXTEND;     l_mon.contexts(l_mon.contexts.LAST)         := g_mon_batches(l_key).contexts(i);
+                    l_mon.mon_types.EXTEND;    l_mon.mon_types(l_mon.mon_types.LAST)       := g_mon_batches(l_key).mon_types(i);
+                    l_mon.action_count.EXTEND; l_mon.action_count(l_mon.action_count.LAST) := g_mon_batches(l_key).action_count(i);
+                    l_mon.used.EXTEND;         l_mon.used(l_mon.used.LAST)                 := g_mon_batches(l_key).used(i);
+                    l_mon.avgs.EXTEND;         l_mon.avgs(l_mon.avgs.LAST)                 := g_mon_batches(l_key).avgs(i);
+                    l_mon.timesStart.EXTEND;   l_mon.timesStart(l_mon.timesStart.LAST)     := g_mon_batches(l_key).timesStart(i);
+                    l_mon.timesStop.EXTEND;    l_mon.timesStop(l_mon.timesStop.LAST)       := g_mon_batches(l_key).timesStop(i);
+                end if;
+            end loop;
+            g_mon_batches(l_key) := l_mon;
+            l_key := g_mon_batches.NEXT(l_key);
+        end loop;
+
+        l_key := g_proc_batches.FIRST;
+        while l_key is not null loop
+            l_proc := null;
+            l_proc.ids := sys.odcinumberlist(); l_proc.status := sys.odcinumberlist(); l_proc.procEnd := t_timestamp_list_t();
+            l_proc.stepsTodo := sys.odcinumberlist(); l_proc.stepsDone := sys.odcinumberlist();
+            l_proc.info := sys.odcivarchar2list(); l_proc.immortal := sys.odcinumberlist();
+            for i in 1 .. g_proc_batches(l_key).ids.COUNT loop
+                if not p_lost.EXISTS(g_proc_batches(l_key).ids(i)) then
+                    l_proc.ids.EXTEND;       l_proc.ids(l_proc.ids.LAST)             := g_proc_batches(l_key).ids(i);
+                    l_proc.status.EXTEND;    l_proc.status(l_proc.status.LAST)       := g_proc_batches(l_key).status(i);
+                    l_proc.procEnd.EXTEND;   l_proc.procEnd(l_proc.procEnd.LAST)     := g_proc_batches(l_key).procEnd(i);
+                    l_proc.stepsTodo.EXTEND; l_proc.stepsTodo(l_proc.stepsTodo.LAST) := g_proc_batches(l_key).stepsTodo(i);
+                    l_proc.stepsDone.EXTEND; l_proc.stepsDone(l_proc.stepsDone.LAST) := g_proc_batches(l_key).stepsDone(i);
+                    l_proc.info.EXTEND;      l_proc.info(l_proc.info.LAST)           := g_proc_batches(l_key).info(i);
+                    l_proc.immortal.EXTEND;  l_proc.immortal(l_proc.immortal.LAST)   := g_proc_batches(l_key).immortal(i);
+                end if;
+            end loop;
+            g_proc_batches(l_key) := l_proc;
+            l_key := g_proc_batches.NEXT(l_key);
+        end loop;
+
+        for i in 1 .. g_watermark_batch.pids.COUNT loop
+            if not p_lost.EXISTS(g_watermark_batch.pids(i)) then
+                l_wm.pids.EXTEND;    l_wm.pids(l_wm.pids.LAST)       := g_watermark_batch.pids(i);
+                l_wm.cids.EXTEND;    l_wm.cids(l_wm.cids.LAST)       := g_watermark_batch.cids(i);
+                l_wm.wm_log.EXTEND;  l_wm.wm_log(l_wm.wm_log.LAST)   := g_watermark_batch.wm_log(i);
+                l_wm.wm_mon.EXTEND;  l_wm.wm_mon(l_wm.wm_mon.LAST)   := g_watermark_batch.wm_mon(i);
+                l_wm.wm_proc.EXTEND; l_wm.wm_proc(l_wm.wm_proc.LAST) := g_watermark_batch.wm_proc(i);
+            end if;
+        end loop;
+        g_watermark_batch := l_wm;
+    exception
+        when others then
+            logLilamErr(sqlCode, sqlErrM, 'fenceBatches');
+    end;
+
+    --------------------------------------------------------------------------
+
+    -- After the flush: forget processes another worker has taken over (session, monitor state, watermarks)
+    procedure dropLostProcesses(p_lost t_lost_pids)
+    as
+        l_pid    PLS_INTEGER;
+        l_prefix varchar2(30);
+        l_key    varchar2(70);
+        l_next   varchar2(70);
+    begin
+        l_pid := p_lost.FIRST;
+        while l_pid is not null loop
+            l_prefix := LPAD(l_pid, 20, '0') || '|';
+            l_key := g_watermarks.NEXT(l_prefix);
+            while l_key is not null and substr(l_key, 1, length(l_prefix)) = l_prefix loop
+                l_next := g_watermarks.NEXT(l_key);
+                g_watermarks.DELETE(l_key);
+                l_key := l_next;
+            end loop;
+            clearAllSessionData(l_pid);
+            warn(g_serverProcessId, g_serverPipeName || '=> Process ' || l_pid
+                 || ' was taken over by another server; its unwritten data is left to that server.');
+            l_pid := p_lost.NEXT(l_pid);
+        end loop;
+    exception
+        when others then
+            logLilamErr(sqlCode, sqlErrM, 'dropLostProcesses');
+    end;
+
+    --------------------------------------------------------------------------
     -- PERFORMANCE: writes the rows of all processes collected in SYNC_ALL_DIRTY.
     -- One FORALL per target table, ONE commit for everything together (autonomous transaction).
     -- STABILITY: without SAVE EXCEPTIONS (see rowFailed). If a FORALL fails, only this
@@ -4556,6 +4749,7 @@ AS
         v_table varchar2(150);
         v_stmt  varchar2(1000);
         v_noWatermarks t_watermark_batch_rec;
+        v_lost  t_lost_pids;
 
         procedure handleErr(p_code number, p_msg varchar2, p_module varchar2) is
         begin
@@ -4563,6 +4757,9 @@ AS
             logLilamErr(p_code, p_msg, p_module);
         end;
     begin
+        -- Failover: write nothing for processes another worker has taken over
+        fenceBatches(v_lost);
+
         -- Logs
         v_key := g_log_batches.FIRST;
         while v_key is not null loop
@@ -4710,6 +4907,7 @@ AS
         g_mon_batches.DELETE;
         g_proc_batches.DELETE;
         g_watermark_batch := v_noWatermarks;
+        dropLostProcesses(v_lost);
 
     exception
         when others then
