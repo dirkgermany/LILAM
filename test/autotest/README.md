@@ -12,6 +12,7 @@ _COMMON/                    Testbasis (einmalig installieren)
   02_aufraeumen.sql           stoppt alle Test-Server und -Jobs
   03_ergebnisse.sql           Übersicht der Testläufe
   04_install_belastung.sql    Tabellen LTB_* und Package LTB für die Belastungstests
+  05_install_performance.sql  Tabellen LTP_* und Package LTP für den Performance-Test
 
 INSESSION/                  LILAM als Bibliothek in der Session der Anwendung
   LASTTEST/  MASSENTEST/  PARALLELBETRIEB/  PROZESSZYKLEN/  DAUERTEST/
@@ -30,6 +31,9 @@ DAUERTEST/                  Dauertest über alle Modi gleichzeitig (Kombination 
 
 BELASTUNG/                  Belastungstests: Laststufen bis zur Grenze (Konzept in BELASTUNG/README.md)
   KAPAZITAET_SERVER/  SKALIERUNG/  DAUERLAST_MIX/  DISPATCHER_ENGPASS/  APEX_STURM/  BATCHSTART/  FEHLERKASKADE/
+
+PERFORMANCE/                Performance-Test: Durchsatz und Aufrufdauer INSESSION und DECOUPLED, ohne und mit Regeln
+                            (für Leser ohne Vorkenntnisse aufbereitet in PERFORMANCE/README.md)
 
 ```
 
@@ -128,3 +132,11 @@ Konfiguration ermitteln und das Verhalten an der Grenze prüfen (keine Datenverl
 Auswirkung auf die Anwendung, saubere Erholung nach Lastende). Die Logik steht im Package `LTB`
 (`_COMMON/04_install_belastung.sql`), das die Hilfen aus `LT` nutzt. Bekannte Grenze aus PARALLELBETRIEB
 run_id 27–30: DBMS_PIPE fällt bei mehreren gleichzeitigen Sendern auf ca. 2.800 Nachrichten/s je Pipe.
+
+## Performance-Test
+
+Der Test unter `PERFORMANCE/` misst, wie viel Zeit ein LILAM-Aufruf die Anwendung kostet und wie schnell die Daten
+in der Datenbank stehen: 3 Clients, INSESSION und DECOUPLED mit 1, 2 und 3 Servern, Dauerfeuer und mit Pausen,
+Ab- und Anmelden unter Last, dazu 5 Clients ohne und mit Regeln. Logik im Package `LTP`
+(`_COMMON/05_install_performance.sql`, nutzt `LT` und `LTB`), Laufzeit ca. 22 min. Ergebnisse und Erklärung in
+`PERFORMANCE/README.md`.
