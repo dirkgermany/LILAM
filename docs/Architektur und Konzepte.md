@@ -66,41 +66,52 @@ Zunächst einige wichtige Begriffsklärungen im Kontext von LILAM.
 
 ### Prozess
 LILAM dient zur Überwachung von Anwendungen, die letztlich einen Prozess irgendeiner Art abbilden. Ein Prozess ist also etwas, das sich mit Software abbilden oder darstellen lässt. Im Sinne von LILAM legt der Entwickler fest, wann ein Prozess beginnt und wann er endet. 
-
 Zu einem Prozess gehören insbesondere sein Name, Informationen zu seinem Lebenszyklus sowie geplante und erledigte Arbeitsschritte. 
 
 Eine Anwendung kann mehrere Prozesse gleichzeitig führen, auch in derselben Datenbanksession: Jeder Aufruf von `NEW_PROCESS` bzw. `SERVER_NEW_PROCESS` startet einen eigenen Prozess mit eigener Prozess-ID, den LILAM unabhängig von den anderen überwacht.
 
 #### Lebenszyklus eines Prozesses
-Ein Prozess wird einmal gestartet und einmal geschlossen. Für saubere, nachvollziehbare und konsistente Prozesszustände ist das abschließende Schließen unverzichtbar.
-
-**Zu Beginn** (`NEW_PROCESS` bzw. `SERVER_NEW_PROCESS`) wird der eine und einzige Eintrag des Prozesses in die *Prozesstabelle* geschrieben.
-**Während** des Prozesses kann dieser Eintrag aktualisiert werden (Status, Fortschritt), und Logs und Metriken werden in die *Log-* bzw. *Monitor-Tabelle* geschrieben.
-**Am Ende** (`CLOSE_PROCESS`) wird der Eintrag ein letztes Mal aktualisiert.
-
->**Wichtiger Hinweis zur Datenpersistenz:**
->LILAM nutzt eine leistungsfähige Pufferung im Speicher, um die Datenbanklast zu minimieren. Monitoring-Daten und Prozesszustände werden im RAM gesammelt und erst in die Datenbank geschrieben, wenn der letzte Schreibvorgang mindestens 1,5 s zurückliegt oder 50.000 Einträge anstehen (siehe [Persistenz und Fehlerbehandlung](#persistenz-und-fehlerbehandlung)).
->
->**Um die vollständige Datenintegrität zu garantieren, ist der Aufruf von CLOSE_PROCESS am Ende Deines Prozesses zwingend erforderlich.**
->
->Endet ein Prozess abnormal (z. B. durch eine nicht abgefangene Exception), ohne CLOSE_PROCESS zu erreichen, gehen alle Daten verloren, die seit dem letzten automatischen Flush noch im Puffer liegen. Wir empfehlen dringend, CLOSE_PROCESS in den zentralen Exception-Handler Deiner Anwendung aufzunehmen.
-
-Letztlich ist für einen vollständigen Lebenszyklus nur erforderlich, zu Beginn des Prozesses die Funktion NEW_PROCESS und an seinem Ende die Prozedur CLOSE_PROCESS aufzurufen.
+Ein Prozess wird einmal gestartet und einmal geschlossen. Für saubere, nachvollziehbare und konsistente Prozesszustände ist das finale Schließen unverzichtbar.
 
 ### Session
 Mit Session ist in LILAM immer die Datenbanksession (Oracle-Session) gemeint. Eine Anwendung läuft in einer Datenbanksession, ebenso jeder LILAM Server. Eine Datenbanksession kann beliebig viele Prozesse führen. Umgekehrt kann ein Prozess über den Dispatcher in mehreren Datenbanksessions fortgesetzt werden, z. B. bei APEX, wo aufeinanderfolgende Seitenaufrufe in verschiedenen Sessions eines Connection-Pools laufen. Im In-Session-Modus liegen die Puffer eines Prozesses im Speicher (PGA) der Datenbanksession, die ihn gestartet hat.
 
 ### LILAM
-LILAM **I**s **L**ogging **A**nd **M**onitoring.
+**LILAM** **I**s **L**ogging **A**nd **M**onitoring. Und mehr.
+Ein PL/SQL Package, das ausschließlich Oracle-Mechanismen nutzt.
+
+### LILAM Server
+Ein eigenständiger entkoppelter Datenbankprozess, dessen Code-Basis das Package `LILAM` ist.
+Der LILAM Server bietet einer oder mehreren Anwendungen die Funktionalitäten von LILAM im entkoppelten `DECOUPLED` Modus an (s.u.). Die Anwendungen können sowohl im selben Schema wie der Server als auch in einem anderen Schema liegen.
+Einen LILAM Server können gleichzeitig mehrere Anwendungen nutzen.
+LILAM Server laufen idealerweise als Scheduled Job. Der Start eines Servers wird durch die API unterstützt.
 
 ### LILAM Client
-Erweitert eine PL/SQL Anweisung 
-### LILAM Server
+Ein LILAM Client ist eine Anwendung, die den LILAM Server über eine Kommunikationsschnittstelle steuert. Dazu bedient sich die Anwendung ebenfalls des Packages `LILAM`.
+LILAM Client und LILAM Server bieten weitgehend gleiche Funktionalitäten in Bezug auf Logging, Monitoring und Observability.
+
+### IN-SESSION Modus
+Nutzt eine Anwendung die Features von LILAM innerhalb derselben Datenbank-Session, d.h. sie teilt sich mit LILAM den Datenbank-Speicherbereich, spreche ich vom IN-SESSION Modus.
+Der Programm-Kontrollfluss ist synchron, d.h. die Anwendung setzt ihre Arbeit erst nach Rückkehr eines Aufruf der LILAM-API fort.
+
+### DECOUPLED Modus
+Nutzt eine Anwendung die Features von LILAM auf Basis des LILAM Servers, sind die Datenbank-Sessions von Anwendung und Server unabhängig voneinander. Autonome Verarbeitungsschritte von Anwendunng und Server sind zeitlich entkoppelt, beide teilen sich nicht die Datenzustände des jeweils anderen.
+
+### HYBRID Modus
+Eine Anwendung kann LILAM gleichzeitig im `DECOUPLED` und im `IN-SESSION` Modus nutzen. Allerdings mit der Einschränkung dass dazu ein jeweils eigenständiger Prozess gestartet wird, was allerdings dank der API sehr unkompliziert zu implementieren ist.
+
 ### LILAM Dispatcher
-### DECOUPLED Mode
-### IN-SESSION Mode
+Ein Dispatcher ist ein spezialisierter LILAM Server, der für eine konkrete Aufgabe entwickelt wurde.
+Der Dispatcher ermöglicht einer Anwendung mit Connection Pooling (z.B. APEX), Prozesse über die Grenzen physischer Sessions hinaus fortzuführen (automatischer Reconnect).
+Der Dispatcher selbst verarbeitet keine Nachrichten, sondern leitet sie an einen LILAM Server der ihm zugewiesenen Gruppe weiter. Die Antworten der Server gehen direkt zurück an die Anwendungen, nicht an den Dispatcher.
+
 ### Baseline
-#### Baseline-Scope
+Die Baseline ist der Normalwert einer Action und wird als Basis für die Berechnung des gleitenden Durchschnitts herangezogen.
+Jede neue Messung innerhalb einer Regel nutzt die Baseline, um Ausreißer zu erkennen. Solange noch zu wenige Messungen in der sog. Warm-Up Phase vorliegen, gibt es keine Baseline, und die Regel greift nicht.
+
+### Baseline-Scope
+Der Baseline-Scope legt fest, wer sich eine Baseline teilt. Standardmäßig sind das alle Prozesse mit demselben Namen, sodass jeder neue Lauf auf den Erfahrungen seiner Vorgänger aufbaut.
+Ohne Scope lernt jeder Prozess für sich allein, mit einem Scope teilen sich mehrere Anwendungen bewusst einen Normalwert.
 
 ## Persistenz und Fehlerbehandlung
 LILAM schreibt gepufferte Daten gebündelt: Ein Flush sammelt die anstehenden Log-, Monitor- und Prozessdaten aller Prozesse, schreibt jede Tabelle mit einem einzigen `FORALL` und committet alles gemeinsam in einer autonomen Transaktion.
