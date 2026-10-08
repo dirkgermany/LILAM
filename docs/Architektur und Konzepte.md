@@ -48,33 +48,31 @@
 
 
 ## Technischer Überblick
-LILAM nutzt die Kernfunktionen, die Oracle über PL/SQL bereitstellt (ab Version 12, getestet unter 19c und 26 AI). LILAM selbst ist ein PL/SQL-Skript, das von anderen PL/SQL-Skripten in verschiedenen Betriebsarten genutzt werden kann.
+LILAM nutzt die Kernfunktionen, die Oracle über PL/SQL bereitstellt (ab Version 12, getestet unter 19c und 26 AI). LILAM selbst ist ein PL/SQL-Skript, das von anderen PL/SQL-Skripten in verschiedenen Betriebsarten genutzt werden kann. Dazu zählen auch APEX-Anwendungen bzw. - allgemein gesprochen - Anwendungen, die zur Laufzeit die Datenbank-Session wechseln können.
 
-LILAM ist damit das Gegenteil von „schwarzer Magie“ oder überzogenem Engineering. Mit wenigen Tabellen, Indizes, einer Sequence und Pipes verfolgt LILAM eine konsequente Zero-Dependency-Strategie. Die Sicherheit der Session-, Log- und Metrikdaten wird durch autonome Transaktionen gewährleistet. Diese sind streng von den Daten im Speicher und von den Transaktionen anderer Anwendungen getrennt und sorgen für ihren eigenen COMMIT, selbst wenn die Anwendung einen Rollback durchführen musste.
+LILAM ist damit das Gegenteil von „schwarzer Magie“ oder überzogenem Engineering. Mit wenigen Datenbankobjekten verfolgt LILAM eine konsequente Zero-Dependency-Strategie. Die Sicherheit der Session-, Log- und Metrikdaten wird durch autonome Transaktionen gewährleistet. Diese sind streng von den Daten im Speicher und von den Transaktionen anderer Anwendungen getrennt und sorgen für ihren eigenen COMMIT, selbst wenn die Anwendung einen Rollback durchführen musste.
 
-LILAM selbst ist ein Package, bestehend aus der üblichen Spezifikation (.pks) und dem Body (.pkb). Der Code umfasst einige tausend echte Codezeilen; in Version 1.3, die bereits die meisten Funktionen enthielt, waren es rund 3.000 LOC. Die Funktionen des LILAM Clients und des LILAM Servers sind vollständig Teil dieses Codes.
+LILAM selbst ist ein PL/SQL Package, bestehend aus der üblichen Spezifikation (.pks) und dem Body (.pkb). Der Code umfasst lediglich einige tausend echte Codezeilen; in Version 2.0, sind es rund 4.500 LOC. Die Funktionen des LILAM Clients, des LILAM Servers und des LILAM Dispatchers sind damit voll abgedeckt.
 
-Für die Installation muss lediglich der Code in ein geeignetes DB-Schema kopiert werden und es müssen einige Berechtigungen vergeben werden. Mehr dazu in setup.md.
+Für die Installation muss der Code in ein geeignetes DB-Schema kopiert und compiliert werden und es müssen einige Berechtigungen vergeben werden. Mehr dazu in setup.md.
 
 **Programmatisch vs. deklarativ:** Wo immer möglich, habe ich versucht, LILAM so zu entwickeln, dass es ohne Konfigurationstabellen, -dateien oder Ähnliches auskommt. Mein Ziel war vielmehr, das Verhalten des Werkzeugs über die API zu steuern, also programmatisch. Als Entwickler weiß ich, wie lästig es sein kann, sich stundenlang durch Vorbereitungen kämpfen zu müssen, bevor man endlich „zur Sache“ kommt. 
 
-Tatsächlich gibt es derzeit keine Konfigurationstabelle(n), Startskripte oder ähnliche Voraussetzungen, um den vollen Funktionsumfang von LILAM zu nutzen (Stand v1.3.0).
+Lediglich für den unkomplizierten Einstieg und Tests existieren Startskripte.
 
 ---
 ## Begriffe
 Zunächst einige wichtige Begriffsklärungen im Kontext von LILAM.
 
----
-## Prozess
+### Prozess
 LILAM dient zur Überwachung von Anwendungen, die letztlich einen Prozess irgendeiner Art abbilden. Ein Prozess ist also etwas, das sich mit Software abbilden oder darstellen lässt. Im Sinne von LILAM legt der Entwickler fest, wann ein Prozess beginnt und wann er endet. 
 
 Zu einem Prozess gehören insbesondere sein Name, Informationen zu seinem Lebenszyklus sowie geplante und erledigte Arbeitsschritte. 
 
----
-## Session
+### Session
 Eine Session repräsentiert den Lebenszyklus eines protokollierten Prozesses. Ein Prozess „lebt“ innerhalb einer Session. Eine Session wird einmal geöffnet und einmal geschlossen. Für saubere, nachvollziehbare und konsistente Prozesszustände ist das abschließende Schließen der Sessions unverzichtbar.
 
-### Lebenszyklus einer Session
+#### Lebenszyklus einer Session
 **Zu Beginn** einer Log-Session wird der eine und einzige Log-Eintrag in die *Master-Tabelle* geschrieben.
 **Während** der Session kann dieser eine Log-Eintrag aktualisiert werden, und zusätzliche Informationen können in die *Detail-Tabelle* geschrieben werden.
 **Am Ende** einer Session kann der Log-Eintrag erneut aktualisiert werden.
@@ -88,7 +86,19 @@ Eine Session repräsentiert den Lebenszyklus eines protokollierten Prozesses. Ei
 
 Letztlich ist für einen vollständigen Lebenszyklus nur erforderlich, zu Beginn der Session die Funktion NEW_SESSION und am Ende der Session die Prozedur CLOSE_SESSION aufzurufen.
 
-### Persistenz und Fehlerbehandlung
+### LILAM
+LILAM **I**s **L**ogging **A**nd **M**onitoring.
+
+### LILAM Client
+Erweitert eine PL/SQL Anweisung 
+### LILAM Server
+### LILAM Dispatcher
+### DECOUPLED Mode
+### IN-SESSION Mode
+### Baseline
+#### Baseline-Scope
+
+## Persistenz und Fehlerbehandlung
 LILAM schreibt gepufferte Daten gebündelt: Ein Flush sammelt die anstehenden Log-, Monitor- und Prozessdaten aller Prozesse, schreibt jede Tabelle mit einem einzigen `FORALL` und committet alles gemeinsam in einer autonomen Transaktion.
 
 Schlägt ein Bulk-Insert fehl (z. B. weil eine Zeile einen Constraint der Anwendungstabellen verletzt), verliert LILAM die übrigen Zeilen nicht:
