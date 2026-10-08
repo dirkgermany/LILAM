@@ -138,7 +138,10 @@ begin
   lt.end_run(l_run);
 exception
   when others then
-    lt.abort_run(l_run, true, sqlerrm || ' ' || dbms_utility.format_error_backtrace);
+    dbms_output.put_line('ABBRUCH: ' || sqlerrm);
+    lt.check_that(l_run, 'Testablauf ohne Abbruch', false, substr(sqlerrm || ' ' || dbms_utility.format_error_backtrace, 1, 900));
+    lt.end_run(l_run);
+    lt.stop_all_servers;
 end;
 /
 
