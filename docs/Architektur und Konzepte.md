@@ -498,6 +498,7 @@ Zusätzlich zu den prozessspezifischen Tabellen verwendet LILAM interne Tabellen
 | --- | --- |
 | `LILAM_SERVER_REGISTRY` | Verwaltet Serverregistrierung, Verfügbarkeit, Heartbeat, Last und Informationen zum aktuell aktiven Rule Set. |
 | `LILAM_RULES` | Speichert versionierte Rule Sets je Gruppe (Server und INSESSION-Prozesse), davon je Gruppe eines aktiv. |
+| `LILAM_WATERMARK` | Wasserstände für das Failover: je Prozess und Client-Session die höchste Laufnummer, bis zu der Logs, Metriken und Prozessdaten committet sind. Der Server schreibt sie im selben Commit wie die Daten. |
 | `LILAM_LOG_INTERNAL` | Bietet ein unabhängiges Rückfall-Logging für interne Fehler des LILAM-Frameworks. |
 
 > [!NOTE]

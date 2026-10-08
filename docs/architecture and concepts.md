@@ -486,6 +486,7 @@ In addition to the process-specific tables, LILAM uses internal tables whose nam
 | --- | --- |
 | `LILAM_SERVER_REGISTRY` | Maintains server registration, availability, heartbeat, load, and currently active Rule Set information. |
 | `LILAM_RULES` | Stores versioned Rule Sets per group (servers and INSESSION processes), one of them active per group. |
+| `LILAM_WATERMARK` | Watermarks for failover: per process and client session the highest sequence number up to which logs, metrics and process data are committed. The server writes them in the same commit as the data. |
 | `LILAM_LOG_INTERNAL` | Provides independent fallback logging for internal LILAM framework errors. |
 
 > [!NOTE]

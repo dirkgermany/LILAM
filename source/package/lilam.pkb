@@ -63,6 +63,7 @@ AS
     C_LILAM_SERVER_REGISTRY         CONSTANT VARCHAR2(50) := 'LILAM_SERVER_REGISTRY';
     C_LILAM_LOG_TABLE               CONSTANT VARCHAR2(20) := 'LILAM_LOG_INTERNAL';
     C_LILAM_PROCESS_ROUTE           CONSTANT VARCHAR2(50) := 'LILAM_PROCESS_ROUTE';
+    C_LILAM_WATERMARK               CONSTANT VARCHAR2(50) := 'LILAM_WATERMARK';
     C_LILAM_SCOPES_TABLE            CONSTANT VARCHAR2(30) := 'LILAM_SCOPES';
     C_LILAM_BASELINES_TABLE         CONSTANT VARCHAR2(30) := 'LILAM_BASELINES';
 
@@ -160,6 +161,38 @@ AS
     );
     TYPE t_failed_server_tab IS TABLE OF t_failed_server_rec INDEX BY BINARY_INTEGER;
     g_failed_server t_failed_server_tab;
+
+    -- Failover: sequence numbers and watermarks
+    -- Client: every fire-and-forget message of a remote process carries a sequence number (per process
+    -- and client session) and the ID of the client session. The server reports per process, client and
+    -- buffer type (log, monitor, process) up to which number everything is committed (LILAM_WATERMARK).
+    g_client_id VARCHAR2(40);                    -- ID of this database session as a client (see getClientId)
+    TYPE t_msg_seq_tab IS TABLE OF PLS_INTEGER INDEX BY BINARY_INTEGER;
+    g_msg_seq t_msg_seq_tab;                     -- last sequence number per remote process
+    -- Server: received and committed sequence numbers per process and client (key: see buildWatermarkKey)
+    TYPE t_watermark_rec IS RECORD (
+        process_id  NUMBER(19,0),
+        client_id   VARCHAR2(40),
+        rcv_log     NUMBER,                      -- highest number received per buffer type
+        rcv_mon     NUMBER,
+        rcv_proc    NUMBER,
+        wm_log      NUMBER,                      -- highest number committed per buffer type
+        wm_mon      NUMBER,
+        wm_proc     NUMBER,
+        pending     BOOLEAN := FALSE             -- received numbers not yet committed
+    );
+    TYPE t_watermark_map IS TABLE OF t_watermark_rec INDEX BY VARCHAR2(70);
+    g_watermarks t_watermark_map;
+    g_watermark_table_ok BOOLEAN := FALSE;       -- LILAM_WATERMARK checked/created in this session
+    -- Watermarks for the next flushBatch (same transaction as the data)
+    TYPE t_watermark_batch_rec IS RECORD (
+        pids     sys.odcinumberlist   := sys.odcinumberlist(),
+        cids     sys.odcivarchar2list := sys.odcivarchar2list(),
+        wm_log   sys.odcinumberlist   := sys.odcinumberlist(),
+        wm_mon   sys.odcinumberlist   := sys.odcinumberlist(),
+        wm_proc  sys.odcinumberlist   := sys.odcinumberlist()
+    );
+    g_watermark_batch t_watermark_batch_rec;
 
     TYPE t_throttle_stat IS RECORD (
         msg_count  PLS_INTEGER := 0,
@@ -891,6 +924,19 @@ AS
     --------------------------------------------------------------------------
     -- Calc Timestamp as key for requests 
     --------------------------------------------------------------------------
+    -- ID of this database session as a LILAM client (failover: sequence numbers are counted per client).
+    -- Stays the same for the lifetime of the package state; a new state is a new client.
+    function getClientId return varchar2
+    as
+    begin
+        if g_client_id is null then
+            g_client_id := SYS_CONTEXT('USERENV', 'SID') || '-' || to_char(sys_extract_utc(systimestamp), 'YYYYMMDDHH24MISSFF3');
+        end if;
+        return g_client_id;
+    end;
+
+    --------------------------------------------------------------------------
+
     function getClientPipe return varchar2
     as
     begin
@@ -1918,7 +1964,10 @@ AS
 
         -- PERFORMANCE: concatenate the message in one step instead of via jsonPut (see jStr/jNum/jTs).
         -- p_request is always an internal constant and does not need to be escaped.
-        l_jsonMain := '{"header":{"msg_type":"API_CALL","request":"' || p_request || '"}'
+        -- Failover: sequence number per process and client session (see LILAM_WATERMARK)
+        g_msg_seq(p_processId) := CASE WHEN g_msg_seq.EXISTS(p_processId) THEN g_msg_seq(p_processId) + 1 ELSE 1 END;
+        l_jsonMain := '{"header":{"msg_type":"API_CALL","request":"' || p_request
+                   || '","seq":' || g_msg_seq(p_processId) || ',"cid":"' || getClientId || '"}'
                    || case when p_payload is not null then ',"payload":' || p_payload end
                    || '}';
 
@@ -2075,6 +2124,156 @@ AS
         WHEN OTHERS THEN
             dbms_output.enable(10000);
             dbms_output.put_line('LILAM INTERNAL ERROR in Procedure createDispatchTable: ' || substr(sqlErrM, 1, 1000) || chr(13) || chr(10) || l_sql);
+    end;
+
+    --------------------------------------------------------------------------
+    -- Failover: watermarks (server side)
+    --------------------------------------------------------------------------
+    procedure createWatermarkTable
+    as
+    begin
+        if g_watermark_table_ok then
+            return;
+        end if;
+        if not objectExists(C_LILAM_WATERMARK, 'TABLE') then
+            execute immediate '
+                CREATE TABLE ' || C_LILAM_WATERMARK || ' (
+                    process_id  NUMBER(19,0) NOT NULL,
+                    client_id   VARCHAR2(40) NOT NULL,
+                    wm_log      NUMBER,
+                    wm_mon      NUMBER,
+                    wm_proc     NUMBER,
+                    updated     TIMESTAMP(6) DEFAULT SYSTIMESTAMP,
+                    CONSTRAINT pk_lilam_watermark PRIMARY KEY (process_id, client_id)
+                )';
+        end if;
+        g_watermark_table_ok := TRUE;
+    exception
+        when others then
+            -- ORA-00955: created by another server at the same time
+            if sqlcode = -955 then
+                g_watermark_table_ok := TRUE;
+            else
+                logLilamErr(sqlCode, sqlErrM, 'createWatermarkTable');
+            end if;
+    end;
+
+    --------------------------------------------------------------------------
+
+    FUNCTION buildWatermarkKey(p_processId NUMBER, p_clientId VARCHAR2) RETURN VARCHAR2 AS
+    BEGIN
+        RETURN LPAD(p_processId, 20, '0') || '|' || p_clientId;
+    END;
+
+    --------------------------------------------------------------------------
+
+    -- Notes the sequence number of a fire-and-forget message before it is processed.
+    -- Each such message affects exactly one buffer type of its process: logs, monitor or process record.
+    procedure noteMessageSeq(p_request varchar2, p_message varchar2)
+    as
+        l_type varchar2(1);
+        l_seq  number;
+        l_cid  varchar2(40);
+        l_pid  number;
+        l_key  varchar2(70);
+        l_rec  t_watermark_rec;
+    begin
+        l_type := case p_request
+                      when 'LOG_ANY'        then 'L'
+                      when C_MARK_EVENT     then 'M'
+                      when 'START_TRACE'    then 'M'
+                      when 'STOP_TRACE'     then 'M'
+                      when 'SET_ANY_STATUS' then 'P'
+                      when 'PROC_STEP_DONE' then 'P'
+                  end;
+        if l_type is null then
+            return;
+        end if;
+
+        l_seq := JSON_VALUE(p_message, '$.header.seq' RETURNING NUMBER);
+        if l_seq is null then
+            return;   -- client without sequence numbers (older version)
+        end if;
+        l_cid := JSON_VALUE(p_message, '$.header.cid');
+        l_pid := JSON_VALUE(p_message, '$.payload.process_id' RETURNING NUMBER);
+        if l_cid is null or l_pid is null then
+            return;
+        end if;
+
+        l_key := buildWatermarkKey(l_pid, l_cid);
+        if not g_watermarks.EXISTS(l_key) then
+            l_rec.process_id := l_pid;
+            l_rec.client_id  := l_cid;
+            g_watermarks(l_key) := l_rec;
+        end if;
+        case l_type
+            when 'L' then g_watermarks(l_key).rcv_log  := greatest(nvl(g_watermarks(l_key).rcv_log, 0), l_seq);
+            when 'M' then g_watermarks(l_key).rcv_mon  := greatest(nvl(g_watermarks(l_key).rcv_mon, 0), l_seq);
+            when 'P' then g_watermarks(l_key).rcv_proc := greatest(nvl(g_watermarks(l_key).rcv_proc, 0), l_seq);
+        end case;
+        g_watermarks(l_key).pending := TRUE;
+    exception
+        when others then
+            logLilamErr(sqlCode, sqlErrM, 'noteMessageSeq');
+    end;
+
+    --------------------------------------------------------------------------
+
+    -- Called by SYNC_ALL_DIRTY after the buffers have been collected for flushBatch.
+    -- A buffer type of a process counts as committed when nothing of this type is buffered any more:
+    -- everything received of it is part of this flush. The new watermarks go into the same transaction.
+    procedure collectWatermarks
+    as
+        l_key     varchar2(70);
+        l_next    varchar2(70);
+        l_idx     pls_integer;
+        l_changed boolean;
+    begin
+        l_key := g_watermarks.FIRST;
+        while l_key is not null loop
+            l_next := g_watermarks.NEXT(l_key);
+
+            if not v_indexSession.EXISTS(g_watermarks(l_key).process_id) then
+                g_watermarks.DELETE(l_key);   -- process closed or not known on this server
+            elsif g_watermarks(l_key).pending then
+                l_idx := v_indexSession(g_watermarks(l_key).process_id);
+                l_changed := FALSE;
+
+                if coalesce(g_sessionList(l_idx).log_dirty_count, 0) = 0
+                   and nvl(g_watermarks(l_key).rcv_log, 0) > nvl(g_watermarks(l_key).wm_log, 0) then
+                    g_watermarks(l_key).wm_log := g_watermarks(l_key).rcv_log;
+                    l_changed := TRUE;
+                end if;
+                if coalesce(g_sessionList(l_idx).monitor_dirty_count, 0) = 0
+                   and nvl(g_watermarks(l_key).rcv_mon, 0) > nvl(g_watermarks(l_key).wm_mon, 0) then
+                    g_watermarks(l_key).wm_mon := g_watermarks(l_key).rcv_mon;
+                    l_changed := TRUE;
+                end if;
+                if not nvl(g_sessionList(l_idx).process_is_dirty, FALSE)
+                   and nvl(g_watermarks(l_key).rcv_proc, 0) > nvl(g_watermarks(l_key).wm_proc, 0) then
+                    g_watermarks(l_key).wm_proc := g_watermarks(l_key).rcv_proc;
+                    l_changed := TRUE;
+                end if;
+
+                g_watermarks(l_key).pending :=
+                       nvl(g_watermarks(l_key).rcv_log, 0)  > nvl(g_watermarks(l_key).wm_log, 0)
+                    or nvl(g_watermarks(l_key).rcv_mon, 0)  > nvl(g_watermarks(l_key).wm_mon, 0)
+                    or nvl(g_watermarks(l_key).rcv_proc, 0) > nvl(g_watermarks(l_key).wm_proc, 0);
+
+                if l_changed then
+                    g_watermark_batch.pids.EXTEND;    g_watermark_batch.pids(g_watermark_batch.pids.LAST)       := g_watermarks(l_key).process_id;
+                    g_watermark_batch.cids.EXTEND;    g_watermark_batch.cids(g_watermark_batch.cids.LAST)       := g_watermarks(l_key).client_id;
+                    g_watermark_batch.wm_log.EXTEND;  g_watermark_batch.wm_log(g_watermark_batch.wm_log.LAST)   := g_watermarks(l_key).wm_log;
+                    g_watermark_batch.wm_mon.EXTEND;  g_watermark_batch.wm_mon(g_watermark_batch.wm_mon.LAST)   := g_watermarks(l_key).wm_mon;
+                    g_watermark_batch.wm_proc.EXTEND; g_watermark_batch.wm_proc(g_watermark_batch.wm_proc.LAST) := g_watermarks(l_key).wm_proc;
+                end if;
+            end if;
+
+            l_key := l_next;
+        end loop;
+    exception
+        when others then
+            logLilamErr(sqlCode, sqlErrM, 'collectWatermarks');
     end;
 
     --------------------------------------------------------------------------
@@ -3191,6 +3390,9 @@ AS
             v_id := v_next_id;
         END LOOP;
 
+        -- Failover: watermarks of the buffers just collected (same commit in flushBatch)
+        collectWatermarks;
+
         g_batch_mode := FALSE;
         flushBatch;
 
@@ -4053,6 +4255,7 @@ AS
         v_key   varchar2(150);
         v_table varchar2(150);
         v_stmt  varchar2(1000);
+        v_noWatermarks t_watermark_batch_rec;
 
         procedure handleErr(p_code number, p_msg varchar2, p_module varchar2) is
         begin
@@ -4182,10 +4385,31 @@ AS
             v_key := g_proc_batches.NEXT(v_key);
         end loop;
 
+        -- Watermarks (failover): in the same transaction as the data they confirm
+        if g_watermark_batch.pids.COUNT > 0 then
+            begin
+                v_stmt := '
+                merge into ' || C_LILAM_WATERMARK || ' w
+                using (select :1 pid, :2 cid, :3 wm_log, :4 wm_mon, :5 wm_proc from dual) s
+                on (w.process_id = s.pid and w.client_id = s.cid)
+                when matched then update
+                    set w.wm_log = s.wm_log, w.wm_mon = s.wm_mon, w.wm_proc = s.wm_proc, w.updated = systimestamp
+                when not matched then insert (process_id, client_id, wm_log, wm_mon, wm_proc, updated)
+                    values (s.pid, s.cid, s.wm_log, s.wm_mon, s.wm_proc, systimestamp)';
+                forall i in 1 .. g_watermark_batch.pids.COUNT
+                    execute immediate v_stmt
+                    USING g_watermark_batch.pids(i), g_watermark_batch.cids(i), g_watermark_batch.wm_log(i),
+                          g_watermark_batch.wm_mon(i), g_watermark_batch.wm_proc(i);
+            exception
+                when others then handleErr(sqlcode, sqlerrm, 'flushBatch/WATERMARK');
+            end;
+        end if;
+
         commit;
         g_log_batches.DELETE;
         g_mon_batches.DELETE;
         g_proc_batches.DELETE;
+        g_watermark_batch := v_noWatermarks;
 
     exception
         when others then
@@ -4193,6 +4417,7 @@ AS
             g_log_batches.DELETE;
             g_mon_batches.DELETE;
             g_proc_batches.DELETE;
+            g_watermark_batch := v_noWatermarks;
             logLilamErr(sqlCode, sqlErrM, 'flushBatch');
     end;
 
@@ -5029,6 +5254,8 @@ AS
         g_remote_sessions.DELETE;
         g_remote_sync.DELETE;
         g_failed_server.DELETE;
+        g_msg_seq.DELETE;
+        g_watermarks.DELETE;
         g_process_cache.DELETE;
         g_monitor_shadows.DELETE;
         g_local_throttle_cache.DELETE;    
@@ -5199,6 +5426,7 @@ AS
                 end if;
                 g_failed_server.DELETE(p_processId);
             end if;
+            g_msg_seq.DELETE(p_processId);
             g_remote_sessions.delete(p_processId);
             g_remote_sync.delete(p_processId);
             g_log_counters.delete(p_processId);
@@ -5540,6 +5768,16 @@ AS
     begin
         execute immediate 'delete from ' || C_LILAM_PROCESS_ROUTE || ' where process_id = :1'
         using p_processId;
+        -- Watermarks of the process (failover) are no longer needed
+        begin
+            execute immediate 'delete from ' || C_LILAM_WATERMARK || ' where process_id = :1'
+            using p_processId;
+        exception
+            when others then
+                if sqlcode != -942 then   -- table does not exist (yet)
+                    logLilamErr(sqlCode, sqlErrM, 'unregisterProcessRoute', 'WATERMARK');
+                end if;
+        end;
         commit;
     exception
         when others then
@@ -5748,6 +5986,7 @@ AS
         pragma autonomous_transaction;
     begin
         createDispatchTable;
+        createWatermarkTable;
         execute immediate 'insert into ' || C_LILAM_PROCESS_ROUTE || '(process_id, pipe_name) values (:1, :2)'
         using p_processId, p_pipeName;
         commit;
@@ -7104,6 +7343,9 @@ AS
             end if;
             return false;
         end if;
+
+        -- Failover: sequence number of fire-and-forget messages (see LILAM_WATERMARK)
+        noteMessageSeq(p_request, p_message);
 
         CASE p_request
             WHEN 'SERVER_SHUTDOWN' then
