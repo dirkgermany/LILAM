@@ -3,7 +3,7 @@
 --
 -- Ein Worker (LT_S1) und der Dispatcher (LT_DISP). Client A schickt waehrend der Lastphase alle 210 ms
 -- ein INFO, sodass der Leerlauf-Flush des Workers laufend greift. Client B misst in frischen Sessions
--- (je ein Job) die Dauer von Reconnect + INFO, NEW_SESSION und CLOSE_SESSION ueber den Dispatcher sowie
+-- (je ein Job) die Dauer von Reconnect + INFO, NEW_PROCESS und CLOSE_PROCESS ueber den Dispatcher sowie
 -- die Sichtbarkeit seines INFO in LILAM_LOG. Je 20 Messungen ohne Last und mit Last.
 -- Nutzt nur die bestehende API (lilam.*, lt.*). Ergebnisse in LT_METRIC (Messwerte mit _noload/_load).
 -- =====================================================================
@@ -28,11 +28,11 @@ declare
         || 'l_t := systimestamp; loop select count(*) into l_n from lilam_log where process_id = ' || l_pid
         || ' and info = ''' || p_tag || ' ' || i || '''; exit when l_n > 0 or lt.ms_since(l_t) > 10000; dbms_session.sleep(0.01); end loop; '
         || 'lt.metric(' || l_run || ', ''vis_ms_' || p_tag || ''', case when l_n > 0 then lt.ms_since(l_t) else -1 end, ''ms''); '
-        -- NEW_SESSION und CLOSE_SESSION ueber den Dispatcher
-        || 'l_t := systimestamp; l_new := lilam.server_new_session(p_processName => ''LT_' || l_run || '_IFN'', p_groupName => '''
+        -- NEW_PROCESS und CLOSE_PROCESS ueber den Dispatcher
+        || 'l_t := systimestamp; l_new := lilam.server_new_process(p_processName => ''LT_' || l_run || '_IFN'', p_groupName => '''
         || lt.c_group || ''', p_logLevel => lilam.logLevelInfo); '
         || 'lt.metric(' || l_run || ', ''ns_ms_' || p_tag || ''', lt.ms_since(l_t), ''ms''); '
-        || 'l_t := systimestamp; lilam.close_session(l_new); '
+        || 'l_t := systimestamp; lilam.close_process(l_new); '
         || 'lt.metric(' || l_run || ', ''cs_ms_' || p_tag || ''', lt.ms_since(l_t), ''ms''); '
         || 'exception when others then lt.joblog(' || l_run || ', ' || i || ', ''ERROR'', sqlerrm); end;');
       l_ok := lt.wait_jobs('LT_CIF_' || l_run || '_' || p_tag || '_' || i, 60);
@@ -48,7 +48,7 @@ begin
   -- Prozess, an den Client B sein INFO schickt (Reconnect aus frischer Session)
   lt.run_job('LT_CIF_' || l_run || '_P',
     'declare l_pid number; begin lilam.set_dispatcher_pipe(''' || lt.c_disp_pipe || '''); '
-    || 'l_pid := lilam.server_new_session(p_processName => ''LT_' || l_run || '_IFP'', p_groupName => ''' || lt.c_group
+    || 'l_pid := lilam.server_new_process(p_processName => ''LT_' || l_run || '_IFP'', p_groupName => ''' || lt.c_group
     || ''', p_logLevel => lilam.logLevelInfo); lt.metric(' || l_run || ', ''pid'', l_pid); end;');
   l_ok := lt.wait_jobs('LT_CIF_' || l_run || '_P', 60);
   select max(value) into l_pid from lt_metric where run_id = l_run and metric = 'pid';
@@ -61,10 +61,10 @@ begin
   lt.run_job('LT_CIF_' || l_run || '_A',
     'declare l_pid number; l_end timestamp := systimestamp + interval ''60'' second; begin '
     || 'lilam.set_dispatcher_pipe(''' || lt.c_disp_pipe || '''); '
-    || 'l_pid := lilam.server_new_session(p_processName => ''LT_' || l_run || '_IFA'', p_groupName => ''' || lt.c_group
+    || 'l_pid := lilam.server_new_process(p_processName => ''LT_' || l_run || '_IFA'', p_groupName => ''' || lt.c_group
     || ''', p_logLevel => lilam.logLevelInfo); '
     || 'while systimestamp < l_end loop lilam.info(l_pid, ''load''); dbms_session.sleep(0.21); '
-    || 'end loop; lilam.close_session(l_pid); end;');
+    || 'end loop; lilam.close_process(l_pid); end;');
   dbms_session.sleep(2);
   measure('load');
   l_ok := lt.wait_jobs('LT_CIF_' || l_run || '_A', 90);

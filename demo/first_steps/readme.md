@@ -2,12 +2,12 @@
 
 ## LILAM
 **LILAM Is Logging And Monitoring**
-Logging and monitoring PL/SQL applications: https://github.com/dirkgermany/LILA-Logging
+Logging and monitoring PL/SQL applications: https://github.com/dirkgermany/LILAM
 
 ## This demo app
 This demo shows the basic API-calls (and there aren't many more) of LILAM:
-* Opening new log session
-* Closing log session
+* Starting a new process
+* Closing the process
 * Writing log entries
 * Updating process (application) status
 
@@ -34,7 +34,7 @@ Copy PL/SQL code of the LILAM package and the sample package (.pks and .pkb) int
 Find the package under https://github.com/dirkgermany/LILAM/tree/main/source/package.
 
 #### Demo
-Same directory as where you found this .md-file: https://github.com/dirkgermany/LILAM/new/main/demo/first_steps.
+Same directory as where you found this .md-file: https://github.com/dirkgermany/LILAM/tree/main/demo/first_steps.
 
 ---
 ## Try the demo and see log results
@@ -46,8 +46,8 @@ exec learn_lilam.simple_sample;
 See log entries. The detailed table contains the backtrace and the error stack.
 ```sql
 -- Process overview with status:
-select * from lilam_log;
--- Details
-select * from lilam_log_detail order by process_id, no;
+select * from lilam_proc;
+-- Log entries
+select * from lilam_log order by process_id, no;
 
    

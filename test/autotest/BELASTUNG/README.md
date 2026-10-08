@@ -48,12 +48,12 @@ Logtexte sind 120 Zeichen lang (`p_text_len`).
 | Kriterium | Grenze |
 |---|---|
 | Clients ungebremst | erreicht ≥ 95 % der angebotenen Aufrufe |
-| Anwendung unbeeinträchtigt | höchstens 0,1 % der normalen Aufrufe > 100 ms (`p_max_slow_pct`; ohne ERROR, NEW_SESSION, CLOSE_SESSION) und keiner > 1 s |
+| Anwendung unbeeinträchtigt | höchstens 0,1 % der normalen Aufrufe > 100 ms (`p_max_slow_pct`; ohne ERROR, NEW_PROCESS, CLOSE_PROCESS) und keiner > 1 s |
 | ERROR | kein ERROR-Aufruf > 500 ms (`p_max_err_ms`; Direktschreiben mit Commit, siehe H6) |
-| CLOSE_SESSION | keine Antwort des Servers ausgeblieben (Client wartet 1 s, siehe H5) |
+| CLOSE_PROCESS | keine Antwort des Servers ausgeblieben (Client wartet 1 s, siehe H5) |
 | LILAM hält mit | Rückstau wächst in der zweiten Stufenhälfte nicht dauerhaft |
 | Sichtbarkeit | Verzug der Probe-Logs ≤ 5 s (`p_max_lag_ms`) |
-| Prozesse | jedes NEW_SESSION liefert eine gültige ID |
+| Prozesse | jedes NEW_PROCESS liefert eine gültige ID |
 | Vollständigkeit | nach Lastende innerhalb `p_drain_max` (Standard 120 s, `DAUERLAST_MIX` 300 s) alles persistiert |
 | Stabilität | keine neuen Einträge in `LILAM_LOG_INTERNAL`, keine Fehler in den Client-Jobs |
 
@@ -81,12 +81,12 @@ Die Tests sollen diese Vermutungen bestätigen oder widerlegen. Zeilen beziehen 
 
 1. **Pipe-Grenze je Server (H1).** Schreiben mehrere Sessions in dieselbe Pipe, fällt `DBMS_PIPE` auf ca. 2.800 Nachrichten/s (PARALLELBETRIEB run 27–30). Ein Worker hat genau eine Datenpipe. Erwartung: Die Grenze eines Servers liegt bei dieser Rate, nicht bei seiner Schreibleistung.
 2. **Dispatcher = eine Pipe für alle (H2).** Ist ein Dispatcher gesetzt, schicken Clients jede Nachricht an ihn (`getServerPipeForSession`, Z. 915). Er parst jede Nachricht (`JSON_QUERY`) und sendet sie erneut (`processRequest`, Z. 6548). Erwartung: Mit Dispatcher steigt die Grenze nicht mit der Zahl der Worker; sie liegt eher unter der eines einzelnen direkt angesprochenen Workers, weil jede Nachricht zwei Pipes durchläuft.
-3. **Routen-Cache (H3).** Der erste Aufruf jedes Prozesses und jeder Aufruf nach `CLOSE_SESSION` kostet im Dispatcher ein `SELECT` auf `LILAM_PROCESS_ROUTE` (`resolveDispatchTarget`, Z. 5906). Prozesswechsel (Teil C) belasten den Dispatcher daher stärker als reine Aufrufe.
-4. **Prozess-Lebenszyklus im Worker (H4).** Je Prozess schreibt der Worker synchron: NEW_SESSION (Prozesszeile), INFO an den Serverprozess, Route (Insert + Commit), Registry (Update + Commit); bei CLOSE_SESSION Persistierung, Route löschen (Commit), Registry (Commit), INFO (Z. 5442, 5232). Während dieser Commits liest der Worker keine Nachrichten.
-5. **CLOSE_SESSION wartet (H5).** Der Client wartet bis 1 s auf die Antwort des Servers (`close_sessionRemote`, Z. 4135), und die Nachricht steht in der Datenpipe hinter allen anderen. Bei Rückstau kostet jedes CLOSE_SESSION die Anwendung bis zu 1 s.
+3. **Routen-Cache (H3).** Der erste Aufruf jedes Prozesses und jeder Aufruf nach `CLOSE_PROCESS` kostet im Dispatcher ein `SELECT` auf `LILAM_PROCESS_ROUTE` (`resolveDispatchTarget`, Z. 5906). Prozesswechsel (Teil C) belasten den Dispatcher daher stärker als reine Aufrufe.
+4. **Prozess-Lebenszyklus im Worker (H4).** Je Prozess schreibt der Worker synchron: NEW_PROCESS (Prozesszeile), INFO an den Serverprozess, Route (Insert + Commit), Registry (Update + Commit); bei CLOSE_PROCESS Persistierung, Route löschen (Commit), Registry (Commit), INFO (Z. 5442, 5232). Während dieser Commits liest der Worker keine Nachrichten.
+5. **CLOSE_PROCESS wartet (H5).** Der Client wartet bis 1 s auf die Antwort des Servers (`close_processRemote`, Z. 4135), und die Nachricht steht in der Datenpipe hinter allen anderen. Bei Rückstau kostet jedes CLOSE_PROCESS die Anwendung bis zu 1 s.
 6. **ERROR kostet die Anwendung einen Commit (H6).** Decoupled schreibt der Client ERROR sofort selbst (`writeLogDirect`, autonome Transaktion mit Commit, Z. 4314) und sendet es zusätzlich an den Server. Erwartung: ERROR dauert ein Vielfaches eines INFO; bei vielen ERROR wird der Commit-Durchsatz (log file sync) zur Grenze, nicht die Pipe.
 7. **Volle Pipe bremst die Anwendung (H7).** `sendNoWait` versucht 3 × mit 1 s Timeout und je 0,3 s Pause (Z. 1697), also bis ca. 3,6 s je Aufruf. Danach geht die Nachricht verloren und steht in `LILAM_LOG_INTERNAL`. Die Pipe fasst 16 MB (`C_MAX_SERVER_PIPE_SIZE`), bei ca. 400–500 Byte je Nachricht rund 35.000 Nachrichten.
-8. **NEW_SESSION unter Ansturm (H8).** NEW_SESSION wartet höchstens 3 s (`C_TIMEOUT_NEW_SESSION_SEC`) und liefert sonst −20110. Ohne Dispatcher fragt jeder Client vorher die Registry ab (`getServerPipeAvailable`). Erwartung bei BATCHSTART: lange NEW_SESSION-Zeiten, erst ab sehr vielen gleichzeitigen Starts Fehlschläge.
+8. **NEW_PROCESS unter Ansturm (H8).** NEW_PROCESS wartet höchstens 3 s (`C_TIMEOUT_NEW_PROCESS_SEC`) und liefert sonst −20110. Ohne Dispatcher fragt jeder Client vorher die Registry ab (`getServerPipeAvailable`). Erwartung bei BATCHSTART: lange NEW_PROCESS-Zeiten, erst ab sehr vielen gleichzeitigen Starts Fehlschläge.
 9. **Index auf INFO (H9).** `LILAM_LOG_IX_INFO` indiziert die Spalte `INFO` (bis 2.000 Byte, Z. 2084). Jeder Log-Insert pflegt diesen Index mit. Kein Testziel, aber ein Kandidat, falls die Schreibleistung der Worker die Grenze ist.
 
 ## Voraussetzungen

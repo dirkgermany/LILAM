@@ -2,7 +2,7 @@
 -- LILAM Test: DECOUPLED / SERVER / PROZESSZYKLEN
 --
 -- Prozesszyklen: viele Prozesse mit vollstaendigem Lebenszyklus, je Client p_window gleichzeitig offen.
--- Je Prozess: NEW_SESSION, Status RUNNING/HALF, Operationen, Rueckleseprobe GET_PROC_STEPS_DONE, CLOSE_SESSION.
+-- Je Prozess: NEW_PROCESS, Status RUNNING/HALF, Operationen, Rueckleseprobe GET_PROC_STEPS_DONE, CLOSE_PROCESS.
 -- Geprueft wird der Endzustand jedes Prozesses in _PROC und die Verteilung auf die Worker.
 -- Der Test startet und stoppt seine Server selbst (Server LT_S1 und LT_S2).
 --

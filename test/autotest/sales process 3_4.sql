@@ -7,8 +7,8 @@ declare
     l_procIdSales_4 number;
 begin    
     loop
-		l_procIdSales_3 := lilam.server_new_session('SALES_PROC_3', 'SALES_GROUP', lilam.logLevelDebug, 60000, 999, 'REGISTRY_TEST');
-		l_procIdSales_4 := lilam.server_new_session('SALES_PROC_4', 'SALES_GROUP', lilam.logLevelDebug, 60000, 999, 'REGISTRY_TEST');
+		l_procIdSales_3 := lilam.server_new_process('SALES_PROC_3', 'SALES_GROUP', lilam.logLevelDebug, 60000, 999, 'REGISTRY_TEST');
+		l_procIdSales_4 := lilam.server_new_process('SALES_PROC_4', 'SALES_GROUP', lilam.logLevelDebug, 60000, 999, 'REGISTRY_TEST');
 		
 		for i in 1..10000 loop
             
@@ -41,8 +41,8 @@ begin
             lilam.proc_step_done(l_procIdSales_4);            
 
         end loop;        
-		lilam.close_session(l_procIdSales_3);
-		lilam.close_session(l_procIdSales_4);
+		lilam.close_process(l_procIdSales_3);
+		lilam.close_process(l_procIdSales_4);
         dbms_session.sleep(240);
 	end loop;
     

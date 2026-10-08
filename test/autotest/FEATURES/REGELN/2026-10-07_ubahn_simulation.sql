@@ -81,9 +81,9 @@ declare
     function new_train(p_mode varchar2, p_name varchar2) return number is
     begin
         if p_mode = lt.c_server then
-            return lilam.server_new_session(p_processName => p_name, p_groupName => c_group);
+            return lilam.server_new_process(p_processName => p_name, p_groupName => c_group);
         end if;
-        return lilam.new_session(p_processName => p_name, p_groupName => c_group);
+        return lilam.new_process(p_processName => p_name, p_groupName => c_group);
     end;
 
     -- Alerts eines Prozesses (Server schreibt asynchron: bis p_max_sec warten)
@@ -202,7 +202,7 @@ declare
         select count(*) into l_n from lilam_alerts where process_id = l_d;
         lt.check_that(l_run, p || 'U7 gleicher Prozessname: gedrosselt (Scope)', l_n = 0, 'Alerts: ' || l_n);
 
-        lilam.close_session(l_a); lilam.close_session(l_b); lilam.close_session(l_c); lilam.close_session(l_d);
+        lilam.close_process(l_a); lilam.close_process(l_b); lilam.close_process(l_c); lilam.close_process(l_d);
 
         -- U8 Signal
         for i in 1 .. 20 loop
@@ -218,7 +218,7 @@ declare
                       l_sig > 0 and json_value(l_pay, '$.rule_id') = 'R-001' and upper(json_value(l_pay, '$.group_name')) = c_group,
                       'Signale: ' || l_sig || ', letzte Payload: ' || substr(l_pay, 1, 400));
 
-        -- U9 Monitor-Zeile mit Dauer (nach CLOSE_SESSION geschrieben)
+        -- U9 Monitor-Zeile mit Dauer (nach CLOSE_PROCESS geschrieben)
         for i in 1 .. 20 loop
             execute immediate 'select max(used_millis) from lilam_mon where process_id = :1 and action = ''STATION_EXIT''
                                  and context = ''Moulin Rouge'' and action_count = 2' into l_used using l_b;

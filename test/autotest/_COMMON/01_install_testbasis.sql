@@ -109,7 +109,7 @@ create or replace package lt authid definer as
         p_ops         number,
         p_sleep_ms    number  default 0,
         p_interleave  boolean default false,   -- TRUE: erst alle Prozesse oeffnen, dann Operationen reihum
-        p_scope       varchar2 default null);  -- p_baselineScope fuer NEW_SESSION (NULL = Default: Prozessname)
+        p_scope       varchar2 default null);  -- p_baselineScope fuer NEW_PROCESS (NULL = Default: Prozessname)
 
     -- Dauerlauf: wiederholt kurze Prozesszyklen bis p_end_ts, mit Pausen und Messwerten
     procedure endurance(
@@ -123,9 +123,9 @@ create or replace package lt authid definer as
         p_metric_min   number default 10);
 
     -- Prozesszyklen: viele Prozesse mit vollstaendigem Lebenszyklus, p_window davon gleichzeitig offen.
-    -- Je Prozess: NEW_SESSION (steps_todo = p_ops), SET_PROCESS_STATUS 'RUNNING',
+    -- Je Prozess: NEW_PROCESS (steps_todo = p_ops), SET_PROCESS_STATUS 'RUNNING',
     --   p_ops Operationen (INFO, TRACE, EVENT, PROC_STEP_DONE), zur Haelfte Status 'HALF',
-    --   am Ende Rueckleseprobe GET_PROC_STEPS_DONE = p_ops, CLOSE_SESSION mit Steps, Info 'DONE ...', Status 2.
+    --   am Ende Rueckleseprobe GET_PROC_STEPS_DONE = p_ops, CLOSE_PROCESS mit Steps, Info 'DONE ...', Status 2.
     -- Operationen werden zufaellig auf die offenen Prozesse verteilt, mit kurzen Zufallspausen.
     procedure lifecycle(
         p_run_id        number,
@@ -153,7 +153,7 @@ create or replace package lt authid definer as
     --   INFO + MARK_EVENT fuer einen bestehenden Prozess, optional neuer Prozess (oeffnen/schliessen)
     --   Laeuft im Modus DISPATCHER als Job (frische Session), im Modus SERVER in der aufrufenden Session
     procedure wake_call(p_run_id number, p_mode varchar2, p_pid number, p_idle_s number,
-                        p_proc_name varchar2, p_new_session boolean default true);
+                        p_proc_name varchar2, p_new_process boolean default true);
 
     -- Standard-Pruefung nach einer Workload (wartet, bis alle Daten persistiert sind):
     --   Prozesse vorhanden und geschlossen, LOG/TRACE/EVENT/STEPS je = processes * ops,
@@ -203,7 +203,7 @@ create or replace package lt authid definer as
     -- INSESSION und SERVER in einem Lauf
     function t_logtext(p_manage boolean default true, p_parent number default null) return number;
     function t_baseline_scope(p_manage boolean default true, p_parent number default null) return number;
-    -- Sichtbarkeit vor CLOSE_SESSION: reine Monitoring-Prozesse (ohne Log) schreiben zeitgesteuert zurueck
+    -- Sichtbarkeit vor CLOSE_PROCESS: reine Monitoring-Prozesse (ohne Log) schreiben zeitgesteuert zurueck
     function t_rueckschreibung(p_manage boolean default true, p_parent number default null) return number;
     -- Baustein von t_rueckschreibung (laeuft als Job = fremde Session): Tabellenstand als Messwerte festhalten
     procedure rs_peek(p_run_id number, p_prefix varchar2, p_key varchar2);
@@ -495,12 +495,12 @@ create or replace package body lt as
     function open_process(p_mode varchar2, p_proc_name varchar2, p_scope varchar2 default null) return number is
     begin
         if p_mode = c_insession then
-            return lilam.new_session(p_proc_name, lilam.logLevelInfo, p_baselineScope => p_scope);
+            return lilam.new_process(p_proc_name, lilam.logLevelInfo, p_baselineScope => p_scope);
         else
             if p_mode = c_dispatcher then
                 lilam.set_dispatcher_pipe(c_disp_pipe);
             end if;
-            return lilam.server_new_session(p_proc_name, c_group, lilam.logLevelInfo, p_baselineScope => p_scope);
+            return lilam.server_new_process(p_proc_name, c_group, lilam.logLevelInfo, p_baselineScope => p_scope);
         end if;
     end;
 
@@ -547,7 +547,7 @@ create or replace package body lt as
                 if p_sleep_ms > 0 then dbms_session.sleep(p_sleep_ms / 1000); end if;
             end loop;
             for p in 1 .. p_processes loop
-                lilam.close_session(l_pids(p));
+                lilam.close_process(l_pids(p));
             end loop;
         else
             for p in 1 .. p_processes loop
@@ -559,7 +559,7 @@ create or replace package body lt as
                     l_calls := l_calls + 5;
                     if p_sleep_ms > 0 then dbms_session.sleep(p_sleep_ms / 1000); end if;
                 end loop;
-                lilam.close_session(l_pids(p));
+                lilam.close_process(l_pids(p));
             end loop;
         end if;
         metric(p_run_id, 'client_elapsed_ms', ms_since(l_t0), 'ms', p_client);
@@ -598,7 +598,7 @@ create or replace package body lt as
                 for o in 1 .. p_ops loop
                     one_op(l_pid, p_client, o);
                 end loop;
-                lilam.close_session(l_pid);
+                lilam.close_process(l_pid);
                 l_cycle_ms := ms_since(l_t);
                 l_cycles := l_cycles + 1;
                 l_sum_ms := l_sum_ms + l_cycle_ms;
@@ -656,11 +656,11 @@ create or replace package body lt as
             l_started := l_started + 1;
             l_t := systimestamp;
             if p_mode = c_insession then
-                l_slots(p_slot).pid := lilam.new_session(p_processName => p_proc_name, p_logLevel => lilam.logLevelInfo,
+                l_slots(p_slot).pid := lilam.new_process(p_processName => p_proc_name, p_logLevel => lilam.logLevelInfo,
                                                       p_procStepsToDo => p_ops, p_daysToKeep => null);
             else
                 if p_mode = c_dispatcher then lilam.set_dispatcher_pipe(c_disp_pipe); end if;
-                l_slots(p_slot).pid := lilam.server_new_session(p_proc_name, c_group, lilam.logLevelInfo, p_ops, null, 'LILAM');
+                l_slots(p_slot).pid := lilam.server_new_process(p_proc_name, c_group, lilam.logLevelInfo, p_ops, null, 'LILAM');
             end if;
             l_open_ms := l_open_ms + ms_since(l_t);
             l_slots(p_slot).proc_no  := l_started;
@@ -679,7 +679,7 @@ create or replace package body lt as
                 joblog(p_run_id, p_client, 'MISMATCH', 'pid=' || l_pid || ' GET_PROC_STEPS_DONE=' || l_steps || ' erwartet ' || p_ops);
             end if;
             l_t := systimestamp;
-            lilam.close_session(l_pid, 'DONE c' || p_client || ' p' || l_slots(p_slot).proc_no, 2, p_ops);
+            lilam.close_process(l_pid, 'DONE c' || p_client || ' p' || l_slots(p_slot).proc_no, 2, p_ops);
             l_close_ms := l_close_ms + ms_since(l_t);
             l_slots(p_slot).pid := null;
             l_closed := l_closed + 1;
@@ -728,7 +728,7 @@ create or replace package body lt as
     end;
 
     procedure wake_call(p_run_id number, p_mode varchar2, p_pid number, p_idle_s number,
-                        p_proc_name varchar2, p_new_session boolean default true) is
+                        p_proc_name varchar2, p_new_process boolean default true) is
         l_t   timestamp := systimestamp;
         l_pid number;
     begin
@@ -752,15 +752,15 @@ create or replace package body lt as
             end loop;
             metric(p_run_id, 'wake_visible_ms_' || p_idle_s || 's', case when l_n > 0 then ms_since(l_tv) else -1 end, 'ms');
         end;
-        if p_new_session then
+        if p_new_process then
             l_t := systimestamp;
             l_pid := open_process(p_mode, p_proc_name || '_N');
             metric(p_run_id, 'wake_new_session_ms_' || p_idle_s || 's', ms_since(l_t), 'ms');
             if nvl(l_pid, -1) <= 0 then
-                joblog(p_run_id, p_idle_s, 'ERROR', 'NEW_SESSION nach ' || p_idle_s || ' s Ruhe lieferte ' || l_pid);
+                joblog(p_run_id, p_idle_s, 'ERROR', 'NEW_PROCESS nach ' || p_idle_s || ' s Ruhe lieferte ' || l_pid);
             else
                 lilam.info(l_pid, 'new after ' || p_idle_s || ' s');
-                lilam.close_session(l_pid);
+                lilam.close_process(l_pid);
             end if;
         end if;
     exception
@@ -1130,14 +1130,14 @@ create or replace package body lt as
             -- aufrufende Session behaelt so auch keine Dispatcher-Einstellung (wichtig im Dauertest)
             run_job('LT_CW' || l_run || '_0',
               'declare l_pid number; begin lilam.set_dispatcher_pipe(''' || c_disp_pipe || '''); '
-              || 'l_pid := lilam.server_new_session(p_processName => ''' || l_prefix || ''', p_groupName => ''' || c_group
+              || 'l_pid := lilam.server_new_process(p_processName => ''' || l_prefix || ''', p_groupName => ''' || c_group
               || ''', p_logLevel => lilam.logLevelInfo); lilam.info(l_pid, ''start''); '
               || 'lt.metric(' || l_run || ', ''wake_pid'', l_pid); end;');
             l_ok := wait_jobs('LT_CW' || l_run || '_0', 60);
             select max(value) into l_pid from lt_metric where run_id = l_run and metric = 'wake_pid';
         else
             -- SERVER: alles in der aufrufenden Session (ohne Dispatcher kennt nur sie den Prozess)
-            l_pid := lilam.server_new_session(p_processName => l_prefix, p_groupName => c_group, p_logLevel => lilam.logLevelInfo);
+            l_pid := lilam.server_new_process(p_processName => l_prefix, p_groupName => c_group, p_logLevel => lilam.logLevelInfo);
             lilam.info(l_pid, 'start');
         end if;
 
@@ -1171,10 +1171,10 @@ create or replace package body lt as
 
         if p_mode = c_dispatcher then
             run_job('LT_CW' || l_run || '_E',
-              'begin lilam.set_dispatcher_pipe(''' || c_disp_pipe || '''); lilam.close_session(' || l_pid || '); end;');
+              'begin lilam.set_dispatcher_pipe(''' || c_disp_pipe || '''); lilam.close_process(' || l_pid || '); end;');
             l_ok := wait_jobs('LT_CW' || l_run || '_E', 60);
         else
-            lilam.close_session(l_pid);
+            lilam.close_process(l_pid);
         end if;
 
         l_ms := wait_count(l_prefix, 'PROC_CLOSED', 1 + p_idle.count, 30);
@@ -1211,15 +1211,15 @@ create or replace package body lt as
         procedure run_case(p_mode varchar2, p_name varchar2, p_text varchar2) is
         begin
             if p_mode = c_insession then
-                l_pid := lilam.new_session(p_processName => l_prefix || '_' || p_mode || '_' || p_name, p_logLevel => lilam.logLevelInfo);
+                l_pid := lilam.new_process(p_processName => l_prefix || '_' || p_mode || '_' || p_name, p_logLevel => lilam.logLevelInfo);
             else
-                l_pid := lilam.server_new_session(p_processName => l_prefix || '_' || p_mode || '_' || p_name,
+                l_pid := lilam.server_new_process(p_processName => l_prefix || '_' || p_mode || '_' || p_name,
                                                   p_groupName => c_group, p_logLevel => lilam.logLevelInfo);
             end if;
             lilam.info(l_pid, 'MARKER_VOR');
             lilam.info(l_pid, p_text);
             lilam.info(l_pid, 'MARKER_NACH');
-            lilam.close_session(l_pid);
+            lilam.close_process(l_pid);
             l_cases := l_cases + 1;
         end;
 
@@ -1278,9 +1278,9 @@ create or replace package body lt as
             l_pid number;
         begin
             if p_mode = c_insession then
-                l_pid := lilam.new_session(p_processName => p_name, p_logLevel => lilam.logLevelInfo, p_baselineScope => p_scope);
+                l_pid := lilam.new_process(p_processName => p_name, p_logLevel => lilam.logLevelInfo, p_baselineScope => p_scope);
             else
-                l_pid := lilam.server_new_session(p_processName => p_name, p_groupName => c_group,
+                l_pid := lilam.server_new_process(p_processName => p_name, p_groupName => c_group,
                                                   p_logLevel => lilam.logLevelInfo, p_baselineScope => p_scope);
             end if;
             for i in 1 .. p_traces loop
@@ -1288,7 +1288,7 @@ create or replace package body lt as
                 dbms_session.sleep(c_sleep_s);
                 lilam.trace_stop(l_pid, c_action);
             end loop;
-            lilam.close_session(l_pid);
+            lilam.close_process(l_pid);
             return l_pid;
         end;
 
@@ -1400,7 +1400,7 @@ create or replace package body lt as
     end;
 
     ----------------------------------------------------------------------
-    -- Rueckschreibung: Sichtbarkeit vor CLOSE_SESSION
+    -- Rueckschreibung: Sichtbarkeit vor CLOSE_PROCESS
     ----------------------------------------------------------------------
     -- Laeuft als Job (fremde Session): liest den Tabellenstand der Testprozesse mit Praefix p_prefix
     -- und haelt ihn als Messwerte <p_key>_<was> fest. Die pruefende Session liest sie aus LT_METRIC.
@@ -1438,7 +1438,7 @@ create or replace package body lt as
 
     -- Je Modus vier Prozesse ohne Log-Aufruf: nur Traces, nur Events, nur Fortschritt, nur Baseline.
     -- Jeweils ein Aufruf, Pause > 1,5 s, ein weiterer Aufruf; danach prueft ein Job aus fremder Session,
-    -- dass auch der Stand des letzten Aufrufs in der Tabelle steht, bevor CLOSE_SESSION laeuft.
+    -- dass auch der Stand des letzten Aufrufs in der Tabelle steht, bevor CLOSE_PROCESS laeuft.
     function t_rueckschreibung(p_manage boolean default true, p_parent number default null) return number is
         c_action  constant varchar2(30) := 'RS_ACTION';
         c_pause_s constant number       := 2;     -- > 1,5 s Schwelle je Prozess und Baseline, > 500 ms Sperre
@@ -1509,7 +1509,7 @@ create or replace package body lt as
             trace(l_trc);
             peek_wait(l_key, 'trc', 2);
             check_foreign(l_key);
-            check_that(l_run, l_key || ' nur Traces: beide Traces vor CLOSE_SESSION in LILAM_MON',
+            check_that(l_run, l_key || ' nur Traces: beide Traces vor CLOSE_PROCESS in LILAM_MON',
                        val(l_key, 'trc') = 2, val(l_key, 'trc'));
 
             -- R2 nur Events
@@ -1519,7 +1519,7 @@ create or replace package body lt as
             dbms_session.sleep(c_pause_s);
             lilam.mark_event(l_evt, c_action);
             peek_wait(l_key, 'evt', 2);
-            check_that(l_run, l_key || ' nur Events: beide Events vor CLOSE_SESSION in LILAM_MON',
+            check_that(l_run, l_key || ' nur Events: beide Events vor CLOSE_PROCESS in LILAM_MON',
                        val(l_key, 'evt') = 2, val(l_key, 'evt'));
 
             -- R3 nur Fortschritt (PROC_STEP_DONE, SET_PROCESS_STATUS)
@@ -1531,9 +1531,9 @@ create or replace package body lt as
             dbms_session.sleep(c_pause_s);
             lilam.set_process_status(l_stp, 2, 'PHASE 2');
             peek_wait(l_key, 'sts', 2);
-            check_that(l_run, l_key || ' nur Fortschritt: STEPS_DONE = 2 vor CLOSE_SESSION in LILAM_PROC',
+            check_that(l_run, l_key || ' nur Fortschritt: STEPS_DONE = 2 vor CLOSE_PROCESS in LILAM_PROC',
                        val(l_key, 'stp') = 2, val(l_key, 'stp'));
-            check_that(l_run, l_key || ' nur Fortschritt: STATUS = 2 vor CLOSE_SESSION in LILAM_PROC',
+            check_that(l_run, l_key || ' nur Fortschritt: STATUS = 2 vor CLOSE_PROCESS in LILAM_PROC',
                        val(l_key, 'sts') = 2, val(l_key, 'sts'));
 
             -- R4 nur Baseline (eigener Scope)
@@ -1543,12 +1543,12 @@ create or replace package body lt as
             dbms_session.sleep(c_pause_s);
             trace(l_bas);
             peek_wait(l_key, 'bas', 2);
-            check_that(l_run, l_key || ' nur Baseline: 2 Messungen vor CLOSE_SESSION in LILAM_BASELINES',
+            check_that(l_run, l_key || ' nur Baseline: 2 Messungen vor CLOSE_PROCESS in LILAM_BASELINES',
                        val(l_key, 'bas') = 2, val(l_key, 'bas'));
 
             -- R5 (nur INSESSION) Gegenprobe: ohne Timer bleibt nach dem letzten Aufruf etwas im Puffer.
             -- PROC_STEP_DONE schreibt (letzter Abgleich > 1,5 s her); der Trace direkt danach faellt in die
-            -- 500-ms-Sperre und bleibt im Puffer, bis CLOSE_SESSION ihn schreibt.
+            -- 500-ms-Sperre und bleibt im Puffer, bis CLOSE_PROCESS ihn schreibt.
             if l_ins then
                 l_key := p_tag || '_R5';
                 dbms_session.sleep(c_pause_s);
@@ -1587,15 +1587,15 @@ create or replace package body lt as
                            val(l_key, 'trccnt') = 4, val(l_key, 'trccnt'));
             end if;
 
-            lilam.close_session(l_trc);
-            lilam.close_session(l_evt);
-            lilam.close_session(l_stp);
-            lilam.close_session(l_bas);
+            lilam.close_process(l_trc);
+            lilam.close_process(l_evt);
+            lilam.close_process(l_stp);
+            lilam.close_process(l_bas);
 
             if l_ins then
                 l_key := p_tag || '_R8';
                 peek(l_prefix, l_key);
-                check_that(l_run, l_key || ' nach CLOSE_SESSION: alle 4 Traces in LILAM_MON, Prozess geschlossen',
+                check_that(l_run, l_key || ' nach CLOSE_PROCESS: alle 4 Traces in LILAM_MON, Prozess geschlossen',
                            val(l_key, 'trc') = 4 and val(l_key, 'trcopen') = 0,
                            val(l_key, 'trc') || ' Traces / offen ' || val(l_key, 'trcopen'));
             end if;
@@ -1664,7 +1664,7 @@ create or replace package body lt as
             for p in 1 .. p_n loop
                 l_pid := open_process(p_mode, l_prefix || '_' || p_tag);
                 for o in 1 .. c_ops loop one_op(l_pid, 0, o); end loop;
-                lilam.close_session(l_pid);
+                lilam.close_process(l_pid);
             end loop;
         end;
 
@@ -1753,14 +1753,14 @@ create or replace package body lt as
             l_label varchar2(10) := p_tag || ' ';
         begin
             if p_mode = c_insession then
-                l_pid := lilam.new_session(p_processName => l_prefix || '_F' || p_tag, p_logLevel => lilam.logLevelInfo,
+                l_pid := lilam.new_process(p_processName => l_prefix || '_F' || p_tag, p_logLevel => lilam.logLevelInfo,
                                            p_tabNameMaster => c_master);
             else
-                l_pid := lilam.server_new_session(p_processName => l_prefix || '_F' || p_tag, p_groupName => c_group,
+                l_pid := lilam.server_new_process(p_processName => l_prefix || '_F' || p_tag, p_groupName => c_group,
                                                   p_logLevel => lilam.logLevelInfo, p_tabNameMaster => c_master);
             end if;
 
-            -- Check-Constraint einmalig anlegen (die Tabelle legt LILAM beim ersten NEW_SESSION an)
+            -- Check-Constraint einmalig anlegen (die Tabelle legt LILAM beim ersten NEW_PROCESS an)
             select count(*) into l_ok from user_constraints where constraint_name = c_master || '_LOG_CK';
             if l_ok = 0 then
                 execute immediate 'alter table ' || c_master || '_LOG add constraint ' || c_master
@@ -1772,7 +1772,7 @@ create or replace package body lt as
             lilam.info(l_pid, 'LT_SPM_BAD');
             lilam.info(l_pid, 'LT_SPM_OK_4');
             lilam.info(l_pid, 'LT_SPM_OK_5');
-            lilam.close_session(l_pid);
+            lilam.close_process(l_pid);
 
             loop
                 execute immediate 'select count(*) from ' || c_master || '_LOG where process_id = :1 and info like ''LT\_SPM\_OK%'' escape ''\'''
@@ -1804,7 +1804,7 @@ create or replace package body lt as
         run_mem(c_server, 'SV');
         run_fallback(c_server, 'SV');
         run_mem(c_dispatcher, 'DP');   -- zuletzt: setzt den Dispatcher fuer diese Session
-        -- Dispatcher-Einstellung der Session aufheben: sonst gehen spaetere NEW_SESSION dieser Session
+        -- Dispatcher-Einstellung der Session aufheben: sonst gehen spaetere NEW_PROCESS dieser Session
         -- an den gleich gestoppten LT_DISP (Ausfall U-Bahn-Simulation run 2034)
         lilam.set_dispatcher_pipe(null);
         if p_manage then stop_all_servers; end if;
@@ -1844,7 +1844,7 @@ create or replace package body lt as
             l_ops := l_ops + 1;
             one_op(l_pid, p_client, l_ops);
         end loop;
-        lilam.close_session(l_pid);
+        lilam.close_process(l_pid);
         metric(p_run_id, 'client_ops', l_ops, 'ops', p_client);
         metric(p_run_id, 'client_api_calls', l_ops * 5, 'calls', p_client);
         metric(p_run_id, 'client_elapsed_ms', ms_since(l_t0), 'ms', p_client);
@@ -1863,7 +1863,7 @@ create or replace package body lt as
         for i in 1 .. p_ops loop
             one_op(l_pid, 0, i);
         end loop;
-        lilam.close_session(l_pid);
+        lilam.close_process(l_pid);
         metric(p_run_id, 'probe_ms', ms_since(l_t0), 'ms');
     exception
         when others then
@@ -2074,9 +2074,9 @@ create or replace package body lt as
         function proc(p_suffix varchar2, p_steps number default null) return number is
         begin
             if l_s is null then
-                return lilam.server_new_session(l_p || p_suffix, c_group, lilam.logLevelInfo, p_procStepsToDo => p_steps);
+                return lilam.server_new_process(l_p || p_suffix, c_group, lilam.logLevelInfo, p_procStepsToDo => p_steps);
             end if;
-            return lilam.new_session(p_processName => l_p || l_s || p_suffix, p_logLevel => lilam.logLevelInfo,
+            return lilam.new_process(p_processName => l_p || l_s || p_suffix, p_logLevel => lilam.logLevelInfo,
                                      p_procStepsToDo => p_steps, p_groupName => lower(l_is_grp));
         end;
 
@@ -2165,7 +2165,7 @@ create or replace package body lt as
         lilam.mark_event(l_pid, 'RG_X'); lilam.mark_event(l_pid, 'RG_D');                             -- 1: falscher Vorgaenger
         lilam.mark_event(l_pid, 'RG_A'); lilam.trace_start(l_pid, 'RG_T'); lilam.trace_stop(l_pid, 'RG_T');  -- 0
         lilam.mark_event(l_pid, 'RG_X'); lilam.trace_start(l_pid, 'RG_T'); lilam.trace_stop(l_pid, 'RG_T');  -- 1
-        lilam.close_session(l_pid);
+        lilam.close_process(l_pid);
         expect('_VG', 'VG-01', 1, 'PRECEDED_BY: Kontext egal, Log kein Vorgaenger, falscher Vorgaenger');
         expect('_VG', 'VG-02', 1, 'PRECEDED_BY mit Kontext RG_A|C1');
         expect('_VG', 'VG-03', 2, 'PRECEDED_BY_WITHIN_SECS: zu spaet und falscher Vorgaenger');
@@ -2175,7 +2175,7 @@ create or replace package body lt as
         l_pid := proc('_VG5');
         lilam.mark_event(l_pid, 'RG_A'); lilam.set_process_status(l_pid, 1);                          -- 0
         lilam.mark_event(l_pid, 'RG_A'); dbms_session.sleep(1.3); lilam.set_process_status(l_pid, 1); -- 1: zu spaet
-        lilam.close_session(l_pid);
+        lilam.close_process(l_pid);
         expect('_VG5', 'VG-05', 1, 'PRECEDED_BY_WITHIN_SECS bei PROCESS_UPDATE: Abstand zum Signal');
 
         -- ---------------------------------------------------------------
@@ -2184,7 +2184,7 @@ create or replace package body lt as
         l_pid := proc('_NF');
         lilam.mark_event(l_pid, 'RG_NF_A'); lilam.mark_event(l_pid, 'RG_NF_B');                          -- 0
         lilam.mark_event(l_pid, 'RG_NF_A'); dbms_session.sleep(1.3); lilam.mark_event(l_pid, 'RG_NF_B'); -- 1
-        lilam.close_session(l_pid);
+        lilam.close_process(l_pid);
         expect('_NF', 'NF-01', 1, 'Nachfolger zu spaet');
         dbms_output.put_line('    Hinweis: ein ganz ausbleibender Nachfolger wird nicht erkannt (keine zeitgesteuerte Pruefung)');
 
@@ -2207,7 +2207,7 @@ create or replace package body lt as
         end loop;
         lilam.trace_start(l_pid, 'RG_AV'); dbms_session.sleep(0.11); lilam.trace_stop(l_pid, 'RG_AV');  -- 0: +10 %
         lilam.trace_start(l_pid, 'RG_AV'); dbms_session.sleep(0.4);  lilam.trace_stop(l_pid, 'RG_AV');  -- 1: +300 %
-        lilam.close_session(l_pid);
+        lilam.close_process(l_pid);
         expect('_MON', 'GP-01', 1, 'MAX_GAP_SECONDS 0.8 bei Events (Dezimalpunkt)');
         expect('_MON', 'GP-02', 1, 'MAX_GAP_SECONDS 0.8 bei TRACE_START');
         expect('_MON', 'DU-01', 1, 'MAX_DURATION_MS bei TRACE_STOP');
@@ -2224,36 +2224,36 @@ create or replace package body lt as
             lilam.trace_stop(l_pid, 'RG_AV0', p_timestamp => l_ts + numtodsinterval(i, 'SECOND')
                              + numtodsinterval(case when i in (2, 3) then 0 else 0.001 end, 'SECOND'));
         end loop;                                                                                       -- 0
-        lilam.close_session(l_pid);
+        lilam.close_process(l_pid);
         expect('_AV0', 'AV-02', 0, 'AVG_DEVIATION_PCT: Durchschnitt unter 1 ms wird nicht ausgewertet');
 
         -- ---------------------------------------------------------------
         -- Prozess-Regeln (je ein Prozess, die Werte bleiben im Prozess stehen)
         -- ---------------------------------------------------------------
-        l_pid := proc('_PS'); lilam.close_session(l_pid);
+        l_pid := proc('_PS'); lilam.close_process(l_pid);
         expect('_PS', 'PR-01', 1, 'ON_START bei PROCESS_START');
 
         l_pid := proc('_ST');
         lilam.set_process_status(l_pid, 2); lilam.set_process_status(l_pid, 3);
-        lilam.close_session(l_pid);
+        lilam.close_process(l_pid);
         expect('_ST', 'PR-02', 1, 'STATUS_EQUALS 3');
 
         l_pid := proc('_IN');
         lilam.set_process_status(l_pid, 1, 'alles gut'); lilam.set_process_status(l_pid, 1, 'Teil KAPUTT');
-        lilam.close_session(l_pid);
+        lilam.close_process(l_pid);
         expect('_IN', 'PR-03', 1, 'INFO_CONTAINS (ohne Gross/Klein)');
 
         l_pid := proc('_SD', 10);
         for i in 1 .. 5 loop lilam.proc_step_done(l_pid); end loop;
-        lilam.close_session(l_pid, p_procStepsDone => 7);
+        lilam.close_process(l_pid, p_procStepsDone => 7);
         expect('_SD', 'PR-06', 2, 'MAX_OCCURRENCE 3 bei 5 Schritten');
-        expect('_SD', 'PR-04', 1, 'STEPS_LEFT_HIGH mit Endstand aus CLOSE_SESSION (7 von 10)');
+        expect('_SD', 'PR-04', 1, 'STEPS_LEFT_HIGH mit Endstand aus CLOSE_PROCESS (7 von 10)');
         expect('_SD', 'PR-05', 1, 'SUCCESS_RATE_LOW 80 % mit Endstand 70 %');
 
         l_pid := proc('_RT');
         lilam.set_process_status(l_pid, 1);                                                 -- 0
         dbms_session.sleep(0.7); lilam.set_process_status(l_pid, 1);                        -- 1
-        lilam.close_session(l_pid);
+        lilam.close_process(l_pid);
         expect('_RT', 'PR-08', 1, 'RUNTIME_EXCEEDED 500 ms (laufender Prozess)');
         expect('_RT', 'PR-07', 1, 'MAX_RUNTIME_EXCEEDED 500 ms (bei PROCESS_STOP)');
 
@@ -2263,7 +2263,7 @@ create or replace package body lt as
         l_pid := proc('_LG');
         for i in 1 .. 10 loop lilam.info(l_pid, 'info ' || i); end loop;
         lilam.warn(l_pid, 'Warnung'); lilam.error(l_pid, 'Fehler');
-        lilam.close_session(l_pid);
+        lilam.close_process(l_pid);
         expect('_LG', 'LG-01', 1, 'SEVERITY ERROR');
         expect('_LG', 'LG-02', 1, 'SEVERITY WARN als zweite Log-Regel (ohne "action")');
 
@@ -2274,7 +2274,7 @@ create or replace package body lt as
         lilam.info(l_pid, 'ohne Suchtext');                                                        -- 0
         lilam.info(l_pid, 'info rg_lc_lvl');                                                       -- LC-02: 0 (falscher Level)
         lilam.error(l_pid, 'Fehler RG_LC_LVL');                                                    -- LC-02: 1
-        lilam.close_session(l_pid);
+        lilam.close_process(l_pid);
         expect('_LC', 'LC-01', 2, 'LOG_CONTAINS ohne Level (INFO und ERROR, Gross/Klein egal)');
         expect('_LC', 'LC-02', 1, 'LOG_CONTAINS ERROR|TEXT nur fuer ERROR');
 
@@ -2286,7 +2286,7 @@ create or replace package body lt as
         lilam.mark_event(l_pid, 'RG_TF'); lilam.trace_start(l_pid, 'RG_TF'); lilam.trace_stop(l_pid, 'RG_TF');
         for i in 1 .. 3 loop lilam.mark_event(l_pid, 'RG_TH'); end loop;
         dbms_session.sleep(2.5); lilam.mark_event(l_pid, 'RG_TH');
-        lilam.close_session(l_pid);
+        lilam.close_process(l_pid);
         expect('_KX', 'KX-01', 1, 'Kontext-Regel nur fuer C1');
         expect('_KX', 'KX-02', 2, 'Action-Regel zusaetzlich fuer alle Kontexte');
         expect('_KX', 'TF-01', 1, 'Trigger-Filter: nur TRACE_STOP, kein MARK_EVENT');
@@ -2323,15 +2323,15 @@ create or replace package body lt as
             start_server('LT_S1');
             wait_servers_ready(sys.odcivarchar2list('LT_S1'));
             -- zwei Prozesse, damit mit hoher Wahrscheinlichkeit beide Server beteiligt sind
-            l_pid := proc('_L2'); lilam.mark_event(l_pid, 'RG_L'); lilam.close_session(l_pid);
-            l_pid := proc('_L2'); lilam.mark_event(l_pid, 'RG_L'); lilam.close_session(l_pid);
+            l_pid := proc('_L2'); lilam.mark_event(l_pid, 'RG_L'); lilam.close_process(l_pid);
+            l_pid := proc('_L2'); lilam.mark_event(l_pid, 'RG_L'); lilam.close_process(l_pid);
             expect('_L2', 'L-01', 2, 'L2 nach Neustart aktiv');
 
             -- L2b: ein neuer Server der Gruppe laedt das aktive Rule Set der Gruppe (allein laufend)
             l_ok := stop_server('LT_S1'); l_ok := stop_server('LT_S2');
             start_server('LT_S3');
             wait_servers_ready(sys.odcivarchar2list('LT_S3'));
-            l_pid := proc('_L2B'); lilam.mark_event(l_pid, 'RG_L'); lilam.close_session(l_pid);
+            l_pid := proc('_L2B'); lilam.mark_event(l_pid, 'RG_L'); lilam.close_process(l_pid);
             expect('_L2B', 'L-01', 1, 'L2b neuer Server LT_S3 laedt das Rule Set der Gruppe');
             l_ok := stop_server('LT_S3');
             execute immediate 'delete from lilam_server_registry where pipe_name = ''LT_S3''';
@@ -2350,7 +2350,7 @@ create or replace package body lt as
              + rejected(c_group, 9);                -- Version 9 gibt es nicht
         check_that(l_run, 'L3 SERVER_UPDATE_RULES lehnt 12 Faelle mit NUM_ERR_RULE_SET ab', l_n = 12, l_n);
         check_that(l_run, 'L3 aktives Rule Set der Gruppe unveraendert', active = c_set || ' v1', active);
-        l_pid := proc('_L3'); lilam.mark_event(l_pid, 'RG_L'); lilam.close_session(l_pid);
+        l_pid := proc('_L3'); lilam.mark_event(l_pid, 'RG_L'); lilam.close_process(l_pid);
         expect('_L3', 'L-01', 1, 'L3 Regeln aus Version 1 bleiben aktiv');
 
         -- L3a: Gruppe ohne Server ist kein Fehler; das Rule Set wird aktiv
@@ -2400,7 +2400,7 @@ create or replace package body lt as
                    l_pipes.count > 0 and l_n = l_pipes.count, l_n || ' von ' || l_pipes.count);
         -- zwei Prozesse, damit mit hoher Wahrscheinlichkeit beide Server beteiligt sind
         for i in 1 .. 2 loop
-            l_pid := proc('_L3C'); lilam.mark_event(l_pid, 'RG_L'); lilam.close_session(l_pid);
+            l_pid := proc('_L3C'); lilam.mark_event(l_pid, 'RG_L'); lilam.close_process(l_pid);
         end loop;
         expect('_L3C', 'L-01', 2, 'L3c Regeln aus Version 1 bleiben aktiv');
         -- Version 1 wieder aktiv (die Server haben sie ohnehin noch geladen)
@@ -2431,7 +2431,7 @@ create or replace package body lt as
         update_rules(2);
         check_that(l_run, 'L4 Wechsel auf Version 2: aktives Rule Set der Gruppe', active = c_set || ' v2', active);
         for i in 1 .. 2 loop
-            l_pid := proc('_L4'); lilam.mark_event(l_pid, 'RG_L'); lilam.mark_event(l_pid, 'RG_V2'); lilam.close_session(l_pid);
+            l_pid := proc('_L4'); lilam.mark_event(l_pid, 'RG_L'); lilam.mark_event(l_pid, 'RG_V2'); lilam.close_process(l_pid);
         end loop;
         expect('_L4', 'L-01', 0, 'L4 Regel aus Version 1 entfernt');
         expect('_L4', 'V2-01', 2, 'L4 Regel aus Version 2 aktiv');
@@ -2448,7 +2448,7 @@ create or replace package body lt as
         dbms_session.sleep(21);
         -- vier Prozesse, damit beide Server beteiligt sind (Round Robin bei Gleichstand)
         for i in 1 .. 4 loop
-            l_pid := proc('_L6'); lilam.mark_event(l_pid, 'RG_L'); lilam.close_session(l_pid);
+            l_pid := proc('_L6'); lilam.mark_event(l_pid, 'RG_L'); lilam.close_process(l_pid);
         end loop;
         expect('_L6', 'L-01', 4, 'L6 Server laden Version 1 ohne UPDATE_RULE (eigene Pruefung)');
 
@@ -2458,29 +2458,29 @@ create or replace package body lt as
         l_s := '_IS';
 
         -- IS-01: Prozess ohne Gruppe hat keine Regeln
-        l_pid := lilam.new_session(p_processName => l_p || '_IS_NG', p_logLevel => lilam.logLevelInfo);
+        l_pid := lilam.new_process(p_processName => l_p || '_IS_NG', p_logLevel => lilam.logLevelInfo);
         lilam.mark_event(l_pid, 'RG_L'); lilam.mark_event(l_pid, 'RG_K', 'C1'); lilam.error(l_pid, 'Fehler ohne Gruppe');
-        lilam.close_session(l_pid);
+        lilam.close_process(l_pid);
         execute immediate 'select count(*) from lilam_alerts where process_name = :1' into l_n using l_p || '_IS_NG';
         check_that(l_run, 'IS-01 Prozess ohne Gruppe: keine Alerts', l_n = 0, 'Alerts ' || l_n);
 
-        -- IS-02: Gruppe in NEW_SESSION klein geschrieben; GROUP_NAME im Alert wie angegeben
+        -- IS-02: Gruppe in NEW_PROCESS klein geschrieben; GROUP_NAME im Alert wie angegeben
         execute immediate 'select count(*) from lilam_alerts where process_name = :1 and rule_id = ''PR-02'' and group_name = :2'
            into l_n using l_p || '_IS_ST', lower(l_is_grp);
         check_that(l_run, 'IS-02 Gruppe klein geschrieben: Regeln greifen, GROUP_NAME wie angegeben', l_n = 1, 'Alerts ' || l_n);
 
         -- IS-03: Versionswechsel per SERVER_UPDATE_RULES; die Session prueft hoechstens alle 15 s.
         --        Der erste Prozess der Gruppe laedt Version 1 (PROCESS_START), das Update direkt danach wirkt noch nicht.
-        l_pid := lilam.new_session(p_processName => l_p || '_IS_3A', p_logLevel => lilam.logLevelInfo, p_groupName => l_is_grp2);
+        l_pid := lilam.new_process(p_processName => l_p || '_IS_3A', p_logLevel => lilam.logLevelInfo, p_groupName => l_is_grp2);
         lilam.server_update_rules(l_is_grp2, c_set, 2);
         lilam.mark_event(l_pid, 'RG_L'); lilam.mark_event(l_pid, 'RG_V2');
-        lilam.close_session(l_pid);
+        lilam.close_process(l_pid);
         expect('_3A', 'L-01', 1, 'IS-03 direkt nach dem Update noch Version 1');
         expect('_3A', 'V2-01', 0, 'IS-03 direkt nach dem Update Version 2 noch nicht aktiv');
         dbms_session.sleep(16);
-        l_pid := lilam.new_session(p_processName => l_p || '_IS_3B', p_logLevel => lilam.logLevelInfo, p_groupName => l_is_grp2);
+        l_pid := lilam.new_process(p_processName => l_p || '_IS_3B', p_logLevel => lilam.logLevelInfo, p_groupName => l_is_grp2);
         lilam.mark_event(l_pid, 'RG_L'); lilam.mark_event(l_pid, 'RG_V2');
-        lilam.close_session(l_pid);
+        lilam.close_process(l_pid);
         expect('_3B', 'L-01', 0, 'IS-03 nach 16 s Regel aus Version 1 entfernt');
         expect('_3B', 'V2-01', 1, 'IS-03 nach 16 s Version 2 aktiv');
 
@@ -2491,9 +2491,9 @@ create or replace package body lt as
            using l_is_grp2, c_set;
         commit;
         dbms_session.sleep(16);
-        l_pid := lilam.new_session(p_processName => l_p || '_IS_4', p_logLevel => lilam.logLevelInfo, p_groupName => l_is_grp2);
+        l_pid := lilam.new_process(p_processName => l_p || '_IS_4', p_logLevel => lilam.logLevelInfo, p_groupName => l_is_grp2);
         lilam.mark_event(l_pid, 'RG_V2');
-        lilam.close_session(l_pid);
+        lilam.close_process(l_pid);
         expect('_4', 'V2-01', 1, 'IS-04 ungueltiges Rule Set abgelehnt, Version 2 bleibt aktiv');
         execute immediate 'select count(*) from lilam_log_internal where log_timestamp >= :1
                               and module_name = ''refreshGroupRules'' and error_code = ''-20130'''
@@ -2504,9 +2504,9 @@ create or replace package body lt as
         execute immediate 'update lilam_rules set is_active = 0 where upper(group_name) = :1' using l_is_grp2;
         commit;
         dbms_session.sleep(16);
-        l_pid := lilam.new_session(p_processName => l_p || '_IS_5', p_logLevel => lilam.logLevelInfo, p_groupName => l_is_grp2);
+        l_pid := lilam.new_process(p_processName => l_p || '_IS_5', p_logLevel => lilam.logLevelInfo, p_groupName => l_is_grp2);
         lilam.mark_event(l_pid, 'RG_V2'); lilam.mark_event(l_pid, 'RG_L');
-        lilam.close_session(l_pid);
+        lilam.close_process(l_pid);
         execute immediate 'select count(*) from lilam_alerts where process_name = :1' into l_n using l_p || '_IS_5';
         check_that(l_run, 'IS-05 kein aktives Rule Set: nach 16 s keine Alerts', l_n = 0, 'Alerts ' || l_n);
         l_s := null;
@@ -2657,7 +2657,7 @@ create or replace package body lt as
             l_sync  number;
         begin
             activate(p_ver, rules_for(p_type, p_var, l_proc));
-            l_pid := lilam.server_new_session(l_proc, c_group, lilam.logLevelInfo);
+            l_pid := lilam.server_new_process(l_proc, c_group, lilam.logLevelInfo);
             dbms_session.sleep(0.5);
             -- Aufwaermen (Baseline, Caches), dann synchronisieren
             signals(l_pid, p_type, 100);
@@ -2666,7 +2666,7 @@ create or replace package body lt as
             signals(l_pid, p_type, l_cnt);
             l_sync := lilam.get_proc_steps_done(l_pid);   -- Antwort erst nach allen Signalen davor
             l_ms := ms_since(l_t0);
-            lilam.close_session(l_pid);
+            lilam.close_process(l_pid);
             if l_sync is null then
                 return -1;
             end if;
@@ -2683,14 +2683,14 @@ create or replace package body lt as
         begin
             activate(p_ver, rules_for(p_type, p_var, l_proc), is_group(p_ver, p_rep));
             -- PROCESS_START laedt das Rule Set der (neuen) Gruppe
-            l_pid := lilam.new_session(p_processName => l_proc, p_logLevel => lilam.logLevelInfo,
+            l_pid := lilam.new_process(p_processName => l_proc, p_logLevel => lilam.logLevelInfo,
                                        p_groupName => is_group(p_ver, p_rep));
             -- Aufwaermen (Baseline, Caches)
             signals(l_pid, p_type, 100);
             l_t0 := systimestamp;
             signals(l_pid, p_type, l_cnt);
             l_ms := ms_since(l_t0);
-            lilam.close_session(l_pid);
+            lilam.close_process(l_pid);
             return round(l_ms * 1000 / l_cnt, 1);
         end;
 

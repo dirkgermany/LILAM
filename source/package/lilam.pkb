@@ -65,12 +65,12 @@ AS
     ---------------------------------------------------------------
     -- Other general Parameters
     ---------------------------------------------------------------
-    C_TIMEOUT_NEW_SESSION_SEC           CONSTANT NUMBER      := 3.0;  -- NEW_SESSION max. time waiting for server response
+    C_TIMEOUT_NEW_PROCESS_SEC           CONSTANT NUMBER      := 3.0;  -- NEW_PROCESS max. time waiting for server response
     C_METRIC_ALERT_FACTOR_SEC           CONSTANT NUMBER      := 2.0;   -- Max. outlier in the duration of a processing step
     C_MAX_LOG_TEXT_LEN                  CONSTANT PLS_INTEGER := 1900;  -- Log texts are always truncated to this length (column INFO: 2000)
 
     -- Baseline scopes (cross-process averages)
-    -- t_session_init.baselineScope:  NULL    => scope = process name (default)
+    -- t_process_init.baselineScope:  NULL    => scope = process name (default)
     --                                '#NONE' => no scope, average per process only
     --                                else    => freely chosen scope name
     C_SCOPE_NONE                        CONSTANT VARCHAR2(20) := '#NONE';
@@ -81,9 +81,12 @@ AS
 
     -- Pipe handling
     C_PIPE_ID_PENDING               CONSTANT BINARY_INTEGER := -1; 
-    -- Control pipe per server/dispatcher: <PIPE>_CTL. Receives NEW_SESSION so that creating a process
+    -- Control pipe per server/dispatcher: <PIPE>_CTL. Receives NEW_PROCESS so that creating a process
     -- does not have to wait behind the data messages of the data pipe (replaces the old, unused '_INTERLEAVE').
     C_CTL_PIPE_SUFFIX               CONSTANT VARCHAR2(20)   := '_CTL';
+    -- STABILITY: the request names in the pipe protocol remain 'NEW_SESSION' and 'CLOSE_SESSION'
+    -- (API: NEW_PROCESS / CLOSE_PROCESS), so that clients and servers of different LILAM versions
+    -- still understand each other.
     C_MAX_CTL_PIPE_SIZE             CONSTANT PLS_INTEGER    := 1048576;
 
     ---------------------------------------------------------------
@@ -129,7 +132,7 @@ AS
     -- Index is the session ID, value is arbitrary (here Boolean)
     TYPE t_remote_sessions IS TABLE OF BOOLEAN INDEX BY BINARY_INTEGER;
     g_remote_sessions t_remote_sessions;
-    -- Client side: what the server reported for a remote process (NEW_SESSION/RECONNECT).
+    -- Client side: what the server reported for a remote process (NEW_PROCESS/RECONNECT).
     -- Needed to write entries up to sync_level directly, without waiting for the server.
     TYPE t_remote_sync_rec IS RECORD (
         log_level       PLS_INTEGER,
@@ -345,7 +348,7 @@ AS
 
     -- Rules of all loaded groups. Key: GROUP|ACTION or GROUP|ACTION|CONTEXT
     -- (GROUP = rule_group of the session). Server: only its own group; INSESSION: every group
-    -- that was specified with NEW_SESSION in this DB session.
+    -- that was specified with NEW_PROCESS in this DB session.
     g_rules_by_context t_rule_map;
     g_rules_by_action  t_rule_map;
 
@@ -406,8 +409,6 @@ AS
     ---------------------------------------------------------------
     -- General Variables
     ---------------------------------------------------------------
-    -- Exclusive SessionId for Logging internal Errors or Warnings
-    g_lilamSessionId                    NUMBER := -1; -- -1 as Flag for not initialized
     
     -- Counters of ERROR and WARN calls per process (in the session that makes the calls)
     TYPE t_log_counter_rec IS RECORD (
@@ -570,7 +571,7 @@ AS
 
     ---------------------------------------------------------------
     -- Set the throttling limit for a process (value from the server's response
-    -- to NEW_SESSION or RECONNECT_PROCESS). Replaces SET_HIGH_PERFORMANCE / g_is_high_perf.
+    -- to NEW_PROCESS or RECONNECT_PROCESS). Replaces SET_HIGH_PERFORMANCE / g_is_high_perf.
     ---------------------------------------------------------------
     PROCEDURE setPerfLimit(p_processId NUMBER, p_perf PLS_INTEGER) IS
         l_rec t_throttle_stat;
@@ -598,7 +599,7 @@ AS
             RETURN FALSE; -- real local in-session process
         END IF;
 
-        -- Invalid ID (e.g. NUM_ERR_SESSION_TIMEOUT from SERVER_NEW_SESSION): never a reconnect attempt
+        -- Invalid ID (e.g. NUM_ERR_PROCESS_TIMEOUT from SERVER_NEW_PROCESS): never a reconnect attempt
         IF p_processId IS NULL OR p_processId <= 0 THEN
             RETURN FALSE;
         END IF;
@@ -920,7 +921,7 @@ AS
     --    (group of the dispatcher from the registry; unknown group: use it as before)
     -- STABILITY: A default dispatcher only routes to the workers of its own group. Without this check a
     -- process of another group ended up at a worker of the dispatcher's group (wrong rule set and
-    -- baselines), or every NEW_SESSION of the session timed out once that dispatcher was stopped.
+    -- baselines), or every NEW_PROCESS of the session timed out once that dispatcher was stopped.
     --------------------------------------------------------------------------
     function getDispatcherForGroup(p_groupName varchar2) return varchar2
     as
@@ -1021,7 +1022,7 @@ AS
     END;
 
     --------------------------------------------------------------------------
-    -- Determines the scope name from t_session_init.baselineScope
+    -- Determines the scope name from t_process_init.baselineScope
     --   NULL    => process name
     --   '#NONE' => no scope (NULL)
     --   '#...'  => unknown reserved value: log it, use the process name
@@ -1607,7 +1608,7 @@ AS
 
         DBMS_PIPE.PACK_MESSAGE(l_jsonMain);
         if p_request = 'NEW_SESSION' then
-            -- NEW_SESSION via the control pipe: overtakes the data messages of other clients in the
+            -- NEW_PROCESS via the control pipe: overtakes the data messages of other clients in the
             -- data pipe (previously regularly > 3 s wait time and timeout under load).
             l_status := DBMS_PIPE.SEND_MESSAGE(ctlPipe(l_serverPipe), timeout => 3);
             sendPing(l_serverPipe);
@@ -1676,12 +1677,12 @@ AS
         l_clientChannel := getClientPipe;
 
         -- Order of selection:
-        --   1. fewest open processes (current_processes, kept up to date by touchServerRegistry on NEW_SESSION)
+        --   1. fewest open processes (current_processes, kept up to date by touchServerRegistry on NEW_PROCESS)
         --   2. lowest message rate (messages per second of the last housekeeping window, in buckets of
         --      C_SELECT_RATE_BUCKET); a rate older than C_SELECT_RATE_MAX_AGE_MS counts as 0
         --   3. the server idle for the longest time (oldest registry entry)
         -- Previously the raw message count (processing) of unaligned windows came first: a server with a
-        -- smaller, older count received every NEW_SESSION until it wrote its own count again (SERVERAUSWAHL).
+        -- smaller, older count received every NEW_PROCESS until it wrote its own count again (SERVERAUSWAHL).
         -- Dispatchers are never the target of server selection: neither for clients without a dispatcher setting
         -- (otherwise an unnecessary detour via the dispatcher) nor for a dispatcher itself when choosing
         -- a worker (it would otherwise send the message to itself endlessly)
@@ -2002,7 +2003,7 @@ AS
         l_master constant varchar2(100) := upper(trim(p_TabNameMaster));
         l_regCols number;
     begin
-        -- Check only once per session and master table (saves about a dozen dictionary queries per NEW_SESSION)
+        -- Check only once per session and master table (saves about a dozen dictionary queries per NEW_PROCESS)
         if g_checked_masters.EXISTS(l_master) then
             return;
         end if;
@@ -2393,7 +2394,7 @@ AS
     -- everything with one FORALL per table and ONE commit.
     --
     -- What is written and when remains unchanged (same due check per process).
-    -- CLOSE_SESSION still writes immediately and only its own process (no batch mode).
+    -- CLOSE_PROCESS still writes immediately and only its own process (no batch mode).
     --------------------------------------------------------------------------
     -- (types and collection buffers see declaration section: t_log_batch_rec, g_batch_mode ...)
 
@@ -2508,7 +2509,7 @@ AS
     is
     begin
         if p_code = -942 then
-            -- Table missing: check and create again on the next NEW_SESSION
+            -- Table missing: check and create again on the next NEW_PROCESS
             g_checked_masters.DELETE; g_safe_tables.DELETE;
             logLilamErr(p_code, p_msg, p_module);
             return true;
@@ -2583,7 +2584,7 @@ AS
     exception
         when others then
             rollback;
-            -- Table missing: check and create again on the next NEW_SESSION
+            -- Table missing: check and create again on the next NEW_PROCESS
             if sqlcode = -942 then g_checked_masters.DELETE; g_safe_tables.DELETE; end if;
             logLilamErr(sqlCode, sqlErrM, 'persist_log_data');
 
@@ -2784,7 +2785,7 @@ AS
     exception
         when others then
             rollback;
-            -- Table missing: check and create again on the next NEW_SESSION
+            -- Table missing: check and create again on the next NEW_PROCESS
             if sqlcode = -942 then g_checked_masters.DELETE; g_safe_tables.DELETE; end if;
             logLilamErr(sqlCode, sqlErrM, 'persist_monitor_data');
 
@@ -4072,9 +4073,9 @@ AS
     end;
 
     -------------------------------------------------------------------
-    -- Ends an earlier started logging session by the process ID.
+    -- Ends a process started earlier, identified by its process ID.
     -- Important! Ignores if the process doesn't exist! No exception is thrown!
-    procedure persist_close_session(p_processId number, p_tableName varchar2, p_procStepsToDo number, p_procStepsDone number, p_processInfo varchar2, p_status PLS_INTEGER)
+    procedure persist_close_process(p_processId number, p_tableName varchar2, p_procStepsToDo number, p_procStepsDone number, p_processInfo varchar2, p_status PLS_INTEGER)
     as
         pragma autonomous_transaction;
         sqlStatement varchar2(1000);
@@ -4127,7 +4128,7 @@ AS
 
     EXCEPTION
         WHEN OTHERS THEN
-            logLilamErr(sqlCode, sqlErrM, 'persist_close_session');
+            logLilamErr(sqlCode, sqlErrM, 'persist_close_process');
             begin
                 if DBMS_SQL.IS_OPEN(sqlCursor) THEN
                     DBMS_SQL.CLOSE_CURSOR(sqlCursor);
@@ -4144,7 +4145,7 @@ AS
 
     --------------------------------------------------------------------------
 
-    procedure persist_new_session(p_processId NUMBER, p_processName VARCHAR2, p_logLevel PLS_INTEGER, p_procStepsToDo PLS_INTEGER, p_daysToKeep PLS_INTEGER, p_procImmortal PLS_INTEGER, p_tabNameMaster VARCHAR2, p_scopeName VARCHAR2)
+    procedure persist_new_process(p_processId NUMBER, p_processName VARCHAR2, p_logLevel PLS_INTEGER, p_procStepsToDo PLS_INTEGER, p_daysToKeep PLS_INTEGER, p_procImmortal PLS_INTEGER, p_tabNameMaster VARCHAR2, p_scopeName VARCHAR2)
     as
         pragma autonomous_transaction;
         sqlStatement varchar2(2000);
@@ -4189,9 +4190,9 @@ AS
     exception
         when others then
             rollback; -- End the transaction in the error case as well
-            -- Table missing: check and create again on the next NEW_SESSION
+            -- Table missing: check and create again on the next NEW_PROCESS
             if sqlcode = -942 then g_checked_masters.DELETE; g_safe_tables.DELETE; end if;
-            logLilamErr(sqlCode, sqlErrM, 'persist_new_session'); 
+            logLilamErr(sqlCode, sqlErrM, 'persist_new_process'); 
             
     end;
 
@@ -4307,7 +4308,7 @@ AS
 
     --------------------------------------------------------------------------
 
-    procedure close_sessionRemote(p_processId number, p_procStepsToDo PLS_INTEGER, p_procStepsDone PLS_INTEGER, p_processInfo varchar2, p_processStatus PLS_INTEGER)
+    procedure close_processRemote(p_processId number, p_procStepsToDo PLS_INTEGER, p_procStepsDone PLS_INTEGER, p_processInfo varchar2, p_processStatus PLS_INTEGER)
     as
         l_payload JSON_OBJ_LILAM; -- Buffer for the JSON string
         l_serverMsg varchar2(100);
@@ -4325,14 +4326,14 @@ AS
 
         if l_response in ('TIMEOUT', 'THROTTLED') or
            l_response like 'ERROR%' then
-           l_serverMsg := 'close_sessionRemote: ' || l_response;
+           l_serverMsg := 'close_processRemote: ' || l_response;
         else
             l_serverMsg := jsonString(l_response, 'payload.server_message');
         end if ;        
 
     EXCEPTION
         WHEN OTHERS THEN
-            logLilamErr(sqlCode, sqlErrM, 'close_sessionRemote'); 
+            logLilamErr(sqlCode, sqlErrM, 'close_processRemote'); 
 
     end;
 
@@ -4921,7 +4922,7 @@ AS
     --------------------------------------------------------------------------
 
     --------------------------------------------------------------------------
-    -- Write open traces of a process as a warning to the log (before the last flush in CLOSE_SESSION)
+    -- Write open traces of a process as a warning to the log (before the last flush in CLOSE_PROCESS)
     --------------------------------------------------------------------------
     PROCEDURE warnOpenTraces(p_processId NUMBER)
     IS
@@ -4942,7 +4943,7 @@ AS
                 write_to_log_buffer(
                     p_processId,
                     logLevelWarn,
-                    'OPEN TRACE (not stopped before CLOSE_SESSION): Action=>' || g_monitor_shadows(v_key).action_name
+                    'OPEN TRACE (not stopped before CLOSE_PROCESS): Action=>' || g_monitor_shadows(v_key).action_name
                         || '; Context=>' || g_monitor_shadows(v_key).context_name
                         || '; Start=>' || to_char(g_monitor_shadows(v_key).start_time, 'YYYY-MM-DD HH24:MI:SS.FF3'),
                     systimestamp,
@@ -5051,9 +5052,9 @@ AS
 
     --------------------------------------------------------------------------
 
-    -- Ends an earlier started logging session by the process ID.
+    -- Ends a process started earlier, identified by its process ID.
     -- Important! Ignores if the process doesn't exist! No exception is thrown!
-    procedure CLOSE_SESSION(
+    procedure CLOSE_PROCESS(
         p_processId     NUMBER,
         p_processInfo   VARCHAR2    DEFAULT NULL,
         p_processStatus PLS_INTEGER DEFAULT NULL,
@@ -5063,7 +5064,7 @@ AS
         v_idx PLS_INTEGER;
     begin
         if is_remote(p_processId) then
-            close_sessionRemote(p_processId, p_procStepsToDo, p_procStepsDone, p_processInfo, p_processStatus);
+            close_processRemote(p_processId, p_procStepsToDo, p_procStepsDone, p_processInfo, p_processStatus);
             g_remote_sessions.delete(p_processId);
             g_remote_sync.delete(p_processId);
             g_log_counters.delete(p_processId);
@@ -5092,7 +5093,7 @@ AS
             evaluateRules(g_process_cache(p_processId), C_PROCESS_STOP);
 
             v_idx := v_indexSession(p_processId);
-            persist_close_session(p_processId,  g_sessionList(v_idx).tabName_master, p_procStepsToDo, p_procStepsDone, p_processInfo, p_processStatus);
+            persist_close_process(p_processId,  g_sessionList(v_idx).tabName_master, p_procStepsToDo, p_procStepsDone, p_processInfo, p_processStatus);
             checkLogsBuffer(p_processId, 'vor clearAllSessionData');
             clearAllSessionData(p_processId);
             checkLogsBuffer(p_processId, 'nach clearAllSessionData');
@@ -5102,77 +5103,77 @@ AS
     
     --------------------------------------------------------------------------
 
-    FUNCTION NEW_SESSION(p_session_init t_session_init) RETURN NUMBER
+    FUNCTION NEW_PROCESS(p_process_init t_process_init) RETURN NUMBER
     as
-        p_processId number(19,0);   
+        l_processId number(19,0);
         v_new_rec t_process_rec;
-        l_session_init t_session_init := p_session_init;
+        l_process_init t_process_init := p_process_init;
         l_scopeName VARCHAR2(100);
         l_scopeId   NUMBER;
         v_idx       PLS_INTEGER;
     begin
 
         -- empty master table (e.g. from JSON without tabname_master) => default
-        l_session_init.tabNameMaster := nvl(trim(l_session_init.tabNameMaster), 'LILAM');
-        createLogTables(l_session_init.tabNameMaster);
+        l_process_init.tabNameMaster := nvl(trim(l_process_init.tabNameMaster), 'LILAM');
+        createLogTables(l_process_init.tabNameMaster);
 
         -- New Process ID by Sequence
-        execute immediate 'select seq_lilam_log.nextVal from dual' into p_processId;
+        execute immediate 'select seq_lilam_log.nextVal from dual' into l_processId;
         
         -- default LogLevel logLevelMonitor
-        if l_session_init.logLevel is null then l_session_init.logLevel := logLevelMonitor; end if;
+        if l_process_init.logLevel is null then l_process_init.logLevel := logLevelMonitor; end if;
         
         -- persist to session internal table
-        insertSession (l_session_init.tabNameMaster, p_processId, l_session_init.logLevel);
+        insertSession (l_process_init.tabNameMaster, l_processId, l_process_init.logLevel);
 
         -- Group for the rules: in the server the server group (dispatcher: no rules),
         -- INSESSION the specified group (NULL = no rules). The rule set of the group is loaded by
         -- the first rule check (PROCESS_START below), afterwards at most every C_RULES_CHECK_INTERVAL_MS.
-        v_idx := v_indexSession(p_processId);
+        v_idx := v_indexSession(l_processId);
         if g_serverPipeName is not null then
             if not g_serverIsDispatcher then
                 g_sessionList(v_idx).group_name := trim(g_serverGroupName);
             end if;
         else
-            g_sessionList(v_idx).group_name := trim(l_session_init.groupName);
+            g_sessionList(v_idx).group_name := trim(l_process_init.groupName);
         end if;
         g_sessionList(v_idx).rule_group := upper(g_sessionList(v_idx).group_name);
-        g_sessionList(v_idx).sync_level := nvl(l_session_init.syncLevel, logLevelError);
+        g_sessionList(v_idx).sync_level := nvl(l_process_init.syncLevel, logLevelError);
 
-        deleteOldLogs(p_processId, upper(trim(l_session_init.processName)), l_session_init.daysToKeep);
+        deleteOldLogs(l_processId, upper(trim(l_process_init.processName)), l_process_init.daysToKeep);
 
         -- Baseline scope (default: process name); on errors NULL => process-local
-        l_scopeName := resolveScopeName(l_session_init.processName, l_session_init.baselineScope);
+        l_scopeName := resolveScopeName(l_process_init.processName, l_process_init.baselineScope);
         l_scopeId   := getOrCreateScopeId(l_scopeName);
-        setScopeId(p_processId, l_scopeId);
+        setScopeId(l_processId, l_scopeId);
         if l_scopeId is null then l_scopeName := null; end if;
 
-        persist_new_session(p_processId, l_session_init.processName, l_session_init.logLevel,  
-            l_session_init.stepsToDo, l_session_init.daysToKeep, l_session_init.procImmortal, l_session_init.tabNameMaster, l_scopeName);
+        persist_new_process(l_processId, l_process_init.processName, l_process_init.logLevel,  
+            l_process_init.stepsToDo, l_process_init.daysToKeep, l_process_init.procImmortal, l_process_init.tabNameMaster, l_scopeName);
 
         -- copy new details data to memory
-        v_new_rec.id             := p_processId;
-        v_new_rec.tabNameMaster  := l_session_init.tabNameMaster;
-        v_new_rec.processName    := l_session_init.processName;
+        v_new_rec.id             := l_processId;
+        v_new_rec.tabNameMaster  := l_process_init.tabNameMaster;
+        v_new_rec.processName    := l_process_init.processName;
         v_new_rec.processStart   := systimestamp;
         v_new_rec.processEnd     := null;
         v_new_rec.lastUpdate     := null;
-        v_new_rec.stepsTodo      := l_session_init.stepsToDo;
+        v_new_rec.stepsTodo      := l_process_init.stepsToDo;
         v_new_rec.stepsDone      := 0;
         v_new_rec.status         := 0;
         v_new_rec.info           := 'START';
 
-        g_process_cache(p_processId) := v_new_rec;
-        evaluateRules(g_process_cache(p_processId), C_PROCESS_START);
+        g_process_cache(l_processId) := v_new_rec;
+        evaluateRules(g_process_cache(l_processId), C_PROCESS_START);
 
-        return p_processId;
+        return l_processId;
     end;
 
 
-    -- Opens/starts a new logging session.
+    -- Starts a new process.
     -- The returned process id must be stored within the calling procedure because it is the reference
-    -- which is recommended for all following actions (e.g. CLOSE_SESSION, DEBUG, SET_PROCESS_STATUS).
-    FUNCTION NEW_SESSION(
+    -- which is recommended for all following actions (e.g. CLOSE_PROCESS, DEBUG, SET_PROCESS_STATUS).
+    FUNCTION NEW_PROCESS(
         p_processName   VARCHAR2,
         p_logLevel      PLS_INTEGER DEFAULT logLevelMonitor,
         p_procStepsToDo PLS_INTEGER DEFAULT NULL,
@@ -5182,17 +5183,17 @@ AS
         p_groupName     VARCHAR2    DEFAULT NULL,
         p_syncLevel     PLS_INTEGER DEFAULT logLevelError) RETURN NUMBER
     as
-        l_session_init t_session_init;
+        l_process_init t_process_init;
     begin
-        l_session_init.syncLevel     := p_syncLevel;
-        l_session_init.processName   := p_processName;
-        l_session_init.logLevel      := p_logLevel;
-        l_session_init.stepsToDo     := p_procStepsToDo;
-        l_session_init.daysToKeep    := p_daysToKeep;
-        l_session_init.tabNameMaster := p_tabNameMaster;
-        l_session_init.baselineScope := p_baselineScope;
-        l_session_init.groupName     := p_groupName;
-        return new_session(l_session_init);
+        l_process_init.syncLevel     := p_syncLevel;
+        l_process_init.processName   := p_processName;
+        l_process_init.logLevel      := p_logLevel;
+        l_process_init.stepsToDo     := p_procStepsToDo;
+        l_process_init.daysToKeep    := p_daysToKeep;
+        l_process_init.tabNameMaster := p_tabNameMaster;
+        l_process_init.baselineScope := p_baselineScope;
+        l_process_init.groupName     := p_groupName;
+        return new_process(l_process_init);
     end;
 
     --------------------------------------------------------------------------
@@ -5201,7 +5202,7 @@ AS
     AS
         l_result number;
     BEGIN
-        -- NULL removes the setting (otherwise every NEW_SESSION would find an empty dispatcher entry)
+        -- NULL removes the setting (otherwise every NEW_PROCESS would find an empty dispatcher entry)
         if p_pipeName is null then
             g_dispatcher_config.DELETE(nvl(upper(p_groupName), 'DEFAULT_DISPATCHER'));
             return;
@@ -5413,7 +5414,7 @@ AS
 
     --------------------------------------------------------------------------
 
-    procedure doRemote_closeSession(p_clientChannel varchar2, p_message VARCHAR2)
+    procedure doRemote_closeProcess(p_clientChannel varchar2, p_message VARCHAR2)
     as
         l_processId     number; 
         l_procStepsToDo PLS_INTEGER; 
@@ -5429,9 +5430,9 @@ AS
         l_processInfo := jsonString(l_payload, 'process_info');
         l_status      := jsonNumber(l_payload, 'process_status');
 
-        checkLogsBuffer(l_processId, 'vor CLOSE_SESSION');
+        checkLogsBuffer(l_processId, 'vor CLOSE_PROCESS');
 
-        CLOSE_SESSION(p_processId => l_processId, p_processInfo => l_processInfo, p_processStatus => l_status,
+        CLOSE_PROCESS(p_processId => l_processId, p_processInfo => l_processInfo, p_processStatus => l_status,
                       p_procStepsDone => l_procStepsDone, p_procStepsToDo => l_procStepsToDo);
         unregisterProcessRoute(l_processId);
         -- Open processes are the first criterion of the server selection: update the registry before the
@@ -5623,11 +5624,11 @@ AS
 
     --------------------------------------------------------------------------
 
-    procedure doRemote_newSession(p_clientChannel varchar2, p_message VARCHAR2)
+    procedure doRemote_newProcess(p_clientChannel varchar2, p_message VARCHAR2)
     as
         l_processId number;
         l_payload JSON_OBJ_LILAM;
-        l_session_init t_session_init;
+        l_process_init t_process_init;
         l_status PLS_INTEGER;
     begin
         l_payload := JSON_QUERY(p_message, '$.payload');
@@ -5636,22 +5637,22 @@ AS
         -- client has already given up: no process, no route, no response (the return channel
         -- no longer exists; a response would only create an orphaned pipe there).
         if jsonTime(l_payload, 'expires_utc') - INTERVAL '0.5' SECOND < sys_extract_utc(systimestamp) then
-            logLilamErr(NUM_ERR_SESSION_TIMEOUT, 'NEW_SESSION verworfen, Client wartet nicht mehr: '
-                        || jsonString(l_payload, 'process_name'), 'doRemote_newSession', 'EXPIRED');
+            logLilamErr(NUM_ERR_PROCESS_TIMEOUT, 'NEW_PROCESS verworfen, Client wartet nicht mehr: '
+                        || jsonString(l_payload, 'process_name'), 'doRemote_newProcess', 'EXPIRED');
             return;
         end if;
 
-        l_session_init.processName := jsonString(l_payload, 'process_name');
-        l_session_init.logLevel    := jsonNumber(l_payload, 'log_level');
-        l_session_init.stepsToDo   := jsonNumber(l_payload, 'steps_todo');
-        l_session_init.daysToKeep  := jsonNumber(l_payload, 'days_to_keep');
-        l_session_init.tabNameMaster := jsonString(l_payload, 'tabname_master');
-        l_session_init.baselineScope := jsonString(l_payload, 'baseline_scope');
-        l_session_init.syncLevel     := nvl(jsonNumber(l_payload, 'sync_level'), logLevelError);
+        l_process_init.processName := jsonString(l_payload, 'process_name');
+        l_process_init.logLevel    := jsonNumber(l_payload, 'log_level');
+        l_process_init.stepsToDo   := jsonNumber(l_payload, 'steps_todo');
+        l_process_init.daysToKeep  := jsonNumber(l_payload, 'days_to_keep');
+        l_process_init.tabNameMaster := jsonString(l_payload, 'tabname_master');
+        l_process_init.baselineScope := jsonString(l_payload, 'baseline_scope');
+        l_process_init.syncLevel     := nvl(jsonNumber(l_payload, 'sync_level'), logLevelError);
 
-        l_processId := NEW_SESSION(l_session_init);
+        l_processId := NEW_PROCESS(l_process_init);
         registerProcessRoute(l_processId, g_serverPipeName); 
-        touchServerRegistry;   -- Keep the registry up to date immediately (load balancing with fast NEW_SESSION)
+        touchServerRegistry;   -- Keep the registry up to date immediately (load balancing with fast NEW_PROCESS)
 
         DBMS_PIPE.RESET_BUFFER;
         -- perf: performance level of this server; the client adjusts its throttling accordingly
@@ -5699,7 +5700,7 @@ AS
     FUNCTION GET_SERVER_PIPE(p_processId NUMBER) RETURN VARCHAR2
     as
     begin
-        -- Invalid ID (e.g. NUM_ERR_SESSION_TIMEOUT from SERVER_NEW_SESSION): no server, no exception
+        -- Invalid ID (e.g. NUM_ERR_PROCESS_TIMEOUT from SERVER_NEW_PROCESS): no server, no exception
         if p_processId is null or p_processId < 0 then
             return null;
         end if;
@@ -5708,7 +5709,7 @@ AS
 
     --------------------------------------------------------------------------
 
-    FUNCTION SERVER_NEW_SESSION(
+    FUNCTION SERVER_NEW_PROCESS(
         p_processName   VARCHAR2,
         p_groupName     VARCHAR2    DEFAULT NULL,
         p_logLevel      PLS_INTEGER DEFAULT logLevelMonitor,
@@ -5729,7 +5730,7 @@ AS
         jsonPut(l_payload, 'baseline_scope', p_baselineScope);
         jsonPut(l_payload, 'sync_level',     p_syncLevel);
 
-        return server_new_session_json(l_payload);
+        return server_new_process_json(l_payload);
     end;
 
     --------------------------------------------------------------------------
@@ -5755,26 +5756,26 @@ AS
 
     --------------------------------------------------------------------------
 
-    FUNCTION SERVER_NEW_SESSION_JSON(p_jsonObject JSON_OBJ_LILAM) RETURN NUMBER
+    FUNCTION SERVER_NEW_PROCESS_JSON(p_jsonObject JSON_OBJ_LILAM) RETURN NUMBER
     as
         l_ProcessId number(19,0) := -500;   
         l_response  varchar2(100);        
         l_payload   JSON_OBJ_LILAM := p_jsonObject;
     begin                        
         -- Expiry time: until then the client waits for the response. If the server only gets to the
-        -- message afterwards (e.g. full pipe), it does not create a process (see doRemote_newSession).
+        -- message afterwards (e.g. full pipe), it does not create a process (see doRemote_newProcess).
         -- This way no orphaned, never closed processes are created.
         -- In UTC, since client and server sessions can have different time zones.
-        jsonPut(l_payload, 'expires_utc', sys_extract_utc(systimestamp) + numtodsinterval(C_TIMEOUT_NEW_SESSION_SEC, 'SECOND'));
+        jsonPut(l_payload, 'expires_utc', sys_extract_utc(systimestamp) + numtodsinterval(C_TIMEOUT_NEW_PROCESS_SEC, 'SECOND'));
 
         -- first check which servers are available
-        l_response := waitForResponse(null, 'NEW_SESSION', l_payload, C_TIMEOUT_NEW_SESSION_SEC);
+        l_response := waitForResponse(null, 'NEW_SESSION', l_payload, C_TIMEOUT_NEW_PROCESS_SEC);
 
         CASE
             WHEN l_response = 'TIMEOUT' THEN
-                l_ProcessId := NUM_ERR_SESSION_TIMEOUT;
+                l_ProcessId := NUM_ERR_PROCESS_TIMEOUT;
             WHEN l_response = 'THROTTLED' THEN
-                l_ProcessId := NUM_ERR_SESSION_THROTTLED;
+                l_ProcessId := NUM_ERR_PROCESS_THROTTLED;
             WHEN l_response LIKE 'ERROR%' THEN
                 l_ProcessId := NUM_COMM_ERR;
             else
@@ -5783,12 +5784,12 @@ AS
         end case;
         
         -- No process created: no exception to the application (philosophy: no impact).
-        -- The application receives the negative ID (constants NUM_ERR_SESSION_* in the specification);
+        -- The application receives the negative ID (constants NUM_ERR_PROCESS_* in the specification);
         -- all further API calls with this ID are silently ignored. Logged in LILAM_LOG_INTERNAL.
         if l_ProcessId < 0 then
             g_client_pipes.DELETE(C_PIPE_ID_PENDING);
             logLilamErr(l_ProcessId, 'Could not establish connection to LILAM-Server: ' || l_response,
-                        'SERVER_NEW_SESSION_JSON', 'NEW_SESSION');
+                        'SERVER_NEW_PROCESS_JSON', 'NEW_PROCESS');
             return l_ProcessId;
         end if;
         
@@ -6757,8 +6758,8 @@ AS
     --------------------------------------------------------------------------
 
     --------------------------------------------------------------------------
-    -- After each NEW_SESSION immediately update open processes and timestamp in the registry.
-    -- Otherwise NEW_SESSION calls in quick succession (e.g. 20 in 0.5 s) still see the values of the
+    -- After each NEW_PROCESS immediately update open processes and timestamp in the registry.
+    -- Otherwise NEW_PROCESS calls in quick succession (e.g. 20 in 0.5 s) still see the values of the
     -- last periodic update and all end up at the same server. With the selection
     -- "oldest entry first" the next request thereby goes to another server.
     --------------------------------------------------------------------------
@@ -6912,7 +6913,7 @@ AS
         DBMS_PIPE.PURGE(ctlPipe(p_pipeName));
         l_dummyRes := DBMS_PIPE.REMOVE_PIPE(ctlPipe(p_pipeName));
         l_dummyRes := DBMS_PIPE.CREATE_PIPE(pipename => upper(p_pipeName), maxpipesize => C_MAX_SERVER_PIPE_SIZE, private => false);
-        -- Control pipe for NEW_SESSION (see C_CTL_PIPE_SUFFIX)
+        -- Control pipe for NEW_PROCESS (see C_CTL_PIPE_SUFFIX)
         l_dummyRes := DBMS_PIPE.CREATE_PIPE(pipename => ctlPipe(p_pipeName), maxpipesize => C_MAX_CTL_PIPE_SIZE, private => false);
     end;
 
@@ -6955,7 +6956,7 @@ AS
             DBMS_PIPE.RESET_BUFFER;
             DBMS_PIPE.PACK_MESSAGE(p_message);        
             if p_request in ('NEW_SESSION', 'SERVER_NEW_SESSION') then
-                -- NEW_SESSION to the worker's control pipe, then a wake-up call into its data pipe
+                -- NEW_PROCESS to the worker's control pipe, then a wake-up call into its data pipe
                 l_status := DBMS_PIPE.SEND_MESSAGE(ctlPipe(l_targetPipe), timeout => 1);
                 sendPing(l_targetPipe);
             else
@@ -6987,12 +6988,12 @@ AS
             WHEN 'NEW_SESSION' THEN
                 if not p_drain then
                     INFO(g_serverProcessId, g_serverPipeName || '=> New remote session ordered');
-                    doRemote_newSession(p_clientChannel, p_message);
+                    doRemote_newProcess(p_clientChannel, p_message);
                 end if;
 
             WHEN 'CLOSE_SESSION' THEN
                 INFO(g_serverProcessId, g_serverPipeName || '=> Remote session closed');
-                doRemote_closeSession(p_clientChannel, p_message);
+                doRemote_closeProcess(p_clientChannel, p_message);
 
             WHEN 'LOG_ANY' then
                 doRemote_logAny(p_message);
@@ -7057,11 +7058,11 @@ AS
         l_ctlPipe        VARCHAR2(150);
     begin
         g_serverIsDispatcher := CASE nvl(p_isDispatcher, 0) WHEN 1 THEN TRUE ELSE FALSE END;
-        g_server_perf := normPerf(p_perfServer);   -- is passed to the clients on NEW_SESSION/RECONNECT
+        g_server_perf := normPerf(p_perfServer);   -- is passed to the clients on NEW_PROCESS/RECONNECT
         g_shutdownPassword := p_password;
         g_serverPipeName := p_pipeName;
         g_serverGroupName := p_groupName;
-        g_serverProcessId := new_session(p_processName => 'LILAM_SERVER', p_logLevel => logLevelMonitor, p_tabNameMaster => 'LILAM_SERVER');
+        g_serverProcessId := new_process(p_processName => 'LILAM_SERVER', p_logLevel => logLevelMonitor, p_tabNameMaster => 'LILAM_SERVER');
         setAnyStatus(g_serverProcessId, 1, 'RUNNING', null, null, null, SYSTIMESTAMP);
 
         registerServerPipe;
@@ -7075,7 +7076,7 @@ AS
         );
 
         LOOP
-            -- First the control pipe (NEW_SESSION), without waiting. If it is empty, this costs only a few µs.
+            -- First the control pipe (NEW_PROCESS), without waiting. If it is empty, this costs only a few µs.
             LOOP
                 l_status := DBMS_PIPE.RECEIVE_MESSAGE(l_ctlPipe, timeout => 0);
                 EXIT WHEN l_status != 0;
@@ -7181,7 +7182,7 @@ AS
         -- final analysis of the buffer states
         DUMP_BUFFER_STATS;
 
-        close_session(g_serverProcessId);
+        close_process(g_serverProcessId);
         updateServerRegistry(FALSE, 0);
 
     EXCEPTION
@@ -7230,7 +7231,7 @@ AS
     l_jsonPayload   JSON_OBJ_LILAM;   -- Payload of the response
     l_api_call      VARCHAR2(30);
     l_proc_id       NUMBER;
-    p_session_init  t_session_init;
+    l_process_init  t_process_init;
 BEGIN
     if not p_callObject IS JSON then
         RAISE_APPLICATION_ERROR(-20005, 'In-Parameter is invalid JSON-Format');
@@ -7239,6 +7240,13 @@ BEGIN
     -- Extract header and params from the request
     l_jsonHeaderIn := jsonObject(l_InObject, 'header');
     l_api_call     := jsonString(l_jsonHeaderIn, 'api_call');
+    -- Former names of the API calls are still accepted
+    l_api_call     := case l_api_call
+                          when 'NEW_SESSION'        then 'NEW_PROCESS'
+                          when 'SERVER_NEW_SESSION' then 'SERVER_NEW_PROCESS'
+                          when 'CLOSE_SESSION'      then 'CLOSE_PROCESS'
+                          else l_api_call
+                      end;
     l_jsonParams   := jsonObject(l_InObject, 'params');
 
     -- Basic response structure; 'status' is deliberately set ONLY ONCE,
@@ -7248,33 +7256,33 @@ BEGIN
     jsonPut(l_jsonPayload, 'value', 'NULL');
 
     case l_api_call
-        when 'SERVER_NEW_SESSION' THEN
+        when 'SERVER_NEW_PROCESS' THEN
             begin
-                l_proc_id := SERVER_NEW_SESSION_JSON(l_jsonParams);
+                l_proc_id := SERVER_NEW_PROCESS_JSON(l_jsonParams);
                 jsonPut(l_jsonHeader, 'status', 'SUCCESS');
                 jsonPut(l_jsonPayload, 'returns', 'PROCESS_ID');
                 jsonPut(l_jsonPayload, 'value', l_proc_id);
 
             exception
                 when others then
-                    logLilamErr(sqlCode, sqlErrM, 'CALL_BY_JSON', 'SERVER_NEW_SESSION');
+                    logLilamErr(sqlCode, sqlErrM, 'CALL_BY_JSON', 'SERVER_NEW_PROCESS');
                     jsonPut(l_jsonHeader, 'status', 'ERROR');
                     jsonPut(l_jsonPayload, 'returns', 'ERR_NO');
                     jsonPut(l_jsonPayload, 'value', SQLCODE);
             end;
 
-        when 'NEW_SESSION' THEN
-            p_session_init.processName   := jsonString(l_jsonParams, 'process_name');
-            p_session_init.logLevel      := jsonNumber(l_jsonParams, 'log_level');
-            p_session_init.stepsToDo     := jsonNumber(l_jsonParams, 'steps_todo');
-            p_session_init.daysToKeep    := jsonNumber(l_jsonParams, 'days_to_keep');
-            p_session_init.procImmortal  := jsonNumber(l_jsonParams, 'process_immortal');
-            p_session_init.tabNameMaster := jsonString(l_jsonParams, 'tabname_master');
-            p_session_init.baselineScope := jsonString(l_jsonParams, 'baseline_scope');
-            p_session_init.groupName     := jsonString(l_jsonParams, 'group_name');
-            p_session_init.syncLevel     := nvl(jsonNumber(l_jsonParams, 'sync_level'), logLevelError);
+        when 'NEW_PROCESS' THEN
+            l_process_init.processName   := jsonString(l_jsonParams, 'process_name');
+            l_process_init.logLevel      := jsonNumber(l_jsonParams, 'log_level');
+            l_process_init.stepsToDo     := jsonNumber(l_jsonParams, 'steps_todo');
+            l_process_init.daysToKeep    := jsonNumber(l_jsonParams, 'days_to_keep');
+            l_process_init.procImmortal  := jsonNumber(l_jsonParams, 'process_immortal');
+            l_process_init.tabNameMaster := jsonString(l_jsonParams, 'tabname_master');
+            l_process_init.baselineScope := jsonString(l_jsonParams, 'baseline_scope');
+            l_process_init.groupName     := jsonString(l_jsonParams, 'group_name');
+            l_process_init.syncLevel     := nvl(jsonNumber(l_jsonParams, 'sync_level'), logLevelError);
 
-            l_proc_id := NEW_SESSION(p_session_init);
+            l_proc_id := NEW_PROCESS(l_process_init);
             jsonPut(l_jsonHeader, 'status', 'SUCCESS');
             jsonPut(l_jsonPayload, 'returns', 'PROCESS_ID');
             jsonPut(l_jsonPayload, 'value', l_proc_id);
@@ -7287,8 +7295,8 @@ BEGIN
             );
             jsonPut(l_jsonHeader, 'status', 'SUCCESS');
 
-        when 'CLOSE_SESSION' THEN
-            CLOSE_SESSION(jsonNumber(l_jsonParams, 'process_id'));
+        when 'CLOSE_PROCESS' THEN
+            CLOSE_PROCESS(jsonNumber(l_jsonParams, 'process_id'));
             jsonPut(l_jsonHeader, 'status', 'SUCCESS');
 
         when 'FLUSH' THEN
@@ -7444,14 +7452,74 @@ END;
     end;
 
     ------------------------------------------------------------------------
+    -- Former names (compatibility)
+    ------------------------------------------------------------------------
+
+    FUNCTION NEW_SESSION(p_session_init t_session_init) RETURN NUMBER
+    as
+    begin
+        return NEW_PROCESS(p_session_init);
+    end;
+
+    FUNCTION NEW_SESSION(
+        p_processName   VARCHAR2,
+        p_logLevel      PLS_INTEGER DEFAULT logLevelMonitor,
+        p_procStepsToDo PLS_INTEGER DEFAULT NULL,
+        p_daysToKeep    PLS_INTEGER DEFAULT NULL,
+        p_tabNameMaster VARCHAR2    DEFAULT 'LILAM',
+        p_baselineScope VARCHAR2    DEFAULT NULL,
+        p_groupName     VARCHAR2    DEFAULT NULL,
+        p_syncLevel     PLS_INTEGER DEFAULT logLevelError) RETURN NUMBER
+    as
+    begin
+        return NEW_PROCESS(p_processName => p_processName, p_logLevel => p_logLevel, p_procStepsToDo => p_procStepsToDo,
+                           p_daysToKeep => p_daysToKeep, p_tabNameMaster => p_tabNameMaster, p_baselineScope => p_baselineScope,
+                           p_groupName => p_groupName, p_syncLevel => p_syncLevel);
+    end;
+
+    FUNCTION SERVER_NEW_SESSION(
+        p_processName   VARCHAR2,
+        p_groupName     VARCHAR2    DEFAULT NULL,
+        p_logLevel      PLS_INTEGER DEFAULT logLevelMonitor,
+        p_procStepsToDo PLS_INTEGER DEFAULT NULL,
+        p_daysToKeep    PLS_INTEGER DEFAULT NULL,
+        p_tabNameMaster VARCHAR2    DEFAULT 'LILAM',
+        p_baselineScope VARCHAR2    DEFAULT NULL,
+        p_syncLevel     PLS_INTEGER DEFAULT logLevelError) RETURN NUMBER
+    as
+    begin
+        return SERVER_NEW_PROCESS(p_processName => p_processName, p_groupName => p_groupName, p_logLevel => p_logLevel,
+                                  p_procStepsToDo => p_procStepsToDo, p_daysToKeep => p_daysToKeep, p_tabNameMaster => p_tabNameMaster,
+                                  p_baselineScope => p_baselineScope, p_syncLevel => p_syncLevel);
+    end;
+
+    FUNCTION SERVER_NEW_SESSION_JSON(p_jsonObject JSON_OBJ_LILAM) RETURN NUMBER
+    as
+    begin
+        return SERVER_NEW_PROCESS_JSON(p_jsonObject);
+    end;
+
+    PROCEDURE CLOSE_SESSION(
+        p_processId     NUMBER,
+        p_processInfo   VARCHAR2    DEFAULT NULL,
+        p_processStatus PLS_INTEGER DEFAULT NULL,
+        p_procStepsDone PLS_INTEGER DEFAULT NULL,
+        p_procStepsToDo PLS_INTEGER DEFAULT NULL)
+    as
+    begin
+        CLOSE_PROCESS(p_processId => p_processId, p_processInfo => p_processInfo, p_processStatus => p_processStatus,
+                      p_procStepsDone => p_procStepsDone, p_procStepsToDo => p_procStepsToDo);
+    end;
+
+    ------------------------------------------------------------------------
 
     PROCEDURE IS_ALIVE
     as
-        pProcessName number(19,0);
+        l_processId number(19,0);
     begin
-        pProcessName := new_session('LILAM Life Check', logLevelDebug);
-        debug(pProcessName, 'First Message of LILAM');
-        close_session(p_processId => pProcessName, p_processInfo => 'OK', p_processStatus => 1, p_procStepsDone => 1, p_procStepsToDo => 1);
+        l_processId := new_process('LILAM Life Check', logLevelDebug);
+        debug(l_processId, 'First Message of LILAM');
+        close_process(p_processId => l_processId, p_processInfo => 'OK', p_processStatus => 1, p_procStepsDone => 1, p_procStepsToDo => 1);
     end;
 
     BEGIN

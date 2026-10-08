@@ -58,10 +58,10 @@ So kann der Dauertest dieselben Tests wiederverwenden. FEHLERFAELLE und DISPATCH
 | WAKEUP | Aufrufe nach Ruhephasen des Servers von 5, 16, 30 und 65 s; das INFO muss höchstens 1 s nach dem Aufruf in der Tabelle stehen | nur DECOUPLED |
 | LASTSPITZE | mehrere Clients senden eine Zeit lang ohne Pause; danach Erholung: alle Daten vollständig, Prozesse geschlossen, keine Routen übrig, ein neuer Prozess arbeitet wieder normal | 6 Clients × 30 s, nur DECOUPLED |
 | FEATURES/BASELINE_SCOPE | prozessübergreifende Baseline: Default-Scope, `#NONE`, frei gewählter gemeinsamer Scope; INSESSION und SERVER | je Modus 7 kurze Prozesse |
-| FEATURES/RUECKSCHREIBUNG | Sichtbarkeit vor `CLOSE_SESSION`: Prozesse ohne Log-Aufruf (nur Traces, nur Events, nur Fortschritt, nur Baseline); nach Aufruf, Pause 2 s und weiterem Aufruf prüft ein Job aus fremder Session `LILAM_MON`, `LILAM_PROC` und `LILAM_BASELINES`. INSESSION-Gegenprobe: ein Aufruf in der 500-ms-Sperre bleibt im Puffer (kein Timer); `FLUSH` (direkt und per `CALL_BY_JSON`) schreibt ihn sofort, der Prozess bleibt offen und zählt weiter; INSESSION und SERVER | je Modus 4 Prozesse, ca. 55 s |
+| FEATURES/RUECKSCHREIBUNG | Sichtbarkeit vor `CLOSE_PROCESS`: Prozesse ohne Log-Aufruf (nur Traces, nur Events, nur Fortschritt, nur Baseline); nach Aufruf, Pause 2 s und weiterem Aufruf prüft ein Job aus fremder Session `LILAM_MON`, `LILAM_PROC` und `LILAM_BASELINES`. INSESSION-Gegenprobe: ein Aufruf in der 500-ms-Sperre bleibt im Puffer (kein Timer); `FLUSH` (direkt und per `CALL_BY_JSON`) schreibt ihn sofort, der Prozess bleibt offen und zählt weiter; INSESSION und SERVER | je Modus 4 Prozesse, ca. 55 s |
 | FEATURES/LOGTEXT_GRENZEN | Kürzung langer Logtexte (1.500–5.000 Zeichen, Umlaute); INSESSION und SERVER | 9 Texte je Modus |
 | FEATURES/DISPATCHER_APEX | APEX/AJAX mit Connection Pool: jeder Request ein eigener Job mit leerem PGA, Trace über zwei Requests, parallele Requests, Request ohne Dispatcher, veraltete ID nach CLOSE | 13 Requests |
-| FEATURES/FEHLERFAELLE | Störungen ohne Wirkung auf die Anwendung: kein Server, negative/veraltete ID, Handshake über Dispatcher, verfallene NEW_SESSION | 6 Fälle |
+| FEATURES/FEHLERFAELLE | Störungen ohne Wirkung auf die Anwendung: kein Server, negative/veraltete ID, Handshake über Dispatcher, verfallene NEW_PROCESS-Anfrage | 6 Fälle |
 | FEATURES/SERVERAUSWAHL | Dispatcher wird nie als Ziel der Serverauswahl gewählt; Last verteilt sich auf die Worker (je Worker mind. 30 %), ohne und mit Dispatcher | 2 Clients × 20 Prozesse |
 | FEATURES/SPEICHER | kein Speicherverlust: PGA-Wachstum je Prozess von Session/Client, Workern und Dispatcher (Median aus 5 Messblöcken, max. 100 Byte); Fallback beim Schreiben (fehlerhafte Zeile übersprungen und protokolliert, übrige geschrieben); INSESSION, SERVER, DISPATCHER. Benötigt `00_grants_als_sys.sql` | je Modus 2.000 + 5 × 1.000 Prozesse, ca. 7 min |
 | FEATURES/REGELN | Rules Engine im SERVER- und INSESSION-Modus mit eigenem Rule Set `LT_REGELN`: Laden per API und nach Neustart, Server laden ein geändertes Rule Set auch ohne UPDATE_RULE-Nachricht (L6), Ablehnung ungültiger Rule Sets, Vorgänger/Nachfolger, Abstand, Dauer, Häufigkeit, Abweichung, Prozess- und Log-Regeln, Kontext-/Action-Regel, Drosselung, Alert-Zeile und Signal; INSESSION zusätzlich ohne Gruppe, Groß-/Kleinschreibung der Gruppe, Versionswechsel nach der 15-s-Prüfung, ungültiges und fehlendes Rule Set. Nur einzeln (ändert das Rule Set der Gruppe LT) | ca. 45 Prozesse, 2–3 Server, ca. 2,5 min |
@@ -71,16 +71,16 @@ Eine Operation besteht aus fünf API-Aufrufen: `INFO`, `TRACE_START`, `TRACE_STO
 Die Standard-Prüfung kontrolliert danach Vollständigkeit (Logs, Traces, Events, Steps), geschlossene Prozesse,
 die Zählung der Baseline, übrig gebliebene Routen sowie Fehler in Client-Jobs und in `LILAM_LOG_INTERNAL`.
 
-### Sichtbarkeit vor CLOSE_SESSION
+### Sichtbarkeit vor CLOSE_PROCESS
 
-Die Standard-Prüfung zählt erst nach `CLOSE_SESSION`, und die Standard-Operation enthält immer ein `INFO`.
-Beides verdeckt, ob gepufferte Daten schon **während** eines Prozesses in den Tabellen stehen: `CLOSE_SESSION`
+Die Standard-Prüfung zählt erst nach `CLOSE_PROCESS`, und die Standard-Operation enthält immer ein `INFO`.
+Beides verdeckt, ob gepufferte Daten schon **während** eines Prozesses in den Tabellen stehen: `CLOSE_PROCESS`
 schreibt zwangsweise alles, und im INSESSION-Modus stößt jeder Log-Aufruf die zeitgesteuerte Rückschreibung an.
 Deshalb prüft `FEATURES/RUECKSCHREIBUNG` gezielt Prozesse **ohne** Log-Aufruf und liest den Stand **vor**
-`CLOSE_SESSION` aus einer **fremden Session** (Job). Neue API-Aufrufe, die Daten puffern, gehören dort mit
+`CLOSE_PROCESS` aus einer **fremden Session** (Job). Neue API-Aufrufe, die Daten puffern, gehören dort mit
 einem eigenen Prozess in die Prüfung.
 
-| Prüfung | nach `CLOSE_SESSION` | vor `CLOSE_SESSION` (fremde Session) |
+| Prüfung | nach `CLOSE_PROCESS` | vor `CLOSE_PROCESS` (fremde Session) |
 |---|---|---|
 | Logs, Traces, Events, Steps (Standard-Operation) | alle Tests | indirekt (Workload loggt immer) |
 | nur Traces / nur Events / nur Fortschritt / nur Baseline | – | RUECKSCHREIBUNG |

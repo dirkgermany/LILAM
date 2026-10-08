@@ -29,8 +29,8 @@ graph LR
     end
 
     %% API Verbindungen
-    API -->|NEW_SESSION| LI
-    API -->|SERVER_NEW_SESSION| CNS
+    API -->|NEW_PROCESS| LI
+    API -->|SERVER_NEW_PROCESS| CNS
     
     %% Datenfluss zu den Tabellen (Linienführung optimiert)
     LI -->|Direct Write| MDBA

@@ -5,10 +5,10 @@
 
 - [Technischer Überblick](#technischer-überblick)
 - [Begriffe](#begriffe)
-- [Prozess](#prozess)
-- [Session](#session)
-  - [Lebenszyklus einer Session](#lebenszyklus-einer-session)
-  - [Persistenz und Fehlerbehandlung](#persistenz-und-fehlerbehandlung)
+  - [Prozess](#prozess)
+    - [Lebenszyklus eines Prozesses](#lebenszyklus-eines-prozesses)
+  - [Session](#session)
+- [Persistenz und Fehlerbehandlung](#persistenz-und-fehlerbehandlung)
 - [Logs / Severity](#logs--severity)
 - [Log-Level](#log-level)
 - [Metriken](#metriken)
@@ -38,7 +38,7 @@
   - [Regeltabelle](#regeltabelle)
   - [Interne Log-Tabelle](#interne-log-tabelle)
 - [API](#api)
-  - [Session-Verwaltung](#session-verwaltung)
+  - [Prozessverwaltung](#prozessverwaltung)
   - [Prozesssteuerung](#prozesssteuerung)
   - [Logging](#logging-1)
   - [Metriken](#metriken-1)
@@ -50,7 +50,7 @@
 ## Technischer Überblick
 LILAM nutzt die Kernfunktionen, die Oracle über PL/SQL bereitstellt (ab Version 12, getestet unter 19c und 26 AI). LILAM selbst ist ein PL/SQL-Skript, das von anderen PL/SQL-Skripten in verschiedenen Betriebsarten genutzt werden kann. Dazu zählen auch APEX-Anwendungen bzw. - allgemein gesprochen - Anwendungen, die zur Laufzeit die Datenbank-Session wechseln können.
 
-LILAM ist damit das Gegenteil von „schwarzer Magie“ oder überzogenem Engineering. Mit wenigen Datenbankobjekten verfolgt LILAM eine konsequente Zero-Dependency-Strategie. Die Sicherheit der Session-, Log- und Metrikdaten wird durch autonome Transaktionen gewährleistet. Diese sind streng von den Daten im Speicher und von den Transaktionen anderer Anwendungen getrennt und sorgen für ihren eigenen COMMIT, selbst wenn die Anwendung einen Rollback durchführen musste.
+LILAM ist damit das Gegenteil von „schwarzer Magie“ oder überzogenem Engineering. Mit wenigen Datenbankobjekten verfolgt LILAM eine konsequente Zero-Dependency-Strategie. Die Sicherheit der Prozess-, Log- und Metrikdaten wird durch autonome Transaktionen gewährleistet. Diese sind streng von den Daten im Speicher und von den Transaktionen anderer Anwendungen getrennt und sorgen für ihren eigenen COMMIT, selbst wenn die Anwendung einen Rollback durchführen musste.
 
 LILAM selbst ist ein PL/SQL Package, bestehend aus der üblichen Spezifikation (.pks) und dem Body (.pkb). Der Code umfasst lediglich einige tausend echte Codezeilen; in Version 2.0, sind es rund 4.500 LOC. Die Funktionen des LILAM Clients, des LILAM Servers und des LILAM Dispatchers sind damit voll abgedeckt.
 
@@ -69,22 +69,26 @@ LILAM dient zur Überwachung von Anwendungen, die letztlich einen Prozess irgend
 
 Zu einem Prozess gehören insbesondere sein Name, Informationen zu seinem Lebenszyklus sowie geplante und erledigte Arbeitsschritte. 
 
-### Session
-Eine Session repräsentiert den Lebenszyklus eines protokollierten Prozesses. Ein Prozess „lebt“ innerhalb einer Session. Eine Session wird einmal geöffnet und einmal geschlossen. Für saubere, nachvollziehbare und konsistente Prozesszustände ist das abschließende Schließen der Sessions unverzichtbar.
+Eine Anwendung kann mehrere Prozesse gleichzeitig führen, auch in derselben Datenbanksession: Jeder Aufruf von `NEW_PROCESS` bzw. `SERVER_NEW_PROCESS` startet einen eigenen Prozess mit eigener Prozess-ID, den LILAM unabhängig von den anderen überwacht.
 
-#### Lebenszyklus einer Session
-**Zu Beginn** einer Log-Session wird der eine und einzige Log-Eintrag in die *Master-Tabelle* geschrieben.
-**Während** der Session kann dieser eine Log-Eintrag aktualisiert werden, und zusätzliche Informationen können in die *Detail-Tabelle* geschrieben werden.
-**Am Ende** einer Session kann der Log-Eintrag erneut aktualisiert werden.
+#### Lebenszyklus eines Prozesses
+Ein Prozess wird einmal gestartet und einmal geschlossen. Für saubere, nachvollziehbare und konsistente Prozesszustände ist das abschließende Schließen unverzichtbar.
+
+**Zu Beginn** (`NEW_PROCESS` bzw. `SERVER_NEW_PROCESS`) wird der eine und einzige Eintrag des Prozesses in die *Prozesstabelle* geschrieben.
+**Während** des Prozesses kann dieser Eintrag aktualisiert werden (Status, Fortschritt), und Logs und Metriken werden in die *Log-* bzw. *Monitor-Tabelle* geschrieben.
+**Am Ende** (`CLOSE_PROCESS`) wird der Eintrag ein letztes Mal aktualisiert.
 
 >**Wichtiger Hinweis zur Datenpersistenz:**
->LILAM nutzt eine leistungsfähige Pufferung im Speicher, um die Datenbanklast zu minimieren. Monitoring-Daten und Prozesszustände werden im RAM gesammelt und erst in die Datenbank geschrieben, wenn ein Schwellwert (z. B. 100 Einträge) erreicht ist.
+>LILAM nutzt eine leistungsfähige Pufferung im Speicher, um die Datenbanklast zu minimieren. Monitoring-Daten und Prozesszustände werden im RAM gesammelt und erst in die Datenbank geschrieben, wenn der letzte Schreibvorgang mindestens 1,5 s zurückliegt oder 50.000 Einträge anstehen (siehe [Persistenz und Fehlerbehandlung](#persistenz-und-fehlerbehandlung)).
 >
->**Um die vollständige Datenintegrität zu garantieren, ist der Aufruf von CLOSE_SESSION am Ende Deines Prozesses zwingend erforderlich.**
+>**Um die vollständige Datenintegrität zu garantieren, ist der Aufruf von CLOSE_PROCESS am Ende Deines Prozesses zwingend erforderlich.**
 >
->Endet ein Prozess abnormal (z. B. durch eine nicht abgefangene Exception), ohne CLOSE_SESSION zu erreichen, gehen alle Daten verloren, die seit dem letzten automatischen Flush noch im Puffer liegen. Wir empfehlen dringend, CLOSE_SESSION in den zentralen Exception-Handler Deiner Anwendung aufzunehmen.
+>Endet ein Prozess abnormal (z. B. durch eine nicht abgefangene Exception), ohne CLOSE_PROCESS zu erreichen, gehen alle Daten verloren, die seit dem letzten automatischen Flush noch im Puffer liegen. Wir empfehlen dringend, CLOSE_PROCESS in den zentralen Exception-Handler Deiner Anwendung aufzunehmen.
 
-Letztlich ist für einen vollständigen Lebenszyklus nur erforderlich, zu Beginn der Session die Funktion NEW_SESSION und am Ende der Session die Prozedur CLOSE_SESSION aufzurufen.
+Letztlich ist für einen vollständigen Lebenszyklus nur erforderlich, zu Beginn des Prozesses die Funktion NEW_PROCESS und an seinem Ende die Prozedur CLOSE_PROCESS aufzurufen.
+
+### Session
+Mit Session ist in LILAM immer die Datenbanksession (Oracle-Session) gemeint. Eine Anwendung läuft in einer Datenbanksession, ebenso jeder LILAM Server. Eine Datenbanksession kann beliebig viele Prozesse führen. Umgekehrt kann ein Prozess über den Dispatcher in mehreren Datenbanksessions fortgesetzt werden, z. B. bei APEX, wo aufeinanderfolgende Seitenaufrufe in verschiedenen Sessions eines Connection-Pools laufen. Im In-Session-Modus liegen die Puffer eines Prozesses im Speicher (PGA) der Datenbanksession, die ihn gestartet hat.
 
 ### LILAM
 LILAM **I**s **L**ogging **A**nd **M**onitoring.
@@ -111,21 +115,21 @@ LILAM verwendet bewusst kein `FORALL ... SAVE EXCEPTIONS`: Bei dynamischem SQL g
 Wie überall in LILAM erreichen solche Fehler die Anwendung nie: Sie werden intern protokolliert, und die Verarbeitung läuft weiter.
 
 ### Wann wird ein Log-Eintrag gespeichert? (Sync-Level)
-Die Pufferung macht LILAM schnell, aber ein gepufferter Eintrag existiert bis zum nächsten Flush nur im Speicher. Was einen harten Ausfall übersteht, hängt daher vom **Sync-Level** des Prozesses ab: Einträge bis zu diesem Level werden synchron geschrieben, alle anderen gepuffert. Der Sync-Level wird beim Start des Prozesses mit `p_syncLevel` (bzw. `t_session_init.syncLevel`, JSON `sync_level`) festgelegt. Standard ist `logLevelError`; `logLevelWarn` macht auch `WARN` synchron, `logLevelSilent` schaltet das synchrone Schreiben ab.
+Die Pufferung macht LILAM schnell, aber ein gepufferter Eintrag existiert bis zum nächsten Flush nur im Speicher. Was einen harten Ausfall übersteht, hängt daher vom **Sync-Level** des Prozesses ab: Einträge bis zu diesem Level werden synchron geschrieben, alle anderen gepuffert. Der Sync-Level wird beim Start des Prozesses mit `p_syncLevel` (bzw. `t_process_init.syncLevel`, JSON `sync_level`) festgelegt. Standard ist `logLevelError`; `logLevelWarn` macht auch `WARN` synchron, `logLevelSilent` schaltet das synchrone Schreiben ab.
 
 | Daten | In-Session | Entkoppelt (Server, auch über Dispatcher) |
 | --- | --- | --- |
 | Einträge bis zum Sync-Level (Standard: `ERROR`) | Werden **vor der Rückkehr des Aufrufs** geschrieben und committet (autonome Transaktion). Der Aufruf erzwingt einen Flush **aller** gepufferten Daten der Datenbanksession: Logs, Metriken und Prozessstatus jedes offenen Prozesses. | **Doppelter Boden:** Der Client schreibt den Eintrag **vor der Rückkehr des Aufrufs** zusätzlich selbst in einer autonomen Transaktion, und zwar immer in **`LILAM_LOG`** seiner eigenen LILAM-Installation (wird bei Bedarf angelegt), mit `NO = -1` und der Prozess-ID. Anschließend sendet er die Meldung wie gewohnt an den Server: Der Server schreibt sie in die Arbeitstabelle des Prozesses (mit seiner normalen laufenden Nummer), wertet die Regeln aus und schreibt seine Puffer weg. Im Normalfall ist der Eintrag daher zweimal gespeichert. |
-| Alle anderen Einträge, Metriken, Prozessstatus | Im PGA der Session gepuffert. Geschrieben, wenn der letzte Flush mindestens 1,5 s zurückliegt oder 50.000 Einträge anstehen, außerdem durch einen synchronen Eintrag, `CLOSE_SESSION` und `FLUSH`. | Über die Pipe gesendet, im PGA des Servers gepuffert, nach denselben Regeln geschrieben, zusätzlich durch das Housekeeping des Servers (alle 0,5 s) und, wenn seine Pipe leer ist, durch den Leerlauf-Flush (höchstens alle 200 ms). |
+| Alle anderen Einträge, Metriken, Prozessstatus | Im PGA der Session gepuffert. Geschrieben, wenn der letzte Flush mindestens 1,5 s zurückliegt oder 50.000 Einträge anstehen, außerdem durch einen synchronen Eintrag, `CLOSE_PROCESS` und `FLUSH`. | Über die Pipe gesendet, im PGA des Servers gepuffert, nach denselben Regeln geschrieben, zusätzlich durch das Housekeeping des Servers (alle 0,5 s) und, wenn seine Pipe leer ist, durch den Leerlauf-Flush (höchstens alle 200 ms). |
 
 Warum `LILAM_LOG` und nicht die Arbeitstabelle des Prozesses? Die Arbeitstabelle kann im Schema des Servers liegen, auf das der Client keinen Zugriff hat, und wo der doppelte Boden landet, soll nicht von Modi, Schemata und Berechtigungen abhängen. Die Regel ist einfach: Alle Einträge stehen wie gewohnt in der Arbeitstabelle; **ist der LILAM Server ausgefallen, stehen die synchronen Einträge zusätzlich in `LILAM_LOG` im Schema des Clients** (`NO = -1`, gleiche `PROCESS_ID`).
 
-Der Server teilt dem Client Log-Level und Sync-Level eines Prozesses mit, wenn der Prozess angelegt (`SERVER_NEW_SESSION`) oder wieder verbunden wird (Dispatcher, APEX). Ohne diese Werte (z. B. bei einem Server einer älteren Version) sendet der Client alles über die Pipe.
+Der Server teilt dem Client Log-Level und Sync-Level eines Prozesses mit, wenn der Prozess angelegt (`SERVER_NEW_PROCESS`) oder wieder verbunden wird (Dispatcher, APEX). Ohne diese Werte (z. B. bei einem Server einer älteren Version) sendet der Client alles über die Pipe.
 
 > [!NOTE]
 > Die Spalte `NO` ist die laufende Nummer, die der Server je Prozess vergibt. Einträge, die ein entkoppelter Client direkt schreibt, haben `NO = -1`.
 
-Der zeitgesteuerte Flush hat keinen Hintergrund-Timer: Er wird nur geprüft, wenn die Session LILAM erneut aufruft. Im In-Session-Modus stößt jeder Log-Aufruf sowie `MARK_EVENT`, `TRACE_STOP` und die Aufrufe der Prozesssteuerung (`SET_PROCESS_STATUS`, `SET_PROC_STEPS_TODO`, `SET_PROC_STEPS_DONE`, `PROC_STEP_DONE`, `SET_PROC_IMMORTAL`) diese Prüfung an (`TRACE_START` nicht), sodass auch reine Monitoring-Anwendungen, die nie loggen, geschrieben werden. Auf dem Server rufen diese Handler die internen Prozeduren ohne die Prüfung auf; dort schreibt die Server-Loop. Die Prüfung läuft höchstens alle 500 ms je Datenbanksession; prozessübergreifende Baselines werden höchstens alle 1,5 s abgeglichen. Eine Session, die LILAM nicht mehr aufruft, behält ihren Puffer, egal wie lange sie wartet: **Im In-Session-Modus werden Daten nur durch `CLOSE_SESSION` (der Prozess endet) oder `FLUSH` (der Prozess bleibt offen) garantiert geschrieben.** Bei einem Connection-Pool (APEX/ORDS) oder bei Prozessen, die sich über mehrere Seitenaufrufe oder Datenbanksessions erstrecken (z. B. AJAX-Seiten, die nur tracen oder Fortschritt melden, während eine abschließende Seite `CLOSE_SESSION` aufruft), verwende den entkoppelten Server zusammen mit dem Dispatcher.
+Der zeitgesteuerte Flush hat keinen Hintergrund-Timer: Er wird nur geprüft, wenn die Session LILAM erneut aufruft. Im In-Session-Modus stößt jeder Log-Aufruf sowie `MARK_EVENT`, `TRACE_STOP` und die Aufrufe der Prozesssteuerung (`SET_PROCESS_STATUS`, `SET_PROC_STEPS_TODO`, `SET_PROC_STEPS_DONE`, `PROC_STEP_DONE`, `SET_PROC_IMMORTAL`) diese Prüfung an (`TRACE_START` nicht), sodass auch reine Monitoring-Anwendungen, die nie loggen, geschrieben werden. Auf dem Server rufen diese Handler die internen Prozeduren ohne die Prüfung auf; dort schreibt die Server-Loop. Die Prüfung läuft höchstens alle 500 ms je Datenbanksession; prozessübergreifende Baselines werden höchstens alle 1,5 s abgeglichen. Eine Session, die LILAM nicht mehr aufruft, behält ihren Puffer, egal wie lange sie wartet: **Im In-Session-Modus werden Daten nur durch `CLOSE_PROCESS` (der Prozess endet) oder `FLUSH` (der Prozess bleibt offen) garantiert geschrieben.** Bei einem Connection-Pool (APEX/ORDS) oder bei Prozessen, die sich über mehrere Seitenaufrufe oder Datenbanksessions erstrecken (z. B. AJAX-Seiten, die nur tracen oder Fortschritt melden, während eine abschließende Seite `CLOSE_PROCESS` aufruft), verwende den entkoppelten Server zusammen mit dem Dispatcher.
 
 Gemessen auf Oracle 23.26 Free (2 CPU-Threads), Testschema `LILAM_TEST`:
 
@@ -145,7 +149,7 @@ Gemessen auf Oracle 23.26 Free (2 CPU-Threads), Testschema `LILAM_TEST`:
 | Ausfall | In-Session | Entkoppelt |
 | --- | --- | --- |
 | `ROLLBACK` des Aufrufers | Nichts. Alle Schreibvorgänge sind autonome Transaktionen. | Nichts. |
-| Unbehandelte Exception, Session beendet (killed), Job abgebrochen, ohne `CLOSE_SESSION` / `FLUSH` | Alles, was seit dem letzten Flush gepuffert wurde (z. B. `INFO` und `WARN`). Ein `ERROR`, dessen Aufruf zurückgekehrt ist, ist gespeichert, zusammen mit allem, was davor gepuffert war. | Nichts auf Seiten des Clients. Einträge, die den Server erreicht haben, gehen nur verloren, wenn der Server ausfällt. |
+| Unbehandelte Exception, Session beendet (killed), Job abgebrochen, ohne `CLOSE_PROCESS` / `FLUSH` | Alles, was seit dem letzten Flush gepuffert wurde (z. B. `INFO` und `WARN`). Ein `ERROR`, dessen Aufruf zurückgekehrt ist, ist gespeichert, zusammen mit allem, was davor gepuffert war. | Nichts auf Seiten des Clients. Einträge, die den Server erreicht haben, gehen nur verloren, wenn der Server ausfällt. |
 | Datenbanksession stirbt während des `ERROR`-Aufrufs | Dieses `ERROR` (es wird am Ende des Aufrufs committet). | Dieses `ERROR`, falls es noch nicht committet war. |
 | LILAM Server beendet (killed) oder abgestürzt | – | Alles im Puffer des Servers und in seiner Pipe, also gepufferte Einträge oberhalb des Sync-Levels. Die Pipe liegt nur in der SGA, und ein neu gestarteter Server leert seine Pipe und kennt die Prozesse seines Vorgängers nicht. Synchrone Einträge sind in `LILAM_LOG` des Clients gespeichert (durch Test bestätigt: ein `ERROR`, das gesendet wurde, während der Server nicht lief, ist dort vorhanden). |
 | Absturz der Instanz | Alles Gepufferte. | Alles Gepufferte und alles in den Pipes. |
@@ -155,9 +159,7 @@ Gemessen auf Oracle 23.26 Free (2 CPU-Threads), Testschema `LILAM_TEST`:
 **Konsequenzen**
 * Sobald ein Aufruf mit einem Level bis zum Sync-Level zurückkehrt, ist der Eintrag committet, in beiden Modi. Die Mehrkosten gegenüber einem gepufferten Eintrag entfallen größtenteils auf den Commit.
 * Wähle `logLevelWarn` als Sync-Level, wenn auch Warnungen einen Ausfall überstehen müssen. Jeder synchrone Eintrag kostet einige Millisekunden; häufige Level (`INFO`, `DEBUG`) sollten daher gepuffert bleiben.
-* Rufe `CLOSE_SESSION` immer im zentralen Exception-Handler auf, oder `FLUSH`, wenn der Prozess weiterlaufen soll (z. B. wenn eine AJAX-Seite weiterarbeitet). Andernfalls gehen gepufferte Einträge aus der Zeit vor dem Ausfall verloren.
-
-Die Session ist eher eine technische Sicht auf die Abläufe innerhalb von LILAM, während der Prozess die Sicht „nach außen“ ist. Ich denke, die beiden Begriffe Session und Prozess können im täglichen Umgang mit LILAM nahezu synonym verwendet werden. Es schadet nicht wirklich, wenn sie ein wenig vermischt werden.
+* Rufe `CLOSE_PROCESS` immer im zentralen Exception-Handler auf, oder `FLUSH`, wenn der Prozess weiterlaufen soll (z. B. wenn eine AJAX-Seite weiterarbeitet). Andernfalls gehen gepufferte Einträge aus der Zeit vor dem Ausfall verloren.
 
 ---
 ## Logs / Severity
@@ -198,7 +200,7 @@ Ein Prozess überwacht die Actions **'A'** und **'B'**:
 Regeln sind in **Rule Sets** organisiert, die als JSON-Objekte aufgebaut sind. Die zentrale Tabelle `LILAM_RULES` speichert jedes Rule Set mit seiner **Gruppe**, seinem Namen und seiner **Version**. Je Gruppe ist genau ein Rule Set aktiv (`IS_ACTIVE`). Jeder LILAM Server lädt beim Start und beim Aufruf von `SERVER_UPDATE_RULES` das aktive Rule Set seiner Gruppe; ein neuer Server der Gruppe verwendet daher automatisch dieselben Regeln.
 
 ### Regeln im INSESSION-Modus
-Auch INSESSION-Prozesse werten Regeln aus, wenn `NEW_SESSION` eine Gruppe erhält (`p_groupName` bzw. `t_session_init.groupName`); ohne Gruppe haben sie keine Regeln. Sie verwenden dasselbe aktive Rule Set der Gruppe wie die Server.
+Auch INSESSION-Prozesse werten Regeln aus, wenn `NEW_PROCESS` eine Gruppe erhält (`p_groupName` bzw. `t_process_init.groupName`); ohne Gruppe haben sie keine Regeln. Sie verwenden dasselbe aktive Rule Set der Gruppe wie die Server.
 
 *   **Laden:** Die erste Regelprüfung eines Prozesses lädt das aktive Rule Set der Gruppe in den Speicher der Datenbanksession. Weitere Prozesse der Gruppe in dieser Session verwenden es mit. Mehrere Gruppen in einer Session bleiben getrennt: Intern erhält jeder Schlüssel die Gruppe als Präfix (`GROUP|Action|Context`); das Rule Set selbst bleibt unverändert.
 *   **Änderungen:** Es gibt keinen Timer. Höchstens alle 15 Sekunden (`C_RULES_CHECK_INTERVAL_MS`) prüft ein API-Aufruf Name und Version des aktiven Rule Sets mit einer kleinen indizierten Abfrage und lädt nur neu, wenn sie sich geändert haben. Server werden durch `SERVER_UPDATE_RULES` benachrichtigt und führen zusätzlich dieselbe Prüfung in ihrem Housekeeping aus, sodass ein Server, der die Benachrichtigung verpasst hat (z. B. volle Pipe), innerhalb von etwa 20 Sekunden nachzieht.
@@ -210,9 +212,9 @@ Auch INSESSION-Prozesse werten Regeln aus, wenn `NEW_SESSION` eine Gruppe erhäl
 Jede Regel ist einem **Trigger-Typ** zugeordnet, der das Signal festlegt, das die Auswertung startet.
 
 #### Trigger-Typen
-*   **`PROCESS_START`**: Ein Prozess (Session) startet.
+*   **`PROCESS_START`**: Ein Prozess startet.
 *   **`PROCESS_UPDATE`**: Statusänderungen oder Fortschrittsmeldungen (z. B. Schrittzähler).
-*   **`PROCESS_STOP`**: Ein Prozess wird geschlossen; die Regel sieht die an `CLOSE_SESSION` übergebenen Endwerte.
+*   **`PROCESS_STOP`**: Ein Prozess wird geschlossen; die Regel sieht die an `CLOSE_PROCESS` übergebenen Endwerte.
 *   **`MARK_EVENT`**: Ein Meilenstein zu einem Zeitpunkt (Marker) trifft ein.
 *   **`TRACE_START`**: Eine Zeitmessung (Transaktion) beginnt. Nützlich für Vorabprüfungen.
 *   **`TRACE_STOP`**: Eine Transaktion ist abgeschlossen. Ideal für die Analyse von Ausführungszeiten.
@@ -317,11 +319,11 @@ Dabei sind zwei Ausnahmen zu beachten:
 
 1. LILAM Clients, die den Kanal zum LILAM Server durch eine zu hohe Melderate zu überfluten drohen, werden sanft und vorübergehend – und kaum spürbar – gedrosselt, bis der LILAM Server den Großteil der Last abgearbeitet hat (Backpressure Management). Wohlgemerkt reden wir hier von Größenordnungen im Millisekundenbereich. Die Grenze ist eine Eigenschaft des LILAM Servers: Sie wird beim Start des Servers mit `p_perfServer` festgelegt (`C_SERVER_PERF_LOW` = 500, `C_SERVER_PERF_MID` = 1500 (Standard), `C_SERVER_PERF_HIGH` = 2500 Nachrichten je Prozess und Sekunde oder ein beliebiger anderer Wert; `0` schaltet den Mechanismus ab) und dem Client mitgeteilt, wenn ein Prozess angelegt oder wieder verbunden wird.
 
-2. Das Anlegen eines Prozesses (`SERVER_NEW_SESSION`) ist synchron, da die Anwendung die Prozess-ID benötigt. Damit das auch unter Last schnell geht, hat jeder LILAM Server eine eigene Steuer-Pipe (`<Pipe-Name>_CTL`), die er vor jeder Datennachricht prüft. Das Anlegen eines Prozesses reiht sich daher nie hinter die Nachrichten anderer Anwendungen ein.
+2. Das Anlegen eines Prozesses (`SERVER_NEW_PROCESS`) ist synchron, da die Anwendung die Prozess-ID benötigt. Damit das auch unter Last schnell geht, hat jeder LILAM Server eine eigene Steuer-Pipe (`<Pipe-Name>_CTL`), die er vor jeder Datennachricht prüft. Das Anlegen eines Prozesses reiht sich daher nie hinter die Nachrichten anderer Anwendungen ein.
 
 **Server-Loop.** Nach einer Nachricht prüft der Server seine Daten-Pipe einmal, ohne zu warten; ist sie leer, wartet er 1 s, dann 2 s, dann jeweils 5 s (Eco-Modus). Eine eintreffende Nachricht weckt ihn sofort. Timeouts von `DBMS_PIPE` sind ganze Sekunden; Bruchteile werden stillschweigend gerundet (aus 0,2 wird 0), deshalb sind die Stufen ganzzahlig. Das Housekeeping (Registry-Eintrag mit Nachrichtenrate, `SYNC_ALL_DIRTY`) ist zeitgesteuert: alle 500 ms, auch während weiterhin Nachrichten eintreffen, und im Leerlauf beim nächsten Aufwachen.
 
-**Leerlauf-Flush.** Ist die Daten-Pipe leer und hält ein Worker noch ungeschriebene Logs, Metriken oder Prozessdaten, schreibt er sie sofort (`SYNC_ALL_DIRTY` mit Force, ohne den Baseline-Abgleich), statt auf die nächste Eco-Stufe zu warten. Das geschieht höchstens alle 200 ms (`C_SERVER_IDLE_FLUSH_MS`), damit kurze Lücken unter Last nicht jeweils einen Commit verursachen, und nie auf einem Dispatcher (er hält keine Daten). Eine synchrone Anfrage (Reconnect, `SERVER_NEW_SESSION`, `CLOSE_SESSION`), die während eines solchen Flush eintrifft, wartet auf ihn (einige Millisekunden). Der Leerlauf-Flush setzt die Zeitsperre von `SYNC_ALL_DIRTY` nicht, sodass das reguläre Housekeeping und der Baseline-Abgleich ihr Intervall behalten. Die Schwelle von 1,5 s je Prozess zählt ab dem letzten Schreibvorgang, der tatsächlich Daten geschrieben hat.
+**Leerlauf-Flush.** Ist die Daten-Pipe leer und hält ein Worker noch ungeschriebene Logs, Metriken oder Prozessdaten, schreibt er sie sofort (`SYNC_ALL_DIRTY` mit Force, ohne den Baseline-Abgleich), statt auf die nächste Eco-Stufe zu warten. Das geschieht höchstens alle 200 ms (`C_SERVER_IDLE_FLUSH_MS`), damit kurze Lücken unter Last nicht jeweils einen Commit verursachen, und nie auf einem Dispatcher (er hält keine Daten). Eine synchrone Anfrage (Reconnect, `SERVER_NEW_PROCESS`, `CLOSE_PROCESS`), die während eines solchen Flush eintrifft, wartet auf ihn (einige Millisekunden). Der Leerlauf-Flush setzt die Zeitsperre von `SYNC_ALL_DIRTY` nicht, sodass das reguläre Housekeeping und der Baseline-Abgleich ihr Intervall behalten. Die Schwelle von 1,5 s je Prozess zählt ab dem letzten Schreibvorgang, der tatsächlich Daten geschrieben hat.
 
 **Herunterfahren.** Bei `SERVER_SHUTDOWN` markiert sich der Server zuerst in der Registry als inaktiv, sodass er nicht mehr gewählt wird. In der Drain-Phase verarbeitet er dann die Nachrichten, die Clients bereits gesendet haben, bis die Daten-Pipe 1 s lang leer bleibt (insgesamt höchstens etwa 5 s). Anschließend schreibt er alle Puffer und entfernt seine Pipes.
 
@@ -336,18 +338,18 @@ Durch die Möglichkeit, mehrere LILAM Server parallel zu betreiben und gleichzei
 Die folgenden Diagramme sind aus dem Code in `lilam.pkb` (Version 2.0) abgeleitet. Namen im `code`-Stil sind die internen Prozeduren, die den jeweiligen Schritt ausführen.
 
 ### In-Session und Entkoppelt im Vergleich
-Die Anwendung verwendet in beiden Modi dieselbe API. Welchen Weg ein Aufruf nimmt, hängt allein von der Prozess-ID ab: `is_remote` prüft, ob die ID zu einem Prozess gehört, der mit `SERVER_NEW_SESSION` angelegt wurde.
+Die Anwendung verwendet in beiden Modi dieselbe API. Welchen Weg ein Aufruf nimmt, hängt allein von der Prozess-ID ab: `is_remote` prüft, ob die ID zu einem Prozess gehört, der mit `SERVER_NEW_PROCESS` angelegt wurde.
 
 ```mermaid
 flowchart LR
     subgraph INS ["In-Session (synchron, in der Session der Anwendung)"]
         direction TB
-        A1["Anwendung<br/>NEW_SESSION (optional p_groupName)"] --> B1["log_any / MARK_EVENT / TRACE_*"]
+        A1["Anwendung<br/>NEW_PROCESS (optional p_groupName)"] --> B1["log_any / MARK_EVENT / TRACE_*"]
         B1 --> C1["PGA-Puffer der Session<br/>(Logs, Metriken, Prozessdaten)"]
         B1 --> G1{"Prozess hat<br/>eine Gruppe?"}
         G1 -- ja --> R1["Regelauswertung in der Session der Anwendung<br/>Rule Set der Gruppe, auf Änderungen geprüft<br/>höchstens alle 15 s"]
         R1 -- "Regel trifft zu" --> AL1[("LILAM_ALERTS + DBMS_ALERT<br/>synchron, autonome Transaktion")]
-        C1 --> D1{"Flush fällig?<br/>geprüft bei log_any, MARK_EVENT, TRACE_STOP,<br/>Prozesssteuerung:<br/>1500 ms, 50.000 Einträge,<br/>ERROR oder CLOSE_SESSION"}
+        C1 --> D1{"Flush fällig?<br/>geprüft bei log_any, MARK_EVENT, TRACE_STOP,<br/>Prozesssteuerung:<br/>1500 ms, 50.000 Einträge,<br/>ERROR oder CLOSE_PROCESS"}
         D1 -- ja --> E1["SYNC_ALL_DIRTY<br/>FORALL + COMMIT<br/>(autonome Transaktion)"]
         D1 -- nein --> B1
         E1 --> T1[("Tabellen<br/>NAME_PROC / _LOG / _MON")]
@@ -355,7 +357,7 @@ flowchart LR
 
     subgraph DEC ["Entkoppelt (asynchron, LILAM Server)"]
         direction TB
-        A2["Anwendung<br/>SERVER_NEW_SESSION"] -- "NEW_SESSION über Steuer-Pipe<br/>(synchron, max. 3 s)" --> S2
+        A2["Anwendung<br/>SERVER_NEW_PROCESS"] -- "NEW_PROCESS über Steuer-Pipe<br/>(synchron, max. 3 s)" --> S2
         B2["log_any / MARK_EVENT / TRACE_*"] -- "sendNoWait<br/>Fire and Forget über Daten-Pipe" --> S2["LILAM Server<br/>(eigene DB-Session / Job)"]
         B2 -. "Grenze je Sekunde erreicht:<br/>UNFREEZE_REQUEST (Backpressure)" .-> S2
         S2 --> C2["PGA-Puffer des Servers<br/>(alle seine Prozesse)"]
@@ -368,7 +370,7 @@ flowchart LR
     INS ~~~ DEC
 ```
 
-Beide Modi verwenden das aktive Rule Set einer Gruppe aus `LILAM_RULES`. Ein Server lädt es beim Start und bei `SERVER_UPDATE_RULES`; ein In-Session-Prozess hat nur dann Regeln, wenn `NEW_SESSION` eine Gruppe erhält, und seine Alerts kosten die Anwendung jeweils einen Commit (siehe [Regeln im INSESSION-Modus](#regeln-im-insession-modus)).
+Beide Modi verwenden das aktive Rule Set einer Gruppe aus `LILAM_RULES`. Ein Server lädt es beim Start und bei `SERVER_UPDATE_RULES`; ein In-Session-Prozess hat nur dann Regeln, wenn `NEW_PROCESS` eine Gruppe erhält, und seine Alerts kosten die Anwendung jeweils einen Commit (siehe [Regeln im INSESSION-Modus](#regeln-im-insession-modus)).
 
 ### Wie ein API-Aufruf sein Ziel findet
 Jeder API-Aufruf mit einer Prozess-ID durchläuft dieselbe Entscheidung (`is_remote`). Ein Reconnect wird nur versucht, wenn ein Dispatcher konfiguriert ist (`SET_DISPATCHER_PIPE`); so kann ein Prozess, der in einer Session angelegt wurde (z. B. in einem APEX-Request), in einer anderen fortgesetzt werden.
@@ -379,7 +381,7 @@ flowchart TD
     R1 -- ja --> SEND["An die Server-Pipe senden<br/>(g_client_pipes)"]
     R1 -- nein --> L1{"ID als lokaler<br/>In-Session-Prozess bekannt?"}
     L1 -- ja --> LOCAL["Lokal verarbeiten<br/>(PGA-Puffer)"]
-    L1 -- nein --> N1{"ID NULL oder negativ?<br/>z. B. NUM_ERR_SESSION_TIMEOUT"}
+    L1 -- nein --> N1{"ID NULL oder negativ?<br/>z. B. NUM_ERR_PROCESS_TIMEOUT"}
     N1 -- ja --> IGN["Still ignorieren"]
     N1 -- nein --> D1{"Dispatcher konfiguriert?"}
     D1 -- nein --> IGN
@@ -403,11 +405,11 @@ sequenceDiagram
     participant W as Worker (LILAM Server)
 
     Note over C,W: Prozess anlegen
-    C->>D: NEW_SESSION in Steuer-Pipe DISPATCHER_CTL + SERVER_PING
+    C->>D: NEW_PROCESS in Steuer-Pipe DISPATCHER_CTL + SERVER_PING
     D->>R: getServerPipeAvailable(group)<br/>wenigste Nachrichten, dann wenigste Prozesse,<br/>Dispatcher ausgenommen
     R-->>D: Worker-Pipe
     D->>W: Weiterleitung in Steuer-Pipe WORKER_CTL + SERVER_PING
-    W->>W: NEW_SESSION, sofern expires_utc nicht überschritten ist
+    W->>W: NEW_PROCESS, sofern expires_utc nicht überschritten ist
     W->>RT: registerProcessRoute(process_id, Worker-Pipe)
     W-->>C: process_id und perf direkt in die Antwort-Pipe des Clients
 
@@ -419,7 +421,7 @@ sequenceDiagram
     W-->>C: Antwort nur bei synchronen Anfragen
 
     Note over C,W: Ende des Prozesses
-    C->>D: CLOSE_SESSION
+    C->>D: CLOSE_PROCESS
     D->>D: Route aus dem Cache entfernen
     D->>W: weiterleiten
     W->>RT: unregisterProcessRoute
@@ -434,7 +436,7 @@ Die Durchschnittswerte (EWMA) von Traces und Events, mit denen Regeln wie `AVG_D
 
 ```mermaid
 flowchart TD
-    NS["NEW_SESSION / SERVER_NEW_SESSION<br/>p_baselineScope"] --> RS{"resolveScopeName"}
+    NS["NEW_PROCESS / SERVER_NEW_PROCESS<br/>p_baselineScope"] --> RS{"resolveScopeName"}
     RS -- "NULL" --> PN["Scope = Prozessname"]
     RS -- "'#NONE'" --> NO["Kein Scope<br/>Durchschnittswerte nur je Prozess"]
     RS -- "anderes '#...'" --> WARN["Eintrag in LILAM_LOG_INTERNAL<br/>Scope = Prozessname"]
@@ -443,7 +445,7 @@ flowchart TD
     WARN --> GS
     OWN --> GS["getOrCreateScopeId<br/>LILAM_SCOPES (autonome Transaktion)"]
     GS -- "Fehler" --> NO
-    GS --> SID["scope_id wird mit der Session gespeichert"]
+    GS --> SID["scope_id wird mit dem Prozess gespeichert"]
 
     SID --> M["Messung: TRACE_STOP / MARK_EVENT"]
     NO --> M
@@ -454,7 +456,7 @@ flowchart TD
     EB -- "Fehler" --> OFF["Scope für diesen Prozess abschalten"] --> LOC
     UPD --> RULE["Regeln vergleichen mit baseline_avg"]
     LOC --> RULE
-    UPD --> SYNC["syncBaselines (höchstens alle 1500 ms,<br/>erzwungen bei CLOSE_SESSION)"]
+    UPD --> SYNC["syncBaselines (höchstens alle 1500 ms,<br/>erzwungen bei CLOSE_PROCESS)"]
     SYNC --> DB[("LILAM_BASELINES")]
     DB -- "Gesamtstand als neue Basis" --> SYNC
 ```
@@ -504,7 +506,7 @@ Zusätzlich zu den prozessspezifischen Tabellen verwendet LILAM interne Tabellen
 ### Prozesstabelle
 **Tabellenkategorie:** Anwendungsspezifische Tabelle
 
-Die Prozesstabelle repräsentiert die Prozesse. Für jeden Prozess gibt es genau einen Eintrag in dieser Master-Tabelle. Während des Lebenszyklus eines Prozesses können sich diese Daten ändern – insbesondere der Zähler für erledigte Prozessschritte (also der Arbeitsfortschritt). Weitere Informationen sind der aktuell für diesen Prozess verwendete Log-Level, der Name des Prozesses sowie die Zeitstempel für Prozessstart, letzte gemeldete Aktualisierung und Abschluss. Eine weitere wichtige Angabe ist die Session-ID, die zur Verwaltung dient.
+Die Prozesstabelle repräsentiert die Prozesse. Für jeden Prozess gibt es genau einen Eintrag in dieser Master-Tabelle. Während des Lebenszyklus eines Prozesses können sich diese Daten ändern – insbesondere der Zähler für erledigte Prozessschritte (also der Arbeitsfortschritt). Weitere Informationen sind der aktuell für diesen Prozess verwendete Log-Level, der Name des Prozesses sowie die Zeitstempel für Prozessstart, letzte gemeldete Aktualisierung und Abschluss.
 
 #### Tabellenstruktur
 Alle Prozesstabellen verwenden unabhängig vom konfigurierten Tabellennamen die folgende Struktur:
@@ -582,7 +584,7 @@ Jeder aktive LILAM Server registriert sich in dieser Tabelle und aktualisiert re
 
 Bis Oktober 2026 war die rohe Nachrichtenanzahl `PROCESSING` das erste Kriterium. Da jeder Server sie für sein eigenes, nicht abgestimmtes Zeitfenster schreibt, erhielt ein Server mit einer kleineren, aber älteren Anzahl jeden neuen Prozess, bis er seine eigene Anzahl erneut schrieb; Schübe neuer Prozesse konnten im Verhältnis 19:1 auf einem Server landen (Diagnose in `test/autotest/FEATURES/SERVERAUSWAHL/results/2026-10-06_serverauswahl_provokation_ergebnis.md`).
 
-Wird `SERVER_NEW_SESSION` mit einem `p_groupName` aufgerufen, werden nur Server berücksichtigt, die für die angeforderte Gruppe registriert sind.
+Wird `SERVER_NEW_PROCESS` mit einem `p_groupName` aufgerufen, werden nur Server berücksichtigt, die für die angeforderte Gruppe registriert sind.
 
 #### Tabellenstruktur
 > [!NOTE]
@@ -615,7 +617,7 @@ Rule Sets werden als JSON-Dokumente gespeichert und über Gruppe, Name und Versi
 | Spalte | Datentyp | Beschreibung |
 | --- | --- | --- |
 | `RULE_SET` | `CLOB` | Enthält das Rule Set als JSON-Dokument (`IS JSON`). |
-| `GROUP_NAME` | `VARCHAR2(50)` | Gruppe, zu der das Rule Set gehört: `GROUP_NAME` der Registry (Server) oder `p_groupName` von `NEW_SESSION` (INSESSION). |
+| `GROUP_NAME` | `VARCHAR2(50)` | Gruppe, zu der das Rule Set gehört: `GROUP_NAME` der Registry (Server) oder `p_groupName` von `NEW_PROCESS` (INSESSION). |
 | `SET_NAME` | `VARCHAR2(30)` | Name zur Identifikation des Rule Sets (Pflicht). |
 | `VERSION` | `NUMBER` | Ganzzahlige Version des Rule Sets (Pflicht). |
 | `IS_ACTIVE` | `NUMBER(1)` | `1` für das Rule Set, das die Gruppe verwendet (Server und INSESSION-Prozesse); höchstens eines je Gruppe. Sonst `0`. |
@@ -656,10 +658,10 @@ Die LILAM API besteht aus rund 35 Prozeduren und Funktionen, von denen einige ü
 
 **API-Überblick:**
 
-### Session-Verwaltung
-* **NEW_SESSION:** Startet eine neue Session.
-* **SERVER_NEW_SESSION:** Startet eine neue Session innerhalb eines LILAM Servers.
-* **CLOSE_SESSION:** Beendet den Lebenszyklus der Session.
+### Prozessverwaltung
+* **NEW_PROCESS:** Startet einen neuen Prozess im In-Session-Modus.
+* **SERVER_NEW_PROCESS:** Startet einen neuen Prozess, den ein LILAM Server verarbeitet (entkoppelter Modus).
+* **CLOSE_PROCESS:** Beendet den Prozess und schreibt seine gepufferten Daten.
 
 ### Prozesssteuerung
 #### Werte setzen

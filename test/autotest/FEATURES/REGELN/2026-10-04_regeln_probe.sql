@@ -138,11 +138,11 @@ begin
   l_t0 := systimestamp;
   lt.start_server('LT_S1');
   lt.wait_servers_ready(sys.odcivarchar2list('LT_S1'));
-  l_pid := lilam.server_new_session('LT_RG_A', 'LT', lilam.logLevelInfo, p_procStepsToDo => 5);
+  l_pid := lilam.server_new_process('LT_RG_A', 'LT', lilam.logLevelInfo, p_procStepsToDo => 5);
   lilam.server_update_rules(l_pid, c_set, 1);
   wait_s(1);
   signals(l_pid);
-  lilam.close_session(l_pid, p_procStepsDone => 2);
+  lilam.close_process(l_pid, p_procStepsDone => 2);
   wait_s(3);
   report('A: SERVER, Regeln per SERVER_UPDATE_RULES', l_t0);
   for r in (select rule_set_name, set_in_use from lilam_server_registry where pipe_name = 'LT_S1') loop
@@ -151,8 +151,8 @@ begin
 
   -- Phase B: neuer Prozess, Regeln schon im RAM
   l_t0 := systimestamp;
-  l_pid := lilam.server_new_session('LT_RG_B', 'LT', lilam.logLevelInfo);
-  lilam.close_session(l_pid);
+  l_pid := lilam.server_new_process('LT_RG_B', 'LT', lilam.logLevelInfo);
+  lilam.close_process(l_pid);
   wait_s(2);
   report('B: PROCESS_START mit geladenen Regeln', l_t0);
 
@@ -161,28 +161,28 @@ begin
   l_ok := lt.stop_server('LT_S1');
   lt.start_server('LT_S1');
   lt.wait_servers_ready(sys.odcivarchar2list('LT_S1'));
-  l_pid := lilam.server_new_session('LT_RG_C', 'LT', lilam.logLevelInfo);
+  l_pid := lilam.server_new_process('LT_RG_C', 'LT', lilam.logLevelInfo);
   lilam.mark_event(l_pid, 'RA_T');
-  lilam.close_session(l_pid);
+  lilam.close_process(l_pid);
   wait_s(2);
   report('C: nach Neustart (erwartet R09C und R12)', l_t0);
 
   -- Phase D: Rule Set v2 mit leerer action
   l_t0 := systimestamp;
-  l_pid := lilam.server_new_session('LT_RG_D', 'LT', lilam.logLevelInfo);
+  l_pid := lilam.server_new_process('LT_RG_D', 'LT', lilam.logLevelInfo);
   lilam.server_update_rules(l_pid, c_set, 2);
   wait_s(1);
   lilam.error(l_pid, 'Fehler fuer V2-1');
   lilam.mark_event(l_pid, 'RA_T2');
-  lilam.close_session(l_pid);
+  lilam.close_process(l_pid);
   wait_s(2);
   report('D: Rule Set v2 mit "action": "" (erwartet V2-1 und V2-2)', l_t0);
 
   -- Phase E: INSESSION
   l_t0 := systimestamp;
-  l_pid := lilam.new_session('LT_RG_E', lilam.logLevelInfo, p_procStepsToDo => 5);
+  l_pid := lilam.new_process('LT_RG_E', lilam.logLevelInfo, p_procStepsToDo => 5);
   signals(l_pid);
-  lilam.close_session(l_pid, p_procStepsDone => 2);
+  lilam.close_process(l_pid, p_procStepsDone => 2);
   report('E: INSESSION', l_t0);
 
   -- Aufraeumen

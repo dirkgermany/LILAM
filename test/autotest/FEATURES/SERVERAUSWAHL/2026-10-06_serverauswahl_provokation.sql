@@ -4,10 +4,10 @@
 --
 -- Hypothese H1: Das erste Kriterium der Serverauswahl (PROCESSING) wird nur im Housekeeping eines
 -- untaetigen Servers geschrieben. Ein beschaeftigter Server behaelt seinen alten (kleinen) Wert und
--- bekommt dann jede weitere NEW_SESSION.
+-- bekommt dann jede weitere NEW_PROCESS.
 --
 -- Nutzt nur die bestehende API (lilam.*, lt.*). Legt eigene Diagnoseobjekte an:
---   LT_DIAG_SEL               je NEW_SESSION: Zeit, gewaehlter Worker, Registry-Snapshot davor
+--   LT_DIAG_SEL               je NEW_PROCESS: Zeit, gewaehlter Worker, Registry-Snapshot davor
 --   lt_diag_sel_burst         ein Burst (laeuft als Client-Job = frische Session)
 --   lt_diag_sel_driver        Versuchsmatrix V0-V7 (laeuft als Job LT_CDIAG_DRV)
 -- Start:   dieses Skript ausfuehren; es kehrt sofort zurueck (run_id in LT_RUN, Test SERVERAUSWAHL_DIAG)
@@ -23,9 +23,9 @@ begin
       param     varchar2(30),
       rep       number,
       burst     varchar2(1),
-      i         number,          -- 1..n = NEW_SESSION, 0 = vor dem Burst, 99 = nach dem Burst
-      t_ms      number,          -- Zeit seit Burst-Beginn vor NEW_SESSION
-      dur_ms    number,          -- Dauer NEW_SESSION
+      i         number,          -- 1..n = NEW_PROCESS, 0 = vor dem Burst, 99 = nach dem Burst
+      t_ms      number,          -- Zeit seit Burst-Beginn vor NEW_PROCESS
+      dur_ms    number,          -- Dauer NEW_PROCESS
       pipe      varchar2(30),    -- gewaehlter Worker (direkt: GET_SERVER_PIPE, Dispatcher: Route)
       s1_proc   number, s1_cur number, s1_stat varchar2(20), s1_age_ms number,
       s2_proc   number, s2_cur number, s2_stat varchar2(20), s2_age_ms number,
@@ -46,7 +46,7 @@ create or replace procedure lt_diag_sel_burst(
     p_gap_s      number   default 0,    -- ... in Sekunden
     p_delay_ms   number   default 0,    -- feste Wartezeit je Iteration
     p_close      number   default 1,    -- 0: Prozesse erst nach dem Burst schliessen
-    p_snap       number   default 1,    -- Registry-Snapshot vor jeder NEW_SESSION
+    p_snap       number   default 1,    -- Registry-Snapshot vor jeder NEW_PROCESS
     p_mimic      number   default 0,    -- 1: wie der Originaltest (2x lt.joblog mit Commit je Iteration)
     p_preload_k  number   default 0)    -- Vorlast: k INFOs auf einen Worker, warten bis dessen PROCESSING > 0
 as
@@ -89,11 +89,11 @@ as
 begin
     -- Vorlast auf einem Worker (direkt), dann warten, bis dessen Housekeeping PROCESSING > 0 schreibt
     if p_preload_k > 0 then
-        l_pid := lilam.server_new_session(p_processName => l_prefix || '_PRE', p_groupName => lt.c_group,
+        l_pid := lilam.server_new_process(p_processName => l_prefix || '_PRE', p_groupName => lt.c_group,
                                           p_logLevel => lilam.logLevelInfo);
         l_pipe := lilam.get_server_pipe(l_pid);
         for j in 1 .. p_preload_k loop lilam.info(l_pid, 'preload ' || j); end loop;
-        lilam.close_session(l_pid);
+        lilam.close_process(l_pid);
         l_waited := 0;
         loop
             select max(case when pipe_name = 'LT_S1' then processing end),
@@ -119,7 +119,7 @@ begin
             if p_snap = 1 then snap(r); end if;
             r.t_ms := lt.ms_since(l_t0);
             l_tb := systimestamp;
-            l_pid := lilam.server_new_session(p_processName => l_prefix || '_' || p_variant, p_groupName => lt.c_group,
+            l_pid := lilam.server_new_process(p_processName => l_prefix || '_' || p_variant, p_groupName => lt.c_group,
                                               p_logLevel => lilam.logLevelInfo);
             r.dur_ms := lt.ms_since(l_tb);
             if p_disp = 1 then
@@ -136,7 +136,7 @@ begin
             l_rows(l_rows.count + 1) := r;
             lilam.info(l_pid, p_variant || ' ' || i);
             if p_close = 1 then
-                lilam.close_session(l_pid);
+                lilam.close_process(l_pid);
             else
                 l_pids(l_pids.count + 1) := l_pid;
             end if;
@@ -146,7 +146,7 @@ begin
     end loop;
     add_row(99, lt.ms_since(l_t0), null, null, true);
 
-    for j in 1 .. l_pids.count loop lilam.close_session(l_pids(j)); end loop;
+    for j in 1 .. l_pids.count loop lilam.close_process(l_pids(j)); end loop;
 
     forall j in 1 .. l_rows.count insert into lt_diag_sel values l_rows(j);
     commit;

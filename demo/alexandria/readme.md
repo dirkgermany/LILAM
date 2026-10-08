@@ -8,7 +8,7 @@ This demo shows the interaction between http_util (Alexandria pl/sql Utility Lib
 Alexandria see https://github.com/mortenbra/alexandria-plsql-utils.
 
 ## This demo app
-First, it calls up a valid web address and writes some log entries. Immediately afterwards, it calls up another invalid address.The results of both calls you can see in the tables lilam_log and lilam_log_detail.
+First, it calls up a valid web address and writes some log entries. Immediately afterwards, it calls up another invalid address.The results of both calls you can see in the tables lilam_proc and lilam_log.
 
 Please have a look to the procedure body and see how few calls are needed for an exact logging.
 
@@ -64,8 +64,8 @@ exec lilam_demo_http.getBlobFromUrl;
 See log entries. The detailed table contains the backtrace and the error stack.
 ```sql
 -- Process overview with status:
-select * from lilam_log;
--- Details
-select * from lilam_log_detail order by process_id, no;
+select * from lilam_proc;
+-- Log entries
+select * from lilam_log order by process_id, no;
 
    

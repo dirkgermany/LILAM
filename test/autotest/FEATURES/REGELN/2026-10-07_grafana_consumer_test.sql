@@ -69,11 +69,11 @@ begin
 
     -- G2 neuer Alert
     dbms_session.sleep(1); -- Consumer wartet wieder auf das Signal
-    l_pid := lilam.new_session(p_processName => 'Line 1 Grafana', p_groupName => 'SUBWAY');
+    l_pid := lilam.new_process(p_processName => 'Line 1 Grafana', p_groupName => 'SUBWAY');
     lilam.trace_start(l_pid, 'STATION_EXIT', 'Moulin Rouge', l_t);
     l_sent := systimestamp;
     lilam.trace_stop(l_pid, 'STATION_EXIT', 'Moulin Rouge', l_t + interval '320' second);
-    lilam.close_session(l_pid);
+    lilam.close_process(l_pid);
     begin
         select alert_id into l_aid from lilam_alerts where process_id = l_pid;
     exception when no_data_found then l_aid := null;

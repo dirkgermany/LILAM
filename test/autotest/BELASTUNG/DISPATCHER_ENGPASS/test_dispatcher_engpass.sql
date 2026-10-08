@@ -8,7 +8,7 @@
 -- Teil B  viele Prozesse: wie Teil A ueber den Dispatcher, aber mit 3.000 offenen, ruhenden Prozessen
 --         (Routen-Tabelle, Routen-Cache im Dispatcher, current_processes der Worker).
 -- Teil C  viele Prozesswechsel: jeder Client beendet nach 20 Aufrufen seinen Prozess und oeffnet einen neuen
---         (APEX/ORDS ohne Reconnect: ein Prozess je Request). NEW_SESSION laeuft ueber die Steuer-Pipe des
+--         (APEX/ORDS ohne Reconnect: ein Prozess je Request). NEW_PROCESS laeuft ueber die Steuer-Pipe des
 --         Dispatchers, jeder neue Prozess kostet im Dispatcher ein SELECT auf LILAM_PROCESS_ROUTE.
 -- Reconnects aus frischen Sessions (APEX mit Session State) prueft APEX_STURM.
 --
@@ -37,7 +37,7 @@ begin
              p_stage_sec  => 45,
              p_open_procs => 3000);
 
-  -- Teil C: viele Prozesswechsel (NEW_SESSION/CLOSE_SESSION alle 20 Aufrufe)
+  -- Teil C: viele Prozesswechsel (NEW_PROCESS/CLOSE_PROCESS alle 20 Aufrufe)
   l_run := ltb.t_stufen(
              p_test       => 'BELASTUNG_DISPATCHER_ENGPASS_C',
              p_mode       => lt.c_dispatcher,

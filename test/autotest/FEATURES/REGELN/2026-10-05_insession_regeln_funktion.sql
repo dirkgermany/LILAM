@@ -37,14 +37,14 @@ begin
 
     -- 1. ohne Gruppe: keine Alerts
     execute immediate 'insert into lt_ins_marks values (''start'', systimestamp)';
-    l_pid0 := lilam.new_session('LT_INS_NOGROUP', p_baselineScope => '#NONE');
+    l_pid0 := lilam.new_process('LT_INS_NOGROUP', p_baselineScope => '#NONE');
     trace(l_pid0, 'STEP_A');
     lilam.error(l_pid0, 'Fehler ohne Gruppe');
-    lilam.close_session(l_pid0);
+    lilam.close_process(l_pid0);
 
     -- 2. mit Gruppe, Rule Set v1: R1 und R2
     mark('v1');
-    l_pid := lilam.new_session('LT_INS_GROUP', p_baselineScope => '#NONE', p_groupName => 'lt_ins');
+    l_pid := lilam.new_process('LT_INS_GROUP', p_baselineScope => '#NONE', p_groupName => 'lt_ins');
     trace(l_pid, 'STEP_A');
     lilam.error(l_pid, 'Fehler mit Gruppe');
 
@@ -73,7 +73,7 @@ begin
     dbms_session.sleep(16);
     mark('kein aktives Set, nach 16 s');
     trace(l_pid, 'STEP_A');
-    lilam.close_session(l_pid);
+    lilam.close_process(l_pid);
     mark('ende');
 end;
 /

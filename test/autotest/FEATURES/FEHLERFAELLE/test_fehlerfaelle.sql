@@ -4,12 +4,12 @@
 -- Prueft, dass Stoerungen im Decoupled-Mode die Anwendung nicht beeintraechtigen:
 -- keine Exception, keine langen Wartezeiten, keine verwaisten Prozesse.
 --
---   F1  SERVER_NEW_SESSION ohne aktiven Server      -> negative ID, keine Exception
+--   F1  SERVER_NEW_PROCESS ohne aktiven Server      -> negative ID, keine Exception
 --   F2  Alle API-Aufrufe mit negativer ID           -> still, ohne Dispatcher
 --   F3  Alle API-Aufrufe mit negativer ID           -> still und schnell, mit Standard-Dispatcher
---   F4  Veraltete ID nach CLOSE_SESSION (Dispatcher) -> still und schnell, keine weiteren Daten
+--   F4  Veraltete ID nach CLOSE_PROCESS (Dispatcher) -> still und schnell, keine weiteren Daten
 --   F5  Takt-Handshake ueber den Dispatcher         -> kein Warten auf Timeout
---   F6  Verfallene NEW_SESSION (direkt per Pipe)    -> Server legt keinen Prozess an
+--   F6  Verfallene NEW_PROCESS-Anfrage (direkt per Pipe)    -> Server legt keinen Prozess an
 --
 -- Hinweis: Das Skript setzt in der eigenen Session einen Dispatcher und setzt am Ende
 -- den Package-Zustand zurueck (DBMS_SESSION.MODIFY_PACKAGE_STATE).
@@ -19,7 +19,7 @@
 set serveroutput on size unlimited
 
 declare
-  c_neg     constant number := lilam.NUM_ERR_SESSION_TIMEOUT;
+  c_neg     constant number := lilam.NUM_ERR_PROCESS_TIMEOUT;
   l_run     number;
   l_t0      timestamp;
   l_pid     number;
@@ -59,7 +59,7 @@ declare
     begin x := lilam.get_metric_avg_duration(p_pid, 'T'); exception when others then e('GET_METRIC_AVG_DURATION'); end;
     begin x := lilam.get_metric_steps(p_pid, 'T'); exception when others then e('GET_METRIC_STEPS'); end;
     begin v := lilam.get_server_pipe(p_pid);      exception when others then e('GET_SERVER_PIPE'); end;
-    begin lilam.close_session(p_pid, 'x', 1);     exception when others then e('CLOSE_SESSION'); end;
+    begin lilam.close_process(p_pid, 'x', 1);     exception when others then e('CLOSE_PROCESS'); end;
     return n;
   end;
 
@@ -78,10 +78,10 @@ begin
   -- F1: kein Server aktiv
   l_t0 := systimestamp;
   begin
-    l_pid := lilam.server_new_session(p_processName => 'LT_' || l_run || '_F1', p_groupName => 'LT_KEIN_SERVER');
-    lt.check_that(l_run, 'F1 SERVER_NEW_SESSION ohne Server: negative ID, keine Exception', l_pid < 0, 'ID ' || l_pid);
+    l_pid := lilam.server_new_process(p_processName => 'LT_' || l_run || '_F1', p_groupName => 'LT_KEIN_SERVER');
+    lt.check_that(l_run, 'F1 SERVER_NEW_PROCESS ohne Server: negative ID, keine Exception', l_pid < 0, 'ID ' || l_pid);
   exception when others then
-    lt.check_that(l_run, 'F1 SERVER_NEW_SESSION ohne Server: negative ID, keine Exception', false, sqlerrm);
+    lt.check_that(l_run, 'F1 SERVER_NEW_PROCESS ohne Server: negative ID, keine Exception', false, sqlerrm);
   end;
   lt.metric(l_run, 'f1_new_session_ms', lt.ms_since(l_t0), 'ms');
 
@@ -105,10 +105,10 @@ begin
   lt.check_that(l_run, 'F3 ... und ohne Wartezeit (< 500 ms gesamt)', l_ms < 500, round(l_ms) || ' ms');
   lt.metric(l_run, 'f3_26_calls_ms', l_ms, 'ms');
 
-  -- F4: veraltete ID nach CLOSE_SESSION
-  l_pid := lilam.server_new_session(p_processName => 'LT_' || l_run || '_F4', p_groupName => 'LT', p_logLevel => lilam.logLevelInfo);
+  -- F4: veraltete ID nach CLOSE_PROCESS
+  l_pid := lilam.server_new_process(p_processName => 'LT_' || l_run || '_F4', p_groupName => 'LT', p_logLevel => lilam.logLevelInfo);
   lilam.info(l_pid, 'vor close');
-  lilam.close_session(l_pid);
+  lilam.close_process(l_pid);
   l_t0 := systimestamp;
   for i in 1 .. 20 loop
     lilam.info(l_pid, 'nach close ' || i);
@@ -119,22 +119,22 @@ begin
   lt.metric(l_run, 'f4_40_calls_ms', l_ms, 'ms');
   dbms_session.sleep(2);
   select count(*) into l_cnt from lilam_log where process_id = l_pid;
-  lt.check_that(l_run, 'F4 keine Daten nach CLOSE_SESSION gespeichert', l_cnt = 1, l_cnt || ' Logs (soll 1)');
+  lt.check_that(l_run, 'F4 keine Daten nach CLOSE_PROCESS gespeichert', l_cnt = 1, l_cnt || ' Logs (soll 1)');
 
   -- F5: Takt-Handshake ueber den Dispatcher (2.500 Nachrichten in < 1 s loesen bei Leistungsstufe MID
   --     = 1.500 mindestens einen Handshake aus)
-  l_pid := lilam.server_new_session(p_processName => 'LT_' || l_run || '_F5', p_groupName => 'LT', p_logLevel => lilam.logLevelInfo);
+  l_pid := lilam.server_new_process(p_processName => 'LT_' || l_run || '_F5', p_groupName => 'LT', p_logLevel => lilam.logLevelInfo);
   l_t0 := systimestamp;
   for i in 1 .. 2500 loop lilam.info(l_pid, 'last ' || i); end loop;
   l_ms := lt.ms_since(l_t0);
-  lilam.close_session(l_pid);
+  lilam.close_process(l_pid);
   lt.check_that(l_run, 'F5 Handshake ueber Dispatcher ohne Timeout (2.500 INFO < 5 s)', l_ms < 5000, round(l_ms) || ' ms');
   lt.metric(l_run, 'f5_2500_info_ms', l_ms, 'ms');
   l_ms  := lt.wait_count('LT_' || l_run || '_F5', 'LOG', 2500, 30);   -- liefert Wartezeit in ms (-1 = Timeout)
   l_cnt := lt.count_lilam('LT_' || l_run || '_F5', 'LOG');
   lt.check_that(l_run, 'F5 alle 2.500 Logs angekommen', l_cnt = 2500, l_cnt);
 
-  -- F6: verfallene NEW_SESSION direkt an einen Worker
+  -- F6: verfallene NEW_PROCESS-Anfrage direkt an einen Worker
   declare
     ch varchar2(50) := 'LT_F6_' || sys_context('USERENV', 'SID');
     st pls_integer; m varchar2(4000);
@@ -145,24 +145,24 @@ begin
        || to_char(sys_extract_utc(systimestamp) - interval '1' second, 'YYYY-MM-DD"T"HH24:MI:SS.FF6') || '"}}');
     st := dbms_pipe.send_message('LT_S1', timeout => 2);
     st := dbms_pipe.receive_message(ch, timeout => 2);
-    lt.check_that(l_run, 'F6 verfallene NEW_SESSION: keine Antwort an den Client', st = 1, 'Status ' || st);
+    lt.check_that(l_run, 'F6 verfallene NEW_PROCESS-Anfrage: keine Antwort an den Client', st = 1, 'Status ' || st);
     st := dbms_pipe.remove_pipe(ch);
   end;
   select count(*) into l_cnt from lilam_proc where process_name = 'LT_' || l_run || '_F6';
-  lt.check_that(l_run, 'F6 verfallene NEW_SESSION: kein Prozess angelegt', l_cnt = 0, l_cnt);
+  lt.check_that(l_run, 'F6 verfallene NEW_PROCESS-Anfrage: kein Prozess angelegt', l_cnt = 0, l_cnt);
 
   lt.stop_all_servers;
 
-  -- Erwartete interne Eintraege: F1 (Verbindungsfehler, waitForResponse + SERVER_NEW_SESSION_JSON)
-  -- und F6 (doRemote_newSession / EXPIRED); sonst nichts
+  -- Erwartete interne Eintraege: F1 (Verbindungsfehler, waitForResponse + SERVER_NEW_PROCESS_JSON)
+  -- und F6 (doRemote_newProcess / EXPIRED); sonst nichts
   execute immediate 'select count(*) from lilam_log_internal where log_timestamp >= :1
-                       and module_name not in (''waitForResponse'', ''SERVER_NEW_SESSION_JSON'', ''doRemote_newSession'')'
+                       and module_name not in (''waitForResponse'', ''SERVER_NEW_PROCESS_JSON'', ''doRemote_newProcess'')'
      into l_cnt using lt.run_started(l_run);
   lt.check_that(l_run, 'Keine unerwarteten internen Protokolleintraege', l_cnt = 0, l_cnt);
   execute immediate 'select count(*) from lilam_log_internal where log_timestamp >= :1
-                       and module_name = ''doRemote_newSession'' and log_operation = ''EXPIRED'''
+                       and module_name = ''doRemote_newProcess'' and log_operation = ''EXPIRED'''
      into l_cnt using lt.run_started(l_run);
-  lt.check_that(l_run, 'F6 verfallene NEW_SESSION intern protokolliert', l_cnt = 1, l_cnt);
+  lt.check_that(l_run, 'F6 verfallene NEW_PROCESS-Anfrage intern protokolliert', l_cnt = 1, l_cnt);
 
   lt.end_run(l_run);
 

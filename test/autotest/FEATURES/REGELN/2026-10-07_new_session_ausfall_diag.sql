@@ -1,8 +1,8 @@
 -- =====================================================================
--- LILAM Diagnose: SERVER_NEW_SESSION-Ausfall aus run 2034 (U-Bahn-Simulation nach SPEICHER)
+-- LILAM Diagnose: SERVER_NEW_PROCESS-Ausfall aus run 2034 (U-Bahn-Simulation nach SPEICHER)
 --
 -- Befund run 2034: In derselben Session lief direkt davor FEATURES/SPEICHER. Der frisch gestartete
--- Server UB_S1 (Gruppe SUBWAY) beantwortete kein SERVER_NEW_SESSION (4 x -20110 nach je 3 s).
+-- Server UB_S1 (Gruppe SUBWAY) beantwortete kein SERVER_NEW_PROCESS (4 x -20110 nach je 3 s).
 -- Ursache (run 2040): lt.t_speicher setzte zuletzt lilam.set_dispatcher_pipe('LT_DISP') fuer die eigene
 -- Session und stoppte LT_DISP danach. getServerPipeForSession nahm bei gesetztem DEFAULT_DISPATCHER immer
 -- den Dispatcher, auch fuer eine andere Gruppe; set_dispatcher_pipe(NULL) hob die Einstellung nicht auf;
@@ -10,14 +10,14 @@
 --
 -- Erwartungen nach der Korrektur (getDispatcherForGroup, SET_DISPATCHER_PIPE(NULL)); in Klammern das
 -- Ergebnis vor der Korrektur (run 2040):
---   V1 Kontrolle: neuer Server LT_DGS (Gruppe LT_DGY), sofort SERVER_NEW_SESSION ohne Dispatcher: Erfolg
---   V2 set_dispatcher_pipe('LT_DISP') (gestoppt, Gruppe LT): SERVER_NEW_SESSION Gruppe LT_DGY geht an
+--   V1 Kontrolle: neuer Server LT_DGS (Gruppe LT_DGY), sofort SERVER_NEW_PROCESS ohne Dispatcher: Erfolg
+--   V2 set_dispatcher_pipe('LT_DISP') (gestoppt, Gruppe LT): SERVER_NEW_PROCESS Gruppe LT_DGY geht an
 --      LT_DGS (vorher: -20110 nach 3 s, Anfrage in LT_DISP_CTL)
 --   V2b dieselbe Session, Gruppe LT (Gruppe des Dispatchers): weiter ueber LT_DISP, also -20110, weil er
 --      gestoppt ist; die Anfrage liegt in LT_DISP_CTL
 --   V5 set_dispatcher_pipe(NULL) hebt die Einstellung auf: Gruppe LT_DGY erreicht LT_DGS (vorher: -20003)
 --   V3 nach Package-Reset: LT_DGS sofort erreichbar (unveraendert)
---   V4 laufender Dispatcher LT_DGD der Gruppe LT_DGX mit Worker LT_DGW: SERVER_NEW_SESSION Gruppe LT_DGY
+--   V4 laufender Dispatcher LT_DGD der Gruppe LT_DGX mit Worker LT_DGW: SERVER_NEW_PROCESS Gruppe LT_DGY
 --      landet bei LT_DGS (vorher: bei LT_DGW, fremde Gruppe)
 --   V4b dieselbe Session, Gruppe LT_DGX: ueber LT_DGD bei LT_DGW (unveraendert)
 --   V6 set_dispatcher_pipe('LT_DGD', p_groupName => 'LT_DGX'), Gruppe LT_DGX: ueber LT_DGD bei LT_DGW
@@ -45,11 +45,11 @@ declare
     l_pid number;
     l_pipe varchar2(100);
 begin
-    l_pid := lilam.server_new_session(p_processName => 'LT_' || :run || '_V1', p_groupName => 'LT_DGY');
+    l_pid := lilam.server_new_process(p_processName => 'LT_' || :run || '_V1', p_groupName => 'LT_DGY');
     lt.metric(:run, 'v1_new_session_ms', (dbms_utility.get_time - l_cs) * 10, 'ms');
     if l_pid > 0 then
         l_pipe := lilam.get_server_pipe(l_pid);
-        lilam.close_session(l_pid);
+        lilam.close_process(l_pid);
     end if;
     lt.check_that(:run, 'V1 ohne Dispatcher: frischer Server LT_DGS antwortet sofort', l_pid > 0 and l_pipe = 'LT_DGS',
                   'pid ' || l_pid || ', Server ' || l_pipe || ', ' || (dbms_utility.get_time - l_cs) * 10 || ' ms');
@@ -67,18 +67,18 @@ declare
 begin
     lilam.set_dispatcher_pipe('LT_DISP');   -- wie lt.t_speicher vor der Korrektur (LT_DISP laeuft nicht)
     l_cs  := dbms_utility.get_time;
-    l_pid := lilam.server_new_session(p_processName => 'LT_' || :run || '_V2', p_groupName => 'LT_DGY');
+    l_pid := lilam.server_new_process(p_processName => 'LT_' || :run || '_V2', p_groupName => 'LT_DGY');
     l_ms  := (dbms_utility.get_time - l_cs) * 10;
     lt.metric(:run, 'v2_new_session_ms', l_ms, 'ms');
     if l_pid > 0 then
         l_pipe := lilam.get_server_pipe(l_pid);
-        lilam.close_session(l_pid);
+        lilam.close_process(l_pid);
     end if;
     lt.check_that(:run, 'V2 Dispatcher LT_DISP (Gruppe LT), Gruppe LT_DGY: direkt an LT_DGS', l_pid > 0 and l_pipe = 'LT_DGS',
                   'pid ' || l_pid || ', Server ' || l_pipe || ', ' || l_ms || ' ms');
 
     l_cs  := dbms_utility.get_time;
-    l_pid := lilam.server_new_session(p_processName => 'LT_' || :run || '_V2B', p_groupName => 'LT');
+    l_pid := lilam.server_new_process(p_processName => 'LT_' || :run || '_V2B', p_groupName => 'LT');
     l_ms  := (dbms_utility.get_time - l_cs) * 10;
     lt.metric(:run, 'v2b_new_session_ms', l_ms, 'ms');
     loop
@@ -89,7 +89,7 @@ begin
     end loop;
     dbms_pipe.purge('LT_DISP');
     lt.check_that(:run, 'V2b eigene Gruppe LT: weiter ueber LT_DISP (gestoppt: -20110, Anfrage in LT_DISP_CTL)',
-                  l_pid = lilam.NUM_ERR_SESSION_TIMEOUT and l_disp = 1,
+                  l_pid = lilam.NUM_ERR_PROCESS_TIMEOUT and l_disp = 1,
                   'pid ' || l_pid || ' nach ' || l_ms || ' ms, Nachrichten in LT_DISP_CTL: ' || l_disp);
 end;
 /
@@ -101,10 +101,10 @@ declare
     l_pipe varchar2(100);
 begin
     lilam.set_dispatcher_pipe(null);
-    l_pid := lilam.server_new_session(p_processName => 'LT_' || :run || '_V5', p_groupName => 'LT_DGY');
+    l_pid := lilam.server_new_process(p_processName => 'LT_' || :run || '_V5', p_groupName => 'LT_DGY');
     if l_pid > 0 then
         l_pipe := lilam.get_server_pipe(l_pid);
-        lilam.close_session(l_pid);
+        lilam.close_process(l_pid);
     end if;
     lt.check_that(:run, 'V5 set_dispatcher_pipe(NULL) hebt die Einstellung auf: LT_DGS erreichbar', l_pid > 0 and l_pipe = 'LT_DGS',
                   'pid ' || l_pid || ', Server ' || l_pipe || ', ' || (dbms_utility.get_time - l_cs) * 10 || ' ms');
@@ -121,11 +121,11 @@ declare
     l_pid number;
     l_pipe varchar2(100);
 begin
-    l_pid := lilam.server_new_session(p_processName => 'LT_' || :run || '_V3', p_groupName => 'LT_DGY');
+    l_pid := lilam.server_new_process(p_processName => 'LT_' || :run || '_V3', p_groupName => 'LT_DGY');
     lt.metric(:run, 'v3_new_session_ms', (dbms_utility.get_time - l_cs) * 10, 'ms');
     if l_pid > 0 then
         l_pipe := lilam.get_server_pipe(l_pid);
-        lilam.close_session(l_pid);
+        lilam.close_process(l_pid);
     end if;
     lt.check_that(:run, 'V3 nach Package-Reset: LT_DGS sofort erreichbar', l_pid > 0 and l_pipe = 'LT_DGS',
                   'pid ' || l_pid || ', Server ' || l_pipe || ', ' || (dbms_utility.get_time - l_cs) * 10 || ' ms');
@@ -140,7 +140,7 @@ begin
 end;
 /
 declare
-    -- Server, der den Prozess tatsaechlich fuehrt (LILAM_PROC.SERVER_PIPE, nach CLOSE_SESSION geschrieben)
+    -- Server, der den Prozess tatsaechlich fuehrt (LILAM_PROC.SERVER_PIPE, nach CLOSE_PROCESS geschrieben)
     function owner_of(p_pid number) return varchar2 is
         l_srv varchar2(100);
     begin
@@ -156,11 +156,11 @@ declare
         l_pipe varchar2(100);
         l_srv  varchar2(100);
     begin
-        l_pid := lilam.server_new_session(p_processName => 'LT_' || :run || '_' || substr(p_check, 1, 3), p_groupName => p_group);
+        l_pid := lilam.server_new_process(p_processName => 'LT_' || :run || '_' || substr(p_check, 1, 3), p_groupName => p_group);
         if l_pid > 0 then
             l_pipe := lilam.get_server_pipe(l_pid);
             lilam.info(l_pid, p_check);
-            lilam.close_session(l_pid);
+            lilam.close_process(l_pid);
             l_srv := owner_of(l_pid);
         end if;
         lt.check_that(:run, p_check, l_pid > 0 and l_pipe = p_client and l_srv = p_owner,
@@ -185,10 +185,10 @@ declare
     l_pipe2 varchar2(100);
 begin
     lilam.set_dispatcher_pipe('LT_DGD', p_groupName => 'LT_DGX');
-    l_pid := lilam.server_new_session(p_processName => 'LT_' || :run || '_V6', p_groupName => 'LT_DGX');
+    l_pid := lilam.server_new_process(p_processName => 'LT_' || :run || '_V6', p_groupName => 'LT_DGX');
     if l_pid > 0 then
         l_pipe := lilam.get_server_pipe(l_pid);
-        lilam.close_session(l_pid);
+        lilam.close_process(l_pid);
         for i in 1 .. 20 loop
             select max(server_pipe) into l_srv from lilam_proc where id = l_pid and process_end is not null;
             exit when l_srv is not null;
@@ -196,10 +196,10 @@ begin
         end loop;
     end if;
     -- andere Gruppe in derselben Session: kein Dispatcher
-    l_pid2 := lilam.server_new_session(p_processName => 'LT_' || :run || '_V6B', p_groupName => 'LT_DGY');
+    l_pid2 := lilam.server_new_process(p_processName => 'LT_' || :run || '_V6B', p_groupName => 'LT_DGY');
     if l_pid2 > 0 then
         l_pipe2 := lilam.get_server_pipe(l_pid2);
-        lilam.close_session(l_pid2);
+        lilam.close_process(l_pid2);
     end if;
     lt.check_that(:run, 'V6 set_dispatcher_pipe mit p_groupName LT_DGX: Gruppe LT_DGX ueber LT_DGD bei LT_DGW',
                   l_pid > 0 and l_pipe = 'LT_DGD' and l_srv = 'LT_DGW',

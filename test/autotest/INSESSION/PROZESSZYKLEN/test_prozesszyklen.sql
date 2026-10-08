@@ -2,7 +2,7 @@
 -- LILAM Test: INSESSION / PROZESSZYKLEN
 --
 -- Prozesszyklen: viele Prozesse mit vollstaendigem Lebenszyklus, je Client p_window gleichzeitig offen.
--- Je Prozess: NEW_SESSION, Status RUNNING/HALF, Operationen, Rueckleseprobe GET_PROC_STEPS_DONE, CLOSE_SESSION.
+-- Je Prozess: NEW_PROCESS, Status RUNNING/HALF, Operationen, Rueckleseprobe GET_PROC_STEPS_DONE, CLOSE_PROCESS.
 -- Geprueft wird der Endzustand jedes Prozesses in _PROC.
 -- Der Test startet und stoppt seine Server selbst (keine Server).
 --
