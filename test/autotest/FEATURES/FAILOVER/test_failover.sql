@@ -9,7 +9,8 @@
 --   2. Phase 1: Logs, Events, ein abgeschlossener und ein offener Trace (FO_OPEN).
 --   3. Phase 2: weitere Logs und Events, sofort danach wird LT_S1 per STOP_JOB abgebrochen
 --      (ohne Drain, gepufferte Daten des Servers gehen verloren).
---   4. Phase 3: weitere Logs und Events ueber einige Sekunden, TRACE_STOP fuer FO_OPEN, CLOSE_PROCESS.
+--   4. Phase 3: weitere Logs und Events ueber ca. 10 s (der Heartbeat gilt erst nach 5 s als veraltet),
+--      TRACE_STOP fuer FO_OPEN, CLOSE_PROCESS.
 --
 --   Erwartet: alle Logs genau einmal, Events lueckenlos nummeriert ohne Dubletten, der offene Trace
 --   ist mit Dauer geschrieben, Prozess geschlossen, Uebernahme in LILAM_LOG_INTERNAL, keine Route und
@@ -86,10 +87,11 @@ begin
 
   -- 4. Phase 3: der Client merkt den Ausfall am stockenden Wasserstand
   l_t0 := systimestamp;
-  logs(c_n3, 10);
+  logs(c_n3, 3);
   lilam.trace_stop(l_pid, 'FO_OPEN');
   lt.metric(l_run, 'client_phase3_ms', lt.ms_since(l_t0), 'ms');
   dbms_output.put_line('Phase 3 in ' || lt.ms_since(l_t0) || ' ms, Server jetzt ' || lilam.get_server_pipe(l_pid));
+  lt.check_that(l_run, 'Uebernahme waehrend Phase 3', upper(lilam.get_server_pipe(l_pid)) = 'LT_S2', lilam.get_server_pipe(l_pid));
   lilam.close_process(l_pid, 'FO Ende', 1);
 
   -- Warten, bis alles geschrieben ist

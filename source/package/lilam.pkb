@@ -1768,6 +1768,12 @@ AS
             -- (A reconnect handles an unreachable server itself, see SERVER_LINK.)
             if p_request not in ('RECONNECT_PROCESS', 'ADOPT_PROCESS') then
                 checkServerAfterTimeout(p_processId);
+                -- Failover: another server has taken over the process (and received the repeated
+                -- messages): ask that server once more
+                if p_processId is not null and g_client_pipes.EXISTS(p_processId)
+                   and upper(g_client_pipes(p_processId)) != upper(l_serverPipe) then
+                    RETURN waitForResponse(p_processId, p_request, p_payload, p_timeoutSec);
+                end if;
             end if;
             RETURN 'TIMEOUT';
         end if ;
