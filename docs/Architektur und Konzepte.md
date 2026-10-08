@@ -61,6 +61,7 @@ Für die Installation muss der Code in ein geeignetes DB-Schema kopiert und comp
 Lediglich für den unkomplizierten Einstieg und Tests existieren Startskripte.
 
 ---
+
 ## Begriffe
 Zunächst einige wichtige Begriffsklärungen im Kontext von LILAM.
 
@@ -112,6 +113,8 @@ Jede neue Messung innerhalb einer Regel nutzt die Baseline, um Ausreißer zu erk
 ### Baseline-Scope
 Der Baseline-Scope legt fest, wer sich eine Baseline teilt. Standardmäßig sind das alle Prozesse mit demselben Namen, sodass jeder neue Lauf auf den Erfahrungen seiner Vorgänger aufbaut.
 Ohne Scope lernt jeder Prozess für sich allein, mit einem Scope teilen sich mehrere Anwendungen bewusst einen Normalwert.
+
+---
 
 ## Persistenz und Fehlerbehandlung
 LILAM schreibt gepufferte Daten gebündelt: Ein Flush sammelt die anstehenden Log-, Monitor- und Prozessdaten aller Prozesse, schreibt jede Tabelle mit einem einzigen `FORALL` und committet alles gemeinsam in einer autonomen Transaktion.
