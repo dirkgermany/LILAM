@@ -7143,7 +7143,7 @@ AS
     FUNCTION SERVER_NEW_PROCESS_JSON(p_jsonObject JSON_OBJ_LILAM) RETURN NUMBER
     as
         l_ProcessId number(19,0) := -500;   
-        l_response  varchar2(100);        
+        l_response  varchar2(1000);       -- response carries group and master table name (failover)
         l_payload   JSON_OBJ_LILAM := p_jsonObject;
     begin                        
         -- Expiry time: until then the client waits for the response. If the server only gets to the
