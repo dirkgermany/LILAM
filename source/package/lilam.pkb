@@ -39,6 +39,13 @@ AS
     -- counts as failed. Messages for its processes are then discarded at once (no waiting for timeouts),
     -- and the heartbeat is checked again at most every n s.
     C_FAILED_SERVER_RECHECK_SEC        CONSTANT PLS_INTEGER  := 5;
+    -- Failover: the client keeps the messages of a remote process that are not committed yet (ring buffer).
+    -- At most this many per process; when it is full, the client asks the server to flush (WATERMARK_REQUEST),
+    -- and only if that does not help, the oldest messages are given up.
+    C_CLIENT_RINGBUFF_MAX              CONSTANT PLS_INTEGER  := 20000;
+    -- The client reads the watermarks of a process at most every n ms (checked every C_RING_CHECK_EVERY_NO messages)
+    C_RING_WATERMARK_CHECK_MS          CONSTANT PLS_INTEGER  := 1000;
+    C_RING_CHECK_EVERY_NO              CONSTANT PLS_INTEGER  := 100;
 
     -- Dedicated to Client
     -- Client throttling: the limit per process comes from the server (p_perfServer, see C_SERVER_PERF_*)
@@ -169,6 +176,31 @@ AS
     g_client_id VARCHAR2(40);                    -- ID of this database session as a client (see getClientId)
     TYPE t_msg_seq_tab IS TABLE OF PLS_INTEGER INDEX BY BINARY_INTEGER;
     g_msg_seq t_msg_seq_tab;                     -- last sequence number per remote process
+    -- Client: ring buffer of the messages above the watermark, per remote process (index: sequence number)
+    TYPE t_ring_msg_rec IS RECORD (
+        msg_type     VARCHAR2(1),                -- buffer type on the server: L(og), M(onitor), P(rocess)
+        msg          JSON_OBJ_LILAM,             -- complete message as sent
+        trace_key    VARCHAR2(200),              -- TRACE_START: kept until its TRACE_STOP is committed
+        unpin_seq    PLS_INTEGER                 -- TRACE_START: sequence number of the matching TRACE_STOP
+    );
+    TYPE t_ring_tab IS TABLE OF t_ring_msg_rec INDEX BY PLS_INTEGER;
+    TYPE t_ring_map IS TABLE OF t_ring_tab INDEX BY BINARY_INTEGER;
+    g_ring t_ring_map;
+    -- Open traces per process: trace key -> sequence number of the TRACE_START in the ring buffer
+    TYPE t_trace_pin_tab IS TABLE OF PLS_INTEGER INDEX BY VARCHAR2(200);
+    TYPE t_trace_pin_map IS TABLE OF t_trace_pin_tab INDEX BY BINARY_INTEGER;
+    g_trace_pins t_trace_pin_map;
+    -- Watermarks known to the client per remote process
+    TYPE t_ring_meta_rec IS RECORD (
+        wm_log          NUMBER := 0,
+        wm_mon          NUMBER := 0,
+        wm_proc         NUMBER := 0,
+        since_check     PLS_INTEGER := 0,        -- messages since the last check of the time
+        last_check_cs   NUMBER,                  -- last read of the watermarks (DBMS_UTILITY.GET_TIME)
+        given_up        PLS_INTEGER := 0         -- messages removed from the full ring buffer without commit
+    );
+    TYPE t_ring_meta_tab IS TABLE OF t_ring_meta_rec INDEX BY BINARY_INTEGER;
+    g_ring_meta t_ring_meta_tab;
     -- Server: received and committed sequence numbers per process and client (key: see buildWatermarkKey)
     TYPE t_watermark_rec IS RECORD (
         process_id  NUMBER(19,0),
@@ -1889,6 +1921,214 @@ AS
     
     ---------------------------------------------------------------
 
+    --------------------------------------------------------------------------
+    -- Failover: ring buffer in the client
+    --------------------------------------------------------------------------
+    -- Buffer type on the server for a fire-and-forget request (see noteMessageSeq)
+    FUNCTION ringMsgType(p_request VARCHAR2) RETURN VARCHAR2 AS
+    BEGIN
+        RETURN CASE p_request
+                   WHEN 'LOG_ANY'        THEN 'L'
+                   WHEN C_MARK_EVENT     THEN 'M'
+                   WHEN 'START_TRACE'    THEN 'M'
+                   WHEN 'STOP_TRACE'     THEN 'M'
+                   WHEN 'SET_ANY_STATUS' THEN 'P'
+                   WHEN 'PROC_STEP_DONE' THEN 'P'
+               END;
+    END;
+
+    --------------------------------------------------------------------------
+
+    -- Removes all messages that are committed according to the known watermarks.
+    -- A TRACE_START stays until its TRACE_STOP is committed: the server keeps open traces only in its PGA,
+    -- a new server needs the start again.
+    procedure trimRing(p_processId number)
+    as
+        l_seq  PLS_INTEGER;
+        l_next PLS_INTEGER;
+        l_max  NUMBER;
+        l_wm   NUMBER;
+    begin
+        if not g_ring.EXISTS(p_processId) or not g_ring_meta.EXISTS(p_processId) then
+            return;
+        end if;
+        l_max := greatest(g_ring_meta(p_processId).wm_log, g_ring_meta(p_processId).wm_mon, g_ring_meta(p_processId).wm_proc);
+
+        l_seq := g_ring(p_processId).FIRST;
+        while l_seq is not null and l_seq <= l_max loop
+            l_next := g_ring(p_processId).NEXT(l_seq);
+            l_wm := case g_ring(p_processId)(l_seq).msg_type
+                        when 'L' then g_ring_meta(p_processId).wm_log
+                        when 'M' then g_ring_meta(p_processId).wm_mon
+                        else g_ring_meta(p_processId).wm_proc
+                    end;
+            if l_seq <= l_wm
+               and (g_ring(p_processId)(l_seq).trace_key is null
+                    or g_ring(p_processId)(l_seq).unpin_seq <= g_ring_meta(p_processId).wm_mon) then
+                g_ring(p_processId).DELETE(l_seq);
+            end if;
+            l_seq := l_next;
+        end loop;
+    exception
+        when others then
+            logLilamErr(sqlCode, sqlErrM, 'trimRing');
+    end;
+
+    --------------------------------------------------------------------------
+
+    -- Reads the watermarks of the process for this client from LILAM_WATERMARK and trims the ring buffer
+    procedure refreshWatermarks(p_processId number)
+    as
+        l_log  NUMBER;
+        l_mon  NUMBER;
+        l_proc NUMBER;
+    begin
+        g_ring_meta(p_processId).last_check_cs := dbms_utility.get_time;
+        begin
+            execute immediate 'select wm_log, wm_mon, wm_proc from ' || C_LILAM_WATERMARK
+                           || ' where process_id = :1 and client_id = :2'
+                into l_log, l_mon, l_proc using p_processId, getClientId;
+        exception
+            when NO_DATA_FOUND then return;   -- nothing committed yet
+            when others then
+                if sqlcode = -942 then return; end if;   -- table missing (server of an older version)
+                raise;
+        end;
+        g_ring_meta(p_processId).wm_log  := greatest(g_ring_meta(p_processId).wm_log,  nvl(l_log, 0));
+        g_ring_meta(p_processId).wm_mon  := greatest(g_ring_meta(p_processId).wm_mon,  nvl(l_mon, 0));
+        g_ring_meta(p_processId).wm_proc := greatest(g_ring_meta(p_processId).wm_proc, nvl(l_proc, 0));
+        trimRing(p_processId);
+    exception
+        when others then
+            logLilamErr(sqlCode, sqlErrM, 'refreshWatermarks');
+    end;
+
+    --------------------------------------------------------------------------
+
+    -- Ring buffer full: ask the server to write everything of the process now and report the watermarks
+    -- (synchronous, behind all messages already sent). If that does not help (server failed, timeout),
+    -- give up the oldest messages that are not pinned.
+    procedure relieveRing(p_processId number)
+    as
+        l_response varchar2(1000);
+        l_seq      PLS_INTEGER;
+        l_next     PLS_INTEGER;
+        l_given    PLS_INTEGER := 0;
+    begin
+        l_response := waitForResponse(p_processId, 'WATERMARK_REQUEST',
+            '{"process_id":' || jNum(p_processId) || jStr('cid', getClientId) || '}', 5);
+        if l_response not like 'ERROR%' and l_response != 'TIMEOUT' then
+            g_ring_meta(p_processId).wm_log  := greatest(g_ring_meta(p_processId).wm_log,  nvl(jsonNumber(l_response, 'wm_log'), 0));
+            g_ring_meta(p_processId).wm_mon  := greatest(g_ring_meta(p_processId).wm_mon,  nvl(jsonNumber(l_response, 'wm_mon'), 0));
+            g_ring_meta(p_processId).wm_proc := greatest(g_ring_meta(p_processId).wm_proc, nvl(jsonNumber(l_response, 'wm_proc'), 0));
+            g_ring_meta(p_processId).last_check_cs := dbms_utility.get_time;
+            trimRing(p_processId);
+        end if;
+
+        -- Still full: give up the oldest tenth (not pinned) so that the buffer does not grow without limit
+        if g_ring(p_processId).COUNT >= C_CLIENT_RINGBUFF_MAX then
+            l_seq := g_ring(p_processId).FIRST;
+            while l_seq is not null and l_given < C_CLIENT_RINGBUFF_MAX / 10 loop
+                l_next := g_ring(p_processId).NEXT(l_seq);
+                if g_ring(p_processId)(l_seq).trace_key is null then
+                    g_ring(p_processId).DELETE(l_seq);
+                    l_given := l_given + 1;
+                end if;
+                l_seq := l_next;
+            end loop;
+            if g_ring_meta(p_processId).given_up = 0 then
+                logLilamErr(NUM_ERR_PIPE_SERVER, 'Ring buffer of process ' || p_processId || ' is full (' || C_CLIENT_RINGBUFF_MAX
+                    || ' messages not committed). The oldest messages can no longer be repeated after a server failure.',
+                    'relieveRing', 'RING_FULL');
+            end if;
+            g_ring_meta(p_processId).given_up := g_ring_meta(p_processId).given_up + l_given;
+        end if;
+    exception
+        when others then
+            logLilamErr(sqlCode, sqlErrM, 'relieveRing');
+    end;
+
+    --------------------------------------------------------------------------
+
+    -- Keeps a message in the ring buffer until it is committed. Called by sendNoWait before sending,
+    -- so that also a message that cannot be sent (full pipe, failed server) can be repeated later.
+    -- PERFORMANCE: per message one entry in an associative array; the watermarks are read at most
+    -- every C_RING_WATERMARK_CHECK_MS, and the time is only checked every C_RING_CHECK_EVERY_NO messages.
+    procedure keepInRing(p_processId number, p_seq PLS_INTEGER, p_request varchar2, p_msg varchar2, p_traceKey varchar2)
+    as
+        l_rec   t_ring_msg_rec;
+        l_meta  t_ring_meta_rec;
+        l_empty t_ring_tab;
+        l_pins  t_trace_pin_tab;
+    begin
+        l_rec.msg_type := ringMsgType(p_request);
+        if l_rec.msg_type is null then
+            return;
+        end if;
+        l_rec.msg := p_msg;
+
+        if not g_ring.EXISTS(p_processId) then
+            g_ring(p_processId) := l_empty;
+            g_ring_meta(p_processId) := l_meta;
+        end if;
+
+        -- Open traces: pin the TRACE_START, release it with the matching TRACE_STOP
+        if p_traceKey is not null then
+            if not g_trace_pins.EXISTS(p_processId) then
+                g_trace_pins(p_processId) := l_pins;
+            end if;
+            if g_trace_pins(p_processId).EXISTS(p_traceKey) then
+                -- earlier start of the same trace: released by this message (stop or new start)
+                if g_ring(p_processId).EXISTS(g_trace_pins(p_processId)(p_traceKey)) then
+                    g_ring(p_processId)(g_trace_pins(p_processId)(p_traceKey)).unpin_seq := p_seq;
+                end if;
+                g_trace_pins(p_processId).DELETE(p_traceKey);
+            end if;
+            if p_request = 'START_TRACE' then
+                l_rec.trace_key := p_traceKey;
+                g_trace_pins(p_processId)(p_traceKey) := p_seq;
+            end if;
+        end if;
+
+        g_ring(p_processId)(p_seq) := l_rec;
+
+        g_ring_meta(p_processId).since_check := g_ring_meta(p_processId).since_check + 1;
+        if g_ring(p_processId).COUNT >= C_CLIENT_RINGBUFF_MAX then
+            refreshWatermarks(p_processId);
+            if g_ring(p_processId).COUNT >= C_CLIENT_RINGBUFF_MAX then
+                relieveRing(p_processId);
+            end if;
+            g_ring_meta(p_processId).since_check := 0;
+        elsif g_ring_meta(p_processId).since_check >= C_RING_CHECK_EVERY_NO then
+            g_ring_meta(p_processId).since_check := 0;
+            if g_ring_meta(p_processId).last_check_cs is null
+               or abs(dbms_utility.get_time - g_ring_meta(p_processId).last_check_cs) * 10 >= C_RING_WATERMARK_CHECK_MS then
+                refreshWatermarks(p_processId);
+            end if;
+        end if;
+    exception
+        when others then
+            logLilamErr(sqlCode, sqlErrM, 'keepInRing');
+    end;
+
+    --------------------------------------------------------------------------
+
+    -- Removes the ring buffer of a process (CLOSE_PROCESS)
+    procedure forgetRing(p_processId number)
+    as
+    begin
+        if g_ring_meta.EXISTS(p_processId) and g_ring_meta(p_processId).given_up > 0 then
+            logLilamErr(NUM_ERR_PIPE_SERVER, 'Process ' || p_processId || ' closed; ' || g_ring_meta(p_processId).given_up
+                || ' messages had to be removed from the full ring buffer before they were committed.',
+                'forgetRing', 'RING_FULL');
+        end if;
+        g_ring.DELETE(p_processId);
+        g_ring_meta.DELETE(p_processId);
+        g_trace_pins.DELETE(p_processId);
+    end;
+
+    --------------------------------------------------------------------------
+
     procedure send_sync_signal(p_processId number)
     as
         l_response varchar2(1000);
@@ -1948,20 +2188,14 @@ AS
         p_processId     in number,
         p_request       in varchar2, -- Needed for assignment/branching in the server
         p_payload       IN varchar2, 
-        p_timeoutSec    IN PLS_INTEGER
+        p_timeoutSec    IN PLS_INTEGER,
+        p_traceKey      IN varchar2 DEFAULT NULL  -- START_TRACE/STOP_TRACE: key of the trace (ring buffer)
     )
     as        
         l_pipeName      VARCHAR2(100);
         l_status        PLS_INTEGER;
         l_jsonMain      JSON_OBJ_LILAM;   -- (unused variables l_now/l_retryInterval removed: saved one SYSTIMESTAMP per call)
     begin
-        -- STABILITY: the server of the process has failed: discard at once instead of waiting for timeouts
-        if serverFailed(p_processId) then
-            return;
-        end if;
-
-        stabilizeInLowPerfEnvironments(p_processId);
-
         -- PERFORMANCE: concatenate the message in one step instead of via jsonPut (see jStr/jNum/jTs).
         -- p_request is always an internal constant and does not need to be escaped.
         -- Failover: sequence number per process and client session (see LILAM_WATERMARK)
@@ -1970,6 +2204,15 @@ AS
                    || '","seq":' || g_msg_seq(p_processId) || ',"cid":"' || getClientId || '"}'
                    || case when p_payload is not null then ',"payload":' || p_payload end
                    || '}';
+        -- Failover: keep the message until the server has committed it (also if it cannot be sent now)
+        keepInRing(p_processId, g_msg_seq(p_processId), p_request, l_jsonMain, p_traceKey);
+
+        -- STABILITY: the server of the process has failed: do not wait for timeouts
+        if serverFailed(p_processId) then
+            return;
+        end if;
+
+        stabilizeInLowPerfEnvironments(p_processId);
 
         l_pipeName := getServerPipeForSession(p_processId, null);
         DBMS_PIPE.PACK_MESSAGE(l_jsonMain);
@@ -3635,7 +3878,8 @@ AS
                   || jStr('context_name', p_contextName)
                   || jTs ('timestamp',    p_timestamp) || '}';
 
-        sendNoWait(p_processId, 'START_TRACE', l_payload, C_SEND_TIMEOUT_SEC);
+        sendNoWait(p_processId, 'START_TRACE', l_payload, C_SEND_TIMEOUT_SEC,
+                   buildMonitorKey(p_processId, p_actionName, p_contextName));
 
     EXCEPTION
         WHEN OTHERS THEN
@@ -3659,7 +3903,8 @@ AS
                   || jStr('context_name', p_contextName)
                   || jTs ('timestamp',    p_timestamp) || '}';
 
-        sendNoWait(p_processId, 'STOP_TRACE', l_payload, C_SEND_TIMEOUT_SEC);
+        sendNoWait(p_processId, 'STOP_TRACE', l_payload, C_SEND_TIMEOUT_SEC,
+                   buildMonitorKey(p_processId, p_actionName, p_contextName));
 
     EXCEPTION
         WHEN OTHERS THEN
@@ -5255,6 +5500,9 @@ AS
         g_remote_sync.DELETE;
         g_failed_server.DELETE;
         g_msg_seq.DELETE;
+        g_ring.DELETE;
+        g_ring_meta.DELETE;
+        g_trace_pins.DELETE;
         g_watermarks.DELETE;
         g_process_cache.DELETE;
         g_monitor_shadows.DELETE;
@@ -5427,6 +5675,7 @@ AS
                 g_failed_server.DELETE(p_processId);
             end if;
             g_msg_seq.DELETE(p_processId);
+            forgetRing(p_processId);
             g_remote_sessions.delete(p_processId);
             g_remote_sync.delete(p_processId);
             g_log_counters.delete(p_processId);
@@ -5695,6 +5944,42 @@ AS
         l_processId  := jsonNumber(l_payload, 'process_id');
 
         procStepDone(l_processId);
+    end;
+
+    --------------------------------------------------------------------------
+
+    -- Failover: the ring buffer of a client is full. Write everything buffered now and report the
+    -- watermarks of the process for this client. The request arrives behind all messages the client
+    -- sent before, so these are part of the flush.
+    procedure doRemote_watermarkRequest(p_clientChannel varchar2, p_message varchar2)
+    as
+        l_payload  JSON_OBJ_LILAM;
+        l_pid      number;
+        l_key      varchar2(70);
+        l_response varchar2(500);
+        l_status   PLS_INTEGER;
+    begin
+        l_payload := JSON_QUERY(p_message, '$.payload');
+        l_pid     := jsonNumber(l_payload, 'process_id');
+        l_key     := buildWatermarkKey(l_pid, jsonString(l_payload, 'cid'));
+
+        SYNC_ALL_DIRTY(p_force => TRUE, p_withBaselines => FALSE);
+
+        l_response := '{"process_id":' || jNum(l_pid);
+        if g_watermarks.EXISTS(l_key) then
+            l_response := l_response
+                       || jNum('wm_log',  nvl(g_watermarks(l_key).wm_log, 0))
+                       || jNum('wm_mon',  nvl(g_watermarks(l_key).wm_mon, 0))
+                       || jNum('wm_proc', nvl(g_watermarks(l_key).wm_proc, 0));
+        end if;
+        l_response := l_response || '}';
+
+        DBMS_PIPE.RESET_BUFFER;
+        DBMS_PIPE.PACK_MESSAGE(l_response);
+        l_status := DBMS_PIPE.SEND_MESSAGE(p_clientChannel, timeout => 1);
+    exception
+        when others then
+            logLilamErr(sqlCode, sqlErrM, 'doRemote_watermarkRequest');
     end;
 
     --------------------------------------------------------------------------
@@ -7382,6 +7667,9 @@ AS
 
             WHEN 'RECONNECT_PROCESS' then
                 doRemote_reconnectProcess(p_clientChannel, p_message);
+
+            WHEN 'WATERMARK_REQUEST' then
+                doRemote_watermarkRequest(p_clientChannel, p_message);
 
             WHEN 'GET_PROCESS_DATA' then
                 doRemote_getProcessData(p_clientChannel, p_message);
