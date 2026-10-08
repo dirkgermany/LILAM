@@ -35,6 +35,10 @@ AS
     C_MAX_SERVER_PIPE_SIZE             CONSTANT PLS_INTEGER := 16777216; --  16777216, 67108864
     
     C_MAX_REGISTRY_HEARTBEAT_AGE_SEC   CONSTANT PLS_INTEGER  := 15;  --  Server HEARTBEAT in Registry mustn't be older
+    -- Client: a server whose request timed out and whose heartbeat is older than C_MAX_REGISTRY_HEARTBEAT_AGE_SEC
+    -- counts as failed. Messages for its processes are then discarded at once (no waiting for timeouts),
+    -- and the heartbeat is checked again at most every n s.
+    C_FAILED_SERVER_RECHECK_SEC        CONSTANT PLS_INTEGER  := 5;
 
     -- Dedicated to Client
     -- Client throttling: the limit per process comes from the server (p_perfServer, see C_SERVER_PERF_*)
@@ -148,6 +152,14 @@ AS
     -- attempt. Prevents every call with an unknown ID from querying the dispatcher synchronously again.
     TYPE t_unknown_pids IS TABLE OF TIMESTAMP INDEX BY BINARY_INTEGER;
     g_unknown_pids t_unknown_pids;
+    -- STABILITY: remote processes whose server has failed (request timed out and heartbeat too old).
+    -- Without this, every further call waited for the timeouts again (backpressure 10 s, full pipe approx. 4 s).
+    TYPE t_failed_server_rec IS RECORD (
+        next_check  TIMESTAMP,              -- next heartbeat check
+        dropped     PLS_INTEGER := 0        -- messages discarded since the failure
+    );
+    TYPE t_failed_server_tab IS TABLE OF t_failed_server_rec INDEX BY BINARY_INTEGER;
+    g_failed_server t_failed_server_tab;
 
     TYPE t_throttle_stat IS RECORD (
         msg_count  PLS_INTEGER := 0,
@@ -461,6 +473,8 @@ AS
     procedure createInternalLogTable;
     FUNCTION SERVER_LINK(p_processId NUMBER, p_pipeName varchar2) RETURN NUMBER;
     procedure refreshGroupRules(p_group varchar2, p_force boolean);
+    function serverFailed(p_processId number) return boolean;
+    procedure checkServerAfterTimeout(p_processId number);
     ------------------------------------------------------------------------
     
     ---------------------------------------------------------------
@@ -1593,6 +1607,11 @@ AS
         l_jsonPayload   JSON_OBJ_LILAM;
         l_jsonMain      JSON_OBJ_LILAM;
     begin
+        -- STABILITY: the server of the process has failed: answer at once instead of waiting for the timeout
+        if p_processId is not null and serverFailed(p_processId) then
+            return 'TIMEOUT';
+        end if;
+
         l_clientChannel := getClientPipe;
         l_groupName := jsonString(p_payload, 'group_name');
 
@@ -1623,7 +1642,14 @@ AS
         DBMS_PIPE.PURGE(l_clientChannel);
         l_status := DBMS_PIPE.REMOVE_PIPE(l_clientChannel);
 
-        if l_statusReceive = 1 THEN RETURN 'TIMEOUT'; end if ;
+        if l_statusReceive = 1 THEN
+            -- Timeout: if the server is not only busy but has failed, mark the process.
+            -- (A reconnect handles an unreachable server itself, see SERVER_LINK.)
+            if p_request != 'RECONNECT_PROCESS' then
+                checkServerAfterTimeout(p_processId);
+            end if;
+            RETURN 'TIMEOUT';
+        end if ;
         return l_msgReceive;
 
     exception
@@ -1660,6 +1686,98 @@ AS
     exception
         when others then
             logLilamErr(sqlCode, sqlErrM, 'isServerPipeActive', 'EXECUTE IMMEDIATE');
+            return false;
+    end;
+
+    ---------------------------------------------------------------
+    -- Client: failure detection for the server of a remote process
+    ---------------------------------------------------------------
+    -- Is the server of the process active? Checks the pipe the client sends to (worker or dispatcher)
+    -- and, if a route exists, also the worker that holds the process (behind a dispatcher).
+    function isProcessServerActive(p_processId number) return boolean
+    as
+        l_routePipe varchar2(50);
+    begin
+        if not g_client_pipes.EXISTS(p_processId) then
+            return true;   -- no server known: no assessment
+        end if;
+        if not isServerPipeActive(g_client_pipes(p_processId)) then
+            return false;
+        end if;
+
+        begin
+            execute immediate 'select pipe_name from ' || C_LILAM_PROCESS_ROUTE || ' where process_id = :1'
+                into l_routePipe using p_processId;
+        exception
+            when others then
+                l_routePipe := null;   -- no route (table missing or process unknown): only the pipe counts
+        end;
+        if l_routePipe is not null and upper(l_routePipe) != upper(g_client_pipes(p_processId)) then
+            return isServerPipeActive(l_routePipe);
+        end if;
+        return true;
+    end;
+
+    --------------------------------------------------------------------------
+
+    -- After a timeout or a failed send: if the server is not active any more, mark the process.
+    -- Further messages are then discarded at once until the server is active again (see serverFailed).
+    -- A server that is only busy keeps its heartbeat and is not marked.
+    procedure checkServerAfterTimeout(p_processId number)
+    as
+        l_rec  t_failed_server_rec;
+        l_pipe varchar2(128);
+    begin
+        if p_processId is null or p_processId <= 0 or g_failed_server.EXISTS(p_processId)
+           or not g_remote_sessions.EXISTS(p_processId) then
+            return;
+        end if;
+        if isProcessServerActive(p_processId) then
+            return;
+        end if;
+
+        l_rec.next_check := systimestamp + numtodsinterval(C_FAILED_SERVER_RECHECK_SEC, 'SECOND');
+        g_failed_server(p_processId) := l_rec;
+        if g_client_pipes.EXISTS(p_processId) then
+            l_pipe := g_client_pipes(p_processId);
+        end if;
+        logLilamErr(NUM_ERR_PIPE_SERVER, 'Server ' || l_pipe || ' of process ' || p_processId
+            || ' does not respond, heartbeat older than ' || C_MAX_REGISTRY_HEARTBEAT_AGE_SEC
+            || ' s. Messages of this process are discarded until the server is active again.',
+            'checkServerAfterTimeout', 'SERVER_FAILED');
+    exception
+        when others then
+            logLilamErr(sqlCode, sqlErrM, 'checkServerAfterTimeout');
+    end;
+
+    --------------------------------------------------------------------------
+
+    -- Has the server of the process failed? Counts the discarded message and checks the
+    -- heartbeat again at most every C_FAILED_SERVER_RECHECK_SEC.
+    function serverFailed(p_processId number) return boolean
+    as
+    begin
+        -- PERFORMANCE: in normal operation a single EXISTS on an empty array
+        if p_processId is null or not g_failed_server.EXISTS(p_processId) then
+            return false;
+        end if;
+
+        if systimestamp >= g_failed_server(p_processId).next_check then
+            if isProcessServerActive(p_processId) then
+                logLilamErr(NUM_ERR_PIPE_SERVER, 'Server of process ' || p_processId || ' is active again; '
+                    || g_failed_server(p_processId).dropped || ' messages were discarded.',
+                    'serverFailed', 'SERVER_RECOVERED');
+                g_failed_server.DELETE(p_processId);
+                return false;
+            end if;
+            g_failed_server(p_processId).next_check := systimestamp + numtodsinterval(C_FAILED_SERVER_RECHECK_SEC, 'SECOND');
+        end if;
+
+        g_failed_server(p_processId).dropped := g_failed_server(p_processId).dropped + 1;
+        return true;
+    exception
+        when others then
+            logLilamErr(sqlCode, sqlErrM, 'serverFailed');
             return false;
     end;
 
@@ -1791,6 +1909,11 @@ AS
         l_status        PLS_INTEGER;
         l_jsonMain      JSON_OBJ_LILAM;   -- (unused variables l_now/l_retryInterval removed: saved one SYSTIMESTAMP per call)
     begin
+        -- STABILITY: the server of the process has failed: discard at once instead of waiting for timeouts
+        if serverFailed(p_processId) then
+            return;
+        end if;
+
         stabilizeInLowPerfEnvironments(p_processId);
 
         -- PERFORMANCE: concatenate the message in one step instead of via jsonPut (see jStr/jNum/jTs).
@@ -1816,6 +1939,7 @@ AS
         if l_status != 0 AND p_processId != g_serverProcessId then
             -- Re-registration with an alternative server
             DBMS_PIPE.RESET_BUFFER;
+            checkServerAfterTimeout(p_processId);
             RAISE_APPLICATION_ERROR(-20006, 'LILAM: Client kann keine Nachrichten an Server senden:  ' || sqlErrM);
         end if;
 
@@ -4904,6 +5028,7 @@ AS
         end if;
         g_remote_sessions.DELETE;
         g_remote_sync.DELETE;
+        g_failed_server.DELETE;
         g_process_cache.DELETE;
         g_monitor_shadows.DELETE;
         g_local_throttle_cache.DELETE;    
@@ -5065,6 +5190,15 @@ AS
     begin
         if is_remote(p_processId) then
             close_processRemote(p_processId, p_procStepsToDo, p_procStepsDone, p_processInfo, p_processStatus);
+            -- Marking of a failed server, with the number of discarded messages if not reported yet
+            if g_failed_server.EXISTS(p_processId) then
+                if g_failed_server(p_processId).dropped > 0 then
+                    logLilamErr(NUM_ERR_PIPE_SERVER, 'Process ' || p_processId || ' closed while its server was not active; '
+                        || g_failed_server(p_processId).dropped || ' messages were discarded.',
+                        'CLOSE_PROCESS', 'SERVER_FAILED');
+                end if;
+                g_failed_server.DELETE(p_processId);
+            end if;
             g_remote_sessions.delete(p_processId);
             g_remote_sync.delete(p_processId);
             g_log_counters.delete(p_processId);
