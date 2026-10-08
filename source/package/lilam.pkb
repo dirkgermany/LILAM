@@ -165,6 +165,8 @@ AS
     g_remote_info t_remote_info_tab;
     -- Server side: messages repeated for an open trace (TRACE_START) restore state only, without rules
     g_replay_mode BOOLEAN := FALSE;
+    -- Server: the current message is repeated after a takeover; the failed worker may already have raised its alerts
+    g_replay_check BOOLEAN := FALSE;
     g_in_failover BOOLEAN := FALSE;              -- client: failoverProcess is running (no recursion via timeouts)
     C_NO_DIRECT_WRITE CONSTANT PLS_INTEGER := -1;  -- Column NO of log entries written directly by the client
     -- Master table of directly written entries: always LILAM (=> LILAM_LOG) in the schema of the calling
@@ -1315,6 +1317,21 @@ AS
     BEGIN
         v_idx_session := v_indexSession(p_rec.process_id);
         v_group       := g_rule_groups(g_sessionList(v_idx_session).rule_group);
+
+        -- Failover: a repeated message must not raise an alert the failed worker already raised.
+        -- The restored monitor state gives the repeated measurement the same action_count.
+        IF g_replay_check THEN
+            EXECUTE IMMEDIATE 'select count(*) from ' || C_LILAM_ALERTS_TABLE || '
+                               where process_id = :1 and rule_id = :2 and action_name = :3
+                                 and (context_name = :4 or (context_name is null and :5 is null))
+                                 and action_count = :6 and rownum = 1'
+                INTO v_alert_id
+                USING p_rec.process_id, p_rule.rule_id, p_rec.action_name, p_rec.context_name, p_rec.context_name, p_rec.action_count;
+            IF v_alert_id > 0 THEN
+                ROLLBACK;
+                RETURN TRUE;
+            END IF;
+        END IF;
 
         v_sqlStmt := '
         INSERT INTO ' || C_LILAM_ALERTS_TABLE || '(
@@ -2479,11 +2496,12 @@ AS
         if l_seq is null then
             return TRUE;   -- client without sequence numbers (older version)
         end if;
-        -- PERFORMANCE: the flag is rare; INSTR before parsing
-        if instr(p_message, '"pin":1') > 0 and JSON_VALUE(p_message, '$.header.pin' RETURNING NUMBER) = 1 then
+        -- PERFORMANCE: the replay flags are set by replayRing directly at the start of the header
+        if substr(p_message, 1, 19) = '{"header":{"pin":1,' then
             g_replay_mode := TRUE;
             return TRUE;
         end if;
+        g_replay_check := substr(p_message, 1, 18) = '{"header":{"rp":1,';
         l_cid := JSON_VALUE(p_message, '$.header.cid');
         l_pid := JSON_VALUE(p_message, '$.payload.process_id' RETURNING NUMBER);
         if l_cid is null or l_pid is null then
@@ -6997,6 +7015,8 @@ AS
             l_msg := g_ring(p_processId)(l_seq).msg;
             if g_ring(p_processId)(l_seq).trace_key is not null and l_seq <= g_ring_meta(p_processId).wm_mon then
                 l_msg := regexp_replace(l_msg, '"header":\{', '"header":{"pin":1,', 1, 1);
+            else
+                l_msg := regexp_replace(l_msg, '"header":\{', '"header":{"rp":1,', 1, 1);
             end if;
             DBMS_PIPE.RESET_BUFFER;
             DBMS_PIPE.PACK_MESSAGE(l_msg);
@@ -8353,7 +8373,8 @@ AS
 
         -- Failover: sequence number of fire-and-forget messages (see LILAM_WATERMARK);
         -- a message repeated after a takeover that this server already has is skipped
-        g_replay_mode := FALSE;
+        g_replay_mode  := FALSE;
+        g_replay_check := FALSE;
         if not noteMessageSeq(p_request, p_message) then
             return false;
         end if;
@@ -8424,7 +8445,8 @@ AS
                 -- Log unknown tag
                 warn(g_serverProcessId, g_serverPipeName || '=> Received unknown request: ' || p_request);
         END CASE;
-        g_replay_mode := FALSE;
+        g_replay_mode  := FALSE;
+        g_replay_check := FALSE;
 
         return false; -- no stop signal
     end;
