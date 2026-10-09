@@ -181,7 +181,7 @@ LILAM prioritizes the stability of your application. It uses a Hybrid Model to b
 
 ### Technology
 #### Autonomous Persistence
-LILAM strictly utilizes `PRAGMA AUTONOMOUS_TRANSACTION`. Synchronous log entries are committed independently of the main transaction even when the calling application executes a `ROLLBACK` due to an error. This ensures the root cause remains available for post-mortem analysis.
+LILAM strictly utilizes `PRAGMA AUTONOMOUS_TRANSACTION`. Synchronous log entries are committed independently of the main transaction, even if the calling application executes a ROLLBACK due to an error. This ensures the root cause remains available for post-mortem analysis.
 
 #### Deep Context Insights
 By leveraging the `UTL_CALL_STACK`, LILAM automatically captures the exact program execution path. Instead of just logging a generic error, it documents the entire call chain, significantly accelerating the debugging process in complex, nested PL/SQL environments.
