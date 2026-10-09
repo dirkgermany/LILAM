@@ -175,7 +175,7 @@ LILAM offers two execution models that can be used interchangeably:
 
 ### Performance & Safety
 LILAM prioritizes the stability of your application. It uses a Hybrid Model to balance speed and system integrity:
-* Logs, metrics, and status updates are handled via Fire-and-Forget to minimize overhead. Zero latency for your business logic.
+* Logs, metrics, and status updates are handled via Fire-and-Forget to minimize overhead.
 * Active Throttling
 * As an optional safeguard, LILAM rate-limits hyperactive clients during load peaks to prevent pipe flooding until the bottleneck is cleared.
 
@@ -185,7 +185,7 @@ LILAM prioritizes the stability of your application. It uses a Hybrid Model to b
 
 ### Technology
 #### Autonomous Persistence
-LILAM strictly utilizes `PRAGMA AUTONOMOUS_TRANSACTION`. This guarantees that log entries and monitoring data are permanently stored in the database, even if the calling main transaction performs a `ROLLBACK` due to an error. This ensures the root cause remains available for post-mortem analysis.
+LILAM strictly utilizes `PRAGMA AUTONOMOUS_TRANSACTION`. Synchronous log entries are committed independently of the main transaction even when the calling application executes a `ROLLBACK` due to an error. This ensures the root cause remains available for post-mortem analysis.
 
 #### Deep Context Insights
 By leveraging the `UTL_CALL_STACK`, LILAM automatically captures the exact program execution path. Instead of just logging a generic error, it documents the entire call chain, significantly accelerating the debugging process in complex, nested PL/SQL environments.
@@ -194,7 +194,7 @@ By leveraging the `UTL_CALL_STACK`, LILAM automatically captures the exact progr
 To minimize the impact on the main application’s overhead, LILAM features an internal buffering system. Log writing is processed efficiently, offering a decisive performance advantage over simple, row-by-row logging methods, especially in high-load production environments. The exception are entries up to the sync level (default `ERROR`): they are written immediately, so that the error and everything logged before it are stored (see the note under Performance & Safety).
 
 #### Robust & Non-Invasive (Silent Mode)
-LILAM is designed to be "invisible." The framework ensures that an internal error during the logging process (e.g., table space issues or configuration errors) doesn't crash the calling application logic. Exceptions within LILAM are caught and handled internally, prioritizing the stability of your business transaction over the logging activity itself.
+LILAM is designed to be "invisible." The framework handles internal errors where possible to reduce the risk of disrupting application logic. Exceptions within LILAM are caught and handled internally.
 
 #### Built-in Extensibility (Adapters)
 LILAMs decoupled architecture is designed for seamless integration with modern monitoring stacks. Its structured data format allows for the easy creation of adapters.
@@ -212,7 +212,7 @@ LILAM is a specialized framework for deep process insights. Using `MARK_EVENT` a
 * **Point-in-Time Events:** Track milestones and calculate intervals between recurring steps using `MARK_EVENT`.
 * **Transaction Tracing:** Use `TRACE_START` and `TRACE_STOP` for precise measurement of work blocks, ensuring clear visibility into long-running tasks.
 * **Moving Averages & Outliers:** LILAM maintains historical benchmarks to detect performance degradation or unusual execution times (outliers) in real-time.
-* **Zero Client Overhead:** Calculations are processed within the session buffer, minimizing database roundtrips and ensuring high performance.
+* **Minimal Client Overhead:** Metric calculations are buffered within the session to minimize database round-trips.
 
 #### Intelligent Metric Calculation
 Instead of performing expensive aggregations across millions of monitor records, LILAM uses an incremental calculation mechanism. Metrics like averages and counters are updated on-the-fly. This ensures that monitoring dashboards (e.g., in Grafana, APEX, or Oracle Jet) remain highly responsive even with massive datasets.
@@ -254,7 +254,7 @@ To illustrate how LILAM works, imagine monitoring a subway system:
 
 **Event (CLOSE_DOOR):** A discrete point in time. We mark this event at a specific station (STATION_ID_400). If a mandatory event did not happen before the next one, LILAM can trigger an alert (PRECEDED_BY).
 
-**Trace/Transaction (TRACK_SECTION):** A time-based segment representing the travel between two points (e.g. SECTION_ID_402). By using trace_start and trace_stop, we automatically measure the travel time (latency).
+**Trace/Transaction (TRACK_SECTION):** A time-based segment representing the travel between two points (e.g. SECTION_ID_402). By using trace_start and trace_stop, we automatically measure the travel time (y).
 
 #### Identifier for the ongoing Process 
 ```sql
@@ -374,7 +374,7 @@ LILAM is designed for high-concurrency environments. The following results were 
 
 LILAM was developed and stress-tested on a consumer-grade laptop using Oracle Database 23ai Free. To provide a realistic assessment of its capabilities, a rigorous test scenario was designed to push the entire system to its physical limits under these conditions.
 
-For a detailed analysis of throughput, latency, and resource efficiency, please refer to the full reports:
+For a detailed analysis of throughput, y, and resource efficiency, please refer to the full reports:
 *   [Performance & Stress-Test Report (English Version)](./performance-report-eng.md)
 *   [Performance- & Belastungstest-Bericht (Deutsche Version)](./performance-report-deu.md)
 
