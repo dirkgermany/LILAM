@@ -137,10 +137,19 @@ Measured on Oracle 23.26 Free (2 CPU threads), test schema `LILAM_TEST`:
 | Caller `ROLLBACK` | Nothing. All writes are autonomous transactions. | Nothing. |
 | Unhandled exception, session killed, job aborted, without `CLOSE_SESSION` / `FLUSH` | Everything buffered since the last flush (e.g. `INFO` and `WARN`). An `ERROR` that has returned is stored, together with everything that was buffered before it. | Nothing on the client side. Entries that have reached the server are lost only if the server fails. |
 | Database session dies during the `ERROR` call | This `ERROR` (it is committed at the end of the call). | This `ERROR`, if it was not yet committed. |
-| LILAM server killed or crashed | – | Everything in the server's buffer and in its pipe, i.e. buffered entries above the sync level. The pipe lives in the SGA only, and a restarted server empties its pipe and does not know the processes of its predecessor. Synchronous entries are stored in `LILAM_LOG` of the client (verified by test: an `ERROR` sent while the server was down is there). |
+| LILAM server killed or crashed | – | With a second active worker in the group: nothing (failover, see below). Without one: everything in the server's buffer and in its pipe, i.e. buffered entries above the sync level, as soon as the client closes the process or more than `C_CLIENT_RINGBUFF_MAX` (20,000) messages pile up. Synchronous entries are stored in `LILAM_LOG` of the client (verified by test: an `ERROR` sent while the server was down is there). |
 | Instance crash | Everything buffered. | Everything buffered and everything in the pipes. |
 | Pipe full (server overloaded) | – | The client retries for a few seconds and then discards the message. It is recorded in `LILAM_LOG_INTERNAL` of the client; the application gets no exception. Synchronous entries are stored in `LILAM_LOG` of the client. |
 | Log table not writable (e.g. tablespace full) | The entry is recorded in `LILAM_LOG_INTERNAL`; the application gets no exception. | Same, in the client or the server. |
+
+**Failover when a worker fails** (decoupled)
+
+* The client numbers every message per process and keeps it in a ring buffer until the server has committed it. For each client session the server writes the watermark to `LILAM_WATERMARK`, in the same commit as the data.
+* If a synchronous request gets no answer or the watermark stops rising, the client checks the server's heartbeat. If it is older than 5 s, the server counts as failed.
+* The client then sends `ADOPT_PROCESS` to another active worker of the same group (with a dispatcher, the dispatcher picks the worker). If no other worker runs, the failed server is asked again, in case it was restarted under the same name.
+* The new worker moves the process route to itself and rebuilds the process from the tables. The client then repeats everything above the watermark. Messages the server already has are skipped. Open traces are restored without rules, and an alert the failed worker already raised is not raised a second time.
+* A worker that only stalled and keeps running writes nothing more for processes taken over.
+* Takeover, and failure without takeover, are recorded in `LILAM_LOG_INTERNAL` of the client. Until a server takes over, the client does not send and checks again at most every 5 s.
 
 **Consequences**
 * Once a call with a level up to the sync level returns, the entry is committed, in both modes. The additional cost compared with a buffered entry is mostly the commit.
@@ -486,6 +495,7 @@ In addition to the process-specific tables, LILAM uses internal tables whose nam
 | --- | --- |
 | `LILAM_SERVER_REGISTRY` | Maintains server registration, availability, heartbeat, load, and currently active Rule Set information. |
 | `LILAM_RULES` | Stores versioned Rule Sets per group (servers and INSESSION processes), one of them active per group. |
+| `LILAM_WATERMARK` | Watermarks for failover: per process and client session the highest sequence number up to which logs, metrics and process data are committed. The server writes them in the same commit as the data. |
 | `LILAM_LOG_INTERNAL` | Provides independent fallback logging for internal LILAM framework errors. |
 
 > [!NOTE]
