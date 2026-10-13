@@ -3280,6 +3280,46 @@ AS
     end;
 
     --------------------------------------------------------------------------
+    -- Primary key on ID of the process table, enforced by the existing index <table>_IX_ID.
+    -- Older installations have only the non-unique index; the key is added on the next start.
+    -- STABILITY: never raises. Several servers may run this at the same time (ORA-02260/-02264:
+    -- another session was faster). ORA-00054 (table busy): try again with the next session.
+    -- Duplicates in old data (ORA-02437) do not block: the key then applies to new rows only
+    -- (ENABLE NOVALIDATE), noted in LILAM_LOG_INTERNAL.
+    --------------------------------------------------------------------------
+    procedure createProcPrimaryKey(p_tableName varchar2)
+    as
+        l_table varchar2(128) := upper(trim(p_tableName));
+        l_stmt  varchar2(1000);
+        l_pk    pls_integer;
+    begin
+        select count(*) into l_pk from user_constraints
+         where table_name = l_table and constraint_type = 'P';
+        if l_pk > 0 then
+            return;
+        end if;
+
+        l_stmt := 'ALTER TABLE ' || l_table || ' ADD CONSTRAINT ' || l_table || '_PK'
+               || ' PRIMARY KEY (id) USING INDEX ' || l_table || '_IX_ID';
+        begin
+            execute immediate l_stmt;
+        exception
+            when others then
+                if sqlcode in (-2260, -2264, -54) then
+                    null;
+                elsif sqlcode = -2437 then
+                    logLilamErr(sqlCode, sqlErrM, 'createProcPrimaryKey', 'duplicate IDs in ' || l_table || ', key ENABLE NOVALIDATE');
+                    run_ddl(l_stmt || ' ENABLE NOVALIDATE', -2260);
+                else
+                    logLilamErr(sqlCode, sqlErrM, 'createProcPrimaryKey', 'EXECUTE IMMEDIATE');
+                end if;
+        end;
+    exception
+        when others then
+            logLilamErr(sqlCode, sqlErrM, 'createProcPrimaryKey');
+    end;
+
+    --------------------------------------------------------------------------
 
     procedure createLogTables(p_TabNameMaster varchar2)
     as
@@ -3502,6 +3542,7 @@ AS
         -- Indexes of the master tables: names are derived from the master name,
         -- so that each master table (LILAM, LILAM_SERVER, custom names) gets its own indexes
         createIndexIfMissing(p_TabNameMaster || C_SUFFIX_PROC_TABLE || '_IX_ID',      p_TabNameMaster || C_SUFFIX_PROC_TABLE, 'id');
+        createProcPrimaryKey(p_TabNameMaster || C_SUFFIX_PROC_TABLE);
         createIndexIfMissing(p_TabNameMaster || C_SUFFIX_PROC_TABLE || '_IX_CLEANUP', p_TabNameMaster || C_SUFFIX_PROC_TABLE, 'process_name, process_end');
         createIndexIfMissing(p_TabNameMaster || C_SUFFIX_LOG_TABLE  || '_IX_PID',     p_TabNameMaster || C_SUFFIX_LOG_TABLE,  'process_id');
         createIndexIfMissing(p_TabNameMaster || C_SUFFIX_LOG_TABLE  || '_IX_INFO',    p_TabNameMaster || C_SUFFIX_LOG_TABLE,  'info');
@@ -5220,13 +5261,13 @@ AS
         l_mon    t_mon_batch_rec;
         l_proc   t_proc_batch_rec;
         l_wm     t_watermark_batch_rec;
+        l_pid    pls_integer;
 
+        -- Collects without duplicates; l_seen (index by PLS_INTEGER) then yields the IDs in ascending order
         procedure addPid(p_pid number) is
         begin
-            if p_pid is not null and not l_seen.EXISTS(p_pid) then
+            if p_pid is not null then
                 l_seen(p_pid) := TRUE;
-                l_pids.EXTEND;
-                l_pids(l_pids.LAST) := p_pid;
             end if;
         end;
     begin
@@ -5251,16 +5292,26 @@ AS
             l_key := g_proc_batches.NEXT(l_key);
         end loop;
         for i in 1 .. g_watermark_batch.pids.COUNT loop addPid(g_watermark_batch.pids(i)); end loop;
-        if l_pids.COUNT = 0 then
+        if l_seen.COUNT = 0 then
             return;
         end if;
+        l_pids.EXTEND(l_seen.COUNT);
+        l_pid := l_seen.FIRST;
+        for i in 1 .. l_pids.COUNT loop
+            l_pids(i) := l_pid;
+            l_pid := l_seen.NEXT(l_pid);
+        end loop;
 
         -- PERFORMANCE: one statement per flush (primary key); the lock is released by the flush commit.
         -- A process without a route (already closed) still belongs to this worker.
+        -- STABILITY (befunde fallback D3): locks in ascending process_id order, like syncBaselines, so two
+        -- workers that share processes during a takeover cannot wait for each other crosswise (ORA-00060).
+        -- The list is sorted and drives the nested loop (hint); ORDER BY would not fix the locking order.
         begin
-            execute immediate 'select process_id, pipe_name from ' || C_LILAM_PROCESS_ROUTE || '
-                               where process_id in (select column_value from table(:1))
-                               for update'
+            execute immediate 'select /*+ leading(t) use_nl(r) */ r.process_id, r.pipe_name
+                               from table(:1) t, ' || C_LILAM_PROCESS_ROUTE || ' r
+                               where r.process_id = t.column_value
+                               for update of r.pipe_name'
                 bulk collect into l_route, l_pipes using l_pids;
         exception
             when others then
@@ -9188,9 +9239,12 @@ AS
                    and isServerPipeActive(jsonString(JSON_QUERY(p_message, '$.payload'), 'old_pipe'), C_FAILOVER_HEARTBEAT_AGE_SEC) then
                     l_targetPipe := jsonString(JSON_QUERY(p_message, '$.payload'), 'old_pipe');
                 end if;
-                -- The worker moves the route before it answers; the cache already points to it
-                if l_targetPipe is not null then
-                    g_dispatch_route_cache(l_processId) := l_targetPipe;
+                -- STABILITY (befunde fallback C2): do not set the cache to the target in advance, the takeover
+                -- can fail (route stays with the old or another worker). The worker moves the route and commits
+                -- before it answers, and the client waits for the answer before it sends again; the next message
+                -- of the process therefore reads the valid route from LILAM_PROCESS_ROUTE (resolveDispatchTarget).
+                if l_processId is not null then
+                    g_dispatch_route_cache.DELETE(l_processId);
                 end if;
             else
                 l_processId := jsonNumber(JSON_QUERY(p_message, '$.payload'), 'process_id');
