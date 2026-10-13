@@ -332,12 +332,12 @@ ORDER  BY no;
 ### Monitoring data
 Events (`MON_TYPE` = 0) and traces (`MON_TYPE` = 1) share one table. `STOP_TIME` remains `NULL` for events.
 ```sql
-SELECT process_id, mon_type, action, context, start_time, stop_time, used_millis, avg_millis, action_count
+SELECT process_id, mon_type, action, context, start_time, stop_time, used_millis, used_millis_ewma, action_count
 FROM   lilam_mon
 WHERE  process_id = <id>;
 ```
 
->| PROCESS_ID | MON_TYPE | ACTION    | CONTEXT    | START_TIME      | STOP_TIME       | USED_MILLIS | AVG_MILLIS | ACTION_COUNT |
+>| PROCESS_ID | MON_TYPE | ACTION    | CONTEXT    | START_TIME      | STOP_TIME       | USED_MILLIS | USED_MILLIS_EWMA | ACTION_COUNT |
 >| ---------- | -------- | --------- | ---------- | --------------- | --------------- | ----------- | ---------- | ------------ |
 >| 1          | 0        | MY_ACTION | MY_CONTEXT | 13.01.26 10:... | NULL            | 402         | 402        | 1            |
 >| 1          | 0        | MY_ACTION | MY_CONTEXT | 13.01.26 10:... | NULL            | 510         | 456        | 2            |

@@ -228,11 +228,11 @@ create or replace package body ltp as
         l clob;
     begin
         l := mk_rule('E1', 'MARK_EVENT', 'LTB_EVENT', 'MAX_OCCURRENCE', '999999999')
-          || ',' || mk_rule('E2', 'MARK_EVENT', 'LTB_EVENT', 'MAX_GAP_SECONDS', '999999')
-          || ',' || mk_rule('E3', 'MARK_EVENT', 'LTB_EVENT', 'PRECEDED_BY_WITHIN_SECS', 'LTB_EVENT|999999')
-          || ',' || mk_rule('T1', 'TRACE_STOP', 'LTB_TRACE', 'MAX_DURATION_MS', '999999999')
-          || ',' || mk_rule('T2', 'TRACE_STOP', 'LTB_TRACE', 'AVG_DEVIATION_PCT', '100000|3|0.1')
-          || ',' || mk_rule('T3', 'TRACE_START', 'LTB_TRACE', 'MAX_GAP_SECONDS', '999999')
+          || ',' || mk_rule('E2', 'MARK_EVENT', 'LTB_EVENT', 'TIME_MAX_GAP_SECONDS', '999999')
+          || ',' || mk_rule('E3', 'MARK_EVENT', 'LTB_EVENT', 'TIME_PRECEDED_BY_WITHIN_SECS', 'LTB_EVENT|999999')
+          || ',' || mk_rule('T1', 'TRACE_STOP', 'LTB_TRACE', 'TIME_MAX_DURATION_MS', '999999999')
+          || ',' || mk_rule('T2', 'TRACE_STOP', 'LTB_TRACE', 'TIME_EWMA_DEVIATION_PCT_UP', '100000|3|0.1')
+          || ',' || mk_rule('T3', 'TRACE_START', 'LTB_TRACE', 'TIME_MAX_GAP_SECONDS', '999999')
           || ',' || mk_rule('L1', 'LOGGING', 'LOGGING', 'SEVERITY', 'ERROR', 60)
           || ',' || mk_rule('L2', 'LOGGING', 'LOGGING', 'SEVERITY', 'MONITOR');
         for c in 1 .. p_clients loop

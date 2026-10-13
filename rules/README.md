@@ -86,7 +86,7 @@ Rules are organized into Rule Sets, stored as JSON documents in the `LILAM_RULES
       "action": "TRACK_SECTION",
       "context": "SECTION_400_001",
       "condition": {
-        "operator": "MAX_DURATION_MS",
+        "operator": "TIME_MAX_DURATION_MS",
         "value": "25000"
       },
       "alert": { "handler": "LILAM_ALERT_MAIL_LOG", "severity": "WARN", "throttle_seconds": 0 }
@@ -118,14 +118,14 @@ Rules on `MARK_EVENT` and `TRACE_STOP` are only evaluated if the log level of th
 | ON_START, ON_STOP, ON_EVENT, ON_UPDATE | – | all except LOGGING | always (the trigger itself is the condition)
 | SEVERITY | `ERROR`, `WARN`, `MONITOR`, `INFO`, `DEBUG` | LOGGING | a log message with exactly this level arrives
 | LOG_CONTAINS | `TEXT` or `LEVEL\|TEXT` | LOGGING | a log message contains the text (case-insensitive), optionally only for this level (`ERROR`, `WARN`, `MONITOR`, `INFO`, `DEBUG`; otherwise the whole value is the text)
-| MAX_DURATION_MS | milliseconds | MARK_EVENT, TRACE_STOP | duration of the trace, or for events the time since the previous event of the same action, is greater than the value
-| AVG_DEVIATION_PCT | `pct[\|warmup[\|alpha]]` | MARK_EVENT, TRACE_STOP | duration is more than `pct` percent above the moving average (EWMA); no evaluation while the average is below 1 ms (measurement resolution), see below
+| TIME_MAX_DURATION_MS | milliseconds | MARK_EVENT, TRACE_STOP | duration of the trace, or for events the time since the previous event of the same action, is greater than the value
+| TIME_EWMA_DEVIATION_PCT_UP | `pct[\|warmup[\|alpha]]` | MARK_EVENT, TRACE_STOP | duration is more than `pct` percent above the moving average (EWMA); no evaluation while the average is below 1 ms (measurement resolution), see below
 | MAX_OCCURRENCE | count | MARK_EVENT, TRACE_STOP, PROCESS_UPDATE, PROCESS_STOP | the action occurred more often than the value within the process (`ACTION_COUNT`); for processes: `STEPS_DONE` > value
-| MAX_GAP_SECONDS | seconds | MARK_EVENT, TRACE_START | time since the previous event (MARK_EVENT) or since the end of the previous trace (TRACE_START) of the same action is greater than the value
+| TIME_MAX_GAP_SECONDS | seconds | MARK_EVENT, TRACE_START | time since the previous event (MARK_EVENT) or since the end of the previous trace (TRACE_START) of the same action is greater than the value
 | PRECEDED_BY | `ACTION` or `ACTION\|CONTEXT` | MARK_EVENT, TRACE_START, PROCESS_UPDATE, PROCESS_STOP | the previous signal of the process was **not** the expected action (and context, if given)⁴
-| PRECEDED_BY_WITHIN_SECS | `ACTION\|SECONDS` or `ACTION\|CONTEXT\|SECONDS` | like PRECEDED_BY | like PRECEDED_BY, or the expected predecessor ended more than the given seconds ago
-| RUNTIME_EXCEEDED | milliseconds | PROCESS_UPDATE | the running process is older than the value
-| MAX_RUNTIME_EXCEEDED | milliseconds | PROCESS_STOP | the total runtime of the process is greater than the value
+| TIME_PRECEDED_BY_WITHIN_SECS | `ACTION\|SECONDS` or `ACTION\|CONTEXT\|SECONDS` | like PRECEDED_BY | like PRECEDED_BY, or the expected predecessor ended more than the given seconds ago
+| TIME_RUNTIME_EXCEEDED | milliseconds | PROCESS_UPDATE | the running process is older than the value
+| TIME_MAX_RUNTIME_EXCEEDED | milliseconds | PROCESS_STOP | the total runtime of the process is greater than the value
 | STEPS_LEFT_HIGH | count | PROCESS_START, PROCESS_UPDATE, PROCESS_STOP | `STEPS_TODO - STEPS_DONE` > value
 | SUCCESS_RATE_LOW | percent | PROCESS_START, PROCESS_UPDATE, PROCESS_STOP | `STEPS_DONE / STEPS_TODO * 100` < value
 | STATUS_EQUALS | number | PROCESS_START, PROCESS_UPDATE, PROCESS_STOP | process status = value
@@ -134,7 +134,7 @@ Rules on `MARK_EVENT` and `TRACE_STOP` are only evaluated if the log level of th
 ⁴ Only events and traces (start and stop) count as predecessors, log messages do not. Without a context in the value, any context of the expected action is accepted. The order is checked when the action starts, not at TRACE_STOP (there the predecessor would usually be the own TRACE_START); loading rejects `PRECEDED_BY*` with TRACE_STOP.
 
 > [!NOTE]
-> Rules are evaluated when a signal arrives. LILAM has no timer-based evaluation: a process that hangs without sending signals, or an event that never arrives ("B must follow A within X seconds" when B never comes), is not detected. The order "B follows A within X seconds" can be checked when B arrives, with `PRECEDED_BY_WITHIN_SECS` on B.
+> Rules are evaluated when a signal arrives. LILAM has no timer-based evaluation: a process that hangs without sending signals, or an event that never arrives ("B must follow A within X seconds" when B never comes), is not detected. The order "B follows A within X seconds" can be checked when B arrives, with `TIME_PRECEDED_BY_WITHIN_SECS` on B.
 
 ---
 ## Table: LILAM_RULES
@@ -176,13 +176,13 @@ Evaluating rules happens in RAM and is cheap: rules for other actions cost nothi
 
 ### Deep Dive: Anomaly Detection with EWMA
 
-The `AVG_DEVIATION_PCT` operator utilizes an **Exponentially Weighted Moving Average (EWMA)**. Unlike a simple arithmetic mean, the EWMA gives more weight to recent data points, allowing the system to adapt to shifting performance trends in real-time.
+The `TIME_EWMA_DEVIATION_PCT_UP` operator utilizes an **Exponentially Weighted Moving Average (EWMA)**. Unlike a simple arithmetic mean, the EWMA gives more weight to recent data points, allowing the system to adapt to shifting performance trends in real-time.
 
 #### What is EWMA?
 It is a statistical measure used to model time-series data. In LILAM, it creates a "moving baseline" for your business transactions. If a new event deviates significantly from this baseline, an alert is triggered.
 
 #### Technical Example: `20|100|0.1`
-When using `AVG_DEVIATION_PCT` with the value `20|100|0.1`, the parameters are defined as follows:
+When using `TIME_EWMA_DEVIATION_PCT_UP` with the value `20|100|0.1`, the parameters are defined as follows:
 
 
 | Parameter | Value | Description |

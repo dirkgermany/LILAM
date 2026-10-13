@@ -21,21 +21,21 @@ create or replace PACKAGE BODY LILAM_GRAFANA AS
     -- Monitor entry of the alert (start/stop/duration); NULL values if not (yet) written.
     -- STABILITY: table names come from LILAM_ALERTS and are checked with DBMS_ASSERT.
     -------------------------------------------------------------------------
-    PROCEDURE readMonitor(p_alert t_alert, p_start OUT TIMESTAMP, p_stop OUT TIMESTAMP, p_used OUT NUMBER) IS
+    PROCEDURE readMonitor(p_alert t_alert, p_start OUT TIMESTAMP, p_stop OUT TIMESTAMP, p_used OUT NUMBER, p_value OUT NUMBER) IS
     BEGIN
         EXECUTE IMMEDIATE
-            'SELECT start_time, stop_time, used_millis FROM '
+            'SELECT start_time, stop_time, used_millis, used_value FROM '
             || dbms_assert.sql_object_name(p_alert.monitor_table_name) || '
               WHERE process_id = :1 AND action = :2 AND action_count = :3
                 AND (context = :4 OR (context IS NULL AND :5 IS NULL))
               ORDER BY stop_time DESC NULLS LAST
               FETCH FIRST 1 ROWS ONLY'
-        INTO p_start, p_stop, p_used
+        INTO p_start, p_stop, p_used, p_value
         USING p_alert.process_id, p_alert.action_name, p_alert.action_count, p_alert.context_name, p_alert.context_name;
     EXCEPTION
         WHEN OTHERS THEN
             -- The server writes monitor data buffered; the alert is sent anyway
-            p_start := NULL; p_stop := NULL; p_used := NULL;
+            p_start := NULL; p_stop := NULL; p_used := NULL; p_value := NULL;
     END;
 
     -------------------------------------------------------------------------
@@ -45,12 +45,13 @@ create or replace PACKAGE BODY LILAM_GRAFANA AS
         l_start TIMESTAMP;
         l_stop  TIMESTAMP;
         l_used  NUMBER;
+        l_value NUMBER;   -- measured value (MARK_EVENT with p_value)
         l_text  VARCHAR2(4000);
         l_obj   JSON_OBJECT_T := JSON_OBJECT_T();
         l_tags  JSON_ARRAY_T  := JSON_ARRAY_T();
     BEGIN
         SELECT * INTO l_alert FROM LILAM_ALERTS WHERE alert_id = p_alertId;
-        readMonitor(l_alert, l_start, l_stop, l_used);
+        readMonitor(l_alert, l_start, l_stop, l_used, l_value);
 
         l_tags.append('lilam');
         l_tags.append('group:'    || l_alert.group_name);
@@ -65,6 +66,7 @@ create or replace PACKAGE BODY LILAM_GRAFANA AS
         l_text := 'LILAM ' || l_alert.rule_id || ' (' || l_alert.alert_severity || '): '
                || l_alert.action_name || nvl2(l_alert.context_name, ' ' || l_alert.context_name, '')
                || nvl2(l_used, ', ' || to_char(round(l_used), 'FM999999999990') || ' ms', '')
+               || nvl2(l_value, ', value ' || to_char(l_value, 'TM9', 'NLS_NUMERIC_CHARACTERS=''.,'''), '')
                || ' - ' || l_alert.process_name || ' (process ' || l_alert.process_id || ', alert ' || l_alert.alert_id || ')';
 
         IF p_dashboardUid IS NOT NULL THEN

@@ -259,8 +259,8 @@ Regeln für andere Actions kosten nichts. Derselben Action und demselben Trigger
 
 | Metrik         | Operatorname (JSON)    | Technische Bedingung                              | Anwendungsfall                                 |
 | :------------- | :--------------------- | :------------------------------------------------ | :--------------------------------------------- |
-| **Laufzeit**   | `RUNTIME_EXCEEDED`     | `(SYSTIMESTAMP - PROCESS_START) > value` ms (PROCESS_UPDATE) | Prozess läuft zu lange (geprüft, wenn ein Signal eintrifft). |
-| **Laufzeit**   | `MAX_RUNTIME_EXCEEDED` | `(PROCESS_END - PROCESS_START) > value` ms (PROCESS_STOP) | Prozess hat zu lange gedauert.         |
+| **Laufzeit**   | `TIME_RUNTIME_EXCEEDED`     | `(SYSTIMESTAMP - PROCESS_START) > value` ms (PROCESS_UPDATE) | Prozess läuft zu lange (geprüft, wenn ein Signal eintrifft). |
+| **Laufzeit**   | `TIME_MAX_RUNTIME_EXCEEDED` | `(PROCESS_END - PROCESS_START) > value` ms (PROCESS_STOP) | Prozess hat zu lange gedauert.         |
 | **Fortschritt** | `STEPS_LEFT_HIGH`     | `(STEPS_TODO - STEPS_DONE) > value`               | Prüfung auf unerledigte Arbeit am Prozessende. |
 | **Effizienz**  | `SUCCESS_RATE_LOW`     | `(STEPS_DONE / STEPS_TODO) * 100 < value`         | Qualität der Batch-Verarbeitung überwachen.    |
 | **Häufigkeit** | `MAX_OCCURRENCE`       | `STEPS_DONE > value`                              | Flutschutz / Erkennung von Endlosschleifen.    |
@@ -268,7 +268,7 @@ Regeln für andere Actions kosten nichts. Derselben Action und demselben Trigger
 | **Infotext**   | `INFO_CONTAINS`        | `UPPER(INFO)` enthält `UPPER(value)`              | Suche nach Schlüsselwörtern wie "FATAL" oder "ERROR". |
 | **Trigger**    | `ON_START`, `ON_UPDATE`, `ON_STOP` | Trigger ausgelöst                     | Start, Fortschritt oder Ende an nachgelagerte Systeme melden. |
 | **Abhängigkeit** | `PRECEDED_BY`        | letztes Event/letzter Trace des Prozesses ≠ `value` (PROCESS_UPDATE, PROCESS_STOP) | Prüft den Vorgänger. |
-| **Abhängigkeit** | `PRECEDED_BY_WITHIN_SECS` | wie `PRECEDED_BY`, zusätzlich maximale Verzögerung | Prüft Vorgänger und max. Verzögerung. |
+| **Abhängigkeit** | `TIME_PRECEDED_BY_WITHIN_SECS` | wie `PRECEDED_BY`, zusätzlich maximale Verzögerung | Prüft Vorgänger und max. Verzögerung. |
 
 #### Action- & Context-Metriken
 **Trigger:** TRACE_START, TRACE_STOP, MARK_EVENT. Diese Regeln bewerten die Daten der Monitor-Tabelle.
@@ -276,12 +276,12 @@ Regeln für andere Actions kosten nichts. Derselben Action und demselben Trigger
 | Metrik          | Operatorname (JSON)   | Technische Bedingung                            | Anwendungsfall                                |
 | :-------------- | :-------------------- | :---------------------------------------------- | :-------------------------------------------- |
 | **Ausführung**  | `ON_EVENT`, `ON_START`, `ON_STOP` | Trigger ausgelöst                   | Einen Orchestrator anstoßen, sobald das Signal eintrifft. |
-| **Dauer**       | `MAX_DURATION_MS`     | `used_time > value` (MARK_EVENT, TRACE_STOP)    | Absolute Zeitgrenze für eine bestimmte Action. |
-| **Abweichung**  | `AVG_DEVIATION_PCT`   | `used_time > avg_time * (1 + value/100)` (MARK_EVENT, TRACE_STOP); nicht ausgewertet, solange `avg_time` < 1 ms | Relative Abweichung vom gleitenden Durchschnitt. |
+| **Dauer**       | `TIME_MAX_DURATION_MS`     | `used_time > value` (MARK_EVENT, TRACE_STOP)    | Absolute Zeitgrenze für eine bestimmte Action. |
+| **Abweichung**  | `TIME_EWMA_DEVIATION_PCT_UP`   | `used_time > avg_time * (1 + value/100)` (MARK_EVENT, TRACE_STOP); nicht ausgewertet, solange `avg_time` < 1 ms | Relative Abweichung vom gleitenden Durchschnitt. |
 | **Häufigkeit**  | `MAX_OCCURRENCE`      | `action_count > value` (MARK_EVENT, TRACE_STOP) | Flutschutz / Erkennung von Endlosschleifen.   |
-| **Intervall**   | `MAX_GAP_SECONDS`     | Zeit seit dem vorherigen Event (MARK_EVENT) oder dem Ende des vorherigen Trace (TRACE_START) > value | Stillstand zwischen zwei Signalen erkennen. |
+| **Intervall**   | `TIME_MAX_GAP_SECONDS`     | Zeit seit dem vorherigen Event (MARK_EVENT) oder dem Ende des vorherigen Trace (TRACE_START) > value | Stillstand zwischen zwei Signalen erkennen. |
 | **Abhängigkeit** | `PRECEDED_BY`        | letztes Event/letzter Trace des Prozesses ≠ `ACTION[\|CONTEXT]` (MARK_EVENT, TRACE_START; nicht TRACE_STOP) | Prüft den Vorgänger.                |
-| **Abhängigkeit** | `PRECEDED_BY_WITHIN_SECS` | wie `PRECEDED_BY`, zusätzlich maximale Verzögerung in Sekunden | Prüft Vorgänger und max. Verzögerung. |
+| **Abhängigkeit** | `TIME_PRECEDED_BY_WITHIN_SECS` | wie `PRECEDED_BY`, zusätzlich maximale Verzögerung in Sekunden | Prüft Vorgänger und max. Verzögerung. |
 
 #### Logging
 **Trigger:** LOGGING.
@@ -312,7 +312,7 @@ Das JSON-Objekt gliedert sich in einen Header für Metadaten und ein Array mit d
       "action": "STATION_EXIT",
       "context": "Moulin Rouge",
       "condition": {
-        "operator": "MAX_DURATION_MS",
+        "operator": "TIME_MAX_DURATION_MS",
         "value": "300000"
       },
       "alert": {
@@ -456,7 +456,7 @@ sequenceDiagram
 `SERVER_UPDATE_RULES` umgeht den Dispatcher: `UPDATE_RULE` wird direkt an die Daten-Pipes aller Worker der Gruppe gesendet.
 
 ### Baseline-Scope
-Die Durchschnittswerte (EWMA) von Traces und Events, mit denen Regeln wie `AVG_DEVIATION_PCT` vergleichen, werden je **Scope** geführt. Standardmäßig ist der Scope der Prozessname, sodass jeder neue Lauf eines Prozesses die Durchschnittswerte seiner Vorgänger fortführt.
+Die Durchschnittswerte (EWMA) von Traces und Events, mit denen Regeln wie `TIME_EWMA_DEVIATION_PCT_UP` vergleichen, werden je **Scope** geführt. Standardmäßig ist der Scope der Prozessname, sodass jeder neue Lauf eines Prozesses die Durchschnittswerte seiner Vorgänger fortführt.
 
 ```mermaid
 flowchart TD
@@ -596,7 +596,7 @@ Events und Traces teilen sich dieselbe Tabellenstruktur. Die Spalte `MON_TYPE` k
 | `ACTION` | `VARCHAR2(100)` | Name der überwachten Action. |
 | `CONTEXT` | `VARCHAR2(100)` | Optionaler Context, um Vorkommen derselben Action zu unterscheiden. |
 | `USED_MILLIS` | `NUMBER(19)` | Gemessene Dauer in Millisekunden. |
-| `AVG_MILLIS` | `NUMBER(19)` | Gleitende durchschnittliche Dauer in Millisekunden für die zugehörige Kombination aus Action und Context. |
+| `USED_MILLIS_EWMA` | `NUMBER(19)` | Gleitende durchschnittliche Dauer in Millisekunden für die zugehörige Kombination aus Action und Context. |
 | `ACTION_COUNT` | `NUMBER(19)` | Anzahl der erfassten Vorkommen für die zugehörige Kombination aus Action und Context. |
 
 

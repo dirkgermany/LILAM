@@ -44,8 +44,8 @@ select s.scope_name, b.action_name, b.context_name, b.avg_ms, b.action_count, b.
   join lilam_scopes s on s.scope_id = b.scope_id
  where s.scope_name = 'APP 1';
 
--- Erwartet: ACTION_COUNT pro Prozess 1..2 (prozesslokal), AVG_MILLIS = Scope-Baseline
-select p.id, p.scope_name, m.action, m.action_count, m.used_millis, m.avg_millis
+-- Erwartet: ACTION_COUNT pro Prozess 1..2 (prozesslokal), USED_MILLIS_EWMA = Scope-Baseline
+select p.id, p.scope_name, m.action, m.action_count, m.used_millis, m.used_millis_ewma
   from lilam_proc p
   join lilam_mon  m on m.process_id = p.id
  where p.process_name = 'App 1'

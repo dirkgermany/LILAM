@@ -924,8 +924,8 @@ Structure of the rule sets and operators: [Rules Engine](../rules/README.md). A 
 
 - **Context rules:** Rules with a context (`Action|Context`) apply in addition to the rules without a context for the same action; LILAM checks both.
 - **Logging rules:** Trigger `LOGGING` supports `SEVERITY` (exactly this level) and `LOG_CONTAINS` with the value `TEXT` or `LEVEL|TEXT`: the log message contains the text (case-insensitive), optionally only for this level. The first part only counts as a level if it is `ERROR`, `WARN`, `MONITOR`, `INFO` or `DEBUG`; otherwise the whole value is the text (max. 100 characters).
-- **`PRECEDED_BY`, `PRECEDED_BY_WITHIN_SECS`:** The order is checked when an action starts (`MARK_EVENT`, `TRACE_START`, `PROCESS_UPDATE`, `PROCESS_STOP`). With `TRACE_STOP`, the rule is rejected at load time, because there the predecessor would usually be its own `TRACE_START`.
-- **`AVG_DEVIATION_PCT`:** As long as the average is below 1 ms (measurement resolution), no evaluation takes place.
+- **`PRECEDED_BY`, `TIME_PRECEDED_BY_WITHIN_SECS`:** The order is checked when an action starts (`MARK_EVENT`, `TRACE_START`, `PROCESS_UPDATE`, `PROCESS_STOP`). With `TRACE_STOP`, the rule is rejected at load time, because there the predecessor would usually be its own `TRACE_START`.
+- **`TIME_EWMA_DEVIATION_PCT_UP`:** As long as the average is below 1 ms (measurement resolution), no evaluation takes place.
 - **No time-based check:** Rules are evaluated when a signal arrives. Missing signals (a hanging process, an event that never comes) are not detected.
 
 ### Rules in INSESSION Mode
@@ -936,7 +936,7 @@ Processes in INSESSION mode also evaluate rules if `NEW_SESSION` receives a grou
 - **Invalid rule set:** It is rejected and logged once per version in `LILAM_LOG_INTERNAL`; the previous rules remain active. The application does not notice any of this.
 - **Alerts:** A triggered alert is written immediately and synchronously (`LILAM_ALERTS` and `DBMS_ALERT` signal, own transaction). This costs the application one commit per alert; `throttle_seconds` limits the frequency. `GROUP_NAME` in the alert is the group from `NEW_SESSION`.
 - **Memory per session:** Throttling (`throttle_seconds`) and the predecessor for `PRECEDED_BY` apply per database session. With a connection pool (e.g. APEX), the same alert can therefore be triggered once per pool connection.
-- **Baseline parameters:** `warmup` and `alpha` from `AVG_DEVIATION_PCT` rules also apply to the average values of the process, just as in the server.
+- **Baseline parameters:** `warmup` and `alpha` from `TIME_EWMA_DEVIATION_PCT_UP` rules also apply to the average values of the process, just as in the server.
 
 ```sql
 l_processId := lilam.new_session('IMPORT_CUSTOMERS', p_groupName => 'METRO');

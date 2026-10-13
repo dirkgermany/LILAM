@@ -11,7 +11,7 @@
       "trigger_type": "TRACE_START",
       "action": "TRACK_SECTION",
       "condition": {
-        "operator": "PRECEDED_BY_WITHIN_SECS",
+        "operator": "TIME_PRECEDED_BY_WITHIN_SECS",
         "value": "CLOSE_DOOR|10"
       },
       "alert": { "handler": "LILAM_ALERT_MAIL_LOG", "severity": "INFO" }
@@ -34,7 +34,7 @@
       "action": "TRACK_SECTION",
       "context": "SECTION_400_001",
       "condition": {
-        "operator": "MAX_DURATION_MS",
+        "operator": "TIME_MAX_DURATION_MS",
         "value": "25000"
       },
       "alert": { "handler": "LILAM_ALERT_MAIL_LOG", "severity": "WARN", "throttle_seconds": 0 }
@@ -89,7 +89,7 @@
       "trigger_type": "TRACE_STOP",
       "action": "TRACK_SECTION",
       "condition": {
-        "operator": "AVG_DEVIATION_PCT",
+        "operator": "TIME_EWMA_DEVIATION_PCT_UP",
         "value": "20|100|0.1" 
       },
       "alert": { "handler": "LILAM_ALERT_MAIL_LOG", "severity": "WARN", "throttle_seconds": 60 }

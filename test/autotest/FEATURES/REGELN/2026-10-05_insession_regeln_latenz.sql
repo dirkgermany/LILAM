@@ -43,11 +43,11 @@ begin
     l_json := '{"rules":[';
     for i in 1 .. 50 loop
         l_json := l_json || '{"id":"O' || i || '","trigger_type":"TRACE_STOP","action":"OTHER_' || i
-               || '","condition":{"operator":"MAX_DURATION_MS","value":"1"},"alert":{"handler":"LT_INS_ALERT"}},';
+               || '","condition":{"operator":"TIME_MAX_DURATION_MS","value":"1"},"alert":{"handler":"LT_INS_ALERT"}},';
     end loop;
     l_json := l_json
-        || '{"id":"M1","trigger_type":"TRACE_STOP","action":"STEP_P","condition":{"operator":"MAX_DURATION_MS","value":"1000000000"},"alert":{"handler":"LT_INS_ALERT"}},'
-        || '{"id":"F1","trigger_type":"TRACE_STOP","action":"STEP_F","condition":{"operator":"MAX_DURATION_MS","value":"-1"},"alert":{"handler":"LT_INS_ALERT"}}]}';
+        || '{"id":"M1","trigger_type":"TRACE_STOP","action":"STEP_P","condition":{"operator":"TIME_MAX_DURATION_MS","value":"1000000000"},"alert":{"handler":"LT_INS_ALERT"}},'
+        || '{"id":"F1","trigger_type":"TRACE_STOP","action":"STEP_F","condition":{"operator":"TIME_MAX_DURATION_MS","value":"-1"},"alert":{"handler":"LT_INS_ALERT"}}]}';
     delete from lilam_rules where group_name in ('LT_INS_P', 'LT_INS_Q');
     insert into lilam_rules (group_name, set_name, version, created, author, rule_set, is_active)
     values ('LT_INS_P', 'LT_INS_PERF', 2, systimestamp, 'Claude', l_json, 0);

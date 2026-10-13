@@ -1057,8 +1057,9 @@ AS
     as
         l_str varchar2(64);
     begin
-        if p_value = trunc(p_value) then
-            return to_char(p_value);       -- Integer: NLS does not matter (normal case)
+        -- Integer: NLS does not matter. STABILITY: from 1E38 on to_char is scientific with NLS separator
+        if p_value = trunc(p_value) and abs(p_value) < 1E38 then
+            return to_char(p_value);
         end if;
         l_str := to_char(p_value, 'TM9', 'NLS_NUMERIC_CHARACTERS=''.,''');
         if substr(l_str, 1, 1) = '.' then

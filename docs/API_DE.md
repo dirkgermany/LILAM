@@ -704,14 +704,48 @@ Verwende `MARK_EVENT` für ein einzelnes Ereignis zu einem bestimmten Zeitpunkt 
 
 Bei wiederholten Markern mit derselben Action und demselben Context verfolgt LILAM Zeitabstand, Anzahl der Vorkommen, durchschnittliche Dauer und signifikante zeitliche Abweichungen.
 
+Optional übergibst Du mit `p_value` einen numerischen Messwert, z. B. einen Aktienkurs, eine Temperatur oder eine Füllmenge. LILAM speichert den Wert und berechnet für die Wertreihe einen eigenen EWMA, getrennt vom zeitlichen Abstand. Damit überwacht LILAM nicht nur Abläufe, sondern auch anwendungsseitig definierte Messwerte.
+
 ```sql
 PROCEDURE MARK_EVENT(
   p_processId   NUMBER,
   p_actionName  VARCHAR2,
-  p_contextName VARCHAR2 DEFAULT NULL,
+  p_contextName VARCHAR2  DEFAULT NULL,
+  p_value       NUMBER    DEFAULT NULL,
   p_timestamp   TIMESTAMP DEFAULT NULL
 )
 ```
+
+| Parameter | Typ | Beschreibung | Erforderlich |
+| --- | --- | --- | --- |
+| `p_processId` | `NUMBER` | ID des Prozesses | [`M`] |
+| `p_actionName` | `VARCHAR2` | Name der Action | [`M`] |
+| `p_contextName` | `VARCHAR2` | Context der Action | [`N`] |
+| `p_value` | `NUMBER` | Messwert; `NULL` = Event ohne Messwert | [`N`] |
+| `p_timestamp` | `TIMESTAMP` | Zeitpunkt des Events; `NULL` = jetzt | [`N`] |
+
+```sql
+-- Event ohne Messwert
+lilam.mark_event(l_processId, 'ORDER_RECEIVED');
+
+-- Event mit Messwert: Kurs der Aktie ARAL
+lilam.mark_event(l_processId, 'SHARE', 'ARAL', 80.71);
+```
+
+**Messwert (`p_value`)**
+
+- Datentyp `NUMBER` ohne Präzisionsangabe: bis 38 Stellen, Beträge bis etwa 10^125, dezimal exakt (`80.71` bleibt `80.71`). Null und negative Werte sind gültige Messwerte.
+- Jede Kombination aus Action und Context bildet eine eigene Reihe. Je Reihe gibt es zwei Kennzahlen:
+  - **Zeitreihe** (wie bisher): Abstand zum vorherigen Event (`USED_MILLIS`) und dessen EWMA (`USED_MILLIS_EWMA`).
+  - **Wertreihe** (nur mit `p_value`): Messwert (`USED_VALUE`) und dessen EWMA (`USED_VALUE_EWMA`).
+- Der EWMA der Werte folgt denselben Regeln wie der zeitliche: Der erste Wert ist der Mittelwert, bis zum Ende des Warm-ups gilt das arithmetische Mittel, danach `alt + alpha * (neu - alt)`. Warm-up und Alpha kommen aus den Regeln `VAL_EWMA_DEVIATION_PCT_UP`/`_DOWN` der Action (sonst Standard: Warm-up 3, Alpha 0,1). Die Wertreihe zählt jedes Event mit Wert, auch das erste; die Zeitreihe zählt Abstände.
+- Mit [Baseline Scope](#baseline-scope) läuft der Wert-EWMA wie der zeitliche über Prozessgrenzen weiter.
+- Ein EWMA ist ein Vergleichswert. Eine Abweichung davon ist ein Signal, keine Diagnose.
+
+> [!IMPORTANT]
+> Verwende eine Kombination aus Action und Context **entweder immer mit oder immer ohne** `p_value`. Ein Event ohne Wert ändert den Wert-EWMA nicht und erhält in `_MON` keinen Wert. Das Mischen von Aufrufen mit und ohne Wert unter derselben Action und demselben Context ist nicht vorgesehen; dasselbe gilt für alle Prozesse, die einen Baseline Scope teilen.
+>
+> Eine Reihe hat genau eine Einheit und Bedeutung. Liefere z. B. einen Kurs nicht mal in Euro und mal in Cent.
 
 ### Procedure TRACE_START
 
@@ -750,6 +784,18 @@ Liefert die durchschnittliche Dauer für die angegebene Metrik.
 
 ```sql
 FUNCTION GET_METRIC_AVG_DURATION(
+  p_processId   NUMBER,
+  p_actionName  VARCHAR2,
+  p_contextName VARCHAR2 DEFAULT NULL
+) RETURN NUMBER
+```
+
+### Function GET_METRIC_AVG_VALUE
+
+Liefert den EWMA der Messwerte (`MARK_EVENT` mit `p_value`) für die angegebene Metrik; `NULL`, solange die Reihe keinen Wert hat. Mit Baseline Scope ist das der prozessübergreifende EWMA.
+
+```sql
+FUNCTION GET_METRIC_AVG_VALUE(
   p_processId   NUMBER,
   p_actionName  VARCHAR2,
   p_contextName VARCHAR2 DEFAULT NULL
@@ -926,8 +972,11 @@ Aufbau der Rule Sets und Operatoren: [Rules Engine](../rules/README.md). Einige 
 
 - **Kontext-Regeln:** Regeln mit Kontext (`Action|Context`) wirken zusätzlich zu den Regeln ohne Kontext derselben Action; LILAM prüft beide.
 - **Logging-Regeln:** Trigger `LOGGING` kennt `SEVERITY` (genau dieser Level) und `LOG_CONTAINS` mit dem Wert `TEXT` oder `LEVEL|TEXT`: Die Log-Meldung enthält den Text (ohne Unterscheidung von Groß-/Kleinschreibung), wahlweise nur für diesen Level. Der erste Teil gilt nur als Level, wenn er `ERROR`, `WARN`, `MONITOR`, `INFO` oder `DEBUG` ist; sonst ist der ganze Wert der Text (max. 100 Zeichen).
-- **`PRECEDED_BY`, `PRECEDED_BY_WITHIN_SECS`:** Die Reihenfolge wird beim Start einer Aktion geprüft (`MARK_EVENT`, `TRACE_START`, `PROCESS_UPDATE`, `PROCESS_STOP`). Mit `TRACE_STOP` wird die Regel beim Laden abgelehnt, denn dort wäre der Vorgänger meist das eigene `TRACE_START`.
-- **`AVG_DEVIATION_PCT`:** Solange der Durchschnitt unter 1 ms liegt (Messauflösung), wird nicht ausgewertet.
+- **`PRECEDED_BY`, `TIME_PRECEDED_BY_WITHIN_SECS`:** Die Reihenfolge wird beim Start einer Aktion geprüft (`MARK_EVENT`, `TRACE_START`, `PROCESS_UPDATE`, `PROCESS_STOP`). Mit `TRACE_STOP` wird die Regel beim Laden abgelehnt, denn dort wäre der Vorgänger meist das eigene `TRACE_START`.
+- **Benennung:** Operatoren, die Zeiten bewerten, beginnen mit `TIME_`, Operatoren für Messwerte aus `MARK_EVENT(p_value)` mit `VAL_`.
+- **`TIME_EWMA_DEVIATION_PCT_UP` / `_DOWN`:** Abweichung nach oben bzw. unten vom EWMA vor der Messung. Solange der Durchschnitt unter 1 ms liegt (Messauflösung), wird nicht ausgewertet.
+- **`VAL_EWMA_DEVIATION_PCT_UP` / `_DOWN`:** dasselbe für Messwerte, Band `|EWMA| * PCT / 100` (auch für negative Werte). Ohne die 1-ms-Ausnahme. Events ohne Wert lösen nichts aus.
+- **`VAL_MIN` / `VAL_MAX`:** fester Grenzwert; Alert, wenn der Wert kleiner bzw. größer ist (die Grenze selbst löst nicht aus). Nur mit Trigger `MARK_EVENT`.
 - **Keine zeitgesteuerte Prüfung:** Regeln werden ausgewertet, wenn ein Signal eintrifft. Ausbleibende Signale (ein hängender Prozess, ein Event, das nie kommt) werden nicht erkannt.
 
 ### Regeln im INSESSION-Modus
@@ -938,7 +987,7 @@ Auch Prozesse im INSESSION-Modus werten Regeln aus, wenn `NEW_PROCESS` eine Grup
 - **Ungültiges Rule Set:** Es wird abgelehnt und einmal je Version in `LILAM_LOG_INTERNAL` protokolliert; die bisherigen Regeln bleiben aktiv. Die Anwendung bemerkt davon nichts.
 - **Alerts:** Ein ausgelöster Alert wird sofort und synchron geschrieben (`LILAM_ALERTS` und `DBMS_ALERT`-Signal, eigene Transaktion). Das kostet die Anwendung pro Alert einen Commit; `throttle_seconds` begrenzt die Häufigkeit. `GROUP_NAME` im Alert ist die Gruppe aus `NEW_PROCESS`.
 - **Gedächtnis je Session:** Drosselung (`throttle_seconds`) und der Vorgänger für `PRECEDED_BY` gelten je Datenbank-Session. Mit einem Connection-Pool (z. B. APEX) kann derselbe Alert daher je Pool-Verbindung einmal ausgelöst werden.
-- **Baseline-Parameter:** `warmup` und `alpha` aus `AVG_DEVIATION_PCT`-Regeln gelten wie im Server auch für die Durchschnittswerte des Prozesses.
+- **Baseline-Parameter:** `warmup` und `alpha` aus `TIME_EWMA_DEVIATION_PCT_*`-Regeln (Zeitreihe) bzw. `VAL_EWMA_DEVIATION_PCT_*`-Regeln (Wertreihe) gelten wie im Server auch für die Durchschnittswerte des Prozesses.
 
 ```sql
 l_processId := lilam.new_process('IMPORT_CUSTOMERS', p_groupName => 'METRO');
@@ -1121,7 +1170,7 @@ LILAM JSON Requests bestehen aus einem Header und einem Parameterobjekt. Der Hea
 | `PROC_STEP_DONE` | `PROC_STEP_DONE` | `process_id` |
 | `SET_PROC_IMMORTAL` | `SET_PROC_IMMORTAL` | `process_id`, `process_immortal` |
 | `INFO`, `DEBUG`, `WARN`, `ERROR` | Logging | `process_id`, `process_info` (Logtext) |
-| `MARK_EVENT`, `TRACE_START`, `TRACE_STOP` | Metriken | `process_id`, `action_name`, `context_name`, `timestamp` |
+| `MARK_EVENT`, `TRACE_START`, `TRACE_STOP` | Metriken | `process_id`, `action_name`, `context_name`, `timestamp`; bei `MARK_EVENT` zusätzlich `value` (Messwert) |
 | `SERVER_SHUTDOWN` | `SERVER_SHUTDOWN` | `process_id`, `pipe_name`, `password` |
 
 Die Antwort enthält den Header der Anfrage, `status` (`SUCCESS` oder `ERROR`) und eine `payload` mit `returns` und `value`, z. B. `"returns": "PROCESS_ID", "value": 4711`. Bei einem unbekannten `api_call` ist `value` = `NUM_ERR_ILLEGAL_REQ` (-20010). Ist `p_callObject` kein gültiges JSON, endet der Aufruf mit der Exception -20005.

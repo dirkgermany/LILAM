@@ -34,7 +34,9 @@ CREATE OR REPLACE PACKAGE LILAM_CONSUMER AS
         actionStop    TIMESTAMP(6),
         actionCount   NUMBER,
         usedMillis    NUMBER,
-        avgMillis     NUMBER
+        usedMillisEwma NUMBER,
+        usedValue     NUMBER,       -- Measured value of MARK_EVENT (p_value)
+        usedValueEwma NUMBER
     );
     
     -- Structure of Table LILAM_ALERTS
