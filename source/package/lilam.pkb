@@ -4311,8 +4311,6 @@ AS
     procedure close_processRemote(p_processId number, p_procStepsToDo PLS_INTEGER, p_procStepsDone PLS_INTEGER, p_processInfo varchar2, p_processStatus PLS_INTEGER)
     as
         l_payload JSON_OBJ_LILAM; -- Buffer for the JSON string
-        l_serverMsg varchar2(100);
-        l_response  varchar2(1000);
     begin
         -- Creating the JSON object
         -- PERFORMANCE: concatenate the message directly instead of via jsonPut (see jStr/jNum/jTs)
@@ -4322,14 +4320,12 @@ AS
                   || jStr('process_info',   p_processInfo)
                   || jNum('process_status', p_processStatus) || '}';
 
-        l_response := waitForResponse(p_processId, 'CLOSE_SESSION', l_payload, 1);
-
-        if l_response in ('TIMEOUT', 'THROTTLED') or
-           l_response like 'ERROR%' then
-           l_serverMsg := 'close_processRemote: ' || l_response;
-        else
-            l_serverMsg := jsonString(l_response, 'payload.server_message');
-        end if ;        
+        -- PERFORMANCE: fire & forget like every other data call. Previously the client waited up to 1 s for the
+        -- server's response, which queues behind all messages already in the data pipe (under load almost always
+        -- the full second, performance test 08.10.2026); the response was not evaluated anyway.
+        -- The order is kept: CLOSE travels through the same pipe as the data of the process.
+        -- Not via the control pipe (like NEW_PROCESS): CLOSE would overtake the data of its own process.
+        sendNoWait(p_processId, 'CLOSE_SESSION', l_payload, C_SEND_TIMEOUT_SEC);
 
     EXCEPTION
         WHEN OTHERS THEN
@@ -5439,9 +5435,12 @@ AS
         -- response, otherwise an idle server (eco mode) keeps a stale count until its next housekeeping
         touchServerRegistry;
 
-        DBMS_PIPE.RESET_BUFFER;
-        DBMS_PIPE.PACK_MESSAGE('{"process_id":' || l_processId || '}');
-        l_status := DBMS_PIPE.SEND_MESSAGE(p_clientChannel, timeout => 1);
+        -- Response only for clients that wait for it (older versions); CLOSE_PROCESS sends without a return channel
+        if p_clientChannel is not null then
+            DBMS_PIPE.RESET_BUFFER;
+            DBMS_PIPE.PACK_MESSAGE('{"process_id":' || l_processId || '}');
+            l_status := DBMS_PIPE.SEND_MESSAGE(p_clientChannel, timeout => 1);
+        end if;
 
     end;    
 

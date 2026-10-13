@@ -89,8 +89,9 @@ Die meisten werden bei jedem passenden Aufruf geprüft, schlagen aber nicht an; 
   Mit nur einem Server staut sich unter Dauerfeuer viel auf: Die Daten stehen bis zu 96 s später in der Datenbank.
 - **Regeln** kosten INSESSION etwa 40 % Durchsatz (Median 50 → 70 µs je Aufruf). Im DECOUPLED-Modus war kein
   Unterschied messbar: Dort begrenzen Nachrichtenweg und CPU, nicht die Regelprüfung.
-- **Abmelden** (`CLOSE_PROCESS`) wartet im DECOUPLED-Modus auf die Bestätigung des Servers. Unter Dauerfeuer steht diese
-  Nachricht hinter allen anderen; die Anwendung wartet dann bis gut 1 s. Bei normaler Last dauert es 10 bis 20 ms.
+- **Abmelden** (`CLOSE_PROCESS`) wartete in diesem Lauf im DECOUPLED-Modus auf die Bestätigung des Servers. Unter Dauerfeuer
+  stand diese Nachricht hinter allen anderen; die Anwendung wartete dann bis gut 1 s, bei normaler Last 10 bis 20 ms.
+  Seit 08.10.2026 sendet `CLOSE_PROCESS` ohne Warten; die Messung wird mit dem nächsten Lauf erneuert.
   Anmelden (`NEW_PROCESS`) dauert 10 bis 50 ms.
 
 Einzelwerte je Aufrufart (INFO, ERROR, TRACE, …) und alle Messgrößen stehen im ausführlichen Bericht
