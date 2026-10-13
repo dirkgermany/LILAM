@@ -70,13 +70,15 @@ Rules are organized into Rule Sets, stored as JSON documents in the `LILAM_RULES
 | rules.condition.metric | string | no | informational only
 | rules.alert.handler | string | yes | name of the `DBMS_ALERT` signal the consumer listens to, max. 30 characters
 | rules.alert.severity | string | no | severity passed to the consumer, max. 30 characters
-| rules.alert.throttle_seconds | number | no | minimum seconds before the same rule fires again for the same action and baseline scope (default 0)
+| rules.alert.throttle_seconds | number | no | minimum seconds before the same rule fires again for the same action, context and baseline scope (default 0)⁴
 
 ¹ The trigger type maps to the LILAM API call that produced the signal, see [Hooks / Trigger Types](#hooks--trigger-types).
 
 ² For process triggers the action is the process name. For `LOGGING` rules the action may be omitted (it is always `LOGGING`).
 
 ³ The context allows different thresholds for instances of the same action, e.g. a speed limit only for track section `SECTION_400_001`. A rule with context applies only to this context; a rule without context applies to **all** contexts of the action. If both exist, both are evaluated.
+
+⁴ The lock period applies per rule, action, context and baseline scope (without scope: per process). A rule without context therefore throttles each context separately: an alert for `SAP` does not suppress one for `SIE`. LILAM stores the lock in the table `LILAM_ALERT_LOCKS`, so it holds across database sessions, pooled connections, server workers and restarts; simultaneous hits in several sessions raise only one alert. Expired locks are deleted about once a minute.
 
 ```json
     {

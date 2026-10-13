@@ -984,7 +984,7 @@ Processes in INSESSION mode also evaluate rules if `NEW_SESSION` receives a grou
 - **Changes:** At most every 15 seconds, LILAM checks on an API call whether the name or version of the group's active rule set has changed, and then reloads it. `SERVER_UPDATE_RULES` therefore also takes effect here, at the latest with the first API call after 15 seconds. If a rule set is changed directly in the table without its name or version changing, a running session does not notice.
 - **Invalid rule set:** It is rejected and logged once per version in `LILAM_LOG_INTERNAL`; the previous rules remain active. The application does not notice any of this.
 - **Alerts:** A triggered alert is written immediately and synchronously (`LILAM_ALERTS` and `DBMS_ALERT` signal, own transaction). This costs the application one commit per alert; `throttle_seconds` limits the frequency. `GROUP_NAME` in the alert is the group from `NEW_SESSION`.
-- **Memory per session:** Throttling (`throttle_seconds`) and the predecessor for `PRECEDED_BY` apply per database session. With a connection pool (e.g. APEX), the same alert can therefore be triggered once per pool connection.
+- **Memory per session:** The predecessor for `PRECEDED_BY` applies per database session; with a connection pool (e.g. APEX) another pooled connection does not know it. Throttling (`throttle_seconds`), in contrast, applies across sessions, pooled connections, server workers and restarts (table `LILAM_ALERT_LOCKS`), per rule, action, context and baseline scope or process.
 - **Baseline parameters:** `warmup` and `alpha` from `TIME_EWMA_DEVIATION_PCT_*` rules (time series) and `VAL_EWMA_DEVIATION_PCT_*` rules (value series) also apply to the average values of the process, just as in the server.
 
 ```sql

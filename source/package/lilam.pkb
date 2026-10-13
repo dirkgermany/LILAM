@@ -98,6 +98,8 @@ AS
     -- INSESSION: check for a changed active rule set of the group at most every n ms
     -- (triggered by API calls; servers are notified via SERVER_UPDATE_RULES and check themselves in the housekeeping)
     C_RULES_CHECK_INTERVAL_MS          CONSTANT PLS_INTEGER := 15000;
+    -- Expired alert locks (LILAM_ALERT_LOCKS) are deleted at most every n ms per session
+    C_ALERT_LOCK_PURGE_MS              CONSTANT PLS_INTEGER := 60000;
 
     ---------------------------------------------------------------
     -- Placeholders for tables
@@ -111,6 +113,7 @@ AS
     C_LILAM_WATERMARK               CONSTANT VARCHAR2(50) := 'LILAM_WATERMARK';
     C_LILAM_SCOPES_TABLE            CONSTANT VARCHAR2(30) := 'LILAM_SCOPES';
     C_LILAM_BASELINES_TABLE         CONSTANT VARCHAR2(30) := 'LILAM_BASELINES';
+    C_LILAM_ALERT_LOCKS_TABLE       CONSTANT VARCHAR2(30) := 'LILAM_ALERT_LOCKS';
 
     ---------------------------------------------------------------
     -- Other general Parameters
@@ -553,12 +556,15 @@ AS
     g_avg_params t_avg_params_map;
     g_val_params t_avg_params_map;   -- same for the value series (VAL_EWMA_DEVIATION_PCT_*)
 
-    TYPE t_alert_history IS TABLE OF TIMESTAMP INDEX BY VARCHAR2(250);
+    -- Throttling: session memory as prefilter for LILAM_ALERT_LOCKS (last alert in UTC, as read
+    -- from or written to the table). Key = lock key, see fire_alert.
+    TYPE t_alert_history IS TABLE OF TIMESTAMP INDEX BY VARCHAR2(1000);
     g_alert_history t_alert_history;
-    -- Throttling for processes without scope (key: process_id, then GROUP|RULE|ACTION).
+    -- Same for processes without scope (key: process_id, then lock key).
     -- STABILITY: removed when the session ends; otherwise g_alert_history would grow with every process_id
     TYPE t_alert_history_proc IS TABLE OF t_alert_history INDEX BY PLS_INTEGER;
     g_alert_history_proc t_alert_history_proc;
+    g_lastLockPurgeCs NUMBER;   -- last purgeAlertLocks (DBMS_UTILITY.GET_TIME)
 
     ----------
     -- TRIGGER
@@ -1476,10 +1482,49 @@ AS
     END;
 
     ------------------------------------------------------------
-    -- Write and signal the alert (own transaction, write-then-signal).
-    -- TRUE if the alert was written.
+    -- Takes the alert lock in LILAM_ALERT_LOCKS (within the caller's transaction).
+    -- TRUE: lock taken, p_lastAlert = p_nowUtc. FALSE: locked by an earlier alert,
+    -- p_lastAlert = its time (NULL if the row vanished in between).
+    -- STABILITY: race-free across sessions; the conditional UPDATE and the primary key let
+    -- only one session take an expired or new lock.
     ------------------------------------------------------------
-    FUNCTION persist_alert(p_rule t_rule_rec, p_rec t_monitor_buffer_rec) RETURN BOOLEAN IS
+    FUNCTION acquireAlertLock(p_lockKey VARCHAR2, p_throttleSec NUMBER, p_nowUtc TIMESTAMP,
+                              p_lastAlert OUT TIMESTAMP) RETURN BOOLEAN IS
+    BEGIN
+        EXECUTE IMMEDIATE 'update ' || C_LILAM_ALERT_LOCKS_TABLE || '
+                              set last_alert_utc = :1, throttle_seconds = :2
+                            where lock_key = :3
+                              and last_alert_utc + numtodsinterval(:4, ''SECOND'') <= :5'
+            USING p_nowUtc, p_throttleSec, p_lockKey, p_throttleSec, p_nowUtc;
+        IF SQL%ROWCOUNT = 0 THEN
+            BEGIN
+                EXECUTE IMMEDIATE 'insert into ' || C_LILAM_ALERT_LOCKS_TABLE || '
+                                   (lock_key, last_alert_utc, throttle_seconds) values (:1, :2, :3)'
+                    USING p_lockKey, p_nowUtc, p_throttleSec;
+            EXCEPTION
+                WHEN DUP_VAL_ON_INDEX THEN
+                    BEGIN
+                        EXECUTE IMMEDIATE 'select last_alert_utc from ' || C_LILAM_ALERT_LOCKS_TABLE || '
+                                            where lock_key = :1'
+                            INTO p_lastAlert USING p_lockKey;
+                    EXCEPTION
+                        WHEN NO_DATA_FOUND THEN p_lastAlert := NULL;
+                    END;
+                    RETURN FALSE;
+            END;
+        END IF;
+        p_lastAlert := p_nowUtc;
+        RETURN TRUE;
+    END;
+
+    ------------------------------------------------------------
+    -- Write and signal the alert (own transaction, write-then-signal).
+    -- TRUE if the alert was written. With p_lockKey the alert lock is taken first
+    -- (acquireAlertLock); p_lastAlert then returns the time of the last alert for the key.
+    ------------------------------------------------------------
+    FUNCTION persist_alert(p_rule t_rule_rec, p_rec t_monitor_buffer_rec,
+                           p_lockKey VARCHAR2, p_throttleSec NUMBER, p_nowUtc TIMESTAMP,
+                           p_lastAlert OUT TIMESTAMP) RETURN BOOLEAN IS
         pragma autonomous_transaction;
         v_idx_session   PLS_INTEGER;
         v_channel_name  VARCHAR2(30); -- max. length of Alert-Name
@@ -1488,6 +1533,7 @@ AS
         v_alert_id      NUMBER;
         v_group         t_rule_group_rec;
     BEGIN
+        p_lastAlert   := p_nowUtc;
         v_idx_session := v_indexSession(p_rec.process_id);
         v_group       := g_rule_groups(g_sessionList(v_idx_session).rule_group);
 
@@ -1504,6 +1550,12 @@ AS
                 ROLLBACK;
                 RETURN TRUE;
             END IF;
+        END IF;
+
+        -- Lock and alert are committed together
+        IF p_lockKey IS NOT NULL AND NOT acquireAlertLock(p_lockKey, p_throttleSec, p_nowUtc, p_lastAlert) THEN
+            ROLLBACK;
+            RETURN FALSE;
         END IF;
 
         v_sqlStmt := '
@@ -1550,61 +1602,93 @@ AS
         -- STABILITY: end the autonomous transaction, otherwise ORA-06519 on exit
         logLilamErr(sqlCode, sqlErrM, 'fire_alert', 'rule ' || p_rule.rule_id);
         rollback;
+        p_lastAlert := NULL;
         RETURN FALSE;
     END;
 
     ------------------------------------------------------------
+    -- Housekeeping: deletes expired alert locks, at most every C_ALERT_LOCK_PURGE_MS per session
+    -- (server housekeeping of the workers; INSESSION from fire_alert).
+    ------------------------------------------------------------
+    PROCEDURE purgeAlertLocks IS
+        pragma autonomous_transaction;
+    BEGIN
+        -- ABS: on overflow of GET_TIME there is at most one additional run
+        IF g_lastLockPurgeCs IS NOT NULL
+           AND abs(dbms_utility.get_time - g_lastLockPurgeCs) * 10 < C_ALERT_LOCK_PURGE_MS THEN
+            RETURN;
+        END IF;
+        g_lastLockPurgeCs := dbms_utility.get_time;
+
+        EXECUTE IMMEDIATE 'delete from ' || C_LILAM_ALERT_LOCKS_TABLE || '
+                            where last_alert_utc + numtodsinterval(throttle_seconds, ''SECOND'') < :1'
+            USING sys_extract_utc(SYSTIMESTAMP);
+        COMMIT;
+    exception
+        when others then
+        rollback;
+        -- ORA-00942: table not yet created (no process in this installation so far)
+        IF sqlcode != -942 THEN
+            logLilamErr(sqlCode, sqlErrM, 'purgeAlertLocks');
+        END IF;
+    END;
+
+    ------------------------------------------------------------
     -- Alert taking throttling into account (throttle_seconds).
-    -- PERFORMANCE: throttling is checked here without an autonomous transaction;
-    -- only an alert that is actually raised opens one.
+    -- Lock per GROUP | scope (S<scope_id>) or process (P<process_id>) | RULE | ACTION | CONTEXT,
+    -- stored in LILAM_ALERT_LOCKS so that it holds across sessions, workers and restarts.
+    -- PERFORMANCE: the session memory filters first; the table is only read when a rule hits
+    -- and the memory knows no running lock. Times in UTC (independent of the session time zone).
     ------------------------------------------------------------
     PROCEDURE fire_alert(p_rule t_rule_rec, p_rec t_monitor_buffer_rec) IS
         v_throttle_sec  NUMBER := coalesce(p_rule.throttle_seconds, 0);
         v_scope_id      NUMBER;
-        v_group         VARCHAR2(50);
-        v_history_key   VARCHAR2(250);
+        v_lock_key      VARCHAR2(1000);
+        v_now_utc       TIMESTAMP := sys_extract_utc(SYSTIMESTAMP);
+        v_last_alert    TIMESTAMP;
         v_empty         t_alert_history;
     BEGIN
         IF v_throttle_sec <= 0 THEN
-            -- without throttling no memory is needed
-            IF persist_alert(p_rule, p_rec) THEN NULL; END IF;
+            -- without throttling no lock is needed
+            IF persist_alert(p_rule, p_rec, NULL, NULL, v_now_utc, v_last_alert) THEN NULL; END IF;
             RETURN;
         END IF;
 
         -- Group first: rule IDs are only unique per rule set (see also installGroupRules)
-        v_group    := g_sessionList(v_indexSession(p_rec.process_id)).rule_group;
         v_scope_id := getScopeId(p_rec.process_id);
+        v_lock_key := g_sessionList(v_indexSession(p_rec.process_id)).rule_group
+                      || CASE WHEN v_scope_id IS NOT NULL THEN '|S' || v_scope_id ELSE '|P' || p_rec.process_id END
+                      || '|' || p_rule.rule_id || '|' || p_rec.action_name || '|' || p_rec.context_name;
 
+        -- Prefilter: lock period known to this session has not yet expired -> do nothing
         IF v_scope_id IS NOT NULL THEN
-            -- Throttle per scope, so that restarts do not lift the lock period
-            v_history_key := v_group || '|S' || v_scope_id || '|' || p_rule.rule_id || '|' || p_rec.action_name;
-
-            -- Lock period since the last alert has not yet expired -> do nothing
-            IF g_alert_history.EXISTS(v_history_key)
-               AND g_alert_history(v_history_key) + numtodsinterval(v_throttle_sec, 'SECOND') > SYSTIMESTAMP THEN
-                RETURN;
+            IF g_alert_history.EXISTS(v_lock_key) THEN
+                v_last_alert := g_alert_history(v_lock_key);
             END IF;
+        ELSIF g_alert_history_proc.EXISTS(p_rec.process_id)
+              AND g_alert_history_proc(p_rec.process_id).EXISTS(v_lock_key) THEN
+            v_last_alert := g_alert_history_proc(p_rec.process_id)(v_lock_key);
+        END IF;
+        IF v_last_alert + numtodsinterval(v_throttle_sec, 'SECOND') > v_now_utc THEN
+            RETURN;
+        END IF;
 
-            IF persist_alert(p_rule, p_rec) THEN
-                g_alert_history(v_history_key) := SYSTIMESTAMP;
-            END IF;
-        ELSE
-            -- Without scope: throttle per process; the entries are removed with the session
-            -- (STABILITY: see g_alert_history_proc)
-            v_history_key := v_group || '|' || p_rule.rule_id || '|' || p_rec.action_name;
-
-            IF g_alert_history_proc.EXISTS(p_rec.process_id)
-               AND g_alert_history_proc(p_rec.process_id).EXISTS(v_history_key)
-               AND g_alert_history_proc(p_rec.process_id)(v_history_key) + numtodsinterval(v_throttle_sec, 'SECOND') > SYSTIMESTAMP THEN
-                RETURN;
-            END IF;
-
-            IF persist_alert(p_rule, p_rec) THEN
+        -- Table decides; afterwards remember the last alert for the key (own or foreign)
+        IF persist_alert(p_rule, p_rec, v_lock_key, v_throttle_sec, v_now_utc, v_last_alert) THEN NULL; END IF;
+        IF v_last_alert IS NOT NULL THEN
+            IF v_scope_id IS NOT NULL THEN
+                g_alert_history(v_lock_key) := v_last_alert;
+            ELSE
+                -- STABILITY: see g_alert_history_proc
                 IF NOT g_alert_history_proc.EXISTS(p_rec.process_id) THEN
                     g_alert_history_proc(p_rec.process_id) := v_empty;
                 END IF;
-                g_alert_history_proc(p_rec.process_id)(v_history_key) := SYSTIMESTAMP;
+                g_alert_history_proc(p_rec.process_id)(v_lock_key) := v_last_alert;
             END IF;
+        END IF;
+
+        IF g_serverPipeName IS NULL THEN
+            purgeAlertLocks;
         END IF;
     exception
         when others then
@@ -3630,6 +3714,18 @@ AS
             if l_regCols = 0 then
                 add_columns('ALTER TABLE ' || C_LILAM_BASELINES_TABLE || ' ADD (avg_val NUMBER, val_count NUMBER(19,0) DEFAULT 0 NOT NULL)');
             end if;
+        end if;
+
+        -- Alert locks (throttle_seconds): last alert per lock key, see fire_alert
+        if not objectExists(C_LILAM_ALERT_LOCKS_TABLE, 'TABLE') then
+            sqlStmt := '
+            CREATE TABLE ' || C_LILAM_ALERT_LOCKS_TABLE || ' (
+                lock_key          VARCHAR2(1000) NOT NULL,
+                last_alert_utc    TIMESTAMP(6)   NOT NULL,
+                throttle_seconds  NUMBER         NOT NULL,
+                CONSTRAINT pk_lilam_alert_locks PRIMARY KEY (lock_key)
+            ) ORGANIZATION INDEX';
+            run_ddl(sqlStmt, -955);   -- created by another session at the same time
         end if;
 
         -- Indexes of the master tables: names are derived from the master name,
@@ -9747,6 +9843,9 @@ AS
                 SYNC_ALL_DIRTY;
                 -- rule set of the group: own check at most every C_RULES_CHECK_INTERVAL_MS (B7)
                 checkServerRules;
+                if not g_serverIsDispatcher then
+                    purgeAlertLocks;   -- internally at most every C_ALERT_LOCK_PURGE_MS
+                end if;
                 l_lastSyncCs := dbms_utility.get_time;
                 l_msgCnt := 0;
             end if;
