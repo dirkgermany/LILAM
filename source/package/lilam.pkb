@@ -2902,7 +2902,7 @@ AS
         execute immediate p_sqlStmt;
     exception
         when OTHERS then
-            if sqlcode != -1430 then
+            if sqlcode not in (-1430, -14411) then   -- column exists / concurrent DDL by another server
                 logLilamErr(sqlCode, sqlErrM, 'add_columns', 'EXECUTE IMMEDIATE');
             end if;
     end;
