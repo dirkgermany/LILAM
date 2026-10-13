@@ -915,6 +915,21 @@ AS
 
     --------------------------------------------------------------------------
 
+    -- Payload of a server message. Unreadable message (e.g. invalid JSON) => NULL and BAD_MESSAGE in LILAM_LOG_INTERNAL
+    function payloadOf(p_message varchar2, p_module varchar2) return varchar2
+    as
+        l_payload varchar2(32767);
+    begin
+        l_payload := JSON_QUERY(p_message, '$.payload');
+        if l_payload is null then
+            logLilamErr(NUM_ERR_ILLEGAL_REQ, 'Unreadable message (' || headerValue(p_message, 'request') || '): '
+                        || substr(p_message, 1, 500), p_module, 'BAD_MESSAGE');
+        end if;
+        return l_payload;
+    end;
+
+    --------------------------------------------------------------------------
+
     function extractFromJsonObjTime(p_obj JSON_OBJECT_T, p_key VARCHAR2) RETURN TIMESTAMP
     as
     BEGIN
@@ -7097,7 +7112,7 @@ AS
         l_monType pls_integer;
         l_payload JSON_OBJ_LILAM;
     begin
-        l_payload := JSON_QUERY(p_message, '$.payload');
+        l_payload := payloadOf(p_message, 'doRemote_startTrace');
         l_processId := jsonNumber(l_payload, 'process_id');
         l_actionName := jsonString(l_payload, 'action_name');
         l_contextName := jsonString(l_payload, 'context_name');
@@ -7118,7 +7133,7 @@ AS
         l_monType pls_integer;
         l_payload JSON_OBJ_LILAM;
     begin
-        l_payload := JSON_QUERY(p_message, '$.payload');
+        l_payload := payloadOf(p_message, 'doRemote_stopTrace');
         l_processId := jsonNumber(l_payload, 'process_id');
         l_actionName := jsonString(l_payload, 'action_name');
         l_contextName := jsonString(l_payload, 'context_name');
@@ -7140,7 +7155,7 @@ AS
         l_monType pls_integer;
         l_payload JSON_OBJ_LILAM;
     begin
-        l_payload := JSON_QUERY(p_message, '$.payload');
+        l_payload := payloadOf(p_message, 'doRemote_markEvent');
         l_processId := jsonNumber(l_payload, 'process_id');
         l_actionName := jsonString(l_payload, 'action_name');
         l_contextName := jsonString(l_payload, 'context_name');
@@ -7163,7 +7178,7 @@ AS
         l_payload JSON_OBJ_LILAM;
         l_timestamp     TIMESTAMP(6);
     begin
-        l_payload := JSON_QUERY(p_message, '$.payload');
+        l_payload := payloadOf(p_message, 'doRemote_setAnyStatus');
         l_processId     := jsonNumber(l_payload, 'process_id');
         l_status        := jsonNumber(l_payload, 'process_status');
         l_processInfo   := jsonString(l_payload, 'process_info');
@@ -7181,7 +7196,7 @@ AS
         l_processId     NUMBER;
         l_payload JSON_OBJ_LILAM;
     begin
-        l_payload := JSON_QUERY(p_message, '$.payload');
+        l_payload := payloadOf(p_message, 'doRemote_procStepDone');
         l_processId  := jsonNumber(l_payload, 'process_id');
 
         procStepDone(l_processId);
@@ -7198,7 +7213,7 @@ AS
         l_response      JSON_OBJ_LILAM;
         l_msg           JSON_OBJ_LILAM;
     begin
-        l_payload       := JSON_QUERY(p_message, '$.payload');
+        l_payload       := payloadOf(p_message, 'doRemote_reconnectProcess');
         l_processId     := jsonNumber(l_payload, 'process_id');
 
         if v_indexSession.EXISTS(l_processId) then
@@ -7489,7 +7504,7 @@ AS
         l_response  JSON_OBJ_LILAM;
         l_msg       JSON_OBJ_LILAM;
     begin
-        l_payload   := JSON_QUERY(p_message, '$.payload');
+        l_payload   := payloadOf(p_message, 'doRemote_adoptProcess');
         l_processId := jsonNumber(l_payload, 'process_id');
         l_oldPipe   := jsonString(l_payload, 'old_pipe');
         -- STABILITY: the table name comes from the client and goes into dynamic SQL
@@ -7568,7 +7583,7 @@ AS
         l_payload JSON_OBJ_LILAM;
         l_timestamp TIMESTAMP(6);
     begin
-        l_payload       := JSON_QUERY(p_message, '$.payload');
+        l_payload       := payloadOf(p_message, 'doRemote_logAny');
         l_processId     := jsonNumber(l_payload, 'process_id');
         l_level         := jsonNumber(l_payload, 'level');
         l_logText       := jsonString(l_payload, 'log_text');
@@ -7627,7 +7642,7 @@ AS
         l_status        PLS_INTEGER;
         l_payload       JSON_OBJ_LILAM;
     begin
-        l_payload     := JSON_QUERY(p_message, '$.payload');
+        l_payload     := payloadOf(p_message, 'doRemote_closeProcess');
         l_processId   := jsonString(l_payload, 'process_id');
         l_procStepsToDo   := jsonNumber(l_payload, 'steps_todo');
         l_procStepsDone   := jsonNumber(l_payload, 'steps_done');
@@ -7814,7 +7829,7 @@ AS
         l_process_init t_process_init;
         l_status PLS_INTEGER;
     begin
-        l_payload := JSON_QUERY(p_message, '$.payload');
+        l_payload := payloadOf(p_message, 'doRemote_newProcess');
 
         -- Check the client's expiry time (with a 500 ms safety margin). If it has passed, the
         -- client has already given up: no process, no route, no response (the return channel
@@ -8459,7 +8474,7 @@ AS
         l_msg       JSON_OBJ_LILAM;
     begin
 
-        l_msgObj     := JSON_QUERY(p_message, '$.payload');
+        l_msgObj     := payloadOf(p_message, 'handleServerShutdown');
         l_password   := jsonString(l_msgObj, 'shutdown_password');
 
         jsonPut(l_header, 'msg_type', 'SERVER_RESPONSE');

@@ -23,7 +23,8 @@
 --   Nur SERVER:
 --   M11 Reconnect: Werte aus einer anderen DB-Session (Job ueber Dispatcher) zaehlen in derselben Reihe
 --   M12 Parallel: 3 Prozesse in einem Scope je 20 Werte 42 => val_count 60, avg_val 42, Reihenfolge je Prozess
---   M13 keine internen LILAM-Fehler (Hinweise BACKPRESSURE/GAP ausgenommen)
+--   M13 keine internen LILAM-Fehler (Hinweise BACKPRESSURE/GAP und die Probe aus M14 ausgenommen)
+--   M14 eine nicht lesbare Nachricht an den Server wird als BAD_MESSAGE protokolliert
 --
 -- Der Test startet und stoppt seine Server selbst (LT_S1, Dispatcher LT_DISP).
 -- Voraussetzungen: LILAM installiert, _COMMON/01_install_testbasis.sql
@@ -388,6 +389,14 @@ declare
                group by m.process_id having count(*) = 20 and count(distinct m.action_count) = 20 and max(m.action_count) = 20)',
              'LT\_' || l_run || '\_PAR\_%');
     chk('M12 parallel: je Prozess 20 Werte, ACTION_COUNT 1..20', l_n = 3, l_n);
+
+    -- M14: nicht lesbare Nachricht (Zahl mit Dezimalkomma wie vor der Korrektur von jNum) wird protokolliert
+    dbms_pipe.pack_message('{"header":{"msg_type":"API_CALL","request":"MARK_EVENT"},"payload":{"process_id":1,"action_name":"MW_BAD","value":1,5E+100}}');
+    l_n := dbms_pipe.send_message('LT_S1', 1);
+    dbms_session.sleep(2);
+    execute immediate 'select count(*) from lilam_log_internal where log_timestamp >= :1 and log_operation = ''BAD_MESSAGE''
+                         and error_message like ''%MW_BAD%''' into l_n using l_t0;
+    chk('M14 nicht lesbare Nachricht in LILAM_LOG_INTERNAL (BAD_MESSAGE)', l_n = 1, l_n);
   end;
 begin
   l_run := lt.begin_run('MESSWERTE', 'INSESSION+SERVER');
@@ -411,7 +420,7 @@ begin
   l_mode := 'ALLE';
   begin
     execute immediate 'select count(*) from lilam_log_internal where log_timestamp >= :1
-                         and nvl(log_operation, ''-'') not in (''BACKPRESSURE'', ''GAP'')' into l_err using l_t0;
+                         and nvl(log_operation, ''-'') not in (''BACKPRESSURE'', ''GAP'', ''BAD_MESSAGE'')' into l_err using l_t0;
   exception when others then l_err := 0;   -- Tabelle entsteht erst beim ersten internen Fehler
   end;
   chk('M13 keine internen LILAM-Fehler', l_err = 0, l_err);
