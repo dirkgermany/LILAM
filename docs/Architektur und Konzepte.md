@@ -165,10 +165,20 @@ Gemessen auf Oracle 23.26 Free (2 CPU-Threads), Testschema `LILAM_TEST`:
 | `ROLLBACK` des Aufrufers | Nichts. Alle Schreibvorgänge sind autonome Transaktionen. | Nichts. |
 | Unbehandelte Exception, Session beendet (killed), Job abgebrochen, ohne `CLOSE_PROCESS` / `FLUSH` | Alles, was seit dem letzten Flush gepuffert wurde (z. B. `INFO` und `WARN`). Ein `ERROR`, dessen Aufruf zurückgekehrt ist, ist gespeichert, zusammen mit allem, was davor gepuffert war. | Nichts auf Seiten des Clients. Einträge, die den Server erreicht haben, gehen nur verloren, wenn der Server ausfällt. |
 | Datenbanksession stirbt während des `ERROR`-Aufrufs | Dieses `ERROR` (es wird am Ende des Aufrufs committet). | Dieses `ERROR`, falls es noch nicht committet war. |
-| LILAM Server beendet (killed) oder abgestürzt | – | Alles im Puffer des Servers und in seiner Pipe, also gepufferte Einträge oberhalb des Sync-Levels. Die Pipe liegt nur in der SGA, und ein neu gestarteter Server leert seine Pipe und kennt die Prozesse seines Vorgängers nicht. Synchrone Einträge sind in `LILAM_LOG` des Clients gespeichert (durch Test bestätigt: ein `ERROR`, das gesendet wurde, während der Server nicht lief, ist dort vorhanden). |
+| LILAM Server beendet (killed) oder abgestürzt | – | Mit einem zweiten aktiven Worker in der Gruppe: nichts (Failover, siehe unten). Ohne ihn: alles im Puffer des Servers und in seiner Pipe, also gepufferte Einträge oberhalb des Sync-Levels, sobald der Client den Prozess beendet und der Server nicht innerhalb von 10 Minuten unter demselben Namen neu startet, oder sobald mehr als `C_CLIENT_RINGBUFF_MAX` (20.000) Meldungen anfallen. Synchrone Einträge sind in `LILAM_LOG` des Clients gespeichert (durch Test bestätigt: ein `ERROR`, das gesendet wurde, während der Server nicht lief, ist dort vorhanden). |
 | Absturz der Instanz | Alles Gepufferte. | Alles Gepufferte und alles in den Pipes. |
 | Pipe voll (Server überlastet) | – | Der Client versucht es einige Sekunden lang erneut und verwirft die Meldung dann. Das wird in `LILAM_LOG_INTERNAL` des Clients vermerkt; die Anwendung erhält keine Exception. Synchrone Einträge sind in `LILAM_LOG` des Clients gespeichert. |
 | Log-Tabelle nicht beschreibbar (z. B. Tablespace voll) | Der Eintrag wird in `LILAM_LOG_INTERNAL` vermerkt; die Anwendung erhält keine Exception. | Ebenso, im Client bzw. im Server. |
+
+**Failover bei Ausfall eines Workers** (entkoppelt)
+
+* Der Client nummeriert jede Meldung je Prozess und behält sie in einem Ringpuffer, bis der Server sie committet hat. Der Server schreibt dazu je Client-Session den Wasserstand in `LILAM_WATERMARK`, im selben Commit wie die Daten.
+* Bleibt eine synchrone Anfrage ohne Antwort oder steigt der Wasserstand nicht mehr, prüft der Client den Heartbeat des Servers. Ist er älter als 5 s und läuft auch der Scheduler-Job des Servers nicht mehr, gilt der Server als ausgefallen. Ein Server schreibt seinen Heartbeat nur zwischen zwei Nachrichten; ist er länger beschäftigt, altert der Heartbeat, obwohl der Server lebt. Ein Server, der hängt, während sein Job weiterläuft, wird deshalb nicht übernommen.
+* Der Client schickt dann `ADOPT_PROCESS` an einen anderen aktiven Worker derselben Gruppe (über den Dispatcher wählt dieser den Worker). Läuft kein anderer, wird der ausgefallene Server erneut gefragt, falls er unter demselben Namen neu gestartet wurde.
+* Der neue Worker hängt die Route des Prozesses auf sich um und baut den Prozess aus den Tabellen auf. Danach wiederholt der Client alles über dem Wasserstand. Meldungen, die der Server schon hat, verwirft er. Offene Traces werden ohne Regeln wiederhergestellt, und ein Alert, den der ausgefallene Worker schon ausgelöst hat, kommt nicht ein zweites Mal.
+* Ein Worker, der nur hing und weiterläuft, schreibt für übernommene Prozesse nichts mehr, auch kein `CLOSE_PROCESS`.
+* Auch `CLOSE_PROCESS` liegt im Ringpuffer, und der Aufruf wartet nicht auf den Server. Den Ringpuffer verwirft der Client erst, wenn `process_end` des Prozesses committet ist. Das prüft er bei späteren LILAM-Aufrufen derselben Session, höchstens einmal je Sekunde. Fällt der Server vorher aus (Heartbeat älter als 15 s und kein laufender Job), übernimmt ein anderer Worker den Prozess, und der Client wiederholt alles Ungeschriebene einschließlich `CLOSE_PROCESS`. War der Prozess schon geschlossen, übernimmt ihn kein Worker mehr. Wird `CLOSE_PROCESS` nicht innerhalb von 10 Minuten geschrieben, gibt der Client den Ringpuffer auf und vermerkt das in `LILAM_LOG_INTERNAL`. Grenze: Der Ringpuffer lebt in der Client-Session. Ruft sie nach dem letzten `CLOSE_PROCESS` LILAM nicht mehr auf, prüft niemand, und mit dem Ende der Session ist er verloren.
+* Übernahme und Ausfall ohne Übernahme stehen in `LILAM_LOG_INTERNAL` des Clients. Bis ein Server übernimmt, sendet der Client nicht und prüft höchstens alle 5 s erneut.
 
 **Konsequenzen**
 * Sobald ein Aufruf mit einem Level bis zum Sync-Level zurückkehrt, ist der Eintrag committet, in beiden Modi. Die Mehrkosten gegenüber einem gepufferten Eintrag entfallen größtenteils auf den Commit.
@@ -373,7 +383,7 @@ flowchart LR
         direction TB
         A2["Anwendung<br/>SERVER_NEW_PROCESS"] -- "NEW_PROCESS über Steuer-Pipe<br/>(synchron, max. 3 s)" --> S2
         B2["log_any / MARK_EVENT / TRACE_*"] -- "sendNoWait<br/>Fire and Forget über Daten-Pipe" --> S2["LILAM Server<br/>(eigene DB-Session / Job)"]
-        B2 -. "Grenze je Sekunde erreicht:<br/>UNFREEZE_REQUEST (Backpressure)" .-> S2
+        B2 -. "Wasserstand lesen (LILAM_WATERMARK):<br/>bei Rückstau kurz bremsen (Backpressure)" .-> T2
         S2 --> C2["PGA-Puffer des Servers<br/>(alle seine Prozesse)"]
         C2 --> R2["Regelauswertung im Server<br/>Rule Set der Servergruppe"]
         C2 --> E2["SYNC_ALL_DIRTY<br/>Housekeeping alle 500 ms,<br/>auch unter Last"]
@@ -512,6 +522,7 @@ Zusätzlich zu den prozessspezifischen Tabellen verwendet LILAM interne Tabellen
 | --- | --- |
 | `LILAM_SERVER_REGISTRY` | Verwaltet Serverregistrierung, Verfügbarkeit, Heartbeat, Last und Informationen zum aktuell aktiven Rule Set. |
 | `LILAM_RULES` | Speichert versionierte Rule Sets je Gruppe (Server und INSESSION-Prozesse), davon je Gruppe eines aktiv. |
+| `LILAM_WATERMARK` | Wasserstände für das Failover: je Prozess und Client-Session die höchste Laufnummer, bis zu der Logs, Metriken und Prozessdaten committet sind. Der Server schreibt sie im selben Commit wie die Daten. |
 | `LILAM_LOG_INTERNAL` | Bietet ein unabhängiges Rückfall-Logging für interne Fehler des LILAM-Frameworks. |
 
 > [!NOTE]

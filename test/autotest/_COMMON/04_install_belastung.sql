@@ -52,9 +52,9 @@ begin
       ns_avg_ms       number,
       ns_max_ms       number,
       ns_fail         number,            -- NEW_PROCESS mit negativer ID
-      cl_avg_ms       number,            -- CLOSE_PROCESS (wartet decoupled auf die Antwort des Servers, max. 1 s)
+      cl_avg_ms       number,            -- CLOSE_PROCESS (bis 08.10.2026 wartete es decoupled bis 1 s auf den Server, seitdem ohne Warten)
       cl_max_ms       number,
-      cl_timeouts     number,            -- CLOSE_PROCESS mit >= 1 s (Antwort des Servers nicht abgewartet)
+      cl_timeouts     number,            -- CLOSE_PROCESS mit >= 1 s
       drain_ms        number,            -- Zeit nach Lastende bis alles persistiert ist
       missing_log     number,
       missing_mon     number,
@@ -298,7 +298,8 @@ create or replace package body ltb as
     function internal_errors return number is
         l_n number;
     begin
-        execute immediate 'select count(*) from lilam_log_internal' into l_n;
+        -- Hinweise zum Rueckstau (Bremsen, volle Pipe) und erkannte Luecken (wiederholt) sind keine Fehler
+        execute immediate 'select count(*) from lilam_log_internal where nvl(log_operation, ''-'') not in (''BACKPRESSURE'', ''GAP'')' into l_n;
         return l_n;
     exception
         when others then return 0;   -- Tabelle existiert erst nach dem ersten internen Fehler
@@ -422,7 +423,7 @@ create or replace package body ltb as
             c_cl := c_cl + 1;
             c_clsum := c_clsum + l_ms;
             if l_ms > c_clmax then c_clmax := l_ms; end if;
-            -- der Client wartet hoechstens 1 s auf die Antwort des Servers (close_processRemote)
+            -- bis 08.10.2026 wartete der Client hoechstens 1 s auf die Antwort des Servers; seitdem sendet CLOSE_PROCESS ohne Warten
             if l_ms >= 990 then c_clto := c_clto + 1; end if;
         end;
 
@@ -1144,6 +1145,7 @@ create or replace package body ltb as
         end loop;
         l_n := lt.wait_count(l_prefix, 'PROC_CLOSED', p_procs, 60);
         lt.check_that(l_run, 'APEX-Prozesse geschlossen', l_n >= 0, l_n || ' ms');
+        l_n := lt.wait_count_max(l_prefix, 'ROUTES', 0, 30);   -- Route verschwindet erst nach dem Schliessen im Server
         l_n := cnt(l_prefix, 'ROUTES');
         lt.check_that(l_run, 'Keine Prozess-Routen uebrig', l_n = 0, 'ist ' || l_n);
         select count(*) into l_n from ltb_req where run_id = l_run and err is not null;

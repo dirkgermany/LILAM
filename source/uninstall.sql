@@ -169,6 +169,7 @@ begin
     drop_table('LILAM_BASELINES');
     drop_table('LILAM_SCOPES');
     drop_table('LILAM_PROCESS_ROUTE');
+    drop_table('LILAM_WATERMARK');
     drop_table('LILAM_SERVER_REGISTRY');
     drop_table('LILAM_LOG_INTERNAL');
 

@@ -90,7 +90,14 @@ create or replace package lt authid definer as
     --   p_what: PROC, PROC_CLOSED, LOG, TRACE, EVENT, STEPS, ROUTES, BASELINE
     function  count_lilam(p_prefix varchar2, p_what varchar2) return number;
     function  wait_count(p_prefix varchar2, p_what varchar2, p_expected number, p_max_sec number) return number;
+    function  wait_count_max(p_prefix varchar2, p_what varchar2, p_max number, p_max_sec number) return number;
     function  internal_errors_since(p_ts timestamp) return number;
+
+    -- CLOSE_PROCESS sendet decoupled ohne Warten (seit 08.10.2026). Pruefungen direkt danach warten zyklisch,
+    -- bis der Server den Prozess geschlossen und seine Route entfernt hat (wie frueher die Antwort des Servers).
+    function  wait_closed(p_pid number, p_max_sec number default 30) return number;
+    procedure close_wait(p_processId number, p_processInfo varchar2 default null, p_processStatus pls_integer default null,
+                         p_procStepsDone pls_integer default null, p_procStepsToDo pls_integer default null);
 
     -- Hilfen
     function  ms_since(p_ts timestamp) return number;
@@ -459,6 +466,47 @@ create or replace package body lt as
         return ms_since(l_t0);
     end;
 
+    -- wartet, bis hoechstens p_max Zeilen gezaehlt werden (z. B. keine Routen mehr); -1 bei Zeitueberschreitung
+    function wait_count_max(p_prefix varchar2, p_what varchar2, p_max number, p_max_sec number) return number is
+        l_t0 timestamp := systimestamp;
+        l_n  number;
+    begin
+        loop
+            l_n := count_lilam(p_prefix, p_what);
+            exit when l_n between 0 and p_max;
+            if ms_since(l_t0) > p_max_sec * 1000 then return -1; end if;
+            dbms_session.sleep(0.25);
+        end loop;
+        return ms_since(l_t0);
+    end;
+
+    -- wartet, bis der Prozess geschlossen und seine Route entfernt ist; liefert Wartezeit in ms, -1 bei Zeitueberschreitung
+    function wait_closed(p_pid number, p_max_sec number default 30) return number is
+        l_t0 timestamp := systimestamp;
+        l_n  number;
+    begin
+        if nvl(p_pid, 0) <= 0 then return 0; end if;
+        loop
+            execute immediate
+               'select (select count(*) from lilam_proc where id = :1 and process_end is not null)
+                     - (select count(*) from lilam_process_route where process_id = :2) from dual'
+               into l_n using p_pid, p_pid;
+            exit when l_n = 1;
+            if ms_since(l_t0) > p_max_sec * 1000 then return -1; end if;
+            dbms_session.sleep(0.05);
+        end loop;
+        return ms_since(l_t0);
+    end;
+
+    procedure close_wait(p_processId number, p_processInfo varchar2 default null, p_processStatus pls_integer default null,
+                         p_procStepsDone pls_integer default null, p_procStepsToDo pls_integer default null) is
+        l_ms number;
+    begin
+        lilam.close_process(p_processId => p_processId, p_processInfo => p_processInfo, p_processStatus => p_processStatus,
+                            p_procStepsDone => p_procStepsDone, p_procStepsToDo => p_procStepsToDo);
+        l_ms := wait_closed(p_processId);
+    end;
+
     function internal_errors_since(p_ts timestamp) return number is
         l_n number;
     begin
@@ -822,6 +870,7 @@ create or replace package body lt as
         end if;
 
         if p_check_routes then
+            l_ms := wait_count_max(p_prefix, 'ROUTES', 0, 30);   -- Route verschwindet erst nach dem Schliessen im Server
             l_n := count_lilam(p_prefix, 'ROUTES');
             check_that(p_run_id, 'Keine Prozess-Routen uebrig', l_n = 0, 'ist ' || l_n);
         end if;
@@ -883,6 +932,7 @@ create or replace package body lt as
         check_that(p_run_id, 'Baseline zaehlt alle Traces = ' || l_exp, l_n = l_exp, 'ist ' || l_n);
 
         if p_check_routes then
+            l_ms := wait_count_max(p_prefix, 'ROUTES', 0, 30);   -- Route verschwindet erst nach dem Schliessen im Server
             l_n := count_lilam(p_prefix, 'ROUTES');
             check_that(p_run_id, 'Keine Prozess-Routen uebrig', l_n = 0, 'ist ' || l_n);
         end if;
@@ -1288,7 +1338,7 @@ create or replace package body lt as
                 dbms_session.sleep(c_sleep_s);
                 lilam.trace_stop(l_pid, c_action);
             end loop;
-            lilam.close_process(l_pid);
+            close_wait(l_pid);
             return l_pid;
         end;
 
@@ -1909,6 +1959,7 @@ create or replace package body lt as
             check_that(l_run, 'Lastspitze: Anzahl ' || w.what || ' = gesendete Operationen', l_n = l_ops, l_n || '/' || l_ops);
             if l_ms >= 0 then metric(l_run, 'drain_' || lower(w.what) || '_ms', l_ms, 'ms'); end if;
         end loop;
+        l_ms := wait_count(l_burst, 'PROC_CLOSED', p_clients, 30);
         l_n := count_lilam(l_burst, 'PROC_CLOSED');
         check_that(l_run, 'Lastspitze: alle Prozesse geschlossen', l_n = p_clients, l_n || '/' || p_clients);
 
@@ -1920,6 +1971,8 @@ create or replace package body lt as
         l_ms := wait_count(l_probe, 'LOG', c_probe_ops, 30);
         check_that(l_run, 'Probe: Daten innerhalb 30 s persistiert', l_ms >= 0, l_ms || ' ms');
 
+        l_ms := wait_count_max(l_burst, 'ROUTES', 0, 30);
+        l_ms := wait_count_max(l_probe, 'ROUTES', 0, 30);
         l_n := count_lilam(l_burst, 'ROUTES') + count_lilam(l_probe, 'ROUTES');
         check_that(l_run, 'Keine Prozess-Routen uebrig', l_n = 0, 'ist ' || l_n);
         select count(*) into l_n from lt_joblog where run_id = l_run and phase = 'ERROR';
@@ -2165,7 +2218,7 @@ create or replace package body lt as
         lilam.mark_event(l_pid, 'RG_X'); lilam.mark_event(l_pid, 'RG_D');                             -- 1: falscher Vorgaenger
         lilam.mark_event(l_pid, 'RG_A'); lilam.trace_start(l_pid, 'RG_T'); lilam.trace_stop(l_pid, 'RG_T');  -- 0
         lilam.mark_event(l_pid, 'RG_X'); lilam.trace_start(l_pid, 'RG_T'); lilam.trace_stop(l_pid, 'RG_T');  -- 1
-        lilam.close_process(l_pid);
+        close_wait(l_pid);
         expect('_VG', 'VG-01', 1, 'PRECEDED_BY: Kontext egal, Log kein Vorgaenger, falscher Vorgaenger');
         expect('_VG', 'VG-02', 1, 'PRECEDED_BY mit Kontext RG_A|C1');
         expect('_VG', 'VG-03', 2, 'PRECEDED_BY_WITHIN_SECS: zu spaet und falscher Vorgaenger');
@@ -2175,7 +2228,7 @@ create or replace package body lt as
         l_pid := proc('_VG5');
         lilam.mark_event(l_pid, 'RG_A'); lilam.set_process_status(l_pid, 1);                          -- 0
         lilam.mark_event(l_pid, 'RG_A'); dbms_session.sleep(1.3); lilam.set_process_status(l_pid, 1); -- 1: zu spaet
-        lilam.close_process(l_pid);
+        close_wait(l_pid);
         expect('_VG5', 'VG-05', 1, 'PRECEDED_BY_WITHIN_SECS bei PROCESS_UPDATE: Abstand zum Signal');
 
         -- ---------------------------------------------------------------
@@ -2184,7 +2237,7 @@ create or replace package body lt as
         l_pid := proc('_NF');
         lilam.mark_event(l_pid, 'RG_NF_A'); lilam.mark_event(l_pid, 'RG_NF_B');                          -- 0
         lilam.mark_event(l_pid, 'RG_NF_A'); dbms_session.sleep(1.3); lilam.mark_event(l_pid, 'RG_NF_B'); -- 1
-        lilam.close_process(l_pid);
+        close_wait(l_pid);
         expect('_NF', 'NF-01', 1, 'Nachfolger zu spaet');
         dbms_output.put_line('    Hinweis: ein ganz ausbleibender Nachfolger wird nicht erkannt (keine zeitgesteuerte Pruefung)');
 
@@ -2207,7 +2260,7 @@ create or replace package body lt as
         end loop;
         lilam.trace_start(l_pid, 'RG_AV'); dbms_session.sleep(0.11); lilam.trace_stop(l_pid, 'RG_AV');  -- 0: +10 %
         lilam.trace_start(l_pid, 'RG_AV'); dbms_session.sleep(0.4);  lilam.trace_stop(l_pid, 'RG_AV');  -- 1: +300 %
-        lilam.close_process(l_pid);
+        close_wait(l_pid);
         expect('_MON', 'GP-01', 1, 'MAX_GAP_SECONDS 0.8 bei Events (Dezimalpunkt)');
         expect('_MON', 'GP-02', 1, 'MAX_GAP_SECONDS 0.8 bei TRACE_START');
         expect('_MON', 'DU-01', 1, 'MAX_DURATION_MS bei TRACE_STOP');
@@ -2224,28 +2277,28 @@ create or replace package body lt as
             lilam.trace_stop(l_pid, 'RG_AV0', p_timestamp => l_ts + numtodsinterval(i, 'SECOND')
                              + numtodsinterval(case when i in (2, 3) then 0 else 0.001 end, 'SECOND'));
         end loop;                                                                                       -- 0
-        lilam.close_process(l_pid);
+        close_wait(l_pid);
         expect('_AV0', 'AV-02', 0, 'AVG_DEVIATION_PCT: Durchschnitt unter 1 ms wird nicht ausgewertet');
 
         -- ---------------------------------------------------------------
         -- Prozess-Regeln (je ein Prozess, die Werte bleiben im Prozess stehen)
         -- ---------------------------------------------------------------
-        l_pid := proc('_PS'); lilam.close_process(l_pid);
+        l_pid := proc('_PS'); close_wait(l_pid);
         expect('_PS', 'PR-01', 1, 'ON_START bei PROCESS_START');
 
         l_pid := proc('_ST');
         lilam.set_process_status(l_pid, 2); lilam.set_process_status(l_pid, 3);
-        lilam.close_process(l_pid);
+        close_wait(l_pid);
         expect('_ST', 'PR-02', 1, 'STATUS_EQUALS 3');
 
         l_pid := proc('_IN');
         lilam.set_process_status(l_pid, 1, 'alles gut'); lilam.set_process_status(l_pid, 1, 'Teil KAPUTT');
-        lilam.close_process(l_pid);
+        close_wait(l_pid);
         expect('_IN', 'PR-03', 1, 'INFO_CONTAINS (ohne Gross/Klein)');
 
         l_pid := proc('_SD', 10);
         for i in 1 .. 5 loop lilam.proc_step_done(l_pid); end loop;
-        lilam.close_process(l_pid, p_procStepsDone => 7);
+        close_wait(l_pid, p_procStepsDone => 7);
         expect('_SD', 'PR-06', 2, 'MAX_OCCURRENCE 3 bei 5 Schritten');
         expect('_SD', 'PR-04', 1, 'STEPS_LEFT_HIGH mit Endstand aus CLOSE_PROCESS (7 von 10)');
         expect('_SD', 'PR-05', 1, 'SUCCESS_RATE_LOW 80 % mit Endstand 70 %');
@@ -2253,7 +2306,7 @@ create or replace package body lt as
         l_pid := proc('_RT');
         lilam.set_process_status(l_pid, 1);                                                 -- 0
         dbms_session.sleep(0.7); lilam.set_process_status(l_pid, 1);                        -- 1
-        lilam.close_process(l_pid);
+        close_wait(l_pid);
         expect('_RT', 'PR-08', 1, 'RUNTIME_EXCEEDED 500 ms (laufender Prozess)');
         expect('_RT', 'PR-07', 1, 'MAX_RUNTIME_EXCEEDED 500 ms (bei PROCESS_STOP)');
 
@@ -2263,7 +2316,7 @@ create or replace package body lt as
         l_pid := proc('_LG');
         for i in 1 .. 10 loop lilam.info(l_pid, 'info ' || i); end loop;
         lilam.warn(l_pid, 'Warnung'); lilam.error(l_pid, 'Fehler');
-        lilam.close_process(l_pid);
+        close_wait(l_pid);
         expect('_LG', 'LG-01', 1, 'SEVERITY ERROR');
         expect('_LG', 'LG-02', 1, 'SEVERITY WARN als zweite Log-Regel (ohne "action")');
 
@@ -2274,7 +2327,7 @@ create or replace package body lt as
         lilam.info(l_pid, 'ohne Suchtext');                                                        -- 0
         lilam.info(l_pid, 'info rg_lc_lvl');                                                       -- LC-02: 0 (falscher Level)
         lilam.error(l_pid, 'Fehler RG_LC_LVL');                                                    -- LC-02: 1
-        lilam.close_process(l_pid);
+        close_wait(l_pid);
         expect('_LC', 'LC-01', 2, 'LOG_CONTAINS ohne Level (INFO und ERROR, Gross/Klein egal)');
         expect('_LC', 'LC-02', 1, 'LOG_CONTAINS ERROR|TEXT nur fuer ERROR');
 
@@ -2286,7 +2339,7 @@ create or replace package body lt as
         lilam.mark_event(l_pid, 'RG_TF'); lilam.trace_start(l_pid, 'RG_TF'); lilam.trace_stop(l_pid, 'RG_TF');
         for i in 1 .. 3 loop lilam.mark_event(l_pid, 'RG_TH'); end loop;
         dbms_session.sleep(2.5); lilam.mark_event(l_pid, 'RG_TH');
-        lilam.close_process(l_pid);
+        close_wait(l_pid);
         expect('_KX', 'KX-01', 1, 'Kontext-Regel nur fuer C1');
         expect('_KX', 'KX-02', 2, 'Action-Regel zusaetzlich fuer alle Kontexte');
         expect('_KX', 'TF-01', 1, 'Trigger-Filter: nur TRACE_STOP, kein MARK_EVENT');
@@ -2323,15 +2376,15 @@ create or replace package body lt as
             start_server('LT_S1');
             wait_servers_ready(sys.odcivarchar2list('LT_S1'));
             -- zwei Prozesse, damit mit hoher Wahrscheinlichkeit beide Server beteiligt sind
-            l_pid := proc('_L2'); lilam.mark_event(l_pid, 'RG_L'); lilam.close_process(l_pid);
-            l_pid := proc('_L2'); lilam.mark_event(l_pid, 'RG_L'); lilam.close_process(l_pid);
+            l_pid := proc('_L2'); lilam.mark_event(l_pid, 'RG_L'); close_wait(l_pid);
+            l_pid := proc('_L2'); lilam.mark_event(l_pid, 'RG_L'); close_wait(l_pid);
             expect('_L2', 'L-01', 2, 'L2 nach Neustart aktiv');
 
             -- L2b: ein neuer Server der Gruppe laedt das aktive Rule Set der Gruppe (allein laufend)
             l_ok := stop_server('LT_S1'); l_ok := stop_server('LT_S2');
             start_server('LT_S3');
             wait_servers_ready(sys.odcivarchar2list('LT_S3'));
-            l_pid := proc('_L2B'); lilam.mark_event(l_pid, 'RG_L'); lilam.close_process(l_pid);
+            l_pid := proc('_L2B'); lilam.mark_event(l_pid, 'RG_L'); close_wait(l_pid);
             expect('_L2B', 'L-01', 1, 'L2b neuer Server LT_S3 laedt das Rule Set der Gruppe');
             l_ok := stop_server('LT_S3');
             execute immediate 'delete from lilam_server_registry where pipe_name = ''LT_S3''';
@@ -2350,7 +2403,7 @@ create or replace package body lt as
              + rejected(c_group, 9);                -- Version 9 gibt es nicht
         check_that(l_run, 'L3 SERVER_UPDATE_RULES lehnt 12 Faelle mit NUM_ERR_RULE_SET ab', l_n = 12, l_n);
         check_that(l_run, 'L3 aktives Rule Set der Gruppe unveraendert', active = c_set || ' v1', active);
-        l_pid := proc('_L3'); lilam.mark_event(l_pid, 'RG_L'); lilam.close_process(l_pid);
+        l_pid := proc('_L3'); lilam.mark_event(l_pid, 'RG_L'); close_wait(l_pid);
         expect('_L3', 'L-01', 1, 'L3 Regeln aus Version 1 bleiben aktiv');
 
         -- L3a: Gruppe ohne Server ist kein Fehler; das Rule Set wird aktiv
@@ -2400,7 +2453,7 @@ create or replace package body lt as
                    l_pipes.count > 0 and l_n = l_pipes.count, l_n || ' von ' || l_pipes.count);
         -- zwei Prozesse, damit mit hoher Wahrscheinlichkeit beide Server beteiligt sind
         for i in 1 .. 2 loop
-            l_pid := proc('_L3C'); lilam.mark_event(l_pid, 'RG_L'); lilam.close_process(l_pid);
+            l_pid := proc('_L3C'); lilam.mark_event(l_pid, 'RG_L'); close_wait(l_pid);
         end loop;
         expect('_L3C', 'L-01', 2, 'L3c Regeln aus Version 1 bleiben aktiv');
         -- Version 1 wieder aktiv (die Server haben sie ohnehin noch geladen)
@@ -2431,7 +2484,7 @@ create or replace package body lt as
         update_rules(2);
         check_that(l_run, 'L4 Wechsel auf Version 2: aktives Rule Set der Gruppe', active = c_set || ' v2', active);
         for i in 1 .. 2 loop
-            l_pid := proc('_L4'); lilam.mark_event(l_pid, 'RG_L'); lilam.mark_event(l_pid, 'RG_V2'); lilam.close_process(l_pid);
+            l_pid := proc('_L4'); lilam.mark_event(l_pid, 'RG_L'); lilam.mark_event(l_pid, 'RG_V2'); close_wait(l_pid);
         end loop;
         expect('_L4', 'L-01', 0, 'L4 Regel aus Version 1 entfernt');
         expect('_L4', 'V2-01', 2, 'L4 Regel aus Version 2 aktiv');
@@ -2448,7 +2501,7 @@ create or replace package body lt as
         dbms_session.sleep(21);
         -- vier Prozesse, damit beide Server beteiligt sind (Round Robin bei Gleichstand)
         for i in 1 .. 4 loop
-            l_pid := proc('_L6'); lilam.mark_event(l_pid, 'RG_L'); lilam.close_process(l_pid);
+            l_pid := proc('_L6'); lilam.mark_event(l_pid, 'RG_L'); close_wait(l_pid);
         end loop;
         expect('_L6', 'L-01', 4, 'L6 Server laden Version 1 ohne UPDATE_RULE (eigene Pruefung)');
 
@@ -2460,7 +2513,7 @@ create or replace package body lt as
         -- IS-01: Prozess ohne Gruppe hat keine Regeln
         l_pid := lilam.new_process(p_processName => l_p || '_IS_NG', p_logLevel => lilam.logLevelInfo);
         lilam.mark_event(l_pid, 'RG_L'); lilam.mark_event(l_pid, 'RG_K', 'C1'); lilam.error(l_pid, 'Fehler ohne Gruppe');
-        lilam.close_process(l_pid);
+        close_wait(l_pid);
         execute immediate 'select count(*) from lilam_alerts where process_name = :1' into l_n using l_p || '_IS_NG';
         check_that(l_run, 'IS-01 Prozess ohne Gruppe: keine Alerts', l_n = 0, 'Alerts ' || l_n);
 
@@ -2474,13 +2527,13 @@ create or replace package body lt as
         l_pid := lilam.new_process(p_processName => l_p || '_IS_3A', p_logLevel => lilam.logLevelInfo, p_groupName => l_is_grp2);
         lilam.server_update_rules(l_is_grp2, c_set, 2);
         lilam.mark_event(l_pid, 'RG_L'); lilam.mark_event(l_pid, 'RG_V2');
-        lilam.close_process(l_pid);
+        close_wait(l_pid);
         expect('_3A', 'L-01', 1, 'IS-03 direkt nach dem Update noch Version 1');
         expect('_3A', 'V2-01', 0, 'IS-03 direkt nach dem Update Version 2 noch nicht aktiv');
         dbms_session.sleep(16);
         l_pid := lilam.new_process(p_processName => l_p || '_IS_3B', p_logLevel => lilam.logLevelInfo, p_groupName => l_is_grp2);
         lilam.mark_event(l_pid, 'RG_L'); lilam.mark_event(l_pid, 'RG_V2');
-        lilam.close_process(l_pid);
+        close_wait(l_pid);
         expect('_3B', 'L-01', 0, 'IS-03 nach 16 s Regel aus Version 1 entfernt');
         expect('_3B', 'V2-01', 1, 'IS-03 nach 16 s Version 2 aktiv');
 
@@ -2493,7 +2546,7 @@ create or replace package body lt as
         dbms_session.sleep(16);
         l_pid := lilam.new_process(p_processName => l_p || '_IS_4', p_logLevel => lilam.logLevelInfo, p_groupName => l_is_grp2);
         lilam.mark_event(l_pid, 'RG_V2');
-        lilam.close_process(l_pid);
+        close_wait(l_pid);
         expect('_4', 'V2-01', 1, 'IS-04 ungueltiges Rule Set abgelehnt, Version 2 bleibt aktiv');
         execute immediate 'select count(*) from lilam_log_internal where log_timestamp >= :1
                               and module_name = ''refreshGroupRules'' and error_code = ''-20130'''
@@ -2506,7 +2559,7 @@ create or replace package body lt as
         dbms_session.sleep(16);
         l_pid := lilam.new_process(p_processName => l_p || '_IS_5', p_logLevel => lilam.logLevelInfo, p_groupName => l_is_grp2);
         lilam.mark_event(l_pid, 'RG_V2'); lilam.mark_event(l_pid, 'RG_L');
-        lilam.close_process(l_pid);
+        close_wait(l_pid);
         execute immediate 'select count(*) from lilam_alerts where process_name = :1' into l_n using l_p || '_IS_5';
         check_that(l_run, 'IS-05 kein aktives Rule Set: nach 16 s keine Alerts', l_n = 0, 'Alerts ' || l_n);
         l_s := null;
@@ -2666,7 +2719,7 @@ create or replace package body lt as
             signals(l_pid, p_type, l_cnt);
             l_sync := lilam.get_proc_steps_done(l_pid);   -- Antwort erst nach allen Signalen davor
             l_ms := ms_since(l_t0);
-            lilam.close_process(l_pid);
+            close_wait(l_pid);
             if l_sync is null then
                 return -1;
             end if;
@@ -2690,7 +2743,7 @@ create or replace package body lt as
             l_t0 := systimestamp;
             signals(l_pid, p_type, l_cnt);
             l_ms := ms_since(l_t0);
-            lilam.close_process(l_pid);
+            close_wait(l_pid);
             return round(l_ms * 1000 / l_cnt, 1);
         end;
 

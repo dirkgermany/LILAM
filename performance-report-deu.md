@@ -1,132 +1,149 @@
-# 📊 LILAM Performance & Stress-Test Report
+# LILAM Performance-Bericht
 
-## 1. Ausstattung der Hardware (Host)
-*   **Modell:** Fujitsu Lifebook A 357
-*   **Prozessor (CPU):** Intel Core i5-7200U: 2,5GHz-2701 MHz (2 Kerne / 4 logische Prozessoren)
-*   **Arbeitsspeicher (RAM):** 16 GB
-*   **Festplatte (Storage):** 477 GB SSD (Basis für High-Speed I/O)
+**Stand:** 13.10.2026, Branch `fallback` (mit Failover, Code-Stand f6dcd44)
+**Grundlage:**
+- Performance-Test (run 2344)
+- Vergleich mit OraOpenSource Logger 3.1.1
+- CPU-Messung des Failover-Codes
 
-## 2. Setup Software-Stack
-*   **Host-OS:** Windows 11 Home
-*   **Virtualisierung:** Oracle VM VirtualBox 7.2.4
-*   **Gast-OS:** Oracle Linux Server 8.10
-*   **Datenbank:** **Oracle AI Database 23.26.0.0.0**
+Die Messskripte stehen unter `test/autotest/PERFORMANCE/`.
 
-## 3. Datenbank-Limits (Oracle 23 Free)
-*   **Instanz-RAM Gesamtlimit:** **2,0 GB (Hard-Limit der Lizenz)**
-*   **SGA (System Global Area):** 1.529 MB (Optimiert auf Buffer-Caching)
-*   **PGA (verfügbarer Rest):** ca. 519 MB (Gemeinsamer Speicher für alle Sessions)
-*   **vCPU:** 3 Kerne (In VirtualBox zugewiesen)
-*   **CPU:** Verwendet max. 2 Threads (Engpass bei parallelen Workern)
+Dieser Bericht ersetzt den früheren Stresstest-Bericht (4 Mio. Aufrufe, Oracle 21c Free). Der frühere Bericht ist in der Git-Historie erhalten.
 
-## 4. Ressourcen-Effizienz der Worker-Architektur
-Die Analyse des Ressourcenverbrauchs während der Hochlastphase (bis zu 2.800 EPS Gesamtlast) zeigt die Skalierbarkeit der gewählten Architektur:
+## Auf einen Blick
 
-*   **SGA-Nutzung (Pipe):** Die Speichernutzung innerhalb der SGA blieb trotz massiver Datenströme minimal. Dies belegt, dass die Worker-Prozesse die Pipes nahezu verzögerungsfrei leeren (Consumer-Geschwindigkeit > Producer-Geschwindigkeit), solange keine I/O-Sperren auftreten.
-*   **PGA-Effizienz (Memory):** Durch den Einsatz von `FORALL` (Bulk-Processing) konnte der Arbeitsspeicherverbrauch pro Session konstant niedrig gehalten werden. Auch bei 4 Mio. Datensätzen trat kein Speicherleck auf.
-*   **CPU-Profil:** Die CPU-Last wurde primär durch den Kontextwechsel zwischen PL/SQL und SQL sowie die Index-Pflege (Paar 2) verursacht. Die Regelprüfung selbst (7 Regeln via assoziatives Array) erzeugte keinen messbaren CPU-Overhead.
-*   **I/O-Verhalten (Redo):** Der Worker-Prozess transformiert hohen logischen Durchsatz in massiven physischen I/O (ca. 4,5 GB Redo-Daten). Die Effizienz der Persistierung hängt hierbei direkt von der Batch-Größe des Commits ab (Faktor 3 Gewinn bei 1000er-Batches).
+- **Ein LILAM-Aufruf kostet die Anwendung im Median 25 bis 100 µs**, in beiden Betriebsarten. Bei normaler Last steht alles wenige Zehntelsekunden bis etwa 2 s nach dem letzten Aufruf in der Datenbank, bei Überlast der Server auch später.
+- **LILAM ist im Normalbetrieb um mehr als eine Größenordnung schneller als ein Logging-Werkzeug, das jeden Eintrag sofort festschreibt.**
+  - OraOpenSource Logger 3.1.1 brauchte für denselben INFO-Eintrag im Median 1,4 ms.
+  - LILAM brauchte 26 µs (INSESSION) bzw. 50 µs (DECOUPLED).
+  - Beide Systeme verfolgen verschiedene Ziele: Logger garantiert jeden Eintrag bei der Rückkehr des Aufrufs, LILAM puffert bzw. entkoppelt.
+- **Stabilität:** In allen 13 Varianten des Performance-Tests ist kein Eintrag verloren gegangen. Unter Dauerfeuer mit mehr Last, als die Server verarbeiten, können aber **einzelne Aufrufe bis zu 10 s warten**. Das ist offen (siehe „Stabilität unter Überlast“).
+- **Der Failover kostet Rechenzeit:** Server +10 %, Client +11 % CPU je Meldung gegenüber dem Stand ohne Failover.
 
+## Umgebung
 
-## 5. Durchsatz & Testszenario
-Das Test-Szenario hatte drei Ziele:
-1. Ermittlung der Latenzen zwischen Zeitpunkt von Logs, Metriken und Prozessänderungen und dem sicheren Persistieren in die LILAM-Tabellen (commit).
-2. Performance eines simulierten Clients, der abwechseln Daten sequentiell in eine Tabelle schreibt und über die API von LILAM Events meldet.
-3. Prüfen der Konsistenz (alle Messpunkte müssen am Ende persistiert sein).
+| | |
+|---|---|
+| Rechner | Fujitsu Lifebook A357, Windows 11 Home; Intel Core i5-7200U (2 Kerne, 4 logische Prozessoren), 16 GB RAM, SSD |
+| Datenbank | Oracle AI Database 26ai Free 23.26.0.0.0 in einer VirtualBox-VM (Oracle Linux 8.10) |
+| Grenze der Free-Edition | höchstens **2 CPU-Threads** für alle Sessions: Anwendungen (Clients), LILAM-Server und Messung teilen sie sich |
+| LILAM-Server | Leistungsstufe MID (1.500 Nachrichten/s je Prozess; darüber bremst der Client kurz ab) |
 
-Das Szenario simulierte somit eine extreme Mischlast (Mixed Workload).
+Die absoluten Zahlen gelten nur für diese kleine Umgebung, und sie streuen stark: Gleicher Code lieferte im selben Test zwischen zwei Läufen bis zum Doppelten (z. B. 17.417 und 36.037 Operationen in LASTSPITZE). Aussagekräftig sind die Verhältnisse zwischen Varianten, die unmittelbar nacheinander gemessen wurden. Auf einem Datenbankserver mit mehr CPU-Threads und schnellem Redo-Speicher sind alle Werte deutlich besser zu erwarten, vor allem der Durchsatz der Server.
 
-### Setup des Szenarios
-Der Testaufbau bestand aus zwei 'Paaren' von je einem LILAM-Client (Produzent) und einem LILAM-Server (Worker).
-Im ersten Paar wurden direkt und ohne Unterbrechung Logs, Metriken und Statusänderungen eines Prozesses gemeldet.
-Im zweiten Paar wurden von einem Client Messpunkte an einen Server geschickt, deren Zeitstempel unmittelbar davor in eine Tabelle geschrieben wurden. Gleichzeitig arbeitete dieser Server mit einem geladenen Regelsatz (s. Zusammenfassende Bewertung).
+## Was ein Aufruf die Anwendung kostet
 
-*   **Paar 1 (High Performance):** 1 Produzent + 1 Worker. Loop mit **4.000.000 Aufrufen**. 
-    *   *Aktion:* API-Call + Bulk-Schreiben in 3 Tabellen (`REMOTE_LOG`, `REMOTE_LOG_MON`, `LILAM_ALERTS`).
-*   **Paar 2 (Latenz-Messung):** 1 Produzent + 1 Worker. **100.000 Aufrufe**.
-    *   *Aktion:* API-Call + Schreiben in 2 Tabellen (`REMOTE_LOG`, `REMOTE_LOG_MON`) + **Einzel-Inserts** in `LATENZ_TEST` (indiziert).
+Performance-Test (`test/autotest/PERFORMANCE/test_performance.sql`, run 2344, Gesamtlaufzeit 21:21 min):
+- Jeder Client ist eine eigene Datenbank-Session und ruft LILAM in einem realistischen Mix auf. Je 100 Aufrufe sind das 44 INFO, 4 WARN, 1 ERROR, 10 TRACE_START, 10 TRACE_STOP, 15 MARK_EVENT, 10 PROC_STEP_DONE und 6 SET_PROCESS_STATUS.
+- Jeder Aufruf wird einzeln gemessen.
+- „Dauerfeuer“: Die Clients rufen ohne Pause auf.
+- „Mit Pausen“: 100 ms Pause nach je 20 Aufrufen, wie in einer Anwendung, die zwischendurch arbeitet.
 
-### Messergebnisse (Durchsatz)
+| Variante | Clients × Aufrufe | Aufrufe/s (Anwendung) | Aufruf Median | Aufruf 99 % | Aufruf Maximum | alles gespeichert nach |
+|---|---|---|---|---|---|---|
+| INSESSION, Dauerfeuer | 3 × 100.000 | 10.563 | 50 µs | 5 ms | 300 ms | 30 s |
+| INSESSION, mit Pausen | 3 × 25.000 | 518 | 50 µs | 6 ms | 400 ms | 146 s |
+| DECOUPLED 1 Server, Dauerfeuer | 3 × 100.000 | 2.582 | 80 µs | 5 ms | **10.000 ms** | 117 s |
+| DECOUPLED 2 Server, Dauerfeuer | 3 × 100.000 | 2.230 | 80 µs | 7 ms | **10.000 ms** | 136 s |
+| DECOUPLED 3 Server, Dauerfeuer | 3 × 100.000 | 2.730 | 70 µs | 4 ms | **6.600 ms** | 112 s |
+| DECOUPLED 1 Server, mit Pausen | 3 × 25.000 | 525 | 100 µs | 6 ms | 300 ms | 144 s |
+| DECOUPLED 2 Server, mit Pausen | 3 × 25.000 | 545 | 90 µs | 3 ms | 49 ms | 138 s |
+| DECOUPLED 3 Server, mit Pausen | 3 × 25.000 | 540 | 90 µs | 3 ms | 92 ms | 139 s |
+| DECOUPLED 2 Server, Dauerfeuer, 100 Ab-/Anmeldungen | 3 × 100.000 | 4.511 | 80 µs | 4 ms | 2.400 ms | 68 s |
 
-| Paar | Verarbeitungs-Modus | Durchsatz (EPS) | Status |
-| :--- | :--- | :--- | :--- |
-| **Paar 1 (Bulk)** | `FORALL` (1000er Batch) | **~1.300 - 1.900** | Stabil über 4 Mio. Datensätze |
-| **Paar 2 (Latenz)** | `Row-by-Row` | **~460 - 800** | Einbruch bei ~450k (I/O Sättigung) |
+„Alles gespeichert nach“ zählt ab dem ersten Aufruf. Nach dem **letzten** Aufruf dauerte es in diesen Varianten höchstens 2,4 s, bei Last mit Pausen höchstens 1,1 s.
 
-*Hinweis: Der Durchsatz von Paar 2 stieg nach Umstellung auf 1.000er Commits um den **Faktor 3** an.*
+**Einzelne Aufrufarten** (Median):
+- INFO 50 µs (INSESSION) bzw. 90–120 µs (DECOUPLED)
+- TRACE_START/STOP, MARK_EVENT, PROC_STEP_DONE, SET_PROCESS_STATUS 30–90 µs
+- ERROR 6–9 ms INSESSION. ERROR wird sofort mit Commit geschrieben (Sync-Level), DECOUPLED etwa 2 ms.
+- NEW_PROCESS meist 15–70 ms, einzeln bis 200 ms (Anmeldung beim Server bzw. Anlage der Tabellen-Zeilen)
+- CLOSE_PROCESS DECOUPLED 40–110 µs. Es wartet nicht mehr auf den Server; früher bis gut 1 s.
 
-## 6. Darstellung der Latenz (Echtzeit-Fähigkeit)
-Gemessen durch den Zeitstempel-Vergleich zwischen Producer (`LATENZ_TEST`) und Engine-Eingang (`REMOTE_LOG_MON`).
+### Regeln
 
-| Metrik | Wert (Clean Run 100k) | Wert (Dauerlast 4M) |
-| :--- | :--- | :--- |
-| **Durchschnitt (Avg)** | **4,14 ms** | ~47.000 ms (Stau-Phase) |
-| **Maximum (Max)** | 2.037,96 ms | > 60.000 ms |
-| **Jitter (StdDev)** | 510,19 | Extrem hoch (CPU Sättigung) |
+5 Clients × 10.000 Aufrufe, Dauerfeuer, Rule Set mit 13 Regeln, die zum Aufrufmix passen:
 
-### Fazit der Latenzmessung
-Die LILAM-Engine ist im Kern **hochperformant (4,14 ms Basis-Latenz)**. Die Latenzsteigerung unter Dauerlast ist ein rein physikalischer Effekt: Das Notebook-I/O und das 2-Thread-Limit der 21c Free Edition führen bei Überlastung zur Stau-Bildung in den Pipes. Durch die implementierte **Flusssteuerung (Backpressure/Handshake)** blieb das Gesamtsystem jedoch zu jeder Zeit konsistent und stabil.
-Die in 
+| Variante | Aufrufe/s | Aufruf Median | Aufruf 99 % |
+|---|---|---|---|
+| INSESSION ohne Regeln | 14.286 | 50 µs | 4 ms |
+| INSESSION mit Regeln | 12.500 | 70 µs | 4 ms |
+| DECOUPLED, 2 Server, ohne Regeln | 2.092 | 2 ms | 14 ms |
+| DECOUPLED, 2 Server, mit Regeln | 2.058 | 3 ms | 14 ms |
 
-### 📊 System-Metriken (Post-Mortem Analyse)
-Nach Abschluss der Testreihen wurden die kumulierten Statistik-Werte der Oracle-Instanz ausgewertet. Diese spiegeln die Gesamtbelastung der Hardware nach mehreren Durchläufen des Stress-Tests wider.
+Regeln kosten INSESSION etwa 20 µs je Aufruf. Im DECOUPLED-Modus prüft der Server die Regeln; dort war kein Unterschied messbar.
 
-#### A. Ressourcen-Sättigung (Wait Events)
-Die Top-Wartezeiten zeigen die interne Koordination der CPU-Threads bei Hochlast.
+Mit 5 Clients auf 2 Servern bremsen die Clients unter Dauerfeuer ab (Median 2–3 ms), weil die Server die Last nicht schneller abarbeiten. Nach dem letzten Aufruf brauchten die Server noch 11–13 s, bis alles geschrieben war (alles gespeichert nach 36–37 s).
 
-| Event Name | Total Waits | Zeit gesamt (Sek.) | Average Wait ms | Ursache |
-| :--- | :--- | :--- | :--- | :--- |
-| `library cache: mutex X` | 282799 | **1.065,85** | 0,04 | CPU-Thread-Limit (Oracle 21c Free) |
-| `library cache pin` | 602926 | **488,94** | 0,01 | Gleichzeitiger Zugriff auf PL/SQL Objekte |
-| `resmgr:cpu quantum` | 4256 | 623,81 | 1,47 | Drosselung durch Resource Manager |
-| `log file sync` | 116 | 2,48 | 0,21 | Warten auf SSD-Quittierung (Commit) |
+## Vergleich mit OraOpenSource Logger
 
-#### B. Datendurchsatz (I/O Statistik)
-Physische Last, die durch die 5 Millionen Transaktionen auf dem Notebook-Speicher generiert wurde.
+**Frage:** Ist LILAM mit all seinen Mechanismen (Puffer, Nachrichten, Ringpuffer, Failover, Regeln) im Normalbetrieb überhaupt schneller als ein verbreitetes Logging-Werkzeug?
 
+**Messung:** `test/autotest/PERFORMANCE/2026-10-13_vergleich_logger_a_lilam.sql` und `..._b_logger.sql`.
+- Eine Session schreibt 10.000 Einträge der Stufe INFO mit 120 Zeichen Text.
+- Gemessen ist die Dauer jedes Aufrufs.
+- Drei Runden, LILAM und Logger abwechselnd. Angegeben ist der Median der Runden.
+- Logger 3.1.1 (letzter Stand 2017) lief in einem eigenen Schema mit den Einstellungen nach der Installation (Stufe DEBUG). Die Anwendung ruft ihn statisch auf.
 
-| Metrik | Wert (MB) | Beschreibung |
-| :--- | :--- | :--- |
-| **Redo Size** | 4499,18 MB | Gesamtvolumen der generierten Änderungsprotokolle |
-| **Physical Writes** | 99,1 MB | Tatsächlich auf die SSD geschriebene Datenmenge |
-| **Physical Reads** | 717,18 MB | Von der SSD gelesene Daten (z.B. für Index-Abgleiche) |
+| Variante | Aufruf Median | Aufruf 99 % | Mittel | gespeichert nach dem letzten Aufruf |
+|---|---|---|---|---|
+| LILAM INSESSION, gepuffert (Standard) | **26 µs** | 191 µs | 43 µs | 0,6 s |
+| LILAM DECOUPLED, 1 Server, gepuffert (Standard) | **50 µs** | 1,3 ms | 255 µs | 0,3 s |
+| Muster „Insert + Commit je Eintrag“ ohne Framework | 113 µs | 4,5 ms | 426 µs | sofort |
+| **Logger 3.1.1** `logger.log_info` | **1.355 µs** | 6,7 ms | 1.777 µs | sofort |
 
-*Analyse:* Ein hohes Redo-Volumen bei gleichzeitig hoher EPS-Rate (2.800+) verdeutlicht die enorme Schreiblast, die das Notebook-I/O bewältigen musste.
+**Ergebnis:**
+- Im Normalbetrieb ist LILAM je Aufruf etwa **50-mal (INSESSION) bzw. 27-mal (DECOUPLED) schneller als Logger**, jeweils im Median.
+- Logger ist auch deutlich langsamer als ein nacktes „Insert + Commit“ (113 µs). Seine Kosten kommen also nicht nur vom Commit, sondern aus dem, was er je Eintrag zusätzlich erfasst und prüft: Aufrufstapel, Kontext, Einstellungen.
 
-#### C. Speicher-Zustand (SGA / Shared Pool)
-Zustand des Arbeitsspeichers nach der massiven Befüllung des Library Cache.
+**Einordnung:**
+- Die Systeme geben unterschiedliche Garantien. Logger hat den Eintrag festgeschrieben, wenn der Aufruf zurückkehrt; die Anwendung trägt dafür die Kosten.
+- LILAM puffert (INSESSION) bzw. schickt den Eintrag ab und arbeitet weiter (DECOUPLED).
+  - Gepuffertes geht bei einem Absturz der Session bzw. des Servers verloren, sofern es nicht vorher festgeschrieben wurde.
+  - Mit dem Failover übernimmt im DECOUPLED-Modus ein anderer Worker; der Client wiederholt aus seinem Ringpuffer.
+  - Einträge bis zum Sync-Level (Standard: ERROR) schreibt auch LILAM sofort fest.
+- Der Mittelwert bei LILAM DECOUPLED (255 µs) liegt deutlich über dem Median. Einzelne Aufrufe warten, wenn der Client wegen der Leistungsstufe kurz abbremst.
 
-| Pool / Name | Wert (MB) | Status |
-| :--- | :--- | :--- |
-| **Shared Pool Total** | **563,22 MB** | Reserviert für SQL & Pipes |
-| **Free Memory** | 136,4 MB | Verbleibende Reserve im Shared Pool |
-| **Total SGA** | **1.129,69 MB** | Fest belegter RAM-Block im Notebook |
+## Stabilität unter Überlast
 
+- **Vollständigkeit:** In allen 13 Varianten des Performance-Tests kamen alle Logs, Traces, Ereignisse und Prozessabschlüsse an.
+- **Lange Einzelaufrufe unter Dauerfeuer:** Wenn mehrere Clients ohne Pause mehr senden, als die Server abarbeiten, wartet ein einzelner Aufruf in seltenen Fällen sehr lange. Gemessen wurde das in den Varianten mit Dauerfeuer:
+  - bis **10 s**, wenn der Client auf die Freigabe durch den überlasteten Server wartet (Abbremsen nach der Leistungsstufe)
+  - bis **5 s**, wenn der Ringpuffer des Clients voll ist (20.000 noch nicht bestätigte Meldungen) und der Client den Server nach dem Wasserstand fragt
+- **Ringpuffer voll:** Das trat in run 2344 bei Variante „2 Server, Dauerfeuer“ für alle drei Clients ein. Der Client gibt dann die ältesten Meldungen aus dem Ringpuffer auf und vermerkt das in `LILAM_LOG_INTERNAL`. Die Meldungen selbst kommen an; nur bei einem gleichzeitigen Serverausfall könnten sie nicht wiederholt werden.
+- Bei Last mit Pausen gab es solche Wartezeiten nicht: höchster Einzelaufruf 49–300 ms.
 
-#### D. Latenz-Verteilung (Analyse Mischlast)
-Die statistische Auswertung zeigt die Performance der Engine während eines parallelen Stresstests (1.300 EPS Hintergrundlast).
+Diese Wartezeiten sind bekannt und für die Überarbeitung vorgesehen (Befunde A1, A2 und F4 in der Befundliste zum Failover). Stabilität geht dabei vor Durchsatz.
 
+## Kosten des Failovers
 
-| Latenz-Klasse             | Anzahl Events | Anteil (%) | Bewertung                     |
-| :------------------------- | :------------ | :--------- | :---------------------------- |
-| **< 5 ms (Echtzeit)**      | 52.044        | **52,04 %**| System-Basisgeschwindigkeit   |
-| **5 - 20 ms (Sehr gut)**   | 1.721         | 1,72 %     | Minimale CPU-Wartezeit        |
-| **20 - 100 ms (Gut)**      | 10.802        | 10,80 %    | Leichte Ressourcen-Konflikte  |
-| **100 - 500 ms (Verz.)**   | 20.355        | 20,36 %    | 2-Thread Limit (Oracle Free)  |
-| **> 500 ms (Stau/I/O)**    | 15.078        | 15,08 %    | SSD / Redo-Log Sättigung      |
+Der Failover (Ringpuffer im Client, Laufnummern und Wasserstände im Server) wurde gegen den Stand ohne Failover (`main`) gemessen.
+- Messung: CPU-Zeit der Sessions aus `v$sesstat`, je 50.000 Aufrufe, 3 Runden im Wechsel, Median.
+- Skript: `2026-10-13_cpu_je_meldung.sql`
 
-**Interpretation der Ergebnisse:**
-Trotz massiver künstlicher Überlastung durch ein paralleles Producer-Paar verarbeitet die LILAM-Engine über **52 % aller Ereignisse in echter Echtzeit (< 5 ms)**. 
+| Stand | Server-CPU je Meldung | Client-CPU je Aufruf |
+|---|---|---|
+| ohne Failover (`main`) | 136 µs | 61 µs |
+| mit Failover, erste Fassung | 171 µs (+26 %) | 70 µs (+16 %) |
+| mit Failover, optimiert (aktueller Stand) | 150 µs (+10 %) | 67 µs (+11 %) |
 
-Die signifikanten Anteile in den höheren Latenz-Klassen (> 100 ms) sind direkt auf die physikalischen Limitierungen der Testumgebung zurückzuführen:
-1. **CPU-Flaschenhals:** Das 2-Thread-Limit der Oracle Free Edition erzwingt bei paralleler Last (Mischlast) Wartezeiten im OS-Scheduler.
-2. **I/O-Sättigung:** Die Erzeugung von knapp 4,5 GB Redo-Daten führt zu periodischen Schreibpausen der Notebook-SSD (Log File Sync), was die Ausreißer im Bereich > 500 ms erklärt.
+Die Optimierung bestand vor allem darin, den Header einer Nachricht ohne `JSON_VALUE` zu lesen. Gemessen wurde mit dem hierarchischen Profiler; Bericht: `test/autotest/PERFORMANCE/results/2026-10-13_hprof_failover.md`.
 
-*Analyse:* Während im unbelasteten Referenzlauf (Clean Run) über 95% der Events in unter 10ms verarbeitet wurden, belegt der Mischlast-Test, dass selbst bei extremer Hardware-Sättigung der Großteil der Daten verzögerungsfrei persistiert wird. Ausreißer korrelieren hierbei exakt mit den physischen Log-Switches der Datenbank.
+Die Arbeitszeit des Servers geht weiterhin zu einem großen Teil in das Lesen der Nachrichten-Payload mit `JSON_VALUE`; das gilt auch ohne Failover. Hier liegt das größte verbleibende Potenzial.
 
----
-**Zusammenfassende Bewertung:**
-Die Metriken belegen eine **100%ige Auslastung der Oracle Free Edition**. Insbesondere die hohen Werte im Bereich `library cache` verdeutlichen, dass die Software-Architektur (LILAM) die physikalischen Verwaltungsgrenzen der Datenbank-Instanz erreicht hat. Das System blieb trotz dieser massiven Sättigung zu jedem Zeitpunkt konsistent.
+## Selbst messen
 
-Die LILAM-Engine weist eine hohe algorithmische Effizienz auf. Validierungstests mit und ohne aktives Regelset (7 Regeln via Assoziativem Array) zeigten identische Durchsatzraten. Dies belegt, dass die logische Verarbeitungsebene im Vergleich zum physikalischen I/O-Durchsatz der Hardware vernachlässigbar geringen Overhead erzeugt. Das System ist somit für komplexe Regelwerke skalierbar, solange die I/O-Kapazität der Storage-Anbindung gewahrt bleibt.
+```sql
+-- Performance-Test (ca. 22 min, nur einzeln ausführen)
+@test/autotest/_COMMON/01_install_testbasis.sql
+@test/autotest/_COMMON/04_install_belastung.sql
+@test/autotest/_COMMON/05_install_performance.sql
+@test/autotest/PERFORMANCE/test_performance.sql
 
+-- Vergleich mit Logger: Logger 3.1.1 in einem eigenen Schema installieren, EXECUTE an das LILAM-Schema,
+-- dann Teil A und Teil B abwechselnd (siehe Kopf der Skripte)
+@test/autotest/PERFORMANCE/2026-10-13_vergleich_logger_a_lilam.sql
+@test/autotest/PERFORMANCE/2026-10-13_vergleich_logger_b_logger.sql
+```
+
+Für die Messungen nur einzeln ausführen: Andere Last in der Datenbank verfälscht die Zahlen.

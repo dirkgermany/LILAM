@@ -12,6 +12,7 @@ _COMMON/                    Testbasis (einmalig installieren)
   02_aufraeumen.sql           stoppt alle Test-Server und -Jobs
   03_ergebnisse.sql           Übersicht der Testläufe
   04_install_belastung.sql    Tabellen LTB_* und Package LTB für die Belastungstests
+  05_install_performance.sql  Tabellen LTP_* und Package LTP für den Performance-Test
 
 INSESSION/                  LILAM als Bibliothek in der Session der Anwendung
   LASTTEST/  MASSENTEST/  PARALLELBETRIEB/  PROZESSZYKLEN/  DAUERTEST/
@@ -24,12 +25,15 @@ DECOUPLED/
 
 FEATURES/                   Funktionstests einzelner Merkmale (modusübergreifend)
   BASELINE_SCOPE/  LOGTEXT_GRENZEN/  DISPATCHER_APEX/  FEHLERFAELLE/  SERVERAUSWAHL/  SPEICHER/  REGELN/  REGELN_LAST/
-  RUECKSCHREIBUNG/  LEERLAUF_FLUSH/
+  RUECKSCHREIBUNG/  LEERLAUF_FLUSH/  FAILOVER/  RUECKSTAU/
 
 DAUERTEST/                  Dauertest über alle Modi gleichzeitig (Kombination der Tests)
 
 BELASTUNG/                  Belastungstests: Laststufen bis zur Grenze (Konzept in BELASTUNG/README.md)
   KAPAZITAET_SERVER/  SKALIERUNG/  DAUERLAST_MIX/  DISPATCHER_ENGPASS/  APEX_STURM/  BATCHSTART/  FEHLERKASKADE/
+
+PERFORMANCE/                Performance-Test: Durchsatz und Aufrufdauer INSESSION und DECOUPLED, ohne und mit Regeln
+                            (für Leser ohne Vorkenntnisse aufbereitet in PERFORMANCE/README.md)
 
 ```
 
@@ -62,6 +66,8 @@ So kann der Dauertest dieselben Tests wiederverwenden. FEHLERFAELLE und DISPATCH
 | FEATURES/LOGTEXT_GRENZEN | Kürzung langer Logtexte (1.500–5.000 Zeichen, Umlaute); INSESSION und SERVER | 9 Texte je Modus |
 | FEATURES/DISPATCHER_APEX | APEX/AJAX mit Connection Pool: jeder Request ein eigener Job mit leerem PGA, Trace über zwei Requests, parallele Requests, Request ohne Dispatcher, veraltete ID nach CLOSE | 13 Requests |
 | FEATURES/FEHLERFAELLE | Störungen ohne Wirkung auf die Anwendung: kein Server, negative/veraltete ID, Handshake über Dispatcher, verfallene NEW_PROCESS-Anfrage | 6 Fälle |
+| FEATURES/FAILOVER | `test_failover.sql`: ein Worker wird abgebrochen, ein zweiter übernimmt den Prozess (`ADOPT_PROCESS`), der Client wiederholt aus dem Ringpuffer; alle Logs genau einmal, Events lückenlos, offener Trace übernommen. `test_failover_close.sql` (FAILOVER_CLOSE): der Worker fällt unmittelbar vor `CLOSE_PROCESS` aus; `CLOSE_PROCESS` blockiert nicht, spätere Aufrufe derselben Session lösen die Übernahme aus, Daten und `CLOSE_PROCESS` werden nachgeholt. `test_failover_busy.sql` (FAILOVER_BUSY): ein Worker ist 22 s blockiert (Sperre auf seiner Registry-Zeile), sein Job läuft weiter; es darf kein Failover geben, keine doppelten Logs; nur SERVER. `test_failover_dispatcher.sql` (FAILOVER_DISPATCHER): wie FAILOVER, aber der Client sendet über den Dispatcher `LT_DISP`; die Route muss danach auf den neuen Worker zeigen | 1 bzw. 2 Prozesse, je ca. 10–30 s |
+| FEATURES/RUECKSTAU | `test_pipe_voll.sql` (PIPE_VOLL): ein Worker liest seine Pipe 25 s nicht (Sperre auf seiner Registry-Zeile), 3 Client-Jobs senden gleichzeitig je 4.000 Meldungen zu 2 KB, bis die Pipe (16 MB) voll ist; der Client hält Meldungen im Ringpuffer zurück und sendet sie in Reihenfolge nach. Alle Logs genau einmal und in Reihenfolge, kein Aufruf über 2 s; legt `PV_CLIENT` und `PV_CLIENT_RES` an; nur SERVER. `test_dispatcher_voll.sql` (DISPATCHER_VOLL): wie PIPE_VOLL, aber über den Dispatcher; ein zweiter Client auf einem anderen Worker darf nicht ausgebremst werden, der Server erkennt die Lücke der verworfenen Meldungen, der Client wiederholt ab dort; legt `DV_CLIENT` und `DV_CLIENT_RES` an | 2–3 Prozesse, je ca. 1–1,5 min |
 | FEATURES/SERVERAUSWAHL | Dispatcher wird nie als Ziel der Serverauswahl gewählt; Last verteilt sich auf die Worker (je Worker mind. 30 %), ohne und mit Dispatcher | 2 Clients × 20 Prozesse |
 | FEATURES/SPEICHER | kein Speicherverlust: PGA-Wachstum je Prozess von Session/Client, Workern und Dispatcher (Median aus 5 Messblöcken, max. 100 Byte); Fallback beim Schreiben (fehlerhafte Zeile übersprungen und protokolliert, übrige geschrieben); INSESSION, SERVER, DISPATCHER. Benötigt `00_grants_als_sys.sql` | je Modus 2.000 + 5 × 1.000 Prozesse, ca. 7 min |
 | FEATURES/REGELN | Rules Engine im SERVER- und INSESSION-Modus mit eigenem Rule Set `LT_REGELN`: Laden per API und nach Neustart, Server laden ein geändertes Rule Set auch ohne UPDATE_RULE-Nachricht (L6), Ablehnung ungültiger Rule Sets, Vorgänger/Nachfolger, Abstand, Dauer, Häufigkeit, Abweichung, Prozess- und Log-Regeln, Kontext-/Action-Regel, Drosselung, Alert-Zeile und Signal; INSESSION zusätzlich ohne Gruppe, Groß-/Kleinschreibung der Gruppe, Versionswechsel nach der 15-s-Prüfung, ungültiges und fehlendes Rule Set. Nur einzeln (ändert das Rule Set der Gruppe LT) | ca. 45 Prozesse, 2–3 Server, ca. 2,5 min |
@@ -128,3 +134,11 @@ Konfiguration ermitteln und das Verhalten an der Grenze prüfen (keine Datenverl
 Auswirkung auf die Anwendung, saubere Erholung nach Lastende). Die Logik steht im Package `LTB`
 (`_COMMON/04_install_belastung.sql`), das die Hilfen aus `LT` nutzt. Bekannte Grenze aus PARALLELBETRIEB
 run_id 27–30: DBMS_PIPE fällt bei mehreren gleichzeitigen Sendern auf ca. 2.800 Nachrichten/s je Pipe.
+
+## Performance-Test
+
+Der Test unter `PERFORMANCE/` misst, wie viel Zeit ein LILAM-Aufruf die Anwendung kostet und wie schnell die Daten
+in der Datenbank stehen: 3 Clients, INSESSION und DECOUPLED mit 1, 2 und 3 Servern, Dauerfeuer und mit Pausen,
+Ab- und Anmelden unter Last, dazu 5 Clients ohne und mit Regeln. Logik im Package `LTP`
+(`_COMMON/05_install_performance.sql`, nutzt `LT` und `LTB`), Laufzeit ca. 22 min. Ergebnisse und Erklärung in
+`PERFORMANCE/README.md`.
