@@ -57,13 +57,24 @@ In run 2219 hat der Sampler den Sprung eingefangen. Session LT_S2, Job-Slave J00
 
 **Widerlegte Vermutung:** neue Extents beim Wachstum geleerter Tabellen. Eine Hilfstabelle (`LT_DIAG_EXT`) ist auf 208 MB mit 17 Extents zu 8 MB gewachsen; die PGA der Session blieb unverändert bei 5.201 KB.
 
-**Offen:**
-- Was Oracle bei `direct path sync` in diesem Moment anlegt, lässt sich ohne `v$sql` (Text von `dy38sj29zz4f6`) und `v$process_memory` (Kategorie des Speichers) nicht feststellen. Beides ist für LILAM_TEST nicht freigegeben.
-- Mit SYS-Rechten lässt sich der Text lesen:
-  `select sql_text from v$sql where sql_id = 'dy38sj29zz4f6';`
+**Text der Anweisung** (von Dirk als SYS ermittelt, 13.10.2026):
+
+`dy38sj29zz4f6` = `update LILAM_PROC set process_end = systimestamp, last_update = systimestamp where id = :PH_PROCESS_ID`
+
+- Das ist das Schließen eines Prozesses in `persist_close_process`, dynamisch über `DBMS_SQL` in einer autonomen Transaktion. Diese Variante kommt ohne Info, Status und Schritte aus.
+- Die Prozedur ist identisch mit `main`; der Cursor wird auch im Fehlerfall geschlossen.
+- Sie läuft im Server bei jedem CLOSE und INSESSION in der Client-Session. Das erklärt, warum der Sprung in beiden Session-Arten vorkommt.
+
+**Weiter offen:**
+- Warum dieses `UPDATE` über den Index auf `ID` einmalig auf `direct path sync` wartet und dabei 33 MB belegt, bleibt ohne `v$sql_plan`, `v$process_memory` und `v$sesstat` offen.
+- Auffällig an `LILAM_PROC`:
+  - Die Optimizer-Statistiken stammen von vor dem Leeren der Tabellen (`num_rows` 150.914).
+  - `ID` hat keinen Primärschlüssel, nur den nicht eindeutigen Index `LILAM_PROC_IX_ID`.
+  - Beides ist auf `main` genauso und hat mit dem Failover nichts zu tun.
 
 ## Bewertung
 
+- Der Sprung entsteht im `UPDATE` beim Schließen eines Prozesses, einem Codeteil, den `fallback` nicht verändert hat.
 - Ein Leck des Failover-Codes liegt nicht vor. Das Wachstum entspricht `main`, und die Sprünge werden nach etwa einer Minute wieder freigegeben.
 - Gefährlich wäre ein Sprung nur, wenn er sich in vielen Sessions gleichzeitig ereignet. Er betraf aber jeweils eine Session, und er verschwand wieder.
 - Die Prüfung in SPEICHER (Median über 5 Blöcke) fängt einen einzelnen Sprung ab. In run 2177 lag der Median trotzdem knapp über der Grenze (107 B); dort lagen auch die übrigen Blöcke hoch (121, 80, 107).
