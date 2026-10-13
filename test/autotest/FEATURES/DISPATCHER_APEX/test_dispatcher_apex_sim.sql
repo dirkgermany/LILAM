@@ -144,6 +144,7 @@ begin
 
   -- Auswertung
   select max(pid) into l_pid from lt_sim_result where step = 'R0';
+  l_num := lt.wait_closed(l_pid);   -- CLOSE_PROCESS sendet ohne Warten: Schliessen im Server abwarten
 
   select count(*) into l_cnt from lt_sim_result where info != 'OK';
   lt.check_that(l_run, 'Alle Requests ohne Exception', l_cnt = 0, l_cnt || ' mit Fehler');
