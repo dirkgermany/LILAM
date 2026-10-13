@@ -3027,7 +3027,7 @@ AS
             execute immediate 'alter table ' || C_LILAM_WATERMARK || ' add (gap_from NUMBER)';
         exception
             when others then
-                if sqlcode not in (-1430, -54) then   -- column exists / table in use by another server
+                if sqlcode not in (-1430, -54, -14411) then   -- column exists / table in use / concurrent DDL by another server
                     raise;
                 end if;
         end;
