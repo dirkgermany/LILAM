@@ -2245,7 +2245,9 @@ AS
 
     -- Reads the watermarks of the process for this client from LILAM_WATERMARK, trims the ring buffer
     -- and measures the lag of the server (see measureLag). A gap reported by the server starts a repetition.
-    procedure refreshWatermarks(p_processId number)
+    -- p_checkAlways: check the server at every stall, not only from a lag of C_FAILOVER_HEARTBEAT_AGE_SEC
+    -- (CLOSE and full ring buffer, both rare).
+    procedure refreshWatermarks(p_processId number, p_checkAlways boolean default false)
     as
         l_log  NUMBER;
         l_mon  NUMBER;
@@ -2272,12 +2274,20 @@ AS
         end if;
         -- Nothing committed since the last check although messages are waiting: is the server still alive?
         -- (fire-and-forget gives no other sign of a failure; only a dead heartbeat leads to a takeover)
+        -- PERFORMANCE (befunde fallback D4): the heartbeat is only checked from a lag of C_FAILOVER_HEARTBEAT_AGE_SEC.
+        -- Before that the server cannot count as failed (its heartbeat is younger); in normal operation the stall
+        -- between two flushes therefore costs no queries. Limit: the lag relies on every C_RING_CHECK_EVERY_NO-th
+        -- message, a failure may be noticed up to that many messages later. CLOSE checks at once (p_checkAlways):
+        -- after a long pause its messages are new, while the heartbeat of a failed server is already old.
+        -- A full ring buffer as well: otherwise a fast client would give up messages before the lag reaches 5 s.
         if nvl(l_log, 0) <= g_ring_meta(p_processId).wm_log
            and nvl(l_mon, 0) <= g_ring_meta(p_processId).wm_mon
            and nvl(l_proc, 0) <= g_ring_meta(p_processId).wm_proc
            and g_ring.EXISTS(p_processId) and g_ring(p_processId).COUNT > 0 then
             measureLag(p_processId, l_nowCs);
-            checkServerAfterTimeout(p_processId);
+            if p_checkAlways or g_ring_meta(p_processId).lag_ms >= C_FAILOVER_HEARTBEAT_AGE_SEC * 1000 then
+                checkServerAfterTimeout(p_processId);
+            end if;
             return;
         end if;
         g_ring_meta(p_processId).wm_log  := greatest(g_ring_meta(p_processId).wm_log,  nvl(l_log, 0));
@@ -2358,7 +2368,7 @@ AS
         while g_ring(p_processId).COUNT >= C_CLIENT_RINGBUFF_MAX
               and (dbms_utility.get_time - l_startCs) * 10 < C_RING_FULL_MAX_WAIT_MS loop
             brake(p_processId, C_BRAKE_SLEEP3_MS, 'ring buffer full');
-            refreshWatermarks(p_processId);
+            refreshWatermarks(p_processId, p_checkAlways => TRUE);
         end loop;
 
         -- Still full: give up the oldest tenth (not pinned) so that the buffer does not grow without limit
@@ -2436,7 +2446,7 @@ AS
             g_ring(p_processId)(p_seq).kept_cs := dbms_utility.get_time;
         end if;
         if g_ring(p_processId).COUNT >= C_CLIENT_RINGBUFF_MAX then
-            refreshWatermarks(p_processId);
+            refreshWatermarks(p_processId, p_checkAlways => TRUE);
             if g_ring(p_processId).COUNT >= C_CLIENT_RINGBUFF_MAX then
                 relieveRing(p_processId);
             end if;
@@ -5920,7 +5930,7 @@ AS
         -- STABILITY (befunde fallback A3): last check for a gap reported by the server before the CLOSE; the
         -- repetition including the CLOSE is sent by sendHeldOnClose. One query per CLOSE.
         if g_ring_meta.EXISTS(p_processId) then
-            refreshWatermarks(p_processId);
+            refreshWatermarks(p_processId, p_checkAlways => TRUE);
         end if;
         sendNoWait(p_processId, 'CLOSE_SESSION', 'P', l_payload, C_SEND_TIMEOUT_SEC);
         sendHeldOnClose(p_processId);
