@@ -75,8 +75,59 @@ Die Reihenfolge richtet sich nach der Wirkung. Umgesetzt wird erst nach Dirks Fr
 
 V1 bis V3 zusammen sollten die Mehrkosten von `fallback` größtenteils aufheben. Mit V5 dürfte der Server schneller werden als `main` heute.
 
+## Umsetzung V1, V2, V3, V5 (13.10.2026, auf Dirks Freigabe)
+
+**Änderungen:**
+
+| Nr. | Umsetzung |
+|---|---|
+| V5 | Neue Funktion `headerValue(p_message, p_key)` liest ein Header-Feld ohne `JSON_VALUE`. `extractClientChannel` und `extractClientRequest` nutzen sie. Fällt bei jedem anderen Aufbau auf `JSON_VALUE` zurück (Header nicht am Anfang, Wert nicht abgeschlossen). |
+| V1 | `noteMessageSeq` liest Laufnummer und Client-ID mit `headerValue` und die Prozess-ID mit der neuen Funktion `payloadProcessId`. Diese erkennt die Prozess-ID nur unmittelbar hinter dem Header, sonst `JSON_VALUE`. |
+| V2 | `noteMessageSeq` merkt sich den Wasserstands-Schlüssel der letzten Meldung (`g_wm_last_pid/cid/key`). |
+| V3 | `sendNoWait` erhält den Ringpuffer-Typ als Konstante vom Aufrufer (`p_ringType`); die Funktion `ringMsgType` entfällt. Außerdem: `g_client_id` direkt; `serverFailed` nur, wenn `g_failed_server.COUNT > 0`; `keepInRing` weist die Felder direkt im Array-Element zu (eine Kopie der Meldung weniger). |
+
+**Gegenprobe vor den Tests:** Eine wortgleiche Kopie von `headerValue` und `payloadProcessId` wurde gegen `JSON_VALUE` geprüft, an 8 Nachrichten mit 7 Feldern: 56 Vergleiche, keine Abweichung. Geprüft wurden:
+- Header von `sendNoWait` und `jsonPut` (mit Leerzeichen)
+- wiederholte Meldungen (`rp`, `pin`)
+- ein Log-Text mit `}` und `"seq":99`
+- ein Header mit Leerzeichen; er fällt auf `JSON_VALUE` zurück
+
+**Regression:** run 2279–2317, 39 Runs, alle bestanden.
+
+**Profil** (HPROF-Run 15–18, je 25.000 Meldungen):
+
+| Messwert | `main` | `fallback` vorher | `fallback` optimiert |
+|---|---|---|---|
+| Client-Arbeitszeit | 2.395 / 2.624 ms | 3.648 / 3.640 ms | 2.807 / 2.139 ms |
+| Server `noteMessageSeq` (eigene Zeit) | – | 956 / 1.220 ms | 242 / 191 ms |
+| Server `extractClientChannel` + `extractClientRequest` | 744 / 782 ms | 695 / 911 ms | 54 / 30 ms |
+| Server: Header lesen insgesamt (mit `headerValue`, `payloadProcessId`) | 744 / 782 ms | 1.750 / 2.217 ms | 1.100 / 931 ms |
+
+**CPU-Zeit ohne Profiler** (`PERFORMANCE/2026-10-13_cpu_je_meldung.sql`, `v$sesstat`, je 3 Runden zu 50.000 Aufrufen im Wechsel, Median):
+
+| Stand | Server-CPU je Meldung | Client-CPU je Aufruf | Wanduhr Client |
+|---|---|---|---|
+| `main` | 136 µs | 61 µs | 8.975 ms |
+| `fallback` vor V1–V5 (42fb44f) | 171 µs (+26 %) | 70 µs (+16 %) | 10.382 ms (+16 %) |
+| `fallback` optimiert | 150 µs (+10 %) | 67 µs (+11 %) | 9.626 ms (+7 %) |
+
+**Durchsatz:** Wechselvergleich run 2318–2335 sowie LASTTEST im Wechsel run 2336–2343. Er streut so stark, dass die Verbesserung darin nicht sicher nachweisbar ist:
+
+| Test | `main` | `fallback` optimiert |
+|---|---|---|
+| LASTSPITZE SERVER | 27.900 / 37.898 / 23.603 | 20.336 / 46.241 / 23.654 |
+| LASTSPITZE DISPATCHER | 12.548 / 12.552 / 11.158 | 7.589 / 10.971 / 11.780 |
+| LASTTEST SERVER, 7 Runden (calls/s) | 6.082 / 6.761 / 5.978 / 6.291 / 7.134 / 5.872 / 5.743 | 3.330 / 3.402 / 5.312 / 5.836 / 5.011 / 5.041 / 3.686 |
+
+Die CPU-Messung ist für solche Vergleiche auf dieser Umgebung besser geeignet.
+
+**Was bleibt:** Server etwa +14 µs je Meldung (Laufnummern, Wasserstände, `headerValue`), Client etwa +6 µs je Aufruf (Ringpuffer, längere Nachricht).
+- Weiteres Potenzial liegt in der Payload, die der Server auf beiden Ständen weiter mit `JSON_VALUE` liest (`jsonString`, `jsonNumber`, etwa 40 µs je Meldung).
+- Das ist kein Failover-Thema und war nicht Teil der Freigabe.
+
 ## Fazit
 
-- Der Mehraufwand von `fallback` sitzt vor allem in `noteMessageSeq` mit drei `JSON_VALUE` je Meldung im Server.
+- Der Mehraufwand von `fallback` saß vor allem in `noteMessageSeq` mit drei `JSON_VALUE` je Meldung im Server.
+- Nach V1–V3 und V5 ist er auf etwa ein Drittel bis die Hälfte geschrumpft: Server-CPU +10 % statt +26 %, Client-CPU +11 % statt +16 %.
 - Im Client kommen kleinere Posten hinzu (Ringpuffer, Header, Hilfsaufrufe).
 - Unabhängig vom Failover verbraucht `JSON_VALUE` auch auf `main` 35–40 % der Arbeitszeit des Servers.

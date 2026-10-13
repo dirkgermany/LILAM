@@ -246,6 +246,10 @@ AS
     );
     TYPE t_watermark_map IS TABLE OF t_watermark_rec INDEX BY VARCHAR2(70);
     g_watermarks t_watermark_map;
+    -- Key of the last message in noteMessageSeq (process, client): reused for the next message of the same pair
+    g_wm_last_pid NUMBER;
+    g_wm_last_cid VARCHAR2(40);
+    g_wm_last_key VARCHAR2(70);
     g_watermark_table_ok BOOLEAN := FALSE;       -- LILAM_WATERMARK checked/created in this session
     -- Watermarks for the next flushBatch (same transaction as the data)
     TYPE t_watermark_batch_rec IS RECORD (
@@ -776,10 +780,61 @@ AS
     as
     begin
         return JSON_VALUE(p_json_doc, '$.' || jsonPath returning NUMBER);
-    exception 
+    exception
         when others then
         logLilamErr(sqlCode, sqlErrM, 'jsonNumber', 'JSON_VALUE');
         return null;
+    end;
+
+    --------------------------------------------------------------------------
+
+    -- Reads a field of the message header, like JSON_VALUE(p_message, '$.header.<p_key>').
+    -- PERFORMANCE: without JSON_VALUE. The server reads several header fields of every message; with JSON_VALUE
+    -- that took 35-40 % of its working time (profile 13.10.2026, befunde fallback F3).
+    -- Prerequisite: the message starts with the header, and the header is a flat object whose keys and values
+    -- LILAM sets itself (request names, pipe names, numbers, client ID): no braces, quotation marks or escapes.
+    -- This holds for sendNoWait ('{"header":{"msg_type":"API_CALL","request":"..","seq":n,"cid":".."}') and for
+    -- jsonPut ('{"header":{"msg_type":"API_CALL", "request":"..", "response":".."}'). Any other layout
+    -- (e.g. a message written by hand with blanks before the header) falls back to JSON_VALUE.
+    function headerValue(p_message varchar2, p_key varchar2) return varchar2
+    as
+        l_end  PLS_INTEGER;   -- end of the header object
+        l_pos  PLS_INTEGER;
+        l_stop PLS_INTEGER;
+    begin
+        if substr(p_message, 1, 11) != '{"header":{' then
+            return JSON_VALUE(p_message, '$.header.' || p_key);
+        end if;
+        l_end := instr(p_message, '}', 12);
+        l_pos := instr(p_message, '"' || p_key || '":', 12);
+        if l_end = 0 or l_pos = 0 or l_pos > l_end then
+            return null;   -- key not in the header
+        end if;
+
+        l_pos := l_pos + length(p_key) + 3;
+        while substr(p_message, l_pos, 1) = ' ' loop
+            l_pos := l_pos + 1;
+        end loop;
+
+        if substr(p_message, l_pos, 1) = '"' then
+            -- text value: up to the next quotation mark (an escaped one cannot occur, see above)
+            l_stop := instr(p_message, '"', l_pos + 1);
+            if l_stop = 0 or l_stop > l_end then
+                return JSON_VALUE(p_message, '$.header.' || p_key);
+            end if;
+            return substr(p_message, l_pos + 1, l_stop - l_pos - 1);
+        end if;
+
+        -- number (or null/true/false): up to the next comma or the end of the header
+        l_stop := instr(p_message, ',', l_pos);
+        if l_stop = 0 or l_stop > l_end then
+            l_stop := l_end;
+        end if;
+        return nullif(trim(substr(p_message, l_pos, l_stop - l_pos)), 'null');
+    exception
+        when others then
+            logLilamErr(sqlCode, sqlErrM, 'headerValue');
+            return JSON_VALUE(p_message, '$.header.' || p_key);
     end;
 
     --------------------------------------------------------------------------
@@ -2022,19 +2077,12 @@ AS
     --------------------------------------------------------------------------
     -- Failover: ring buffer in the client
     --------------------------------------------------------------------------
-    -- Buffer type on the server for a fire-and-forget request (see noteMessageSeq)
-    FUNCTION ringMsgType(p_request VARCHAR2) RETURN VARCHAR2 AS
-    BEGIN
-        RETURN CASE p_request
-                   WHEN 'LOG_ANY'        THEN 'L'
-                   WHEN C_MARK_EVENT     THEN 'M'
-                   WHEN 'START_TRACE'    THEN 'M'
-                   WHEN 'STOP_TRACE'     THEN 'M'
-                   WHEN 'SET_ANY_STATUS' THEN 'P'
-                   WHEN 'PROC_STEP_DONE' THEN 'P'
-                   WHEN 'CLOSE_SESSION'  THEN 'P'   -- repeated after a takeover until process_end is committed
-               END;
-    END;
+    -- Buffer type on the server for a fire-and-forget request: each caller of sendNoWait passes it as a constant
+    -- (p_ringType), the server determines it the same way in noteMessageSeq:
+    --   L  LOG_ANY
+    --   M  MARK_EVENT, START_TRACE, STOP_TRACE
+    --   P  SET_ANY_STATUS, PROC_STEP_DONE, CLOSE_SESSION (repeated after a takeover until process_end is committed)
+    -- PERFORMANCE: previously the function ringMsgType determined it per message with a CASE (befunde fallback F3).
 
     --------------------------------------------------------------------------
 
@@ -2162,23 +2210,26 @@ AS
     -- so that also a message that cannot be sent (full pipe, failed server) can be repeated later.
     -- PERFORMANCE: per message one entry in an associative array; the watermarks are read at most
     -- every C_RING_WATERMARK_CHECK_MS, and the time is only checked every C_RING_CHECK_EVERY_NO messages.
-    procedure keepInRing(p_processId number, p_seq PLS_INTEGER, p_request varchar2, p_msg varchar2, p_traceKey varchar2)
+    -- p_ringType: buffer type on the server, L(og), M(onitor) or P(rocess), given by the caller (see sendNoWait)
+    procedure keepInRing(p_processId number, p_seq PLS_INTEGER, p_request varchar2, p_ringType varchar2, p_msg varchar2, p_traceKey varchar2)
     as
-        l_rec   t_ring_msg_rec;
         l_meta  t_ring_meta_rec;
         l_empty t_ring_tab;
         l_pins  t_trace_pin_tab;
     begin
-        l_rec.msg_type := ringMsgType(p_request);
-        if l_rec.msg_type is null then
+        if p_ringType is null then
             return;
         end if;
-        l_rec.msg := p_msg;
 
         if not g_ring.EXISTS(p_processId) then
             g_ring(p_processId) := l_empty;
             g_ring_meta(p_processId) := l_meta;
         end if;
+
+        -- PERFORMANCE: assign the fields directly in the array element. Previously the message (up to 8,000
+        -- characters) was copied twice, into a local record and from there into the ring buffer (befunde fallback F3).
+        g_ring(p_processId)(p_seq).msg_type := p_ringType;
+        g_ring(p_processId)(p_seq).msg      := p_msg;
 
         -- Open traces: pin the TRACE_START, release it with the matching TRACE_STOP
         if p_traceKey is not null then
@@ -2193,12 +2244,10 @@ AS
                 g_trace_pins(p_processId).DELETE(p_traceKey);
             end if;
             if p_request = 'START_TRACE' then
-                l_rec.trace_key := p_traceKey;
+                g_ring(p_processId)(p_seq).trace_key := p_traceKey;
                 g_trace_pins(p_processId)(p_traceKey) := p_seq;
             end if;
         end if;
-
-        g_ring(p_processId)(p_seq) := l_rec;
 
         g_ring_meta(p_processId).since_check := g_ring_meta(p_processId).since_check + 1;
         if g_ring(p_processId).COUNT >= C_CLIENT_RINGBUFF_MAX then
@@ -2313,7 +2362,8 @@ AS
     procedure sendNoWait(
         p_processId     in number,
         p_request       in varchar2, -- Needed for assignment/branching in the server
-        p_payload       IN varchar2, 
+        p_ringType      in varchar2, -- buffer type for the ring buffer: L, M or P (see keepInRing)
+        p_payload       IN varchar2,
         p_timeoutSec    IN PLS_INTEGER,
         p_traceKey      IN varchar2 DEFAULT NULL  -- START_TRACE/STOP_TRACE: key of the trace (ring buffer)
     )
@@ -2330,15 +2380,17 @@ AS
         -- p_request is always an internal constant and does not need to be escaped.
         -- Failover: sequence number per process and client session (see LILAM_WATERMARK)
         g_msg_seq(p_processId) := CASE WHEN g_msg_seq.EXISTS(p_processId) THEN g_msg_seq(p_processId) + 1 ELSE 1 END;
+        -- PERFORMANCE: g_client_id directly; getClientId only once per session (COALESCE evaluates lazily)
         l_jsonMain := '{"header":{"msg_type":"API_CALL","request":"' || p_request
-                   || '","seq":' || g_msg_seq(p_processId) || ',"cid":"' || getClientId || '"}'
+                   || '","seq":' || g_msg_seq(p_processId) || ',"cid":"' || coalesce(g_client_id, getClientId) || '"}'
                    || case when p_payload is not null then ',"payload":' || p_payload end
                    || '}';
         -- Failover: keep the message until the server has committed it (also if it cannot be sent now)
-        keepInRing(p_processId, g_msg_seq(p_processId), p_request, l_jsonMain, p_traceKey);
+        keepInRing(p_processId, g_msg_seq(p_processId), p_request, p_ringType, l_jsonMain, p_traceKey);
 
-        -- STABILITY: the server of the process has failed: do not wait for timeouts
-        if serverFailed(p_processId) then
+        -- STABILITY: the server of the process has failed: do not wait for timeouts.
+        -- PERFORMANCE: in normal operation no server has failed; no call of serverFailed per message.
+        if g_failed_server.COUNT > 0 and serverFailed(p_processId) then
             return;
         end if;
 
@@ -2540,6 +2592,35 @@ AS
 
     --------------------------------------------------------------------------
 
+    -- Process ID of a message from sendNoWait, like JSON_VALUE(p_message, '$.payload.process_id' RETURNING NUMBER).
+    -- The payload directly follows the header and starts with the process ID: '..},"payload":{"process_id":123,..'.
+    -- PERFORMANCE: without JSON_VALUE (befunde fallback F3, see headerValue). Any other layout falls back to JSON_VALUE.
+    function payloadProcessId(p_message varchar2) return number
+    as
+        C_PATTERN constant varchar2(30) := '},"payload":{"process_id":';
+        l_pos  PLS_INTEGER;
+        l_stop PLS_INTEGER;
+        l_brace PLS_INTEGER;
+    begin
+        l_pos := instr(p_message, C_PATTERN);
+        -- STABILITY: only directly behind the header (its first closing brace), not inside a text of the application
+        if l_pos = 0 or l_pos != instr(p_message, '}') then
+            return JSON_VALUE(p_message, '$.payload.process_id' RETURNING NUMBER);
+        end if;
+        l_pos   := l_pos + length(C_PATTERN);
+        l_stop  := instr(p_message, ',', l_pos);
+        l_brace := instr(p_message, '}', l_pos);
+        if l_stop = 0 or (l_brace > 0 and l_brace < l_stop) then
+            l_stop := l_brace;
+        end if;
+        return to_number(substr(p_message, l_pos, l_stop - l_pos));
+    exception
+        when others then
+            return JSON_VALUE(p_message, '$.payload.process_id' RETURNING NUMBER);
+    end;
+
+    --------------------------------------------------------------------------
+
     -- Notes the sequence number of a fire-and-forget message before it is processed.
     -- Each such message affects exactly one buffer type of its process: logs, monitor or process record.
     -- Returns FALSE for a message this server already has (repeated after a failover): skip it.
@@ -2566,7 +2647,9 @@ AS
             return TRUE;
         end if;
 
-        l_seq := JSON_VALUE(p_message, '$.header.seq' RETURNING NUMBER);
+        -- PERFORMANCE: headerValue and payloadProcessId instead of JSON_VALUE. The three JSON_VALUE calls cost
+        -- 38-49 us per message, most of the additional work of the failover in the server (befunde fallback F3).
+        l_seq := to_number(headerValue(p_message, 'seq'));
         if l_seq is null then
             return TRUE;   -- client without sequence numbers (older version)
         end if;
@@ -2576,13 +2659,21 @@ AS
             return TRUE;
         end if;
         g_replay_check := substr(p_message, 1, 18) = '{"header":{"rp":1,';
-        l_cid := JSON_VALUE(p_message, '$.header.cid');
-        l_pid := JSON_VALUE(p_message, '$.payload.process_id' RETURNING NUMBER);
+        l_cid := headerValue(p_message, 'cid');
+        l_pid := payloadProcessId(p_message);
         if l_cid is null or l_pid is null then
             return TRUE;
         end if;
 
-        l_key := buildWatermarkKey(l_pid, l_cid);
+        -- PERFORMANCE: consecutive messages mostly come from the same process and client; reuse the key
+        if l_pid = g_wm_last_pid and l_cid = g_wm_last_cid then
+            l_key := g_wm_last_key;
+        else
+            l_key := buildWatermarkKey(l_pid, l_cid);
+            g_wm_last_pid := l_pid;
+            g_wm_last_cid := l_cid;
+            g_wm_last_key := l_key;
+        end if;
         if not g_watermarks.EXISTS(l_key) then
             l_rec.process_id := l_pid;
             l_rec.client_id  := l_cid;
@@ -4028,7 +4119,7 @@ AS
                   || jStr('context_name', p_contextName)
                   || jTs ('timestamp',    p_timestamp) || '}';
 
-        sendNoWait(p_processId, 'START_TRACE', l_payload, C_SEND_TIMEOUT_SEC,
+        sendNoWait(p_processId, 'START_TRACE', 'M', l_payload, C_SEND_TIMEOUT_SEC,
                    buildMonitorKey(p_processId, p_actionName, p_contextName));
 
     EXCEPTION
@@ -4053,7 +4144,7 @@ AS
                   || jStr('context_name', p_contextName)
                   || jTs ('timestamp',    p_timestamp) || '}';
 
-        sendNoWait(p_processId, 'STOP_TRACE', l_payload, C_SEND_TIMEOUT_SEC,
+        sendNoWait(p_processId, 'STOP_TRACE', 'M', l_payload, C_SEND_TIMEOUT_SEC,
                    buildMonitorKey(p_processId, p_actionName, p_contextName));
 
     EXCEPTION
@@ -4082,7 +4173,7 @@ AS
                   || jStr('context_name', p_contextName)
                   || jTs ('timestamp',    p_timestamp) || '}';
 
-        sendNoWait(p_processId, C_MARK_EVENT, l_payload, C_SEND_TIMEOUT_SEC);
+        sendNoWait(p_processId, C_MARK_EVENT, 'M', l_payload, C_SEND_TIMEOUT_SEC);
 
     EXCEPTION
         WHEN OTHERS THEN
@@ -5298,7 +5389,7 @@ AS
         -- the full second, performance test 08.10.2026); the response was not evaluated anyway.
         -- The order is kept: CLOSE travels through the same pipe as the data of the process.
         -- Not via the control pipe (like NEW_PROCESS): CLOSE would overtake the data of its own process.
-        sendNoWait(p_processId, 'CLOSE_SESSION', l_payload, C_SEND_TIMEOUT_SEC);
+        sendNoWait(p_processId, 'CLOSE_SESSION', 'P', l_payload, C_SEND_TIMEOUT_SEC);
 
     EXCEPTION
         WHEN OTHERS THEN
@@ -5318,7 +5409,7 @@ AS
         l_payload := '{"process_id":' || jNum(p_processId)
                   || jTs('timestamp', p_timestamp) || '}';
 
-        sendNoWait(p_processId, 'PROC_STEP_DONE', l_payload, C_SEND_TIMEOUT_SEC);
+        sendNoWait(p_processId, 'PROC_STEP_DONE', 'P', l_payload, C_SEND_TIMEOUT_SEC);
     end;
     --------------------------------------------------------------------------
 
@@ -5335,7 +5426,7 @@ AS
                   || jNum('process_immortal', p_immortal)
                   || jTs ('timestamp',        p_timestamp) || '}';
 
-        sendNoWait(p_processId, 'SET_ANY_STATUS', l_payload, C_SEND_TIMEOUT_SEC);
+        sendNoWait(p_processId, 'SET_ANY_STATUS', 'P', l_payload, C_SEND_TIMEOUT_SEC);
     end;
 
     --------------------------------------------------------------------------
@@ -5384,7 +5475,7 @@ AS
                   || jStr('err_callstack', p_errCallstack)
                   || jTs ('timestamp',     p_timestamp) || '}';
 
-        sendNoWait(p_processId, 'LOG_ANY', l_payload, C_SEND_TIMEOUT_SEC);
+        sendNoWait(p_processId, 'LOG_ANY', 'L', l_payload, C_SEND_TIMEOUT_SEC);
 
     EXCEPTION
         WHEN OTHERS THEN
@@ -6205,15 +6296,15 @@ AS
     function extractClientChannel(p_json_doc varchar2) return varchar2
     as
     begin
-        return JSON_VALUE(p_json_doc, '$.header.response');
-    end;        
+        return headerValue(p_json_doc, 'response');
+    end;
 
     --------------------------------------------------------------------------
 
     function extractClientRequest(p_json_doc varchar2) return varchar2
     as
     begin
-        return JSON_VALUE(p_json_doc, '$.header.request');
+        return headerValue(p_json_doc, 'request');
     end;
 
     --------------------------------------------------------------------------
