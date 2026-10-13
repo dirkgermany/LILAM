@@ -206,6 +206,7 @@ LILAM is a specialized framework for deep process insights. Using `MARK_EVENT` a
 
 * **Independent Statistics:** Monitor multiple activities (e.g., XML_PARSING, FILE_UPLOAD) simultaneously.
 * **Point-in-Time Events:** Track milestones and calculate intervals between recurring steps using `MARK_EVENT`.
+* **Measured Values:** Pass a numeric value with `MARK_EVENT` (e.g. a share price: `lilam.mark_event(l_pid, 'SHARE', 'ARAL', 80.71)`). LILAM keeps a separate moving average for the values and checks them with `VAL_` rules (fixed limits and deviations from the trend).
 * **Transaction Tracing:** Use `TRACE_START` and `TRACE_STOP` for precise measurement of work blocks, ensuring clear visibility into long-running tasks.
 * **Moving Averages & Outliers:** LILAM maintains historical benchmarks to detect performance degradation or unusual execution times (outliers) in real-time.
 * **Minimal Client Overhead:** Metric calculations are buffered within the session to minimize database round-trips.
@@ -332,12 +333,12 @@ ORDER  BY no;
 ### Monitoring data
 Events (`MON_TYPE` = 0) and traces (`MON_TYPE` = 1) share one table. `STOP_TIME` remains `NULL` for events.
 ```sql
-SELECT process_id, mon_type, action, context, start_time, stop_time, used_millis, avg_millis, action_count
+SELECT process_id, mon_type, action, context, start_time, stop_time, used_millis, used_millis_ewma, action_count
 FROM   lilam_mon
 WHERE  process_id = <id>;
 ```
 
->| PROCESS_ID | MON_TYPE | ACTION    | CONTEXT    | START_TIME      | STOP_TIME       | USED_MILLIS | AVG_MILLIS | ACTION_COUNT |
+>| PROCESS_ID | MON_TYPE | ACTION    | CONTEXT    | START_TIME      | STOP_TIME       | USED_MILLIS | USED_MILLIS_EWMA | ACTION_COUNT |
 >| ---------- | -------- | --------- | ---------- | --------------- | --------------- | ----------- | ---------- | ------------ |
 >| 1          | 0        | MY_ACTION | MY_CONTEXT | 13.01.26 10:... | NULL            | 402         | 402        | 1            |
 >| 1          | 0        | MY_ACTION | MY_CONTEXT | 13.01.26 10:... | NULL            | 510         | 456        | 2            |

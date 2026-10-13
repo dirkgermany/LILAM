@@ -8,7 +8,7 @@
 -- Varianten (je ein Rule Set LT_PERF, Version = Variante):
 --   1 E_NONE     keine Regeln
 --   2 E_OTHER50  50 Regeln auf andere Actions (nur Map-Lookup)
---   3 E_MATCH1   1 passende Regel, schlaegt nicht an (MAX_DURATION_MS)
+--   3 E_MATCH1   1 passende Regel, schlaegt nicht an (TIME_MAX_DURATION_MS)
 --   4 E_MATCH20  20 passende Regeln, gemischte Operatoren, schlagen nicht an
 --   5 E_MATCH100 100 passende Regeln, gemischte Operatoren, schlagen nicht an
 --   6 E_FIRE0    1 Regel ON_EVENT, throttle 0  -> jedes Event ein Alert
@@ -44,11 +44,11 @@ declare
   begin
     for i in 1 .. p_n loop
       case mod(i, 6)
-        when 0 then l_op := 'MAX_DURATION_MS';         l_val := '99999999';
-        when 1 then l_op := 'MAX_GAP_SECONDS';         l_val := '999';
+        when 0 then l_op := 'TIME_MAX_DURATION_MS';         l_val := '99999999';
+        when 1 then l_op := 'TIME_MAX_GAP_SECONDS';         l_val := '999';
         when 2 then l_op := 'PRECEDED_BY';             l_val := 'PERF_EV';
-        when 3 then l_op := 'PRECEDED_BY_WITHIN_SECS'; l_val := 'PERF_EV|999';
-        when 4 then l_op := 'AVG_DEVIATION_PCT';       l_val := '100000|3|0.1';
+        when 3 then l_op := 'TIME_PRECEDED_BY_WITHIN_SECS'; l_val := 'PERF_EV|999';
+        when 4 then l_op := 'TIME_EWMA_DEVIATION_PCT_UP';       l_val := '100000|3|0.1';
         else        l_op := 'MAX_OCCURRENCE';          l_val := '99999999';
       end case;
       l := l || case when i > 1 then ',' end || rule('M' || i, 'MARK_EVENT', 'PERF_EV', l_op, l_val, 3600);
@@ -72,7 +72,7 @@ declare
       l := l || case when i > 1 then ',' end || rule('O' || i, 'MARK_EVENT', 'OTHER_' || i, 'ON_EVENT', '');
     end loop;
     put_set(2, l);
-    put_set(3, rule('M1', 'MARK_EVENT', 'PERF_EV', 'MAX_DURATION_MS', '99999999'));
+    put_set(3, rule('M1', 'MARK_EVENT', 'PERF_EV', 'TIME_MAX_DURATION_MS', '99999999'));
     put_set(4, mixed(20));
     put_set(5, mixed(100));
     put_set(6, rule('F0', 'MARK_EVENT', 'PERF_EV', 'ON_EVENT', '', 0));

@@ -52,7 +52,7 @@ declare
       "action": "STATION_EXIT",
       "context": "Moulin Rouge",
       "condition": {
-        "operator": "MAX_DURATION_MS",
+        "operator": "TIME_MAX_DURATION_MS",
         "value": "300000"
       },
       "alert": {

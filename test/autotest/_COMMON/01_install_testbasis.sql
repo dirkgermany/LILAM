@@ -510,7 +510,8 @@ create or replace package body lt as
     function internal_errors_since(p_ts timestamp) return number is
         l_n number;
     begin
-        execute immediate 'select count(*) from lilam_log_internal where log_timestamp >= :1' into l_n using p_ts;
+        execute immediate 'select count(*) from lilam_log_internal where log_timestamp >= :1
+                             and nvl(log_operation, ''-'') not in (''BACKPRESSURE'', ''GAP'')' into l_n using p_ts;   -- Hinweise, keine Fehler
         return l_n;
     exception
         when others then return 0;   -- Tabelle existiert erst nach dem ersten internen Fehler
@@ -1400,7 +1401,7 @@ create or replace package body lt as
                                 where p.process_name = :1 and m.action = :2' into l_cnt using l_app, c_action;
             check_that(l_run, p_tag || ' B2 _MON zaehlt prozesslokal (max. 2 je Prozess)', l_cnt = 2, l_cnt);
 
-            -- B3: AVG_MILLIS des letzten Eintrags = Baseline des Scopes
+            -- B3: USED_MILLIS_EWMA des letzten Eintrags = Baseline des Scopes
             -- Mit mehreren Servern (z. B. im Dauertest) haelt jeder Server die Baseline in seiner PGA und gleicht sie
             -- nur alle 1,5 s ab. _MON zeigt dann den Stand eines Servers, die Tabelle den zusammengefuehrten Stand.
             -- Deshalb gilt dort eine Toleranz von 20 % der Baseline, sonst +-1 ms.
@@ -1411,9 +1412,9 @@ create or replace package body lt as
                                  into l_servers using c_group;
             end if;
             l_tol := case when l_servers > 1 then greatest(1, 0.2 * l_avg) else 1 end;
-            execute immediate 'select max(m.avg_millis) keep (dense_rank last order by m.stop_time)
+            execute immediate 'select max(m.used_millis_ewma) keep (dense_rank last order by m.stop_time)
                                  from lilam_mon m where m.process_id = :1 and m.action = :2' into l_mon using l_pid, c_action;
-            check_that(l_run, p_tag || ' B3 _MON.AVG_MILLIS des letzten Prozesses = Baseline', abs(nvl(l_mon, -1) - l_avg) <= l_tol,
+            check_that(l_run, p_tag || ' B3 _MON.USED_MILLIS_EWMA des letzten Prozesses = Baseline', abs(nvl(l_mon, -1) - l_avg) <= l_tol,
                        'MON ' || l_mon || ' / Baseline ' || round(l_avg, 1) || ' / Toleranz ' || round(l_tol, 1)
                        || ' ms / Server ' || l_servers);
 
@@ -1864,7 +1865,8 @@ create or replace package body lt as
             l_n number;
         begin
             execute immediate 'select count(*) from lilam_log_internal where log_timestamp >= :1
-                                 and not (error_code = -2290 and log_operation like ''row % skipped'')'
+                                 and not (error_code = -2290 and log_operation like ''row % skipped'')
+                                 and nvl(log_operation, ''-'') not in (''BACKPRESSURE'', ''GAP'')'
                 into l_n using run_started(l_run);
             check_that(l_run, 'Keine weiteren internen LILAM-Fehler', l_n = 0, l_n || ' Eintraege');
         exception
@@ -2046,25 +2048,25 @@ create or replace package body lt as
             -- Version 1: alle Szenarien
             l :=          r('VG-01', 'MARK_EVENT',  'RG_B',  'PRECEDED_BY', 'RG_A');
             l := l || ',' || r('VG-02', 'MARK_EVENT',  'RG_B2', 'PRECEDED_BY', 'RG_A|C1');
-            l := l || ',' || r('VG-03', 'MARK_EVENT',  'RG_D',  'PRECEDED_BY_WITHIN_SECS', 'RG_C|1');
+            l := l || ',' || r('VG-03', 'MARK_EVENT',  'RG_D',  'TIME_PRECEDED_BY_WITHIN_SECS', 'RG_C|1');
             l := l || ',' || r('VG-04', 'TRACE_START', 'RG_T',  'PRECEDED_BY', 'RG_A');
-            l := l || ',' || r('VG-05', 'PROCESS_UPDATE', '#P#_VG5', 'PRECEDED_BY_WITHIN_SECS', 'RG_A|1');
-            l := l || ',' || r('NF-01', 'MARK_EVENT',  'RG_NF_B', 'PRECEDED_BY_WITHIN_SECS', 'RG_NF_A|1');
-            l := l || ',' || r('GP-01', 'MARK_EVENT',  'RG_G',  'MAX_GAP_SECONDS', '0.8');
-            l := l || ',' || r('GP-02', 'TRACE_START', 'RG_GT', 'MAX_GAP_SECONDS', '0.8');
-            l := l || ',' || r('DU-01', 'TRACE_STOP',  'RG_DT', 'MAX_DURATION_MS', '100');
-            l := l || ',' || r('DU-02', 'MARK_EVENT',  'RG_DE', 'MAX_DURATION_MS', '500');
+            l := l || ',' || r('VG-05', 'PROCESS_UPDATE', '#P#_VG5', 'TIME_PRECEDED_BY_WITHIN_SECS', 'RG_A|1');
+            l := l || ',' || r('NF-01', 'MARK_EVENT',  'RG_NF_B', 'TIME_PRECEDED_BY_WITHIN_SECS', 'RG_NF_A|1');
+            l := l || ',' || r('GP-01', 'MARK_EVENT',  'RG_G',  'TIME_MAX_GAP_SECONDS', '0.8');
+            l := l || ',' || r('GP-02', 'TRACE_START', 'RG_GT', 'TIME_MAX_GAP_SECONDS', '0.8');
+            l := l || ',' || r('DU-01', 'TRACE_STOP',  'RG_DT', 'TIME_MAX_DURATION_MS', '100');
+            l := l || ',' || r('DU-02', 'MARK_EVENT',  'RG_DE', 'TIME_MAX_DURATION_MS', '500');
             l := l || ',' || r('OC-01', 'MARK_EVENT',  'RG_OC', 'MAX_OCCURRENCE', '3');
-            l := l || ',' || r('AV-01', 'TRACE_STOP',  'RG_AV', 'AVG_DEVIATION_PCT', '50|3|0.5');
-            l := l || ',' || r('AV-02', 'TRACE_STOP',  'RG_AV0', 'AVG_DEVIATION_PCT', '100|3|0.1');
+            l := l || ',' || r('AV-01', 'TRACE_STOP',  'RG_AV', 'TIME_EWMA_DEVIATION_PCT_UP', '50|3|0.5');
+            l := l || ',' || r('AV-02', 'TRACE_STOP',  'RG_AV0', 'TIME_EWMA_DEVIATION_PCT_UP', '100|3|0.1');
             l := l || ',' || r('PR-01', 'PROCESS_START',  '#P#_PS', 'ON_START', '');
             l := l || ',' || r('PR-02', 'PROCESS_UPDATE', '#P#_ST', 'STATUS_EQUALS', '3');
             l := l || ',' || r('PR-03', 'PROCESS_UPDATE', '#P#_IN', 'INFO_CONTAINS', 'kaputt');
             l := l || ',' || r('PR-04', 'PROCESS_STOP',   '#P#_SD', 'STEPS_LEFT_HIGH', '2');
             l := l || ',' || r('PR-05', 'PROCESS_STOP',   '#P#_SD', 'SUCCESS_RATE_LOW', '80');
             l := l || ',' || r('PR-06', 'PROCESS_UPDATE', '#P#_SD', 'MAX_OCCURRENCE', '3');
-            l := l || ',' || r('PR-07', 'PROCESS_STOP',   '#P#_RT', 'MAX_RUNTIME_EXCEEDED', '500');
-            l := l || ',' || r('PR-08', 'PROCESS_UPDATE', '#P#_RT', 'RUNTIME_EXCEEDED', '500');
+            l := l || ',' || r('PR-07', 'PROCESS_STOP',   '#P#_RT', 'TIME_MAX_RUNTIME_EXCEEDED', '500');
+            l := l || ',' || r('PR-08', 'PROCESS_UPDATE', '#P#_RT', 'TIME_RUNTIME_EXCEEDED', '500');
             l := l || ',' || r('LG-01', 'LOGGING', 'LOGGING', 'SEVERITY', 'ERROR');
             l := l || ',' || r('LG-02', 'LOGGING', null, 'SEVERITY', 'WARN');
             l := l || ',' || r('LC-01', 'LOGGING', null, 'LOG_CONTAINS', 'RG_LC_TEXT');
@@ -2083,14 +2085,14 @@ create or replace package body lt as
             -- Versionen 3-6: ungueltig (fehlender Handler, unbekannter Operator, Operator passt nicht zum Trigger, leere Action)
             ins(3, r('X3-01', 'MARK_EVENT', 'RG_V2', 'ON_EVENT', '', null, 0, null));
             ins(4, r('X4-01', 'MARK_EVENT', 'RG_V2', 'PRECEDED_BY_WITHIN_MS', 'RG_A|1000'));
-            ins(5, r('X5-01', 'TRACE_STOP', 'RG_V2', 'MAX_GAP_SECONDS', '1'));
+            ins(5, r('X5-01', 'TRACE_STOP', 'RG_V2', 'TIME_MAX_GAP_SECONDS', '1'));
             -- Version 6: ungueltig, leere "action" (Beispiel SEQ-009 der Analyse; r() laesst eine leere Action weg)
             ins(6, '{"id":"X6-01","trigger_type":"MARK_EVENT","action":"","condition":{"operator":"ON_EVENT","value":""}'
                 || ',"alert":{"handler":"' || c_handler || '","severity":"WARN","throttle_seconds":0}}');
             -- Versionen 7, 8, 10: ungueltig, leere Teile im Wert (C2; vorher still umgedeutet)
             ins(7,  r('X7-01',  'MARK_EVENT', 'RG_V2', 'PRECEDED_BY', '|C1'));
-            ins(8,  r('X8-01',  'TRACE_STOP', 'RG_V2', 'AVG_DEVIATION_PCT', '20||0.3'));
-            ins(10, r('X10-01', 'TRACE_STOP', 'RG_V2', 'MAX_DURATION_MS', '|5'));
+            ins(8,  r('X8-01',  'TRACE_STOP', 'RG_V2', 'TIME_EWMA_DEVIATION_PCT_UP', '20||0.3'));
+            ins(10, r('X10-01', 'TRACE_STOP', 'RG_V2', 'TIME_MAX_DURATION_MS', '|5'));
             -- Versionen 11, 12: ungueltig, unbekannter Schluessel bzw. Objekt statt Text (C2, G6 = C+)
             ins(11, replace(r('X11-01', 'MARK_EVENT', 'RG_V2', 'ON_EVENT', '', 'C1'), '"context"', '"contxt"'));
             ins(12, replace(r('X12-01', 'MARK_EVENT', 'RG_V2', 'ON_EVENT', '', 'C1'), '"context":"C1"', '"context":{"name":"C1"}'));
@@ -2221,15 +2223,15 @@ create or replace package body lt as
         close_wait(l_pid);
         expect('_VG', 'VG-01', 1, 'PRECEDED_BY: Kontext egal, Log kein Vorgaenger, falscher Vorgaenger');
         expect('_VG', 'VG-02', 1, 'PRECEDED_BY mit Kontext RG_A|C1');
-        expect('_VG', 'VG-03', 2, 'PRECEDED_BY_WITHIN_SECS: zu spaet und falscher Vorgaenger');
+        expect('_VG', 'VG-03', 2, 'TIME_PRECEDED_BY_WITHIN_SECS: zu spaet und falscher Vorgaenger');
         expect('_VG', 'VG-04', 1, 'PRECEDED_BY bei TRACE_START');
 
-        -- PRECEDED_BY_WITHIN_SECS bei PROCESS_UPDATE (C4/N1): Bezugszeit ist das Signal, nicht der Prozessstart
+        -- TIME_PRECEDED_BY_WITHIN_SECS bei PROCESS_UPDATE (C4/N1): Bezugszeit ist das Signal, nicht der Prozessstart
         l_pid := proc('_VG5');
         lilam.mark_event(l_pid, 'RG_A'); lilam.set_process_status(l_pid, 1);                          -- 0
         lilam.mark_event(l_pid, 'RG_A'); dbms_session.sleep(1.3); lilam.set_process_status(l_pid, 1); -- 1: zu spaet
         close_wait(l_pid);
-        expect('_VG5', 'VG-05', 1, 'PRECEDED_BY_WITHIN_SECS bei PROCESS_UPDATE: Abstand zum Signal');
+        expect('_VG5', 'VG-05', 1, 'TIME_PRECEDED_BY_WITHIN_SECS bei PROCESS_UPDATE: Abstand zum Signal');
 
         -- ---------------------------------------------------------------
         -- Nachfolger: "B folgt A innerhalb 1 s" (Pruefung beim Eintreffen von B)
@@ -2261,14 +2263,14 @@ create or replace package body lt as
         lilam.trace_start(l_pid, 'RG_AV'); dbms_session.sleep(0.11); lilam.trace_stop(l_pid, 'RG_AV');  -- 0: +10 %
         lilam.trace_start(l_pid, 'RG_AV'); dbms_session.sleep(0.4);  lilam.trace_stop(l_pid, 'RG_AV');  -- 1: +300 %
         close_wait(l_pid);
-        expect('_MON', 'GP-01', 1, 'MAX_GAP_SECONDS 0.8 bei Events (Dezimalpunkt)');
-        expect('_MON', 'GP-02', 1, 'MAX_GAP_SECONDS 0.8 bei TRACE_START');
-        expect('_MON', 'DU-01', 1, 'MAX_DURATION_MS bei TRACE_STOP');
-        expect('_MON', 'DU-02', 1, 'MAX_DURATION_MS bei Events (Abstand)');
+        expect('_MON', 'GP-01', 1, 'TIME_MAX_GAP_SECONDS 0.8 bei Events (Dezimalpunkt)');
+        expect('_MON', 'GP-02', 1, 'TIME_MAX_GAP_SECONDS 0.8 bei TRACE_START');
+        expect('_MON', 'DU-01', 1, 'TIME_MAX_DURATION_MS bei TRACE_STOP');
+        expect('_MON', 'DU-02', 1, 'TIME_MAX_DURATION_MS bei Events (Abstand)');
         expect('_MON', 'OC-01', 2, 'MAX_OCCURRENCE 3 bei 5 Events');
-        expect('_MON', 'AV-01', 1, 'AVG_DEVIATION_PCT 50 % nach Warm-up');
+        expect('_MON', 'AV-01', 1, 'TIME_EWMA_DEVIATION_PCT_UP 50 % nach Warm-up');
 
-        -- AVG_DEVIATION_PCT unter 1 ms (C4): feste Zeitstempel, Dauern 1, 0, 0 ms => Durchschnitt 1/3 ms,
+        -- TIME_EWMA_DEVIATION_PCT_UP unter 1 ms (C4): feste Zeitstempel, Dauern 1, 0, 0 ms => Durchschnitt 1/3 ms,
         -- dann 1 ms (+200 %, ueber 100 %) => keine Auswertung unter der Messaufloesung von 1 ms
         l_pid := proc('_AV0');
         l_ts  := systimestamp - interval '10' second;
@@ -2278,7 +2280,7 @@ create or replace package body lt as
                              + numtodsinterval(case when i in (2, 3) then 0 else 0.001 end, 'SECOND'));
         end loop;                                                                                       -- 0
         close_wait(l_pid);
-        expect('_AV0', 'AV-02', 0, 'AVG_DEVIATION_PCT: Durchschnitt unter 1 ms wird nicht ausgewertet');
+        expect('_AV0', 'AV-02', 0, 'TIME_EWMA_DEVIATION_PCT_UP: Durchschnitt unter 1 ms wird nicht ausgewertet');
 
         -- ---------------------------------------------------------------
         -- Prozess-Regeln (je ein Prozess, die Werte bleiben im Prozess stehen)
@@ -2307,8 +2309,8 @@ create or replace package body lt as
         lilam.set_process_status(l_pid, 1);                                                 -- 0
         dbms_session.sleep(0.7); lilam.set_process_status(l_pid, 1);                        -- 1
         close_wait(l_pid);
-        expect('_RT', 'PR-08', 1, 'RUNTIME_EXCEEDED 500 ms (laufender Prozess)');
-        expect('_RT', 'PR-07', 1, 'MAX_RUNTIME_EXCEEDED 500 ms (bei PROCESS_STOP)');
+        expect('_RT', 'PR-08', 1, 'TIME_RUNTIME_EXCEEDED 500 ms (laufender Prozess)');
+        expect('_RT', 'PR-07', 1, 'TIME_MAX_RUNTIME_EXCEEDED 500 ms (bei PROCESS_STOP)');
 
         -- ---------------------------------------------------------------
         -- Log-Regeln: zwei SEVERITY-Regeln, viele nicht passende Logs
@@ -2572,7 +2574,8 @@ create or replace package body lt as
         end if;
         reset_rules;   -- sonst laden spaetere Server der Gruppe LT dieses Rule Set
         execute immediate 'select count(*) from lilam_log_internal where log_timestamp >= :1
-                              and not (module_name = ''refreshGroupRules'' and error_code = ''-20130'')'
+                              and not (module_name = ''refreshGroupRules'' and error_code = ''-20130'')
+                              and nvl(log_operation, ''-'') not in (''BACKPRESSURE'', ''GAP'')'
            into l_n using run_started(l_run);
         check_that(l_run, 'Keine weiteren internen LILAM-Fehler', l_n = 0, l_n);
         end_run(l_run);
@@ -2644,22 +2647,22 @@ create or replace package body lt as
                     l_t := l_trg;
                     case p_type
                         when 'EVENT' then
-                            l_op := case mod(i, 5) when 0 then 'MAX_DURATION_MS' when 1 then 'MAX_GAP_SECONDS' when 2 then 'MAX_OCCURRENCE'
-                                                   when 3 then 'PRECEDED_BY' else 'PRECEDED_BY_WITHIN_SECS' end;
+                            l_op := case mod(i, 5) when 0 then 'TIME_MAX_DURATION_MS' when 1 then 'TIME_MAX_GAP_SECONDS' when 2 then 'MAX_OCCURRENCE'
+                                                   when 3 then 'PRECEDED_BY' else 'TIME_PRECEDED_BY_WITHIN_SECS' end;
                             l_v  := case mod(i, 5) when 0 then '999999999' when 1 then '999999' when 2 then '999999999'
                                                    when 3 then 'RL_EV' else 'RL_EV|999999' end;
                         when 'TRACE' then
                             l_t  := case when mod(i, 2) = 0 then 'TRACE_STOP' else 'TRACE_START' end;
-                            l_op := case when l_t = 'TRACE_START' then case mod(i, 4) when 1 then 'MAX_GAP_SECONDS' else 'PRECEDED_BY' end
-                                         else case mod(i, 3) when 0 then 'MAX_DURATION_MS' when 1 then 'MAX_OCCURRENCE' else 'AVG_DEVIATION_PCT' end end;
-                            l_v  := case l_op when 'MAX_GAP_SECONDS' then '999999' when 'PRECEDED_BY' then 'RL_TR'
-                                              when 'AVG_DEVIATION_PCT' then '100000|3|0.1' else '999999999' end;
+                            l_op := case when l_t = 'TRACE_START' then case mod(i, 4) when 1 then 'TIME_MAX_GAP_SECONDS' else 'PRECEDED_BY' end
+                                         else case mod(i, 3) when 0 then 'TIME_MAX_DURATION_MS' when 1 then 'MAX_OCCURRENCE' else 'TIME_EWMA_DEVIATION_PCT_UP' end end;
+                            l_v  := case l_op when 'TIME_MAX_GAP_SECONDS' then '999999' when 'PRECEDED_BY' then 'RL_TR'
+                                              when 'TIME_EWMA_DEVIATION_PCT_UP' then '100000|3|0.1' else '999999999' end;
                         when 'LOG' then
                             l_op := 'SEVERITY';
                             l_v  := case mod(i, 4) when 0 then 'ERROR' when 1 then 'WARN' when 2 then 'DEBUG' else 'MONITOR' end;
                         else
                             l_op := case mod(i, 5) when 0 then 'STATUS_EQUALS' when 1 then 'INFO_CONTAINS' when 2 then 'MAX_OCCURRENCE'
-                                                   when 3 then 'RUNTIME_EXCEEDED' else 'STEPS_LEFT_HIGH' end;
+                                                   when 3 then 'TIME_RUNTIME_EXCEEDED' else 'STEPS_LEFT_HIGH' end;
                             l_v  := case l_op when 'STATUS_EQUALS' then '999' when 'INFO_CONTAINS' then 'xyz_nie' else '999999999' end;
                     end case;
                     add(r('M' || i, l_t, l_act, l_op, l_v));

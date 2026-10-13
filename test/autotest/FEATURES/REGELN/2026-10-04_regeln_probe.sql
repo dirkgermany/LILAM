@@ -26,7 +26,7 @@ declare
   "header": { "rule_set": "LT_RULES", "rule_set_version": 1, "description": "Diagnose Regeln" },
   "rules": [
     { "id": "R01", "trigger_type": "TRACE_STOP", "action": "RA_TRACE",
-      "condition": { "operator": "MAX_DURATION_MS", "value": "50" },
+      "condition": { "operator": "TIME_MAX_DURATION_MS", "value": "50" },
       "alert": { "handler": "LT_RULE_ALERT", "severity": "WARN", "throttle_seconds": 0 } },
     { "id": "R04", "trigger_type": "MARK_EVENT", "action": "RA_B",
       "condition": { "operator": "PRECEDED_BY", "value": "RA_A" },
@@ -59,13 +59,13 @@ declare
       "condition": { "operator": "ON_EVENT", "value": "" },
       "alert": { "handler": "LT_RULE_ALERT", "severity": "INFO", "throttle_seconds": 60 } },
     { "id": "R13", "trigger_type": "TRACE_START", "action": "RA_G",
-      "condition": { "operator": "MAX_GAP_SECONDS", "value": "1" },
+      "condition": { "operator": "TIME_MAX_GAP_SECONDS", "value": "1" },
       "alert": { "handler": "LT_RULE_ALERT", "severity": "WARN", "throttle_seconds": 0 } },
     { "id": "R14", "trigger_type": "MARK_EVENT", "action": "RA_W",
-      "condition": { "operator": "PRECEDED_BY_WITHIN_SECS", "value": "RA_V|5" },
+      "condition": { "operator": "TIME_PRECEDED_BY_WITHIN_SECS", "value": "RA_V|5" },
       "alert": { "handler": "LT_RULE_ALERT", "severity": "WARN", "throttle_seconds": 0 } },
     { "id": "R15", "trigger_type": "MARK_EVENT", "action": "RA_M",
-      "condition": { "operator": "MAX_GAP_SECONDS", "value": "1" },
+      "condition": { "operator": "TIME_MAX_GAP_SECONDS", "value": "1" },
       "alert": { "handler": "LT_RULE_ALERT", "severity": "WARN", "throttle_seconds": 0 } }
   ]
 }~');
@@ -102,11 +102,11 @@ declare
     lilam.error(p_pid, 'Fehler fuer R11');
     -- R12: zweimal ON_EVENT, throttle 60 s -> 1 Alert
     lilam.mark_event(p_pid, 'RA_T'); lilam.mark_event(p_pid, 'RA_T');
-    -- R13: zwei Traces mit 1,5 s Abstand, MAX_GAP_SECONDS 1 auf TRACE_START -> laut Doku 1 Alert
+    -- R13: zwei Traces mit 1,5 s Abstand, TIME_MAX_GAP_SECONDS 1 auf TRACE_START -> laut Doku 1 Alert
     lilam.trace_start(p_pid, 'RA_G'); lilam.trace_stop(p_pid, 'RA_G');
     dbms_session.sleep(1.5);
     lilam.trace_start(p_pid, 'RA_G'); lilam.trace_stop(p_pid, 'RA_G');
-    -- R15: zwei Events mit 1,5 s Abstand, MAX_GAP_SECONDS 1 -> 1 Alert
+    -- R15: zwei Events mit 1,5 s Abstand, TIME_MAX_GAP_SECONDS 1 -> 1 Alert
     lilam.mark_event(p_pid, 'RA_M'); dbms_session.sleep(1.5); lilam.mark_event(p_pid, 'RA_M');
     -- R14: RA_V direkt vor RA_W -> 0 Alerts (Kontrolle)
     lilam.mark_event(p_pid, 'RA_V'); lilam.mark_event(p_pid, 'RA_W');

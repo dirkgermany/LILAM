@@ -179,6 +179,9 @@ LILAM captures detailed process steps by measuring their **frequency** and **dur
 ### Discrete Events
 **MARK_EVENT:** Records a point-in-time milestone. LILAM measures the time spans between consecutive occurrences of the same action.
 
+### Measured Values
+**MARK_EVENT with `p_value`:** The event also carries a numeric measurement, e.g. a share price: `MARK_EVENT(1000, 'SHARE', 'ARAL', 80.71)`. For each combination of action and context LILAM keeps two separate series: the **time series** (interval to the previous event, `USED_MILLIS`/`USED_MILLIS_EWMA`) and the **value series** (`USED_VALUE`/`USED_VALUE_EWMA`). Rules prefixed `TIME_` evaluate times, rules prefixed `VAL_` evaluate measured values. This extends process monitoring to the monitoring of measurements defined by the application, without a new API or table. Use a combination of action and context either always with or always without a value, always in the same unit.
+
 ### Transaction Tracing
 **TRACE:** Measures the specific duration of a work step from start to finish.
 
@@ -233,8 +236,8 @@ Rules for other actions cost nothing. Multiple rules can be assigned to the same
 
 | Metric         | Operator Name (JSON)   | Technical Condition                               | Use Case                                       |
 | :------------- | :--------------------- | :------------------------------------------------ | :--------------------------------------------- |
-| **Runtime**    | `RUNTIME_EXCEEDED`     | `(SYSTIMESTAMP - PROCESS_START) > value` ms (PROCESS_UPDATE) | Process runs too long (checked when a signal arrives). |
-| **Runtime**    | `MAX_RUNTIME_EXCEEDED` | `(PROCESS_END - PROCESS_START) > value` ms (PROCESS_STOP) | Process took too much time.            |
+| **Runtime**    | `TIME_RUNTIME_EXCEEDED`     | `(SYSTIMESTAMP - PROCESS_START) > value` ms (PROCESS_UPDATE) | Process runs too long (checked when a signal arrives). |
+| **Runtime**    | `TIME_MAX_RUNTIME_EXCEEDED` | `(PROCESS_END - PROCESS_START) > value` ms (PROCESS_STOP) | Process took too much time.            |
 | **Progress**   | `STEPS_LEFT_HIGH`      | `(STEPS_TODO - STEPS_DONE) > value`               | Check for unfinished work at process end.      |
 | **Efficiency** | `SUCCESS_RATE_LOW`     | `(STEPS_DONE / STEPS_TODO) * 100 < value`         | Monitor batch processing quality.              |
 | **Frequency**  | `MAX_OCCURRENCE`       | `STEPS_DONE > value`                              | Flood protection / infinite loop detection.    |
@@ -242,7 +245,7 @@ Rules for other actions cost nothing. Multiple rules can be assigned to the same
 | **Info Text**  | `INFO_CONTAINS`        | `UPPER(INFO)` contains `UPPER(value)`             | Search for keywords like "FATAL" or "ERROR".   |
 | **Trigger**    | `ON_START`, `ON_UPDATE`, `ON_STOP` | trigger fired                         | Signal start, progress or end downstream.      |
 | **Dependency** | `PRECEDED_BY`          | last event/trace of the process ≠ `value` (PROCESS_UPDATE, PROCESS_STOP) | Validates predecessor. |
-| **Dependency** | `PRECEDED_BY_WITHIN_SECS` | like `PRECEDED_BY`, plus maximum delay          | Validates predecessor and max. delay.          |
+| **Dependency** | `TIME_PRECEDED_BY_WITHIN_SECS` | like `PRECEDED_BY`, plus maximum delay          | Validates predecessor and max. delay.          |
 
 #### Action & Context Metrics
 **Trigger:** TRACE_START, TRACE_STOP, MARK_EVENT. These rules evaluate the data of the Monitor Table.
@@ -250,12 +253,16 @@ Rules for other actions cost nothing. Multiple rules can be assigned to the same
 | Metric          | Operator Name (JSON)  | Technical Condition                             | Use Case                                      |
 | :-------------- | :-------------------- | :---------------------------------------------- | :-------------------------------------------- |
 | **Execution**   | `ON_EVENT`, `ON_START`, `ON_STOP` | trigger fired                       | Trigger an orchestrator as soon as the signal hits. |
-| **Duration**    | `MAX_DURATION_MS`     | `used_time > value` (MARK_EVENT, TRACE_STOP)    | Absolute time limit for a specific action.    |
-| **Variance**    | `AVG_DEVIATION_PCT`   | `used_time > avg_time * (1 + value/100)` (MARK_EVENT, TRACE_STOP); not evaluated while `avg_time` < 1 ms | Relative deviation from moving average. |
+| **Duration**    | `TIME_MAX_DURATION_MS`     | `used_time > value` (MARK_EVENT, TRACE_STOP)    | Absolute time limit for a specific action.    |
+| **Variance**    | `TIME_EWMA_DEVIATION_PCT_UP`   | `used_time > avg_time * (1 + value/100)` (MARK_EVENT, TRACE_STOP); not evaluated while `avg_time` < 1 ms | Relative deviation above the moving average. |
+| **Variance**    | `TIME_EWMA_DEVIATION_PCT_DOWN` | `used_time < avg_time * (1 - value/100)` (MARK_EVENT, TRACE_STOP); not evaluated while `avg_time` < 1 ms | Relative deviation below (e.g. suspiciously fast processing). |
+| **Value**       | `VAL_EWMA_DEVIATION_PCT_UP`    | `used_value > avg_value + \|avg_value\| * value/100` (MARK_EVENT) | Measured value rises clearly above its trend. |
+| **Value**       | `VAL_EWMA_DEVIATION_PCT_DOWN`  | `used_value < avg_value - \|avg_value\| * value/100` (MARK_EVENT) | Measured value drops clearly below its trend. |
+| **Value**       | `VAL_MIN`, `VAL_MAX`           | `used_value < value` or `used_value > value` (MARK_EVENT) | Fixed limits, e.g. minimum stock. |
 | **Frequency**   | `MAX_OCCURRENCE`      | `action_count > value` (MARK_EVENT, TRACE_STOP) | Flood protection / infinite loop detection.   |
-| **Interval**    | `MAX_GAP_SECONDS`     | time since previous event (MARK_EVENT) or end of previous trace (TRACE_START) > value | Detect stall between two signals. |
+| **Interval**    | `TIME_MAX_GAP_SECONDS`     | time since previous event (MARK_EVENT) or end of previous trace (TRACE_START) > value | Detect stall between two signals. |
 | **Dependency**  | `PRECEDED_BY`         | last event/trace of the process ≠ `ACTION[\|CONTEXT]` (MARK_EVENT, TRACE_START; not TRACE_STOP) | Validates predecessor.                  |
-| **Dependency**  | `PRECEDED_BY_WITHIN_SECS` | like `PRECEDED_BY`, plus maximum delay in seconds | Validates predecessor and max. delay.   |
+| **Dependency**  | `TIME_PRECEDED_BY_WITHIN_SECS` | like `PRECEDED_BY`, plus maximum delay in seconds | Validates predecessor and max. delay.   |
 
 #### Logging
 **Trigger:** LOGGING.
@@ -286,7 +293,7 @@ The JSON object is divided into a header for metadata and an array of individual
       "action": "STATION_EXIT",
       "context": "Moulin Rouge",
       "condition": {
-        "operator": "MAX_DURATION_MS",
+        "operator": "TIME_MAX_DURATION_MS",
         "value": "300000"
       },
       "alert": {
@@ -430,7 +437,9 @@ sequenceDiagram
 `SERVER_UPDATE_RULES` bypasses the dispatcher: `UPDATE_RULE` is sent directly to the data pipes of all workers of the group.
 
 ### Baseline Scope
-The averages (EWMA) of traces and events, which rules such as `AVG_DEVIATION_PCT` compare against, are kept per **scope**. By default the scope is the process name, so every new run of a process continues the averages of its predecessors.
+The averages (EWMA) of traces and events, which rules such as `TIME_EWMA_DEVIATION_PCT_UP` compare against, are kept per **scope**. By default the scope is the process name, so every new run of a process continues the averages of its predecessors.
+
+A row in `LILAM_BASELINES` (scope, action, context) holds both series: the time series in `AVG_MS`/`ACTION_COUNT` and the value series from `MARK_EVENT(p_value)` in `AVG_VAL`/`VAL_COUNT`. Each series has its own counter and therefore its own warm-up; synchronisation and delta merge work the same for both. The value series counts every event with a value, the time series counts intervals (the first event of a process has none).
 
 ```mermaid
 flowchart TD
@@ -569,9 +578,11 @@ Events and traces share the same table structure. The `MON_TYPE` column identifi
 | `HOST_NAME` | `VARCHAR2(50)` | Client host, determined by `SYS_CONTEXT('USERENV','HOST')`. |
 | `ACTION` | `VARCHAR2(100)` | Name of the monitored action. |
 | `CONTEXT` | `VARCHAR2(100)` | Optional context used to distinguish occurrences of the same action. |
-| `USED_MILLIS` | `NUMBER(19)` | Measured duration in milliseconds. |
-| `AVG_MILLIS` | `NUMBER(19)` | Moving average duration in milliseconds for the corresponding action and context. |
-| `ACTION_COUNT` | `NUMBER(19)` | Number of occurrences recorded for the corresponding action and context. |
+| `USED_MILLIS` | `NUMBER(19)` | Interval to the previous event or duration of the trace in milliseconds. |
+| `USED_MILLIS_EWMA` | `NUMBER(19)` | EWMA of the interval or duration for the corresponding action and context. |
+| `USED_VALUE` | `NUMBER` | Numeric measurement passed with `MARK_EVENT(p_value)`; otherwise `NULL`. |
+| `USED_VALUE_EWMA` | `NUMBER` | EWMA of the measured values; only filled for events with a value. |
+| `ACTION_COUNT` | `NUMBER(19)` | Number of observations so far of the action and context in the process. |
 
 
 ### Registry Table

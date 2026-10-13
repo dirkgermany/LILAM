@@ -89,7 +89,11 @@ create or replace PACKAGE BODY LILAM_MAILER AS
                   '<tr><td style="width: 200px; font-weight: bold; border-bottom: 1px solid #ddd; padding: 8px;">Aktion / Kontext:</td>' ||
                   '<td style="border-bottom: 1px solid #ddd; padding: 8px;">' || l_lilam_rec.actionName || ' | ' || NVL(l_lilam_rec.contextName, 'None') || '</td></tr>' ||
                   '<tr><td style="font-weight: bold; border-bottom: 1px solid #ddd; padding: 8px;">Dauer (Ist / Schnitt):</td>' ||
-                  '<td style="border-bottom: 1px solid #ddd; padding: 8px;"><b>' || l_lilam_rec.usedMillis || ' ms</b> (Schnitt: ' || l_lilam_rec.avgMillis || ' ms)</td></tr>' ||
+                  '<td style="border-bottom: 1px solid #ddd; padding: 8px;"><b>' || l_lilam_rec.usedMillis || ' ms</b> (Schnitt: ' || l_lilam_rec.usedMillisEwma || ' ms)</td></tr>' ||
+                  CASE WHEN l_lilam_rec.usedValue IS NOT NULL THEN
+                  '<tr><td style="font-weight: bold; border-bottom: 1px solid #ddd; padding: 8px;">Messwert (Ist / Schnitt):</td>' ||
+                  '<td style="border-bottom: 1px solid #ddd; padding: 8px;"><b>' || l_lilam_rec.usedValue || '</b> (Schnitt: ' || l_lilam_rec.usedValueEwma || ')</td></tr>'
+                  END ||
                   '<tr><td style="font-weight: bold; border-bottom: 1px solid #ddd; padding: 8px;">Zeitpunkt:</td>' ||
                   '<td style="border-bottom: 1px solid #ddd; padding: 8px;">' || TO_CHAR(l_lilam_rec.actionStart, 'HH24:MI:SS.FF3') || '</td></tr>' ||
                   '</table>';
@@ -119,7 +123,9 @@ create or replace PACKAGE BODY LILAM_MAILER AS
                        'Alert ID: ' || p_alertRec.alert_id || CHR(10) ||
                        'Rule:     ' || p_alertRec.rule_id  || ' (' || l_json_rec.condition_operator || ')' || CHR(10) ||
                        'Details:  ' || l_lilam_rec.info || CHR(10) ||
-                       'Dauer:    ' || l_duration || ' ms';
+                       'Dauer:    ' || l_duration || ' ms' ||
+                       CASE WHEN l_lilam_rec.usedValue IS NOT NULL THEN
+                           CHR(10) || 'Messwert: ' || l_lilam_rec.usedValue || ' (Schnitt: ' || l_lilam_rec.usedValueEwma || ')' END;
                        
         return l_body;
     end;

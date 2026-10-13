@@ -40,7 +40,8 @@ CREATE OR REPLACE PACKAGE BODY LILAM_CONSUMER AS
                 master.info, master.process_start, master.process_end,
                 master.steps_todo, master.steps_done, monitor.mon_type,
                 monitor.action, monitor.context,monitor.start_time, monitor.stop_time,
-                monitor.action_count, monitor.used_millis, monitor.avg_millis
+                monitor.action_count, monitor.used_millis, monitor.used_millis_ewma,
+                monitor.used_value, monitor.used_value_ewma
              FROM ' || p_procTabName || ' master
              LEFT JOIN ' || p_monitorTabName || ' monitor
                 ON master.id = monitor.process_id
@@ -53,7 +54,8 @@ CREATE OR REPLACE PACKAGE BODY LILAM_CONSUMER AS
             l_lilam_rec.stepsTodo, l_lilam_rec.stepsDone,
             l_lilam_rec.monitorType, l_lilam_rec.actionName, l_lilam_rec.contextName,
             l_lilam_rec.actionStart, l_lilam_rec.actionStop, l_lilam_rec.actionCount,
-            l_lilam_rec.usedMillis,l_lilam_rec.avgMillis      
+            l_lilam_rec.usedMillis, l_lilam_rec.usedMillisEwma,
+            l_lilam_rec.usedValue, l_lilam_rec.usedValueEwma
         USING p_action, p_actionCount, p_context, p_context, p_processId;
         
         return l_lilam_rec;

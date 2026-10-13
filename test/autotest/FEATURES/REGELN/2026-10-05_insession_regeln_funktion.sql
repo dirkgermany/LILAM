@@ -27,10 +27,10 @@ begin
     commit;
 
     rs(1, '{"rules":[
-      {"id":"R1","trigger_type":"TRACE_STOP","action":"STEP_A","condition":{"operator":"MAX_DURATION_MS","value":"10"},"alert":{"handler":"LT_INS_ALERT","severity":"WARN"}},
+      {"id":"R1","trigger_type":"TRACE_STOP","action":"STEP_A","condition":{"operator":"TIME_MAX_DURATION_MS","value":"10"},"alert":{"handler":"LT_INS_ALERT","severity":"WARN"}},
       {"id":"R2","trigger_type":"LOGGING","condition":{"operator":"SEVERITY","value":"ERROR"},"alert":{"handler":"LT_INS_ALERT","severity":"ERROR"}}]}');
     rs(2, '{"rules":[
-      {"id":"R1B","trigger_type":"TRACE_STOP","action":"STEP_A","condition":{"operator":"MAX_DURATION_MS","value":"10"},"alert":{"handler":"LT_INS_ALERT","severity":"WARN"}}]}');
+      {"id":"R1B","trigger_type":"TRACE_STOP","action":"STEP_A","condition":{"operator":"TIME_MAX_DURATION_MS","value":"10"},"alert":{"handler":"LT_INS_ALERT","severity":"WARN"}}]}');
     rs(3, '{"rules":[
       {"id":"BAD","trigger_type":"TRACE_STOP","action":"STEP_A","condition":{"operator":"NO_SUCH_OP","value":"10"},"alert":{"handler":"LT_INS_ALERT"}}]}');
     lilam.server_update_rules('LT_INS', 'LT_INS_RULES', 1);

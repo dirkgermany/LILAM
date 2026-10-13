@@ -340,6 +340,8 @@ AS
         used_time     NUMBER,
         action_count  PLS_INTEGER,
         avg_time      NUMBER,         -- Reference average BEFORE this measurement (NULL during warm-up)
+        used_value    NUMBER,         -- Measured value of MARK_EVENT (NULL = no value)
+        avg_value     NUMBER,         -- Reference value EWMA BEFORE this measurement (NULL during warm-up)
         -- Process-specific fields
         process_end   TIMESTAMP,
         last_update   TIMESTAMP,
@@ -368,7 +370,11 @@ AS
         stop_time       TIMESTAMP(6),          -- Stop time of the action
         used_time       NUMBER,             -- Duration of the last execution (in sec.)
         action_count   PLS_INTEGER := 0,   -- Work step of an action / transaction (per process)
-        baseline_avg    NUMBER              -- Average BEFORE this measurement, reference for rules (not persisted)
+        baseline_avg    NUMBER,             -- Average BEFORE this measurement, reference for rules (not persisted)
+        used_value      NUMBER,             -- Measured value of MARK_EVENT (NULL = no value)
+        value_ewma      NUMBER,             -- EWMA of the measured values
+        value_count     PLS_INTEGER := 0,   -- Number of measured values (per process)
+        baseline_value  NUMBER              -- Value EWMA BEFORE this measurement, reference for rules (not persisted)
     );
     TYPE t_monitor_history_tab IS TABLE OF t_monitor_buffer_rec;    
     TYPE t_monitor_map IS TABLE OF t_monitor_history_tab INDEX BY VARCHAR2(200);
@@ -388,6 +394,10 @@ AS
         action_count    NUMBER := 0,
         base_avg        NUMBER,
         base_count      NUMBER := 0,
+        avg_val         NUMBER,         -- value series (MARK_EVENT with p_value), same handling as avg_ms
+        val_count       NUMBER := 0,
+        base_val        NUMBER,
+        base_val_count  NUMBER := 0,
         in_db           BOOLEAN := FALSE,
         dirty           BOOLEAN := FALSE,
         last_touch_cs   NUMBER          -- last use (DBMS_UTILITY.GET_TIME), for eviction
@@ -469,6 +479,8 @@ AS
         action_count sys.odcinumberlist   := sys.odcinumberlist(),
         used         sys.odcinumberlist   := sys.odcinumberlist(),
         avgs         sys.odcinumberlist   := sys.odcinumberlist(),
+        vals         sys.odcinumberlist   := sys.odcinumberlist(),
+        valAvgs      sys.odcinumberlist   := sys.odcinumberlist(),
         timesStart   t_timestamp_list_t   := t_timestamp_list_t(),
         timesStop    t_timestamp_list_t   := t_timestamp_list_t()
     );
@@ -501,7 +513,7 @@ AS
         target_action       VARCHAR2(100),
         target_context      VARCHAR2(100),
         condition_metric    VARCHAR2(50),
-        condition_operator  VARCHAR2(50),  -- MAX_DURATION_MS, PRECEDED_BY, etc.
+        condition_operator  VARCHAR2(50),  -- TIME_MAX_DURATION_MS, PRECEDED_BY, etc.
         condition_value     VARCHAR2(250),
         alert_handler       VARCHAR2(30),  -- Name of the DBMS_ALERT signal (max. 30 characters)
         alert_severity      VARCHAR2(30),
@@ -539,6 +551,7 @@ AS
     -- Key as for the rules with group; 'DEFAULT' applies to all
     TYPE t_avg_params_map IS TABLE OF t_avg_params INDEX BY VARCHAR2(300);
     g_avg_params t_avg_params_map;
+    g_val_params t_avg_params_map;   -- same for the value series (VAL_EWMA_DEVIATION_PCT_*)
 
     TYPE t_alert_history IS TABLE OF TIMESTAMP INDEX BY VARCHAR2(250);
     g_alert_history t_alert_history;
@@ -902,6 +915,21 @@ AS
 
     --------------------------------------------------------------------------
 
+    -- Payload of a server message. Unreadable message (e.g. invalid JSON) => NULL and BAD_MESSAGE in LILAM_LOG_INTERNAL
+    function payloadOf(p_message varchar2, p_module varchar2) return varchar2
+    as
+        l_payload varchar2(32767);
+    begin
+        l_payload := JSON_QUERY(p_message, '$.payload');
+        if l_payload is null then
+            logLilamErr(NUM_ERR_ILLEGAL_REQ, 'Unreadable message (' || headerValue(p_message, 'request') || '): '
+                        || substr(p_message, 1, 500), p_module, 'BAD_MESSAGE');
+        end if;
+        return l_payload;
+    end;
+
+    --------------------------------------------------------------------------
+
     function extractFromJsonObjTime(p_obj JSON_OBJECT_T, p_key VARCHAR2) RETURN TIMESTAMP
     as
     BEGIN
@@ -944,6 +972,8 @@ AS
         end if;
         return l_str;
     end;
+
+    function jNum(p_value number) return varchar2;  -- forward declaration, see below
 
     ------------------------------------------------------------------------
 
@@ -992,9 +1022,10 @@ AS
         l_str := jsonPutPrep(p_jsonString);
         if p_jsonString is null and substr(valueNum, 1,1) = '{' and substr(valueNum, -1) = '}' then
             l_str := '"' || jsonKey || '": ' || valueNum;    
-        else 
+        else
             l_str := '{' || l_str || '"' || trim(jsonKey) || '":';
-            l_str := l_str || valueNum || '}'; 
+            -- STABILITY: jNum, decimals independent of NLS (measured values)
+            l_str := l_str || jNum(valueNum) || '}';
         end if;
         p_jsonString := l_str;
     end;
@@ -1041,8 +1072,9 @@ AS
     as
         l_str varchar2(64);
     begin
-        if p_value = trunc(p_value) then
-            return to_char(p_value);       -- Integer: NLS does not matter (normal case)
+        -- Integer: NLS does not matter. STABILITY: from 1E38 on to_char is scientific with NLS separator
+        if p_value = trunc(p_value) and abs(p_value) < 1E38 then
+            return to_char(p_value);
         end if;
         l_str := to_char(p_value, 'TM9', 'NLS_NUMERIC_CHARACTERS=''.,''');
         if substr(l_str, 1, 1) = '.' then
@@ -1096,7 +1128,7 @@ AS
     -- Millis between two timestamps
     --------------------------------------------------------------------------
     function get_ms_diff(p_start timestamp, p_end timestamp) return number is
-        -- STABILITY: day(9) instead of day(0), otherwise ORA-01873 from a difference of one day (e.g. RUNTIME_EXCEEDED)
+        -- STABILITY: day(9) instead of day(0), otherwise ORA-01873 from a difference of one day (e.g. TIME_RUNTIME_EXCEEDED)
         v_diff interval day(9) to second(3); -- Limit precision to ms
     begin
         v_diff := p_end - p_start;
@@ -1361,21 +1393,26 @@ AS
 
         BEGIN
             EXECUTE IMMEDIATE
-                'select avg_ms, action_count from ' || C_LILAM_BASELINES_TABLE ||
+                'select avg_ms, action_count, avg_val, val_count from ' || C_LILAM_BASELINES_TABLE ||
                 ' where scope_id = :1 and action_name = :2 and context_name = :3'
-                INTO l_rec.avg_ms, l_rec.action_count
+                INTO l_rec.avg_ms, l_rec.action_count, l_rec.avg_val, l_rec.val_count
                 USING p_scopeId, p_actionName, nvl(p_contextName, C_BASELINE_NULL_CONTEXT);
             l_rec.in_db := TRUE;
         EXCEPTION
             WHEN NO_DATA_FOUND THEN
                 l_rec.avg_ms := NULL;
                 l_rec.action_count := 0;
+                l_rec.avg_val := NULL;
+                l_rec.val_count := 0;
                 l_rec.in_db := FALSE;
         END;
 
         l_rec.action_count := nvl(l_rec.action_count, 0);
         l_rec.base_avg     := l_rec.avg_ms;
         l_rec.base_count   := l_rec.action_count;
+        l_rec.val_count      := nvl(l_rec.val_count, 0);
+        l_rec.base_val       := l_rec.avg_val;
+        l_rec.base_val_count := l_rec.val_count;
         l_rec.dirty        := FALSE;
         l_rec.last_touch_cs := dbms_utility.get_time;
 
@@ -1385,30 +1422,31 @@ AS
     --------------------------------------------------------------------------
     -- Check if a single step needs more time than average over all steps per action
     --------------------------------------------------------------------------
-    function validateDurationInAverage(p_monitor_rec t_monitor_buffer_rec, p_metricFactor number) return BOOLEAN
+    --------------------------------------------------------------------------
+    -- *_EWMA_DEVIATION_PCT_UP/_DOWN: does p_current deviate from p_reference (EWMA before the
+    -- measurement) by more than p_pct percent upwards (p_up) or downwards?
+    -- NULL reference (warm-up) => no deviation.
+    -- p_isTime: STABILITY: time resolution is 1 ms; below that a percentage is noise
+    -- (e.g. avg 0.0005 ms and 1 ms = 200,000 %) => no evaluation. Not for values.
+    -- Values may be negative, hence the band is |reference| * pct.
+    --------------------------------------------------------------------------
+    function deviatesFromEwma(p_current number, p_reference number, p_pct number, p_up boolean, p_isTime boolean) return BOOLEAN
     as
     begin
-        -- If there is no trend yet (initial start / warm-up), we cannot validate anything.
-        -- STABILITY: measurement resolution is 1 ms; below that a percentage is noise
-        -- (e.g. avg 0.0005 ms and 1 ms = 200,000 %) => no evaluation.
-        if p_monitor_rec.avg_action_time is null or p_monitor_rec.avg_action_time < 1
-           or p_monitor_rec.used_time is null or p_metricFactor is null then
-            return TRUE; 
-        end if;
-
-        -- Comparison against the existing trend
-        -- Since p_old_ewma follows the trend during warm-up, 
-        -- the 10% (or X%) threshold only applies once the EWMA has stabilized.
-        if p_monitor_rec.used_time > p_monitor_rec.avg_action_time * (1 + p_metricFactor / 100) then
+        if p_reference is null or p_current is null or p_pct is null
+           or (p_isTime and p_reference < 1) then
             return FALSE;
         end if;
 
-        return TRUE;
+        if p_up then
+            return p_current > p_reference + abs(p_reference) * p_pct / 100;
+        end if;
+        return p_current < p_reference - abs(p_reference) * p_pct / 100;
     end;
 
     --------------------------------------------------------------------------
 
-    -- Returns the n-th value from 'a|b|c' (e.g. AVG_DEVIATION_PCT: 'pct|warmup|alpha').
+    -- Returns the n-th value from 'a|b|c' (e.g. TIME_EWMA_DEVIATION_PCT_UP: 'pct|warmup|alpha').
     -- Missing or invalid values => NULL (callers set defaults)
     FUNCTION extractRuleValue(p_param VARCHAR2, p_position PLS_INTEGER) return number
     AS
@@ -1636,7 +1674,7 @@ AS
                         WHEN 'PRECEDED_BY' THEN
                             fire := NOT (g_last_action_per_process.EXISTS(p_ctx.process_id) AND predecessorMatches(p_list(i)));
 
-                        WHEN 'PRECEDED_BY_WITHIN_SECS' THEN
+                        WHEN 'TIME_PRECEDED_BY_WITHIN_SECS' THEN
                             IF g_last_action_per_process.EXISTS(p_ctx.process_id) AND predecessorMatches(p_list(i)) THEN
                                 -- For process triggers start_time is the process start; use the time of the signal
                                 -- (PROCESS_STOP: process_end, PROCESS_UPDATE: signal time in last_update).
@@ -1653,19 +1691,31 @@ AS
                         -- =====================================================
                         -- MONITOR-ONLY OPERATORS
                         -- =====================================================
-                        WHEN 'AVG_DEVIATION_PCT' THEN
+                        WHEN 'TIME_EWMA_DEVIATION_PCT_UP' THEN
                             -- Compare the current duration with the average BEFORE this measurement.
                             -- avg_time is NULL during warm-up => no evaluation.
-                            p_monRec.start_time      := p_ctx.start_time;
-                            p_monRec.stop_time       := p_ctx.stop_time;
-                            p_monRec.used_time       := p_ctx.used_time;
-                            p_monRec.avg_action_time := p_ctx.avg_time;
-                            fire := NOT validateDurationInAverage(p_monRec, p_list(i).cond_num);
+                            fire := deviatesFromEwma(p_ctx.used_time, p_ctx.avg_time, p_list(i).cond_num, TRUE, TRUE);
 
-                        WHEN 'MAX_DURATION_MS' THEN
+                        WHEN 'TIME_EWMA_DEVIATION_PCT_DOWN' THEN
+                            fire := deviatesFromEwma(p_ctx.used_time, p_ctx.avg_time, p_list(i).cond_num, FALSE, TRUE);
+
+                        WHEN 'TIME_MAX_DURATION_MS' THEN
                             fire := p_ctx.used_time > p_list(i).cond_num;
 
-                        WHEN 'MAX_GAP_SECONDS' THEN
+                        -- Value operators (MARK_EVENT with p_value); no value => no alert
+                        WHEN 'VAL_EWMA_DEVIATION_PCT_UP' THEN
+                            fire := deviatesFromEwma(p_ctx.used_value, p_ctx.avg_value, p_list(i).cond_num, TRUE, FALSE);
+
+                        WHEN 'VAL_EWMA_DEVIATION_PCT_DOWN' THEN
+                            fire := deviatesFromEwma(p_ctx.used_value, p_ctx.avg_value, p_list(i).cond_num, FALSE, FALSE);
+
+                        WHEN 'VAL_MIN' THEN
+                            fire := p_ctx.used_value < p_list(i).cond_num;
+
+                        WHEN 'VAL_MAX' THEN
+                            fire := p_ctx.used_value > p_list(i).cond_num;
+
+                        WHEN 'TIME_MAX_GAP_SECONDS' THEN
                             -- Events: distance to the previous event; traces (TRACE_START): distance to the end of the previous trace
                             v_key := buildMonitorKey(p_ctx.process_id, p_ctx.action_name, p_ctx.context_name);
                             IF p_trigger = C_MARK_EVENT AND g_monitor_shadows.EXISTS(v_key) THEN
@@ -1679,12 +1729,12 @@ AS
                         -- =====================================================
                         -- PROCESS-ONLY OPERATORS
                         -- =====================================================
-                        WHEN 'RUNTIME_EXCEEDED' THEN
+                        WHEN 'TIME_RUNTIME_EXCEEDED' THEN
                             -- running process; checked only when a signal arrives
                             fire := p_ctx.process_end IS NULL
                                 AND get_ms_diff(p_ctx.start_time, systimestamp) > p_list(i).cond_num;
 
-                        WHEN 'MAX_RUNTIME_EXCEEDED' THEN
+                        WHEN 'TIME_MAX_RUNTIME_EXCEEDED' THEN
                             fire := p_ctx.process_end IS NOT NULL
                                 AND get_ms_diff(p_ctx.start_time, p_ctx.process_end) > p_list(i).cond_num;
 
@@ -1775,6 +1825,8 @@ AS
         l_ctx.used_time    := p_monitorRec.used_time;
         l_ctx.action_count := p_monitorRec.action_count;
         l_ctx.avg_time     := p_monitorRec.baseline_avg;
+        l_ctx.used_value   := p_monitorRec.used_value;
+        l_ctx.avg_value    := p_monitorRec.baseline_value;
         return l_ctx;
     END;
 
@@ -1827,7 +1879,7 @@ AS
     END evaluateRules;
 
     -- Method used for mapping to the central evaluate method
-    -- p_signalTime: time of the signal (PROCESS_UPDATE), reference time for PRECEDED_BY_WITHIN_SECS
+    -- p_signalTime: time of the signal (PROCESS_UPDATE), reference time for TIME_PRECEDED_BY_WITHIN_SECS
     PROCEDURE evaluateRules(p_processRec t_process_rec, p_trigger VARCHAR2, p_signalTime TIMESTAMP := NULL)
     AS
         l_ctx t_eval_context_rec;
@@ -2850,7 +2902,7 @@ AS
         execute immediate p_sqlStmt;
     exception
         when OTHERS then
-            if sqlcode != -1430 then
+            if sqlcode not in (-1430, -14411) then   -- column exists / concurrent DDL by another server
                 logLilamErr(sqlCode, sqlErrM, 'add_columns', 'EXECUTE IMMEDIATE');
             end if;
     end;
@@ -2975,7 +3027,7 @@ AS
             execute immediate 'alter table ' || C_LILAM_WATERMARK || ' add (gap_from NUMBER)';
         exception
             when others then
-                if sqlcode not in (-1430, -54) then   -- column exists / table in use by another server
+                if sqlcode not in (-1430, -54, -14411) then   -- column exists / table in use / concurrent DDL by another server
                     raise;
                 end if;
         end;
@@ -3416,11 +3468,21 @@ AS
                 "ACTION"        VARCHAR2(100),
                 "CONTEXT"  VARCHAR2(100),
                 "USED_MILLIS"   NUMBER(19,0), -- Millis as a number for easy evaluation
-                "AVG_MILLIS"    NUMBER(19,0),
+                "USED_MILLIS_EWMA" NUMBER(19,0),
+                "USED_VALUE"    NUMBER,       -- Measured value of MARK_EVENT (p_value)
+                "USED_VALUE_EWMA" NUMBER,
                 "ACTION_COUNT"    NUMBER(19,0)
             )';
             sqlStmt := replaceNameTable(sqlStmt, C_PARAM_MON_TABLE, C_SUFFIX_MON_TABLE, p_TabNameMaster);
             run_sql(sqlStmt);
+        else
+            -- Existing table: columns for measured values
+            select count(*) into l_regCols from user_tab_columns
+             where table_name = upper(p_TabNameMaster || C_SUFFIX_MON_TABLE) and column_name = 'USED_VALUE_EWMA';
+            if l_regCols = 0 then
+                add_columns('ALTER TABLE ' || p_TabNameMaster || C_SUFFIX_MON_TABLE
+                            || ' ADD (used_millis_ewma NUMBER(19,0), used_value NUMBER, used_value_ewma NUMBER)');
+            end if;
         end if ;
 
         if not objectExists(C_LILAM_SERVER_REGISTRY, 'TABLE') then
@@ -3555,10 +3617,19 @@ AS
                 context_name  VARCHAR2(100) DEFAULT ''' || C_BASELINE_NULL_CONTEXT || ''' NOT NULL,
                 avg_ms        NUMBER,
                 action_count  NUMBER(19,0)  DEFAULT 0 NOT NULL,
+                avg_val       NUMBER,
+                val_count     NUMBER(19,0)  DEFAULT 0 NOT NULL,
                 last_update   TIMESTAMP(6),
                 CONSTRAINT pk_lilam_baselines PRIMARY KEY (scope_id, action_name, context_name)
             ) ORGANIZATION INDEX';
             run_sql(sqlStmt);
+        else
+            -- Existing table: value series (MARK_EVENT with p_value)
+            select count(*) into l_regCols from user_tab_columns
+             where table_name = upper(C_LILAM_BASELINES_TABLE) and column_name = 'VAL_COUNT';
+            if l_regCols = 0 then
+                add_columns('ALTER TABLE ' || C_LILAM_BASELINES_TABLE || ' ADD (avg_val NUMBER, val_count NUMBER(19,0) DEFAULT 0 NOT NULL)');
+            end if;
         end if;
 
         -- Indexes of the master tables: names are derived from the master name,
@@ -3786,6 +3857,7 @@ AS
         p_processId number, p_target_table varchar2,
         p_actions sys.odcivarchar2list, p_contexts sys.odcivarchar2list, p_mon_types sys.odcinumberlist,
         p_action_count sys.odcinumberlist, p_used sys.odcinumberlist, p_avgs sys.odcinumberlist,
+        p_vals sys.odcinumberlist, p_valAvgs sys.odcinumberlist,
         p_timesStart t_timestamp_list_t, p_timesStop t_timestamp_list_t)
     as
         l_n     pls_integer;
@@ -3802,6 +3874,8 @@ AS
         g_mon_batches(p_target_table).action_count.EXTEND(p_actions.COUNT);
         g_mon_batches(p_target_table).used.EXTEND(p_actions.COUNT);
         g_mon_batches(p_target_table).avgs.EXTEND(p_actions.COUNT);
+        g_mon_batches(p_target_table).vals.EXTEND(p_actions.COUNT);
+        g_mon_batches(p_target_table).valAvgs.EXTEND(p_actions.COUNT);
         g_mon_batches(p_target_table).timesStart.EXTEND(p_actions.COUNT);
         g_mon_batches(p_target_table).timesStop.EXTEND(p_actions.COUNT);
         for i in 1 .. p_actions.COUNT loop
@@ -3812,6 +3886,8 @@ AS
             g_mon_batches(p_target_table).action_count(l_n + i) := p_action_count(i);
             g_mon_batches(p_target_table).used(l_n + i)         := p_used(i);
             g_mon_batches(p_target_table).avgs(l_n + i)         := p_avgs(i);
+            g_mon_batches(p_target_table).vals(l_n + i)         := p_vals(i);
+            g_mon_batches(p_target_table).valAvgs(l_n + i)      := p_valAvgs(i);
             g_mon_batches(p_target_table).timesStart(l_n + i)   := p_timesStart(i);
             g_mon_batches(p_target_table).timesStop(l_n + i)    := p_timesStop(i);
         end loop;
@@ -4081,6 +4157,8 @@ AS
         p_action_count sys.odcinumberlist,
         p_used         sys.odcinumberlist,
         p_avgs         sys.odcinumberlist,
+        p_vals         sys.odcinumberlist,
+        p_valAvgs      sys.odcinumberlist,
         p_timesStart   t_timestamp_list_t,
         p_timesStop    t_timestamp_list_t
     )
@@ -4095,7 +4173,7 @@ AS
         if g_batch_mode then
             if p_actions.count > 0 then
                 appendMonBatch(p_processId, p_target_table, p_actions, p_contexts, p_mon_types,
-                               p_action_count, p_used, p_avgs, p_timesStart, p_timesStop);
+                               p_action_count, p_used, p_avgs, p_vals, p_valAvgs, p_timesStart, p_timesStop);
             end if;
             return;
         end if;
@@ -4104,14 +4182,15 @@ AS
             -- Security: validate the table name
             v_safe_table := safeTableName(p_target_table);
             v_stmt := 'insert into ' || v_safe_table || '
-                (PROCESS_ID, ACTION, CONTEXT, MON_TYPE, ACTION_COUNT, USED_MILLIS, AVG_MILLIS, START_TIME, STOP_TIME, SESSION_USER, HOST_NAME)
-                values (:1, :2, :3, :4, :5, :6, :7, :8, :9, :10, :11)';
+                (PROCESS_ID, ACTION, CONTEXT, MON_TYPE, ACTION_COUNT, USED_MILLIS, USED_MILLIS_EWMA, USED_VALUE, USED_VALUE_EWMA,
+                 START_TIME, STOP_TIME, SESSION_USER, HOST_NAME)
+                values (:1, :2, :3, :4, :5, :6, :7, :8, :9, :10, :11, :12, :13)';
             begin
                 -- STABILITY: without SAVE EXCEPTIONS, see rowFailed
                 forall i in 1 .. p_actions.count
                     execute immediate v_stmt
-                    using p_processId, p_actions(i), p_contexts(i), p_mon_types(i), p_action_count(i), p_used(i), p_avgs(i), p_timesStart(i),
-                          p_timesStop(i), v_user, v_host;
+                    using p_processId, p_actions(i), p_contexts(i), p_mon_types(i), p_action_count(i), p_used(i), p_avgs(i),
+                          p_vals(i), p_valAvgs(i), p_timesStart(i), p_timesStop(i), v_user, v_host;
             exception
                 when others then
                     -- Fallback: write individually, skip faulty rows
@@ -4119,8 +4198,8 @@ AS
                     for i in 1 .. p_actions.count loop
                         begin
                             execute immediate v_stmt
-                            using p_processId, p_actions(i), p_contexts(i), p_mon_types(i), p_action_count(i), p_used(i), p_avgs(i), p_timesStart(i),
-                                  p_timesStop(i), v_user, v_host;
+                            using p_processId, p_actions(i), p_contexts(i), p_mon_types(i), p_action_count(i), p_used(i), p_avgs(i),
+                                  p_vals(i), p_valAvgs(i), p_timesStart(i), p_timesStop(i), v_user, v_host;
                         exception
                             when others then
                                 exit when rowFailed(sqlcode, sqlerrm, 'persist_monitor_data', i);
@@ -4144,6 +4223,8 @@ AS
     -- sync (avg - base_avg, count - base_count) and then takes over
     -- the overall state from the DB. One writer => exact EWMA,
     -- several parallel writers => good approximation without lost updates.
+    -- The time series (avg_ms/action_count) and the value series (avg_val/val_count)
+    -- are merged the same way, each with its own counter.
     -- Unused, clean entries are removed from the PGA.
     --------------------------------------------------------------------
     PROCEDURE syncBaselines(p_force BOOLEAN DEFAULT FALSE)
@@ -4157,6 +4238,8 @@ AS
         l_rec        t_baseline_rec;
         l_dbAvg      NUMBER;
         l_dbCnt      NUMBER;
+        l_dbVal      NUMBER;
+        l_dbVCnt     NUMBER;
 
         -- Delta updates for entries that exist in the DB
         l_upd_keys   sys.odcivarchar2list := sys.odcivarchar2list();
@@ -4166,6 +4249,9 @@ AS
         l_upd_dAvg   sys.odcinumberlist   := sys.odcinumberlist();
         l_upd_dCnt   sys.odcinumberlist   := sys.odcinumberlist();
         l_upd_avg    sys.odcinumberlist   := sys.odcinumberlist();
+        l_upd_dVal   sys.odcinumberlist   := sys.odcinumberlist();
+        l_upd_dVCnt  sys.odcinumberlist   := sys.odcinumberlist();
+        l_upd_val    sys.odcinumberlist   := sys.odcinumberlist();
 
         -- Return the new DB values
         l_ret_scope  sys.odcinumberlist   := sys.odcinumberlist();
@@ -4173,11 +4259,15 @@ AS
         l_ret_ctx    sys.odcivarchar2list := sys.odcivarchar2list();
         l_ret_avg    sys.odcinumberlist   := sys.odcinumberlist();
         l_ret_cnt    sys.odcinumberlist   := sys.odcinumberlist();
+        l_ret_val    sys.odcinumberlist   := sys.odcinumberlist();
+        l_ret_vcnt   sys.odcinumberlist   := sys.odcinumberlist();
 
         -- New entries (or entries no longer present in the DB)
         l_ins_keys   sys.odcivarchar2list := sys.odcivarchar2list();
         l_ins_avg    sys.odcinumberlist   := sys.odcinumberlist();
         l_ins_cnt    sys.odcinumberlist   := sys.odcinumberlist();
+        l_ins_val    sys.odcinumberlist   := sys.odcinumberlist();
+        l_ins_vcnt   sys.odcinumberlist   := sys.odcinumberlist();
 
         TYPE t_key_lookup IS TABLE OF VARCHAR2(250) INDEX BY VARCHAR2(250);
         l_lookup     t_key_lookup;
@@ -4188,14 +4278,18 @@ AS
             RETURN p_scopeId || '|' || p_action || '|' || p_dbContext;
         END;
 
-        PROCEDURE takeOver(p_key VARCHAR2, p_avg NUMBER, p_cnt NUMBER) IS
+        PROCEDURE takeOver(p_key VARCHAR2, p_avg NUMBER, p_cnt NUMBER, p_val NUMBER, p_vcnt NUMBER) IS
         BEGIN
-            g_baselines(p_key).avg_ms       := p_avg;
-            g_baselines(p_key).base_avg     := p_avg;
-            g_baselines(p_key).action_count := p_cnt;
-            g_baselines(p_key).base_count   := p_cnt;
-            g_baselines(p_key).in_db        := TRUE;
-            g_baselines(p_key).dirty        := FALSE;
+            g_baselines(p_key).avg_ms         := p_avg;
+            g_baselines(p_key).base_avg       := p_avg;
+            g_baselines(p_key).action_count   := p_cnt;
+            g_baselines(p_key).base_count     := p_cnt;
+            g_baselines(p_key).avg_val        := p_val;
+            g_baselines(p_key).base_val       := p_val;
+            g_baselines(p_key).val_count      := p_vcnt;
+            g_baselines(p_key).base_val_count := p_vcnt;
+            g_baselines(p_key).in_db          := TRUE;
+            g_baselines(p_key).dirty          := FALSE;
         END;
     BEGIN
         IF g_baselines.COUNT = 0 THEN
@@ -4215,14 +4309,18 @@ AS
             l_rec  := g_baselines(l_key);
 
             IF l_rec.dirty THEN
-                IF l_rec.in_db AND l_rec.base_avg IS NOT NULL THEN
+                IF l_rec.in_db THEN
                     l_upd_keys.EXTEND;   l_upd_keys(l_upd_keys.LAST)     := l_key;
                     l_upd_scope.EXTEND;  l_upd_scope(l_upd_scope.LAST)   := l_rec.scope_id;
                     l_upd_action.EXTEND; l_upd_action(l_upd_action.LAST) := l_rec.action_name;
                     l_upd_ctx.EXTEND;    l_upd_ctx(l_upd_ctx.LAST)       := nvl(l_rec.context_name, C_BASELINE_NULL_CONTEXT);
+                    -- delta NULL (no base yet) => the own value is taken (see update)
                     l_upd_dAvg.EXTEND;   l_upd_dAvg(l_upd_dAvg.LAST)     := l_rec.avg_ms - l_rec.base_avg;
                     l_upd_dCnt.EXTEND;   l_upd_dCnt(l_upd_dCnt.LAST)     := l_rec.action_count - l_rec.base_count;
                     l_upd_avg.EXTEND;    l_upd_avg(l_upd_avg.LAST)       := l_rec.avg_ms;
+                    l_upd_dVal.EXTEND;   l_upd_dVal(l_upd_dVal.LAST)     := l_rec.avg_val - l_rec.base_val;
+                    l_upd_dVCnt.EXTEND;  l_upd_dVCnt(l_upd_dVCnt.LAST)   := l_rec.val_count - l_rec.base_val_count;
+                    l_upd_val.EXTEND;    l_upd_val(l_upd_val.LAST)       := l_rec.avg_val;
                     l_lookup(dbKey(l_rec.scope_id, l_rec.action_name, nvl(l_rec.context_name, C_BASELINE_NULL_CONTEXT))) := l_key;
                 ELSE
                     l_ins_keys.EXTEND;   l_ins_keys(l_ins_keys.LAST)     := l_key;
@@ -4246,18 +4344,27 @@ AS
         -- so two sessions cannot wait for each other crosswise (ORA-00060, load test BATCHSTART run 1946).
 
         -- 2. Delta merge as bulk update (key order: g_baselines is iterated in ascending key order)
-        --    A negative result (extremely opposing parallel writers) is replaced by the own value.
+        --    Time: a negative result (extremely opposing parallel writers) is replaced by the own value.
+        --    Values may be negative, so there is no such check for them.
+        --    Without new measurements of a series (count delta 0) its average stays unchanged.
         IF l_upd_keys.COUNT > 0 THEN
             FORALL i IN 1 .. l_upd_keys.COUNT
                 EXECUTE IMMEDIATE
                    'update ' || C_LILAM_BASELINES_TABLE || '
-                       set avg_ms       = CASE WHEN avg_ms + :1 > 0 THEN avg_ms + :2 ELSE :3 END,
-                           action_count = action_count + :4,
+                       set avg_ms       = CASE WHEN :1 = 0 THEN avg_ms
+                                               WHEN avg_ms + :2 > 0 THEN avg_ms + :3 ELSE :4 END,
+                           action_count = action_count + :5,
+                           avg_val      = CASE WHEN :6 = 0 THEN avg_val
+                                               WHEN avg_val IS NULL OR :7 IS NULL THEN :8 ELSE avg_val + :9 END,
+                           val_count    = val_count + :10,
                            last_update  = SYSTIMESTAMP
-                     where scope_id = :5 and action_name = :6 and context_name = :7
-                    returning scope_id, action_name, context_name, avg_ms, action_count into :8, :9, :10, :11, :12'
-                USING l_upd_dAvg(i), l_upd_dAvg(i), l_upd_avg(i), l_upd_dCnt(i), l_upd_scope(i), l_upd_action(i), l_upd_ctx(i)
-                RETURNING BULK COLLECT INTO l_ret_scope, l_ret_action, l_ret_ctx, l_ret_avg, l_ret_cnt;
+                     where scope_id = :11 and action_name = :12 and context_name = :13
+                    returning scope_id, action_name, context_name, avg_ms, action_count, avg_val, val_count
+                         into :14, :15, :16, :17, :18, :19, :20'
+                USING l_upd_dCnt(i), l_upd_dAvg(i), l_upd_dAvg(i), l_upd_avg(i), l_upd_dCnt(i),
+                      l_upd_dVCnt(i), l_upd_dVal(i), l_upd_val(i), l_upd_dVal(i), l_upd_dVCnt(i),
+                      l_upd_scope(i), l_upd_action(i), l_upd_ctx(i)
+                RETURNING BULK COLLECT INTO l_ret_scope, l_ret_action, l_ret_ctx, l_ret_avg, l_ret_cnt, l_ret_val, l_ret_vcnt;
 
             -- No longer present in the DB (e.g. deleted manually) => create again
             FOR i IN 1 .. l_upd_keys.COUNT LOOP
@@ -4272,7 +4379,7 @@ AS
             FOR i IN 1 .. l_ret_scope.COUNT LOOP
                 l_dbKey := dbKey(l_ret_scope(i), l_ret_action(i), l_ret_ctx(i));
                 IF l_lookup.EXISTS(l_dbKey) THEN
-                    takeOver(l_lookup(l_dbKey), l_ret_avg(i), l_ret_cnt(i));
+                    takeOver(l_lookup(l_dbKey), l_ret_avg(i), l_ret_cnt(i), l_ret_val(i), l_ret_vcnt(i));
                 END IF;
             END LOOP;
         END IF;
@@ -4299,35 +4406,50 @@ AS
             BEGIN
                 EXECUTE IMMEDIATE
                     'insert into ' || C_LILAM_BASELINES_TABLE ||
-                    ' (scope_id, action_name, context_name, avg_ms, action_count, last_update) values (:1, :2, :3, :4, :5, SYSTIMESTAMP)'
+                    ' (scope_id, action_name, context_name, avg_ms, action_count, avg_val, val_count, last_update)' ||
+                    ' values (:1, :2, :3, :4, :5, :6, :7, SYSTIMESTAMP)'
                     USING l_rec.scope_id, l_rec.action_name, nvl(l_rec.context_name, C_BASELINE_NULL_CONTEXT),
-                          l_rec.avg_ms, l_rec.action_count - l_rec.base_count;
-                l_dbAvg := l_rec.avg_ms;
-                l_dbCnt := l_rec.action_count - l_rec.base_count;
+                          l_rec.avg_ms, l_rec.action_count - l_rec.base_count,
+                          l_rec.avg_val, l_rec.val_count - l_rec.base_val_count;
+                l_dbAvg  := l_rec.avg_ms;
+                l_dbCnt  := l_rec.action_count - l_rec.base_count;
+                l_dbVal  := l_rec.avg_val;
+                l_dbVCnt := l_rec.val_count - l_rec.base_val_count;
             EXCEPTION
                 WHEN DUP_VAL_ON_INDEX THEN
                     EXECUTE IMMEDIATE
                        'update ' || C_LILAM_BASELINES_TABLE || '
-                           set avg_ms       = (nvl(avg_ms, 0) * action_count + :1 * :2) / nullif(action_count + :3, 0),
-                               action_count = action_count + :4,
+                           set avg_ms       = CASE WHEN :1 = 0 THEN avg_ms
+                                                   ELSE (nvl(avg_ms, 0) * action_count + :2 * :3) / nullif(action_count + :4, 0) END,
+                               action_count = action_count + :5,
+                               avg_val      = CASE WHEN :6 = 0 THEN avg_val
+                                                   WHEN avg_val IS NULL THEN :7
+                                                   ELSE (avg_val * val_count + :8 * :9) / nullif(val_count + :10, 0) END,
+                               val_count    = val_count + :11,
                                last_update  = SYSTIMESTAMP
-                         where scope_id = :5 and action_name = :6 and context_name = :7
-                        returning avg_ms, action_count into :8, :9'
-                        USING l_rec.avg_ms, l_rec.action_count - l_rec.base_count, l_rec.action_count - l_rec.base_count,
+                         where scope_id = :12 and action_name = :13 and context_name = :14
+                        returning avg_ms, action_count, avg_val, val_count into :15, :16, :17, :18'
+                        USING l_rec.action_count - l_rec.base_count,
+                              l_rec.avg_ms, l_rec.action_count - l_rec.base_count, l_rec.action_count - l_rec.base_count,
                               l_rec.action_count - l_rec.base_count,
+                              l_rec.val_count - l_rec.base_val_count, l_rec.avg_val,
+                              l_rec.avg_val, l_rec.val_count - l_rec.base_val_count, l_rec.val_count - l_rec.base_val_count,
+                              l_rec.val_count - l_rec.base_val_count,
                               l_rec.scope_id, l_rec.action_name, nvl(l_rec.context_name, C_BASELINE_NULL_CONTEXT)
-                        RETURNING INTO l_dbAvg, l_dbCnt;
+                        RETURNING INTO l_dbAvg, l_dbCnt, l_dbVal, l_dbVCnt;
             END;
             -- Remember values; they are taken over only after a successful commit
-            l_ins_avg.EXTEND; l_ins_avg(l_ins_avg.LAST) := l_dbAvg;
-            l_ins_cnt.EXTEND; l_ins_cnt(l_ins_cnt.LAST) := l_dbCnt;
+            l_ins_avg.EXTEND;  l_ins_avg(l_ins_avg.LAST)   := l_dbAvg;
+            l_ins_cnt.EXTEND;  l_ins_cnt(l_ins_cnt.LAST)   := l_dbCnt;
+            l_ins_val.EXTEND;  l_ins_val(l_ins_val.LAST)   := l_dbVal;
+            l_ins_vcnt.EXTEND; l_ins_vcnt(l_ins_vcnt.LAST) := l_dbVCnt;
         END LOOP;
 
         COMMIT;
 
         -- 4. Take over the overall state from the DB (new base for the next delta; updated entries in step 2)
         FOR i IN 1 .. l_ins_keys.COUNT LOOP
-            takeOver(l_ins_keys(i), l_ins_avg(i), l_ins_cnt(i));
+            takeOver(l_ins_keys(i), l_ins_avg(i), l_ins_cnt(i), l_ins_val(i), l_ins_vcnt(i));
         END LOOP;
 
     EXCEPTION
@@ -4481,6 +4603,8 @@ AS
         v_action_count  sys.odcinumberlist := sys.odcinumberlist();
         v_used        sys.odcinumberlist   := sys.odcinumberlist();
         v_avgs        sys.odcinumberlist   := sys.odcinumberlist();
+        v_vals        sys.odcinumberlist   := sys.odcinumberlist();
+        v_valAvgs     sys.odcinumberlist   := sys.odcinumberlist();
         v_timesStart  t_timestamp_list_t   := t_timestamp_list_t();
         v_timesStop   t_timestamp_list_t   := t_timestamp_list_t();
 
@@ -4516,6 +4640,9 @@ AS
                         v_action_count.extend; v_action_count(v_action_count.last):= g_monitor_groups(v_group_key)(i).action_count;
                         v_used.extend;         v_used(v_used.last)                := g_monitor_groups(v_group_key)(i).used_time;
                         v_avgs.extend;         v_avgs(v_avgs.last)                := g_monitor_groups(v_group_key)(i).avg_action_time;
+                        v_vals.extend;         v_vals(v_vals.last)                := g_monitor_groups(v_group_key)(i).used_value;
+                        v_valAvgs.extend;      v_valAvgs(v_valAvgs.last)          := CASE WHEN g_monitor_groups(v_group_key)(i).used_value IS NOT NULL
+                                                                                          THEN g_monitor_groups(v_group_key)(i).value_ewma END;
                         v_timesStart.extend;   v_timesStart(v_timesStart.last)    := g_monitor_groups(v_group_key)(i).start_time;
                         v_timesStop.extend;    v_timesStop(v_timesStop.last)      := g_monitor_groups(v_group_key)(i).stop_time;
                     end loop;
@@ -4537,7 +4664,8 @@ AS
                 p_action_count   => v_action_count,
                 p_used         => v_used,
                 p_avgs         => v_avgs,
-
+                p_vals         => v_vals,
+                p_valAvgs      => v_valAvgs,
                 p_timesStart   => v_timesStart,
                 p_timesStop    => v_timesStop
             );
@@ -4626,11 +4754,12 @@ AS
         p_curr_count pls_integer, -- Running counter including the current measurement
         p_new_value  number,      -- Currently measured duration (ms)
         p_warmup     pls_integer default 100, -- Threshold for smoothing
-        p_alpha      number      default 0.1  -- Weighting (0.1 = 10% new, 90% old)
+        p_alpha      number      default 0.1, -- Weighting (0.1 = 10% new, 90% old)
+        p_isValue    boolean     default false -- value series: 0 is a valid average
     ) return number is
     begin
         -- Case 1: initialization (the very first record)
-        if p_old_avg is null or p_old_avg = 0 or p_curr_count <= 1 then
+        if p_old_avg is null or (p_old_avg = 0 and not p_isValue) or p_curr_count <= 1 then
             return p_new_value;
         end if;
 
@@ -4697,7 +4826,7 @@ AS
     --------------------------------------------------------------------------
     -- Creating and adding/updating a record in the monitor list
     --------------------------------------------------------------------------    
-    procedure insertEventMonitorRemote(p_processId number, p_actionName varchar2, p_contextName varchar2, p_timestamp timestamp)
+    procedure insertEventMonitorRemote(p_processId number, p_actionName varchar2, p_contextName varchar2, p_value number, p_timestamp timestamp)
     as
         l_payload JSON_OBJ_LILAM; -- Buffer for the JSON string
     begin
@@ -4711,6 +4840,7 @@ AS
         l_payload := '{"process_id":' || jNum(p_processId)
                   || jStr('action_name',  p_actionName)
                   || jStr('context_name', p_contextName)
+                  || jNum('value',        p_value)
                   || jTs ('timestamp',    p_timestamp) || '}';
 
         sendNoWait(p_processId, C_MARK_EVENT, 'M', l_payload, C_SEND_TIMEOUT_SEC);
@@ -4723,8 +4853,9 @@ AS
 
     --------------------------------------------------------------------------
 
-    -- Baseline parameters from AVG_DEVIATION_PCT rules of the process's group, otherwise DEFAULT
-    function findAvgRule(p_processId number, p_action varchar2, p_context varchar2) return t_avg_params
+    -- Baseline parameters from the *_EWMA_DEVIATION_PCT_* rules of the process's group, otherwise DEFAULT.
+    -- p_isValue: value series (VAL_*), otherwise time series (TIME_*)
+    function findAvgRule(p_processId number, p_action varchar2, p_context varchar2, p_isValue boolean default false) return t_avg_params
     as
         l_group   varchar2(50);
         l_ruleKey varchar2(300);
@@ -4734,10 +4865,18 @@ AS
         end if;
         if l_group is not null then
             l_ruleKey := l_group || '|' || p_action;
-            IF g_avg_params.EXISTS(l_ruleKey || '|' || p_context) THEN
-                return g_avg_params(l_ruleKey || '|' || p_context);
-            ELSIF g_avg_params.EXISTS(l_ruleKey) THEN
-                return g_avg_params(l_ruleKey);
+            if p_isValue then
+                IF g_val_params.EXISTS(l_ruleKey || '|' || p_context) THEN
+                    return g_val_params(l_ruleKey || '|' || p_context);
+                ELSIF g_val_params.EXISTS(l_ruleKey) THEN
+                    return g_val_params(l_ruleKey);
+                end if;
+            else
+                IF g_avg_params.EXISTS(l_ruleKey || '|' || p_context) THEN
+                    return g_avg_params(l_ruleKey || '|' || p_context);
+                ELSIF g_avg_params.EXISTS(l_ruleKey) THEN
+                    return g_avg_params(l_ruleKey);
+                end if;
             end if;
         end if;
         return g_avg_params('DEFAULT');
@@ -4749,7 +4888,7 @@ AS
     -- With scope:  cross-process baseline (g_baselines)
     -- Without scope or on errors: process-local as before
     -- baseline_avg is the average BEFORE the measurement; NULL during warm-up,
-    -- so that AVG_DEVIATION_PCT only applies once the baseline is stable.
+    -- so that TIME_EWMA_DEVIATION_PCT_* only applies once the baseline is stable.
     --------------------------------------------------------------------------
     procedure applyBaseline(
         p_processId   number,
@@ -4796,8 +4935,57 @@ AS
     end;
 
     --------------------------------------------------------------------------
+    -- Same as applyBaseline for the value series of MARK_EVENT (p_rec.used_value must be set).
+    -- Own counter (val_count/value_count): every event with a value counts, also the first one.
+    -- baseline_value is the value EWMA BEFORE the measurement; NULL during warm-up.
+    --------------------------------------------------------------------------
+    procedure applyValueBaseline(
+        p_processId   number,
+        p_prevVal     number,        -- process-local value EWMA before the measurement
+        p_prevCount   pls_integer,   -- process-local number of values before this one
+        p_rec         in out nocopy t_monitor_buffer_rec
+    )
+    as
+        l_params  t_avg_params;
+        l_scopeId number;
+        l_key     varchar2(250);
+        l_oldVal  number;
+        l_oldCnt  number;
+    begin
+        l_params  := findAvgRule(p_processId, p_rec.action_name, p_rec.context_name, p_isValue => TRUE);
+        l_scopeId := getScopeId(p_processId);
+        p_rec.value_count := p_prevCount + 1;
 
-    procedure writeEventToMonitorBuffer (p_processId number, p_actionName varchar2, p_contextName varchar2, p_timestamp timestamp)
+        if l_scopeId is not null then
+            begin
+                l_key := buildBaselineKey(l_scopeId, p_rec.action_name, p_rec.context_name);
+                ensureBaseline(l_key, l_scopeId, p_rec.action_name, p_rec.context_name);
+
+                l_oldVal := g_baselines(l_key).avg_val;
+                l_oldCnt := g_baselines(l_key).val_count;
+
+                g_baselines(l_key).val_count     := l_oldCnt + 1;
+                g_baselines(l_key).avg_val       := calculate_ewma(l_oldVal, l_oldCnt + 1, p_rec.used_value, l_params.warmup, l_params.alpha, p_isValue => TRUE);
+                g_baselines(l_key).dirty         := TRUE;
+                g_baselines(l_key).last_touch_cs := dbms_utility.get_time;
+
+                p_rec.value_ewma     := g_baselines(l_key).avg_val;
+                p_rec.baseline_value := CASE WHEN l_oldCnt >= coalesce(l_params.warmup, 0) THEN l_oldVal END;
+                return;
+            exception
+                when others then
+                    logLilamErr(sqlCode, sqlErrM, 'applyValueBaseline', 'scope_id=' || l_scopeId || '; scope disabled for process ' || p_processId);
+                    setScopeId(p_processId, null);
+            end;
+        end if;
+
+        p_rec.value_ewma     := calculate_ewma(p_prevVal, p_prevCount + 1, p_rec.used_value, l_params.warmup, l_params.alpha, p_isValue => TRUE);
+        p_rec.baseline_value := CASE WHEN p_prevCount >= coalesce(l_params.warmup, 0) THEN p_prevVal END;
+    end;
+
+    --------------------------------------------------------------------------
+
+    procedure writeEventToMonitorBuffer (p_processId number, p_actionName varchar2, p_contextName varchar2, p_value number, p_timestamp timestamp)
     as
         -- Key prefix should ideally contain p_processId for faster flush access
         v_key        constant varchar2(200) := buildMonitorKey(p_processId, p_actionName, p_contextName);
@@ -4807,7 +4995,7 @@ AS
         l_rec        t_monitor_buffer_rec;
     begin
         if is_remote(p_processId) then
-            insertEventMonitorRemote(p_processId, p_actionName, p_contextName, p_timestamp);
+            insertEventMonitorRemote(p_processId, p_actionName, p_contextName, p_value, p_timestamp);
             return;
         end if ;
 
@@ -4855,6 +5043,15 @@ AS
             l_rec.avg_action_time := 0;
             l_rec.baseline_avg    := NULL;
         end if ;
+
+        -- Value series: separate from the time series. Without a value the value EWMA is carried
+        -- over unchanged (stays in the shadow entry, not written to _MON).
+        l_rec.used_value  := p_value;
+        l_rec.value_ewma  := l_prev.value_ewma;
+        l_rec.value_count := coalesce(l_prev.value_count, 0);
+        if p_value is not null then
+            applyValueBaseline(p_processId, l_prev.value_ewma, l_rec.value_count, l_rec);
+        end if;
 
         if NOT g_monitor_groups.EXISTS(v_key) THEN
             g_monitor_groups(v_key) := t_monitor_history_tab();
@@ -5057,12 +5254,12 @@ AS
     --------------------------------------------------------------------------
     -- Monitoring a step
     --------------------------------------------------------------------------
-    PROCEDURE MARK_EVENT(p_processId NUMBER, p_actionName VARCHAR2, p_contextName VARCHAR2 default NULL, p_timestamp timestamp default NULL)
+    PROCEDURE MARK_EVENT(p_processId NUMBER, p_actionName VARCHAR2, p_contextName VARCHAR2 default NULL, p_value NUMBER default NULL, p_timestamp timestamp default NULL)
     as
         l_timestamp TIMESTAMP(6);
     begin
         l_timestamp := coalesce(p_timestamp, SYSTIMESTAMP);
-        writeEventToMonitorBuffer (p_processId, p_actionName, p_contextName, l_timestamp);
+        writeEventToMonitorBuffer (p_processId, p_actionName, p_contextName, p_value, l_timestamp);
         syncInSession(p_processId);
     end;
     --------------------------------------------------------------------------
@@ -5113,8 +5310,21 @@ AS
             v_rec.start_time  := jsonTime(l_payload, 'start_time');
             v_rec.stop_time  := jsonTime(l_payload, 'stop_time');
             v_rec.avg_action_time  := jsonNumber(l_payload, 'avg_action_time');
+            v_rec.value_ewma  := jsonNumber(l_payload, 'value_ewma');
         end if;
         return v_rec;
+    end;
+
+    --------------------------------------------------------------------------
+    -- Value EWMA of the last event of the series (shadow entry; survives the flush)
+    function getLastValueEwma(p_processId number, p_actionName varchar2, p_contextName varchar2) return number
+    as
+        v_key constant varchar2(200) := buildMonitorKey(p_processId, p_actionName, p_contextName);
+    begin
+        if g_monitor_shadows.EXISTS(v_key) then
+            return g_monitor_shadows(v_key).value_ewma;
+        end if;
+        return null;
     end;
 
     --------------------------------------------------------------------------
@@ -5130,6 +5340,25 @@ AS
 
         v_rec := getLastMonitorEntry(p_processId, p_actionName, p_contextName);
         RETURN coalesce(v_rec.avg_action_time, 0);
+    end;
+
+    --------------------------------------------------------------------------
+
+    -- EWMA of the measured values (MARK_EVENT with p_value); NULL if the series has no value yet
+    FUNCTION GET_METRIC_AVG_VALUE(p_processId NUMBER, p_actionName VARCHAR2, p_contextName VARCHAR2) return NUMBER
+    as
+        v_rec t_monitor_buffer_rec;
+    begin
+        if is_remote(p_processId) then
+            v_rec := getLastMonitorEntryRemote(p_processId, p_actionName, p_contextName);
+            return v_rec.value_ewma;
+        end if ;
+
+        return getLastValueEwma(p_processId, p_actionName, p_contextName);
+    exception
+        when others then
+            logLilamErr(sqlCode, sqlErrM, 'GET_METRIC_AVG_VALUE');
+            return null;
     end;
 
     --------------------------------------------------------------------------
@@ -5383,6 +5612,7 @@ AS
             l_mon.pids := sys.odcinumberlist(); l_mon.actions := sys.odcivarchar2list(); l_mon.contexts := sys.odcivarchar2list();
             l_mon.mon_types := sys.odcinumberlist(); l_mon.action_count := sys.odcinumberlist(); l_mon.used := sys.odcinumberlist();
             l_mon.avgs := sys.odcinumberlist(); l_mon.timesStart := t_timestamp_list_t(); l_mon.timesStop := t_timestamp_list_t();
+            l_mon.vals := sys.odcinumberlist(); l_mon.valAvgs := sys.odcinumberlist();
             for i in 1 .. g_mon_batches(l_key).pids.COUNT loop
                 if not p_lost.EXISTS(g_mon_batches(l_key).pids(i)) then
                     l_mon.pids.EXTEND;         l_mon.pids(l_mon.pids.LAST)                 := g_mon_batches(l_key).pids(i);
@@ -5392,6 +5622,8 @@ AS
                     l_mon.action_count.EXTEND; l_mon.action_count(l_mon.action_count.LAST) := g_mon_batches(l_key).action_count(i);
                     l_mon.used.EXTEND;         l_mon.used(l_mon.used.LAST)                 := g_mon_batches(l_key).used(i);
                     l_mon.avgs.EXTEND;         l_mon.avgs(l_mon.avgs.LAST)                 := g_mon_batches(l_key).avgs(i);
+                    l_mon.vals.EXTEND;         l_mon.vals(l_mon.vals.LAST)                 := g_mon_batches(l_key).vals(i);
+                    l_mon.valAvgs.EXTEND;      l_mon.valAvgs(l_mon.valAvgs.LAST)           := g_mon_batches(l_key).valAvgs(i);
                     l_mon.timesStart.EXTEND;   l_mon.timesStart(l_mon.timesStart.LAST)     := g_mon_batches(l_key).timesStart(i);
                     l_mon.timesStop.EXTEND;    l_mon.timesStop(l_mon.timesStop.LAST)       := g_mon_batches(l_key).timesStop(i);
                 end if;
@@ -5572,15 +5804,17 @@ AS
             begin
                 v_table := safeTableName(v_key);
                 v_stmt := 'insert into ' || v_table || '
-                        (PROCESS_ID, ACTION, CONTEXT, MON_TYPE, ACTION_COUNT, USED_MILLIS, AVG_MILLIS, START_TIME, STOP_TIME, SESSION_USER, HOST_NAME)
-                        values (:1, :2, :3, :4, :5, :6, :7, :8, :9, :10, :11)';
+                        (PROCESS_ID, ACTION, CONTEXT, MON_TYPE, ACTION_COUNT, USED_MILLIS, USED_MILLIS_EWMA, USED_VALUE, USED_VALUE_EWMA,
+                         START_TIME, STOP_TIME, SESSION_USER, HOST_NAME)
+                        values (:1, :2, :3, :4, :5, :6, :7, :8, :9, :10, :11, :12, :13)';
                 savepoint sp_flush_mon;
                 begin
                     forall i in 1 .. g_mon_batches(v_key).pids.COUNT
                         execute immediate v_stmt
                         USING g_mon_batches(v_key).pids(i), g_mon_batches(v_key).actions(i), g_mon_batches(v_key).contexts(i),
                               g_mon_batches(v_key).mon_types(i), g_mon_batches(v_key).action_count(i), g_mon_batches(v_key).used(i),
-                              g_mon_batches(v_key).avgs(i), g_mon_batches(v_key).timesStart(i), g_mon_batches(v_key).timesStop(i),
+                              g_mon_batches(v_key).avgs(i), g_mon_batches(v_key).vals(i), g_mon_batches(v_key).valAvgs(i),
+                              g_mon_batches(v_key).timesStart(i), g_mon_batches(v_key).timesStop(i),
                               v_user, v_host;
                 exception
                     when others then
@@ -5591,7 +5825,8 @@ AS
                                 execute immediate v_stmt
                                 USING g_mon_batches(v_key).pids(i), g_mon_batches(v_key).actions(i), g_mon_batches(v_key).contexts(i),
                                       g_mon_batches(v_key).mon_types(i), g_mon_batches(v_key).action_count(i), g_mon_batches(v_key).used(i),
-                                      g_mon_batches(v_key).avgs(i), g_mon_batches(v_key).timesStart(i), g_mon_batches(v_key).timesStop(i),
+                                      g_mon_batches(v_key).avgs(i), g_mon_batches(v_key).vals(i), g_mon_batches(v_key).valAvgs(i),
+                                      g_mon_batches(v_key).timesStart(i), g_mon_batches(v_key).timesStop(i),
                                       v_user, v_host;
                             exception
                                 when others then
@@ -6877,7 +7112,7 @@ AS
         l_monType pls_integer;
         l_payload JSON_OBJ_LILAM;
     begin
-        l_payload := JSON_QUERY(p_message, '$.payload');
+        l_payload := payloadOf(p_message, 'doRemote_startTrace');
         l_processId := jsonNumber(l_payload, 'process_id');
         l_actionName := jsonString(l_payload, 'action_name');
         l_contextName := jsonString(l_payload, 'context_name');
@@ -6898,7 +7133,7 @@ AS
         l_monType pls_integer;
         l_payload JSON_OBJ_LILAM;
     begin
-        l_payload := JSON_QUERY(p_message, '$.payload');
+        l_payload := payloadOf(p_message, 'doRemote_stopTrace');
         l_processId := jsonNumber(l_payload, 'process_id');
         l_actionName := jsonString(l_payload, 'action_name');
         l_contextName := jsonString(l_payload, 'context_name');
@@ -6920,14 +7155,14 @@ AS
         l_monType pls_integer;
         l_payload JSON_OBJ_LILAM;
     begin
-        l_payload := JSON_QUERY(p_message, '$.payload');
+        l_payload := payloadOf(p_message, 'doRemote_markEvent');
         l_processId := jsonNumber(l_payload, 'process_id');
         l_actionName := jsonString(l_payload, 'action_name');
         l_contextName := jsonString(l_payload, 'context_name');
         l_timestamp := jsonTime(l_payload, 'timestamp');
         l_monType := jsonNumber(l_payload, 'monitor_type');
 
-        writeEventToMonitorBuffer(l_processId, l_actionName, l_contextName, l_timestamp);
+        writeEventToMonitorBuffer(l_processId, l_actionName, l_contextName, jsonNumber(l_payload, 'value'), l_timestamp);
     end;
 
     --------------------------------------------------------------------------
@@ -6943,7 +7178,7 @@ AS
         l_payload JSON_OBJ_LILAM;
         l_timestamp     TIMESTAMP(6);
     begin
-        l_payload := JSON_QUERY(p_message, '$.payload');
+        l_payload := payloadOf(p_message, 'doRemote_setAnyStatus');
         l_processId     := jsonNumber(l_payload, 'process_id');
         l_status        := jsonNumber(l_payload, 'process_status');
         l_processInfo   := jsonString(l_payload, 'process_info');
@@ -6961,7 +7196,7 @@ AS
         l_processId     NUMBER;
         l_payload JSON_OBJ_LILAM;
     begin
-        l_payload := JSON_QUERY(p_message, '$.payload');
+        l_payload := payloadOf(p_message, 'doRemote_procStepDone');
         l_processId  := jsonNumber(l_payload, 'process_id');
 
         procStepDone(l_processId);
@@ -6978,7 +7213,7 @@ AS
         l_response      JSON_OBJ_LILAM;
         l_msg           JSON_OBJ_LILAM;
     begin
-        l_payload       := JSON_QUERY(p_message, '$.payload');
+        l_payload       := payloadOf(p_message, 'doRemote_reconnectProcess');
         l_processId     := jsonNumber(l_payload, 'process_id');
 
         if v_indexSession.EXISTS(l_processId) then
@@ -7122,8 +7357,10 @@ AS
             start_time    TIMESTAMP(6),
             stop_time     TIMESTAMP(6),
             used_millis   NUMBER,
-            avg_millis    NUMBER,
-            action_count  NUMBER
+            millis_ewma   NUMBER,
+            action_count  NUMBER,
+            value_ewma    NUMBER,
+            value_count   NUMBER
         );
         TYPE t_mon_rows IS TABLE OF t_mon_row;
         l_rows  t_mon_rows;
@@ -7134,10 +7371,16 @@ AS
     begin
         -- PERFORMANCE: one statement, index _IX_PID; only the newest row per action/context/type
         l_stmt := '
-        select action, context, mon_type, start_time, stop_time, used_millis, avg_millis, action_count
+        select action, context, mon_type, start_time, stop_time, used_millis, used_millis_ewma, action_count,
+               value_ewma, value_count
         from (
             select m.*, row_number() over (partition by action, context, mon_type
-                                           order by start_time desc, action_count desc) rn
+                                           order by start_time desc, action_count desc) rn,
+                   -- value series: last value EWMA and number of values (events without a value write none)
+                   last_value(used_value_ewma ignore nulls) over (partition by action, context, mon_type
+                                           order by start_time, action_count
+                                           rows between unbounded preceding and unbounded following) value_ewma,
+                   count(used_value) over (partition by action, context, mon_type) value_count
             from ' || C_PARAM_MON_TABLE || ' m
             where process_id = :1
         )
@@ -7154,8 +7397,10 @@ AS
             l_rec.start_time      := l_rows(i).start_time;
             l_rec.stop_time       := l_rows(i).stop_time;
             l_rec.used_time       := l_rows(i).used_millis;
-            l_rec.avg_action_time := l_rows(i).avg_millis;
+            l_rec.avg_action_time := l_rows(i).millis_ewma;
             l_rec.action_count    := l_rows(i).action_count;
+            l_rec.value_ewma      := l_rows(i).value_ewma;
+            l_rec.value_count     := l_rows(i).value_count;
             l_key := buildMonitorKey(p_processId, l_rec.action_name, l_rec.context_name);
             if l_rec.monitor_type = C_MON_TYPE_TRACE then
                 g_monitor_averages(l_key) := l_rec;
@@ -7259,7 +7504,7 @@ AS
         l_response  JSON_OBJ_LILAM;
         l_msg       JSON_OBJ_LILAM;
     begin
-        l_payload   := JSON_QUERY(p_message, '$.payload');
+        l_payload   := payloadOf(p_message, 'doRemote_adoptProcess');
         l_processId := jsonNumber(l_payload, 'process_id');
         l_oldPipe   := jsonString(l_payload, 'old_pipe');
         -- STABILITY: the table name comes from the client and goes into dynamic SQL
@@ -7338,7 +7583,7 @@ AS
         l_payload JSON_OBJ_LILAM;
         l_timestamp TIMESTAMP(6);
     begin
-        l_payload       := JSON_QUERY(p_message, '$.payload');
+        l_payload       := payloadOf(p_message, 'doRemote_logAny');
         l_processId     := jsonNumber(l_payload, 'process_id');
         l_level         := jsonNumber(l_payload, 'level');
         l_logText       := jsonString(l_payload, 'log_text');
@@ -7397,7 +7642,7 @@ AS
         l_status        PLS_INTEGER;
         l_payload       JSON_OBJ_LILAM;
     begin
-        l_payload     := JSON_QUERY(p_message, '$.payload');
+        l_payload     := payloadOf(p_message, 'doRemote_closeProcess');
         l_processId   := jsonString(l_payload, 'process_id');
         l_procStepsToDo   := jsonNumber(l_payload, 'steps_todo');
         l_procStepsDone   := jsonNumber(l_payload, 'steps_done');
@@ -7485,7 +7730,8 @@ AS
         jsonPut(l_payload, 'used_time', v_rec.used_time);
         jsonPut(l_payload, 'start_time', v_rec.start_time);
         jsonPut(l_payload, 'stop_time', v_rec.stop_time);
-        jsonPut(l_payload, 'avg_action_time', v_rec.avg_action_time); 
+        jsonPut(l_payload, 'avg_action_time', v_rec.avg_action_time);
+        jsonPut(l_payload, 'value_ewma', getLastValueEwma(l_processId, l_actionName, l_contextName));
 
         jsonPut(l_header, 'msg_type', 'SERVER_RESPONSE');
         jsonPut(l_header, 'msg_name', 'LAST_MONITOR_ENTRY');
@@ -7583,7 +7829,7 @@ AS
         l_process_init t_process_init;
         l_status PLS_INTEGER;
     begin
-        l_payload := JSON_QUERY(p_message, '$.payload');
+        l_payload := payloadOf(p_message, 'doRemote_newProcess');
 
         -- Check the client's expiry time (with a 500 ms safety margin). If it has passed, the
         -- client has already given up: no process, no route, no response (the return channel
@@ -8228,7 +8474,7 @@ AS
         l_msg       JSON_OBJ_LILAM;
     begin
 
-        l_msgObj     := JSON_QUERY(p_message, '$.payload');
+        l_msgObj     := payloadOf(p_message, 'handleServerShutdown');
         l_password   := jsonString(l_msgObj, 'shutdown_password');
 
         jsonPut(l_header, 'msg_type', 'SERVER_RESPONSE');
@@ -8380,7 +8626,7 @@ AS
     -- The rules end up in the OUT parameters; the loaded rules of the server remain untouched.
     --------------------------------------------------------------------------
     FUNCTION parseRuleSet(p_ruleSet CLOB, p_byCtx OUT NOCOPY t_rule_map, p_byAction OUT NOCOPY t_rule_map,
-                          p_avg OUT NOCOPY t_avg_params_map) RETURN VARCHAR2
+                          p_avg OUT NOCOPY t_avg_params_map, p_val OUT NOCOPY t_avg_params_map) RETURN VARCHAR2
     IS
         TYPE t_seen_map IS TABLE OF BOOLEAN INDEX BY VARCHAR2(50);
         -- an empty or blank part in 'a|b|c' (start, middle or end)
@@ -8584,15 +8830,18 @@ AS
             l_ok := CASE
                 WHEN l_op IN ('ON_START', 'ON_STOP', 'ON_EVENT', 'ON_UPDATE') THEN l_trig != C_LOGGING
                 WHEN l_op IN ('SEVERITY', 'LOG_CONTAINS') THEN l_trig = C_LOGGING
-                WHEN l_op IN ('MAX_DURATION_MS', 'AVG_DEVIATION_PCT') THEN l_trig IN (C_MARK_EVENT, C_TRACE_STOP)
-                WHEN l_op = 'MAX_GAP_SECONDS' THEN l_trig IN (C_MARK_EVENT, C_TRACE_START)
+                WHEN l_op IN ('TIME_MAX_DURATION_MS', 'TIME_EWMA_DEVIATION_PCT_UP', 'TIME_EWMA_DEVIATION_PCT_DOWN') THEN
+                     l_trig IN (C_MARK_EVENT, C_TRACE_STOP)
+                WHEN l_op = 'TIME_MAX_GAP_SECONDS' THEN l_trig IN (C_MARK_EVENT, C_TRACE_START)
+                WHEN l_op IN ('VAL_EWMA_DEVIATION_PCT_UP', 'VAL_EWMA_DEVIATION_PCT_DOWN', 'VAL_MIN', 'VAL_MAX') THEN
+                     l_trig = C_MARK_EVENT
                 WHEN l_op = 'MAX_OCCURRENCE' THEN l_trig IN (C_MARK_EVENT, C_TRACE_STOP, C_PROCESS_UPDATE, C_PROCESS_STOP)
                 -- No TRACE_STOP: the order is decided when the action starts;
                 -- at TRACE_STOP the predecessor is usually the own TRACE_START.
-                WHEN l_op IN ('PRECEDED_BY', 'PRECEDED_BY_WITHIN_SECS') THEN
+                WHEN l_op IN ('PRECEDED_BY', 'TIME_PRECEDED_BY_WITHIN_SECS') THEN
                      l_trig IN (C_MARK_EVENT, C_TRACE_START, C_PROCESS_UPDATE, C_PROCESS_STOP)
-                WHEN l_op = 'RUNTIME_EXCEEDED' THEN l_trig = C_PROCESS_UPDATE
-                WHEN l_op = 'MAX_RUNTIME_EXCEEDED' THEN l_trig = C_PROCESS_STOP
+                WHEN l_op = 'TIME_RUNTIME_EXCEEDED' THEN l_trig = C_PROCESS_UPDATE
+                WHEN l_op = 'TIME_MAX_RUNTIME_EXCEEDED' THEN l_trig = C_PROCESS_STOP
                 WHEN l_op IN ('STEPS_LEFT_HIGH', 'SUCCESS_RATE_LOW', 'STATUS_EQUALS', 'INFO_CONTAINS') THEN
                      l_trig IN (C_PROCESS_START, C_PROCESS_UPDATE, C_PROCESS_STOP)
                 ELSE NULL
@@ -8632,18 +8881,18 @@ AS
                         RETURN fail('LOG_CONTAINS needs TEXT or LEVEL|TEXT (text max. 100)');
                     END IF;
                     l_rule.cond_upper := upper(substr(r.value, l_parts + 1));
-                WHEN l_op IN ('PRECEDED_BY', 'PRECEDED_BY_WITHIN_SECS') THEN
-                    -- PRECEDED_BY: ACTION[|CONTEXT]; PRECEDED_BY_WITHIN_SECS: ACTION[|CONTEXT]|SECONDS
+                WHEN l_op IN ('PRECEDED_BY', 'TIME_PRECEDED_BY_WITHIN_SECS') THEN
+                    -- PRECEDED_BY: ACTION[|CONTEXT]; TIME_PRECEDED_BY_WITHIN_SECS: ACTION[|CONTEXT]|SECONDS
                     -- STABILITY: empty parts ('|C1', 'A|') would otherwise be skipped and change the meaning
                     IF regexp_like(r.value, C_EMPTY_PART) THEN
                         RETURN fail(l_op || ': empty part in "condition.value"');
                     END IF;
                     l_parts := CASE WHEN r.value IS NULL THEN 0 ELSE regexp_count(r.value, '\|') + 1 END;
-                    IF l_op = 'PRECEDED_BY_WITHIN_SECS' THEN
+                    IF l_op = 'TIME_PRECEDED_BY_WITHIN_SECS' THEN
                         l_rule.cond_num := ruleNumber(r.value, l_parts);
                         l_parts := l_parts - 1;
                         IF l_rule.cond_num IS NULL OR l_rule.cond_num < 0 THEN
-                            RETURN fail('PRECEDED_BY_WITHIN_SECS needs ACTION[|CONTEXT]|SECONDS');
+                            RETURN fail('TIME_PRECEDED_BY_WITHIN_SECS needs ACTION[|CONTEXT]|SECONDS');
                         END IF;
                     END IF;
                     IF l_parts NOT IN (1, 2) THEN
@@ -8657,22 +8906,22 @@ AS
                         RETURN fail(l_op || ' needs ACTION or ACTION|CONTEXT');
                     END IF;
                 ELSE
-                    -- all other operators: number (AVG_DEVIATION_PCT: 'pct|warmup|alpha')
+                    -- all other operators: number (*_EWMA_DEVIATION_PCT_*: 'pct|warmup|alpha')
                     -- STABILITY: no empty parts and no surplus parts, otherwise a value would be
                     -- read from the wrong position ('20||0.3' => warmup 0.3, '|5' => 5)
                     IF regexp_like(r.value, C_EMPTY_PART)
-                       OR regexp_count(r.value, '\|') > CASE WHEN l_op = 'AVG_DEVIATION_PCT' THEN 2 ELSE 0 END THEN
-                        RETURN fail(CASE WHEN l_op = 'AVG_DEVIATION_PCT' THEN 'AVG_DEVIATION_PCT needs PCT[|WARMUP[|ALPHA]]'
+                       OR regexp_count(r.value, '\|') > CASE WHEN l_op LIKE '%EWMA_DEVIATION_PCT%' THEN 2 ELSE 0 END THEN
+                        RETURN fail(CASE WHEN l_op LIKE '%EWMA_DEVIATION_PCT%' THEN l_op || ' needs PCT[|WARMUP[|ALPHA]]'
                                          ELSE l_op || ' needs a number (decimal point ".")' END);
                     END IF;
                     l_rule.cond_num := ruleNumber(r.value, 1);
                     IF l_rule.cond_num IS NULL THEN
                         RETURN fail(l_op || ' needs a number (decimal point ".")');
                     END IF;
-                    IF l_op = 'AVG_DEVIATION_PCT' AND (
+                    IF l_op LIKE '%EWMA_DEVIATION_PCT%' AND (
                            (regexp_substr(r.value, '[^|]+', 1, 2) IS NOT NULL AND ruleNumber(r.value, 2) IS NULL)
                         OR (regexp_substr(r.value, '[^|]+', 1, 3) IS NOT NULL AND ruleNumber(r.value, 3) IS NULL)) THEN
-                        RETURN fail('AVG_DEVIATION_PCT needs PCT[|WARMUP[|ALPHA]]');
+                        RETURN fail(l_op || ' needs PCT[|WARMUP[|ALPHA]]');
                     END IF;
             END CASE;
 
@@ -8693,10 +8942,13 @@ AS
                 p_byAction(l_key)(p_byAction(l_key).LAST) := l_rule;
             END IF;
 
-            IF l_op = 'AVG_DEVIATION_PCT' THEN
-                -- 'pct|warmup|alpha'; missing values => default
+            -- 'pct|warmup|alpha'; missing values => default. _UP and _DOWN of a series share the parameters.
+            IF l_op LIKE 'TIME_EWMA_DEVIATION_PCT%' THEN
                 p_avg(l_key).warmup := coalesce(ruleNumber(r.value, 2), g_avg_params('DEFAULT').warmup);
                 p_avg(l_key).alpha  := coalesce(ruleNumber(r.value, 3), g_avg_params('DEFAULT').alpha);
+            ELSIF l_op LIKE 'VAL_EWMA_DEVIATION_PCT%' THEN
+                p_val(l_key).warmup := coalesce(ruleNumber(r.value, 2), g_avg_params('DEFAULT').warmup);
+                p_val(l_key).alpha  := coalesce(ruleNumber(r.value, 3), g_avg_params('DEFAULT').alpha);
             END IF;
         END LOOP;
 
@@ -8740,6 +8992,13 @@ AS
             l_key := l_next;
         END LOOP;
 
+        l_key := g_val_params.FIRST;
+        WHILE l_key IS NOT NULL LOOP
+            l_next := g_val_params.NEXT(l_key);
+            IF substr(l_key, 1, l_len) = l_prefix THEN g_val_params.DELETE(l_key); END IF;
+            l_key := l_next;
+        END LOOP;
+
         -- Throttling starts over with the new rule set
         l_key := g_alert_history.FIRST;
         WHILE l_key IS NOT NULL LOOP
@@ -8764,7 +9023,7 @@ AS
     -- Take over a checked rule set for a group (replaces the previous rules of the group)
     --------------------------------------------------------------------------
     procedure installGroupRules(p_group varchar2, p_byCtx t_rule_map, p_byAction t_rule_map,
-                                p_avg t_avg_params_map, p_ruleSetName varchar2, p_ruleSetVersion number)
+                                p_avg t_avg_params_map, p_val t_avg_params_map, p_ruleSetName varchar2, p_ruleSetVersion number)
     as
         l_key VARCHAR2(300);
     begin
@@ -8788,6 +9047,12 @@ AS
             l_key := p_avg.NEXT(l_key);
         END LOOP;
 
+        l_key := p_val.FIRST;
+        WHILE l_key IS NOT NULL LOOP
+            g_val_params(p_group || '|' || l_key) := p_val(l_key);
+            l_key := p_val.NEXT(l_key);
+        END LOOP;
+
         -- Name/version as in LILAM_RULES (SET_NAME/VERSION); the consumer finds the rule through it
         g_rule_groups(p_group).set_name    := p_ruleSetName;
         g_rule_groups(p_group).set_version := p_ruleSetVersion;
@@ -8809,6 +9074,7 @@ AS
         l_byCtx    t_rule_map;
         l_byAction t_rule_map;
         l_avg      t_avg_params_map;
+        l_val      t_avg_params_map;
         l_err      VARCHAR2(1000);
         l_new      t_rule_group_rec;
     begin
@@ -8850,7 +9116,7 @@ AS
         g_rule_groups(p_group).seen_name    := l_name;
         g_rule_groups(p_group).seen_version := l_version;
 
-        l_err := parseRuleSet(l_ruleSet, l_byCtx, l_byAction, l_avg);
+        l_err := parseRuleSet(l_ruleSet, l_byCtx, l_byAction, l_avg, l_val);
         IF l_err IS NOT NULL THEN
             logLilamErr(NUM_ERR_RULE_SET, 'Rule set ' || l_name || ' v' || l_version || ' (group ' || p_group || ') rejected: ' || l_err, 'refreshGroupRules');
             if g_serverPipeName is not null and should_raise_error(g_serverProcessId) then
@@ -8859,7 +9125,7 @@ AS
             RETURN;
         END IF;
 
-        installGroupRules(p_group, l_byCtx, l_byAction, l_avg, l_name, l_version);
+        installGroupRules(p_group, l_byCtx, l_byAction, l_avg, l_val, l_name, l_version);
 
     exception
         when others then
@@ -8939,8 +9205,9 @@ AS
         l_byCtx    t_rule_map;
         l_byAction t_rule_map;
         l_avg      t_avg_params_map;
+        l_val      t_avg_params_map;
     BEGIN
-        RETURN parseRuleSet(p_ruleSet, l_byCtx, l_byAction, l_avg);
+        RETURN parseRuleSet(p_ruleSet, l_byCtx, l_byAction, l_avg, l_val);
     EXCEPTION
         WHEN OTHERS THEN
             RETURN substr(sqlErrM, 1, 1000);
@@ -8959,6 +9226,7 @@ AS
         l_byCtx    t_rule_map;
         l_byAction t_rule_map;
         l_avg      t_avg_params_map;
+        l_val      t_avg_params_map;
         l_err      VARCHAR2(1000);
         l_pipes    sys.odcivarchar2list;
         l_status   PLS_INTEGER;
@@ -8975,7 +9243,7 @@ AS
                 RAISE_APPLICATION_ERROR(NUM_ERR_RULE_SET, l_label || ' exists more than once in ' || C_LILAM_RULES_TABLE);
         END;
 
-        l_err := parseRuleSet(l_ruleSet, l_byCtx, l_byAction, l_avg);
+        l_err := parseRuleSet(l_ruleSet, l_byCtx, l_byAction, l_avg, l_val);
         IF l_err IS NOT NULL THEN
             RAISE_APPLICATION_ERROR(NUM_ERR_RULE_SET, l_label || ' rejected: ' || l_err);
         END IF;
@@ -9690,7 +9958,8 @@ BEGIN
             jsonPut(l_jsonHeader, 'status', 'SUCCESS');
 
         when C_MARK_EVENT THEN
-            MARK_EVENT(jsonNumber(l_jsonParams, 'process_id'), jsonString(l_jsonParams, 'action_name'), jsonString(l_jsonParams, 'context_name'), jsonTime(l_jsonParams, 'timestamp'));
+            MARK_EVENT(jsonNumber(l_jsonParams, 'process_id'), jsonString(l_jsonParams, 'action_name'), jsonString(l_jsonParams, 'context_name'),
+                       jsonNumber(l_jsonParams, 'value'), jsonTime(l_jsonParams, 'timestamp'));
             jsonPut(l_jsonHeader, 'status', 'SUCCESS');
 
         when C_TRACE_START THEN
