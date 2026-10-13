@@ -69,6 +69,9 @@ AS
     -- For C_PIPE_FULL_RECENT_MS after a full pipe also new messages are sent without waiting.
     C_PIPE_FULL_PAUSE_MS               CONSTANT PLS_INTEGER  := 1000;
     C_PIPE_FULL_RECENT_MS              CONSTANT PLS_INTEGER  := 10000;
+    -- Sending on held back messages takes at most this long per call; the rest follows with the next calls
+    -- (test PIPE_VOLL run 2355: about 1,500 messages of 2 KB in one call took up to 3 s)
+    C_PIPE_HELD_SEND_MS                CONSTANT PLS_INTEGER  := 100;
     -- A closed remote process keeps its ring buffer until the CLOSE is committed (see checkClosing).
     -- If no server takes the process over within this time, the client gives up the ring buffer.
     C_CLOSING_MAX_AGE_SEC              CONSTANT PLS_INTEGER  := 600;
@@ -252,6 +255,10 @@ AS
     );
     TYPE t_ring_meta_tab IS TABLE OF t_ring_meta_rec INDEX BY BINARY_INTEGER;
     g_ring_meta t_ring_meta_tab;
+    -- Processes with messages held back because of a full pipe (unsent_from set): every call of the session
+    -- sends them on (sendHeldOthers), not only the next call of the same process
+    TYPE t_pid_set IS TABLE OF BOOLEAN INDEX BY BINARY_INTEGER;
+    g_held_pids t_pid_set;
     -- Client: closed remote processes whose CLOSE is not confirmed yet (process_end not committed).
     -- Ring buffer, server pipe and takeover data stay until then (see checkClosing).
     TYPE t_closing_rec IS RECORD (
@@ -2421,6 +2428,7 @@ AS
         logBackpressureSum(p_processId);
         g_ring.DELETE(p_processId);
         g_ring_meta.DELETE(p_processId);
+        g_held_pids.DELETE(p_processId);
         g_trace_pins.DELETE(p_processId);
     end;
 
@@ -2498,6 +2506,7 @@ AS
         l_nowCs NUMBER := dbms_utility.get_time;
     begin
         DBMS_PIPE.RESET_BUFFER;
+        g_held_pids(p_processId) := TRUE;
         g_ring_meta(p_processId).pause_until_cs := l_nowCs + C_PIPE_FULL_PAUSE_MS / 10;
         g_ring_meta(p_processId).last_full_cs   := l_nowCs;
         g_ring_meta(p_processId).full_phases    := g_ring_meta(p_processId).full_phases + 1;
@@ -2516,18 +2525,25 @@ AS
 
     --------------------------------------------------------------------------
 
-    -- Sends the messages held back because of a full pipe, in their order and without waiting (timeout 0).
-    -- Returns false if the pipe is still full; the rest stays held back for another pause.
-    function sendHeldBack(p_processId number, p_pipe varchar2) return boolean
+    -- Sends the messages held back because of a full pipe, in their order and without waiting (timeout 0),
+    -- for at most p_maxMs. Returns false if the pipe is still full (the rest stays held back for another pause)
+    -- or the time is used up (the rest follows with the next call, without pause).
+    function sendHeldBack(p_processId number, p_pipe varchar2, p_maxMs PLS_INTEGER default C_PIPE_HELD_SEND_MS) return boolean
     as
-        l_seq    PLS_INTEGER;
-        l_status PLS_INTEGER;
+        l_seq     PLS_INTEGER;
+        l_status  PLS_INTEGER;
+        l_startCs NUMBER := dbms_utility.get_time;
     begin
         l_seq := g_ring_meta(p_processId).unsent_from;
         if not g_ring(p_processId).EXISTS(l_seq) then
             l_seq := g_ring(p_processId).NEXT(l_seq);   -- given up in the meantime (relieveRing)
         end if;
         while l_seq is not null loop
+            -- STABILITY: the application call must not take long (befunde fallback A2, run 2355)
+            if (dbms_utility.get_time - l_startCs) * 10 >= p_maxMs then
+                g_ring_meta(p_processId).unsent_from := l_seq;
+                return false;
+            end if;
             DBMS_PIPE.RESET_BUFFER;
             DBMS_PIPE.PACK_MESSAGE(g_ring(p_processId)(l_seq).msg);
             l_status := DBMS_PIPE.SEND_MESSAGE(p_pipe, timeout => 0);
@@ -2539,12 +2555,78 @@ AS
             l_seq := g_ring(p_processId).NEXT(l_seq);
         end loop;
         g_ring_meta(p_processId).unsent_from := null;
+        g_held_pids.DELETE(p_processId);
         return true;
     exception
         when others then
             DBMS_PIPE.RESET_BUFFER;
             logLilamErr(sqlCode, sqlErrM, 'sendHeldBack');
             return false;
+    end;
+
+    --------------------------------------------------------------------------
+
+    -- Sends on the held back messages of the other processes of this session whose pause is over.
+    -- Otherwise they would wait for the next call of their own process (which may never come, e.g. after CLOSE).
+    -- PERFORMANCE: called only if g_held_pids is not empty.
+    procedure sendHeldOthers(p_exceptPid number)
+    as
+        l_pid  PLS_INTEGER;
+        l_next PLS_INTEGER;
+        l_sent BOOLEAN;
+    begin
+        l_pid := g_held_pids.FIRST;
+        while l_pid is not null loop
+            l_next := g_held_pids.NEXT(l_pid);
+            if not g_ring_meta.EXISTS(l_pid) or not g_ring.EXISTS(l_pid) or g_ring_meta(l_pid).unsent_from is null then
+                g_held_pids.DELETE(l_pid);
+            elsif l_pid != nvl(p_exceptPid, -1) and dbms_utility.get_time >= g_ring_meta(l_pid).pause_until_cs then
+                l_sent := sendHeldBack(l_pid, getServerPipeForSession(l_pid, null));
+            end if;
+            l_pid := l_next;
+        end loop;
+    exception
+        when others then
+            logLilamErr(sqlCode, sqlErrM, 'sendHeldOthers');
+    end;
+
+    --------------------------------------------------------------------------
+
+    -- CLOSE_PROCESS with messages held back (full pipe, befunde fallback A2): try to send them, including the
+    -- CLOSE, for at most C_PIPE_FULL_PAUSE_MS. The application may end its session after the CLOSE; held back
+    -- messages would then be lost. If the pipe stays full, the next call of the session sends them (logged).
+    procedure sendHeldOnClose(p_processId number)
+    as
+        l_startCs NUMBER := dbms_utility.get_time;
+        l_pipe    varchar2(128);
+        l_count   PLS_INTEGER := 0;
+        l_seq     PLS_INTEGER;
+    begin
+        if not g_ring_meta.EXISTS(p_processId) or g_ring_meta(p_processId).unsent_from is null then
+            return;
+        end if;
+        l_pipe := getServerPipeForSession(p_processId, null);
+        loop
+            exit when sendHeldBack(p_processId, l_pipe,
+                                   greatest(1, C_PIPE_FULL_PAUSE_MS - (dbms_utility.get_time - l_startCs) * 10));
+            exit when (dbms_utility.get_time - l_startCs) * 10 >= C_PIPE_FULL_PAUSE_MS;
+            dbms_session.sleep(0.1);   -- pipe still full
+        end loop;
+
+        if g_ring_meta(p_processId).unsent_from is not null then
+            l_seq := g_ring(p_processId).NEXT(g_ring_meta(p_processId).unsent_from - 1);
+            while l_seq is not null loop
+                l_count := l_count + 1;
+                l_seq := g_ring(p_processId).NEXT(l_seq);
+            end loop;
+            logLilamErr(NUM_ERR_PIPE_SERVER, 'Process ' || p_processId || ' closed while server pipe ' || l_pipe || ' is full; '
+                || l_count || ' messages including the CLOSE are still held back. They are sent with the next call of this'
+                || ' session and lost if the session ends before.',
+                'sendHeldOnClose', 'PIPE_FULL');
+        end if;
+    exception
+        when others then
+            logLilamErr(sqlCode, sqlErrM, 'sendHeldOnClose');
     end;
 
     --------------------------------------------------------------------------
@@ -2568,6 +2650,10 @@ AS
         -- Closed processes whose CLOSE is not confirmed yet (PERFORMANCE: normally only COUNT on an empty array)
         if g_closing.COUNT > 0 then
             checkClosing;
+        end if;
+        -- Messages of other processes held back because of a full pipe (PERFORMANCE: normally only COUNT)
+        if g_held_pids.COUNT > 0 then
+            sendHeldOthers(p_processId);
         end if;
         -- PERFORMANCE: concatenate the message in one step instead of via jsonPut (see jStr/jNum/jTs).
         -- p_request is always an internal constant and does not need to be escaped.
@@ -5602,6 +5688,7 @@ AS
         -- The order is kept: CLOSE travels through the same pipe as the data of the process.
         -- Not via the control pipe (like NEW_PROCESS): CLOSE would overtake the data of its own process.
         sendNoWait(p_processId, 'CLOSE_SESSION', 'P', l_payload, C_SEND_TIMEOUT_SEC);
+        sendHeldOnClose(p_processId);
         logBackpressureSum(p_processId);
 
     EXCEPTION
@@ -6182,6 +6269,7 @@ AS
         g_remote_info.DELETE;
         g_ring.DELETE;
         g_ring_meta.DELETE;
+        g_held_pids.DELETE;
         g_trace_pins.DELETE;
         g_watermarks.DELETE;
         g_process_cache.DELETE;
@@ -7403,6 +7491,7 @@ AS
                     || ' stopped at sequence number ' || l_seq || ' (pipe status ' || l_status || ').',
                     'replayRing', 'FAILOVER');
                 -- The rest is held back like at a full pipe and sent later in its order (see sendHeldBack)
+                g_held_pids(p_processId) := TRUE;
                 g_ring_meta(p_processId).unsent_from    := l_seq;
                 g_ring_meta(p_processId).pause_until_cs := dbms_utility.get_time + C_PIPE_FULL_PAUSE_MS / 10;
                 return l_count;
@@ -7412,6 +7501,7 @@ AS
         end loop;
         -- Everything held back because of a full pipe has been sent now
         if g_ring_meta.EXISTS(p_processId) then
+            g_held_pids.DELETE(p_processId);
             g_ring_meta(p_processId).unsent_from := null;
         end if;
         return l_count;
@@ -7632,6 +7722,10 @@ AS
         -- Closed processes whose CLOSE is not confirmed yet (PERFORMANCE: normally only COUNT on an empty array)
         if g_closing.COUNT > 0 then
             checkClosing;
+        end if;
+        -- Messages held back because of a full pipe (befunde fallback A2)
+        if g_held_pids.COUNT > 0 then
+            sendHeldOthers(null);
         end if;
 
         -- first check which servers are available
