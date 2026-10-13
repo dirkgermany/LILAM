@@ -77,7 +77,7 @@ LILAM is developed by a developer who hates over-engineered tools. Focus: 5 minu
     ```
 
 ## Key features
-1. **Lightweight:** One Package, a handful of Tables, one Sequence. That's it!
+1. **Self-Installing:** One package and one sequence; all tables are created by LILAM itself when they are first needed: three per application (`_PROC`, `_LOG`, `_MON`) plus nine internal tables for rules, alerts, baselines and the server infrastructure (see [Tables](docs/architecture%20and%20concepts.md#tables)). No install scripts, no schedulers required for in-session use
 2. **Concurrent Logging:** Supports multiple, simultaneous log entries from the same or different sessions without blocking
 3. **Runtime Observability:** Captures and correlates logs, events and business transactions in near real-time, providing deep, fluent performance tracing across application sessions
 4. **Rule-Based Orchestration:** Evaluates versioned JSON rule-sets against observability data to automatically trigger alerts or execute decoupled consumers for reactive error-handling and workflow control
@@ -86,7 +86,7 @@ LILAM is developed by a developer who hates over-engineered tools. Focus: 5 minu
 7. **Smart Context Capture:** Automatically records ERR_STACK,  ERR_BACKTRACE, and ERR_CALLSTACK based on log level—deep insights with zero manual effort
 8. **Optional self-cleaning:** Automatically purges expired logs per application during session start—no background jobs or schedulers required
 9. **Future Ready:** Built and tested in latest Oracle 26ai (2026) and 19c environment
-10. **Small Footprint:**  <5k lines of logical PL/SQL code ensures simple quality and security control, fast compilation, zero bloat and minimal Shared Pool utilization (reducing memory pressure and fragmentation)
+10. **Self-Contained:** One package without dependencies on other packages or external libraries; it uses only Oracle built-ins such as `DBMS_PIPE`, `DBMS_ALERT` and `DBMS_SCHEDULER`. With server failover, measured values and the rule engine the code has grown to about 7,800 lines of logical PL/SQL code (without blank and comment lines); quality and security reviews still cover a single package
 
 ---
 ## Comparison
