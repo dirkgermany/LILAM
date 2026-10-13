@@ -53,6 +53,9 @@ AS
     -- A closed remote process keeps its ring buffer until the CLOSE is committed (see checkClosing).
     -- If no server takes the process over within this time, the client gives up the ring buffer.
     C_CLOSING_MAX_AGE_SEC              CONSTANT PLS_INTEGER  := 600;
+    -- checkClosing: heartbeat age from which the server of a closed process counts as failed. Longer than
+    -- C_FAILOVER_HEARTBEAT_AGE_SEC: for a closed process nothing is waiting, a wrong takeover only costs.
+    C_CLOSING_HEARTBEAT_AGE_SEC        CONSTANT PLS_INTEGER  := 15;
 
     -- Dedicated to Client
     -- Client throttling: the limit per process comes from the server (p_perfServer, see C_SERVER_PERF_*)
@@ -1831,18 +1834,45 @@ AS
     end;
 
     ---------------------------------------------------------------
+
+    -- Failover: is the server alive? Besides a fresh heartbeat, a running scheduler job of the server counts
+    -- (job name = pipe name, see CREATE_SERVER). A server writes its heartbeat only between two messages;
+    -- if it is busy for longer, the heartbeat ages although the server lives. Previously such a server
+    -- was taken over, and both servers wrote the same data (befunde fallback F1, run 2192).
+    -- Limit: a server that hangs while its job keeps running is not taken over.
+    function isServerAlive(p_pipeName varchar2, p_maxAgeSec PLS_INTEGER) return boolean
+    as
+        l_cnt PLS_INTEGER;
+    begin
+        if p_pipeName is null then
+            return false;
+        end if;
+        if isServerPipeActive(p_pipeName, p_maxAgeSec) then
+            return true;
+        end if;
+        -- PERFORMANCE: only when the heartbeat is old
+        select count(*) into l_cnt from user_scheduler_running_jobs where job_name = upper(p_pipeName);
+        return l_cnt > 0;
+    exception
+        when others then
+            logLilamErr(sqlCode, sqlErrM, 'isServerAlive');
+            return false;
+    end;
+
+    ---------------------------------------------------------------
     -- Client: failure detection for the server of a remote process
     ---------------------------------------------------------------
     -- Is the server of the process active? Checks the pipe the client sends to (worker or dispatcher)
     -- and, if a route exists, also the worker that holds the process (behind a dispatcher).
-    function isProcessServerActive(p_processId number) return boolean
+    -- p_maxAgeSec: heartbeat age from which a server without a running job counts as failed
+    function isProcessServerActive(p_processId number, p_maxAgeSec PLS_INTEGER default C_FAILOVER_HEARTBEAT_AGE_SEC) return boolean
     as
         l_routePipe varchar2(50);
     begin
         if not g_client_pipes.EXISTS(p_processId) then
             return true;   -- no server known: no assessment
         end if;
-        if not isServerPipeActive(g_client_pipes(p_processId), C_FAILOVER_HEARTBEAT_AGE_SEC) then
+        if not isServerAlive(g_client_pipes(p_processId), p_maxAgeSec) then
             return false;
         end if;
 
@@ -1854,7 +1884,7 @@ AS
                 l_routePipe := null;   -- no route (table missing or process unknown): only the pipe counts
         end;
         if l_routePipe is not null and upper(l_routePipe) != upper(g_client_pipes(p_processId)) then
-            return isServerPipeActive(l_routePipe, C_FAILOVER_HEARTBEAT_AGE_SEC);
+            return isServerAlive(l_routePipe, p_maxAgeSec);
         end if;
         return true;
     end;
@@ -4795,6 +4825,40 @@ AS
     end;
 
     --------------------------------------------------------------------------
+
+    -- Fencing for direct writes (CLOSE_PROCESS): has another worker taken the process over?
+    -- Then the process is forgotten here without writing (like after flushBatch, see dropLostProcesses).
+    -- A process without a route (or without route table) still belongs to this worker.
+    -- Limit: unlike flushBatch the route is not locked; a takeover between this check and the end of the
+    -- CLOSE is not fenced. It needs a server that counts as failed although its job runs (isServerAlive).
+    function processTakenOver(p_processId number) return boolean
+    as
+        l_pipe varchar2(128);
+        l_lost t_lost_pids;
+    begin
+        if g_serverPipeName is null or g_serverIsDispatcher or p_processId is null then
+            return false;
+        end if;
+        begin
+            execute immediate 'select pipe_name from ' || C_LILAM_PROCESS_ROUTE || ' where process_id = :1'
+                into l_pipe using p_processId;
+        exception
+            when others then
+                return false;   -- no route (closed, unknown) or no route table
+        end;
+        if upper(l_pipe) = upper(g_serverPipeName) then
+            return false;
+        end if;
+        l_lost(p_processId) := TRUE;
+        dropLostProcesses(l_lost);
+        return true;
+    exception
+        when others then
+            logLilamErr(sqlCode, sqlErrM, 'processTakenOver');
+            return false;
+    end;
+
+    --------------------------------------------------------------------------
     -- PERFORMANCE: writes the rows of all processes collected in SYNC_ALL_DIRTY.
     -- One FORALL per target table, ONE commit for everything together (autonomous transaction).
     -- STABILITY: without SAVE EXCEPTIONS (see rowFailed). If a FORALL fails, only this
@@ -6342,6 +6406,12 @@ AS
         l_pipe varchar2(128);
     begin
         createDispatchTable;
+        -- STABILITY: the old server still lives (only busy, its job runs): do not take its process.
+        -- MOVED makes the client ask that server itself (befunde fallback F1).
+        if p_oldPipe is not null and upper(p_oldPipe) != upper(g_serverPipeName)
+           and isServerAlive(p_oldPipe, C_FAILOVER_HEARTBEAT_AGE_SEC) then
+            return 'MOVED:' || p_oldPipe;
+        end if;
         execute immediate 'update ' || C_LILAM_PROCESS_ROUTE || ' set pipe_name = :1, created = systimestamp
                            where process_id = :2 and upper(pipe_name) = upper(:3)'
         using g_serverPipeName, p_processId, p_oldPipe;
@@ -6663,9 +6733,20 @@ AS
     procedure unregisterProcessRoute(p_processId number)
     as
         pragma autonomous_transaction;
+        l_other PLS_INTEGER;
     begin
-        execute immediate 'delete from ' || C_LILAM_PROCESS_ROUTE || ' where process_id = :1'
-        using p_processId;
+        -- STABILITY: only the own route. If another worker has taken the process over, its route and
+        -- the watermarks stay (previously a late CLOSE of the old worker deleted them, befunde fallback F1).
+        execute immediate 'delete from ' || C_LILAM_PROCESS_ROUTE || ' where process_id = :1 and upper(pipe_name) = upper(:2)'
+        using p_processId, g_serverPipeName;
+        if sql%rowcount = 0 then
+            execute immediate 'select count(*) from ' || C_LILAM_PROCESS_ROUTE || ' where process_id = :1'
+                into l_other using p_processId;
+            if l_other > 0 then
+                commit;
+                return;
+            end if;
+        end if;
         -- Watermarks of the process (failover) are no longer needed
         begin
             execute immediate 'delete from ' || C_LILAM_WATERMARK || ' where process_id = :1'
@@ -6701,6 +6782,13 @@ AS
         l_status      := jsonNumber(l_payload, 'process_status');
 
         checkLogsBuffer(l_processId, 'vor CLOSE_PROCESS');
+
+        -- STABILITY: fencing also for the CLOSE, which writes directly (not via flushBatch). If another worker has
+        -- taken the process over, it closes the process from the client's replay; this worker writes nothing.
+        -- Previously both wrote: logs twice, wrong status (befunde fallback D2/F1, run 2192).
+        if processTakenOver(l_processId) then
+            return;
+        end if;
 
         CLOSE_PROCESS(p_processId => l_processId, p_processInfo => l_processInfo, p_processStatus => l_status,
                       p_procStepsDone => l_procStepsDone, p_procStepsToDo => l_procStepsToDo);
@@ -7254,7 +7342,7 @@ AS
                 if l_end is not null then
                     forgetClosing(l_pid);
                 else
-                    if not isProcessServerActive(l_pid)
+                    if not isProcessServerActive(l_pid, C_CLOSING_HEARTBEAT_AGE_SEC)
                        and (g_closing(l_pid).next_failover is null or systimestamp >= g_closing(l_pid).next_failover) then
                         g_closing(l_pid).next_failover := systimestamp + numtodsinterval(C_FAILED_SERVER_RECHECK_SEC, 'SECOND');
                         -- Taken over: the ring buffer with the CLOSE is repeated, a later check confirms it.
