@@ -50,6 +50,9 @@ AS
     -- The client reads the watermarks of a process at most every n ms (checked every C_RING_CHECK_EVERY_NO messages)
     C_RING_WATERMARK_CHECK_MS          CONSTANT PLS_INTEGER  := 1000;
     C_RING_CHECK_EVERY_NO              CONSTANT PLS_INTEGER  := 100;
+    -- A closed remote process keeps its ring buffer until the CLOSE is committed (see checkClosing).
+    -- If no server takes the process over within this time, the client gives up the ring buffer.
+    C_CLOSING_MAX_AGE_SEC              CONSTANT PLS_INTEGER  := 600;
 
     -- Dedicated to Client
     -- Client throttling: the limit per process comes from the server (p_perfServer, see C_SERVER_PERF_*)
@@ -217,6 +220,15 @@ AS
     );
     TYPE t_ring_meta_tab IS TABLE OF t_ring_meta_rec INDEX BY BINARY_INTEGER;
     g_ring_meta t_ring_meta_tab;
+    -- Client: closed remote processes whose CLOSE is not confirmed yet (process_end not committed).
+    -- Ring buffer, server pipe and takeover data stay until then (see checkClosing).
+    TYPE t_closing_rec IS RECORD (
+        closed_at      TIMESTAMP,                -- CLOSE_PROCESS of the client
+        next_failover  TIMESTAMP                 -- next takeover attempt if the server has failed
+    );
+    TYPE t_closing_tab IS TABLE OF t_closing_rec INDEX BY BINARY_INTEGER;
+    g_closing t_closing_tab;
+    g_closing_check_cs NUMBER;                   -- last run of checkClosing (DBMS_UTILITY.GET_TIME)
     -- Server: received and committed sequence numbers per process and client (key: see buildWatermarkKey)
     TYPE t_watermark_rec IS RECORD (
         process_id  NUMBER(19,0),
@@ -559,6 +571,8 @@ AS
     function serverFailed(p_processId number) return boolean;
     procedure checkServerAfterTimeout(p_processId number);
     function failoverProcess(p_processId number) return boolean;
+    procedure checkClosing;
+    procedure unregisterProcessRoute(p_processId number);
     PROCEDURE clearAllSessionData(p_processId NUMBER);
     ------------------------------------------------------------------------
     
@@ -1988,6 +2002,7 @@ AS
                    WHEN 'STOP_TRACE'     THEN 'M'
                    WHEN 'SET_ANY_STATUS' THEN 'P'
                    WHEN 'PROC_STEP_DONE' THEN 'P'
+                   WHEN 'CLOSE_SESSION'  THEN 'P'   -- repeated after a takeover until process_end is committed
                END;
     END;
 
@@ -2192,6 +2207,24 @@ AS
 
     --------------------------------------------------------------------------
 
+    -- Removes what the client kept for a closed remote process (CLOSE committed, or given up)
+    procedure forgetClosing(p_processId number)
+    as
+    begin
+        g_closing.DELETE(p_processId);
+        -- The ID was connected again in the meantime (reconnect via dispatcher): its data belong to that connection
+        if g_remote_sessions.EXISTS(p_processId) then
+            return;
+        end if;
+        g_failed_server.DELETE(p_processId);
+        forgetRing(p_processId);
+        g_remote_info.DELETE(p_processId);
+        g_remote_sync.DELETE(p_processId);
+        g_client_pipes.DELETE(p_processId);
+    end;
+
+    --------------------------------------------------------------------------
+
     procedure send_sync_signal(p_processId number)
     as
         l_response varchar2(1000);
@@ -2259,6 +2292,10 @@ AS
         l_status        PLS_INTEGER;
         l_jsonMain      JSON_OBJ_LILAM;   -- (unused variables l_now/l_retryInterval removed: saved one SYSTIMESTAMP per call)
     begin
+        -- Closed processes whose CLOSE is not confirmed yet (PERFORMANCE: normally only COUNT on an empty array)
+        if g_closing.COUNT > 0 then
+            checkClosing;
+        end if;
         -- PERFORMANCE: concatenate the message in one step instead of via jsonPut (see jStr/jNum/jTs).
         -- p_request is always an internal constant and does not need to be escaped.
         -- Failover: sequence number per process and client session (see LILAM_WATERMARK)
@@ -2493,6 +2530,7 @@ AS
                       when 'STOP_TRACE'     then 'M'
                       when 'SET_ANY_STATUS' then 'P'
                       when 'PROC_STEP_DONE' then 'P'
+                      when 'CLOSE_SESSION'  then 'P'
                   end;
         if l_type is null then
             return TRUE;
@@ -5939,22 +5977,16 @@ AS
     begin
         if is_remote(p_processId) then
             close_processRemote(p_processId, p_procStepsToDo, p_procStepsDone, p_processInfo, p_processStatus);
-            -- Marking of a failed server, with the number of messages not sent if not reported yet
-            if g_failed_server.EXISTS(p_processId) then
-                if g_failed_server(p_processId).dropped > 0 then
-                    logLilamErr(NUM_ERR_PIPE_SERVER, 'Process ' || p_processId || ' closed while its server was not active; '
-                        || g_failed_server(p_processId).dropped || ' messages could not be sent and were not taken over by any server.',
-                        'CLOSE_PROCESS', 'SERVER_FAILED');
-                end if;
-                g_failed_server.DELETE(p_processId);
-            end if;
+            -- STABILITY: the CLOSE is in the ring buffer. Ring buffer, server pipe and takeover data stay until
+            -- the CLOSE is committed; if the server fails before, another worker takes over the process and the
+            -- client repeats the ring buffer including the CLOSE (see checkClosing).
+            -- Previously the ring buffer was removed right after sending: a failure of the server shortly
+            -- before the CLOSE lost the CLOSE and everything not yet written (befunde fallback B2).
+            -- The API no longer knows the process (is_remote = FALSE), as before.
+            g_closing(p_processId).closed_at := systimestamp;
             g_msg_seq.DELETE(p_processId);
-            g_remote_info.DELETE(p_processId);
-            forgetRing(p_processId);
             g_remote_sessions.delete(p_processId);
-            g_remote_sync.delete(p_processId);
             g_log_counters.delete(p_processId);
-            g_client_pipes.delete(p_processId);
             g_local_throttle_cache.delete(p_processId);
             return;
         end if ;
@@ -6452,8 +6484,8 @@ AS
     --------------------------------------------------------------------------
 
     -- Builds the session of a process that another worker started, from its tables.
-    -- FALSE if the process is unknown.
-    function adoptSession(p_processId number, p_tabNameMaster varchar2, p_syncLevel PLS_INTEGER) return boolean
+    -- FALSE if the process is unknown or already closed (p_closed: process_end is committed).
+    function adoptSession(p_processId number, p_tabNameMaster varchar2, p_syncLevel PLS_INTEGER, p_closed out boolean) return boolean
     as
         l_proc   t_process_rec;
         l_idx    PLS_INTEGER;
@@ -6461,9 +6493,16 @@ AS
         l_stmt   varchar2(1000);
         l_serial number;
     begin
+        p_closed := FALSE;
         insertSession(p_tabNameMaster, p_processId, logLevelMonitor);
         l_proc := readProcessRecord(p_processId);
         if l_proc.id is null then
+            clearAllSessionData(p_processId);
+            return false;
+        end if;
+        -- The CLOSE was committed before the failure: do not revive the process
+        if l_proc.processEnd is not null then
+            p_closed := TRUE;
             clearAllSessionData(p_processId);
             return false;
         end if;
@@ -6521,6 +6560,7 @@ AS
         l_claim     varchar2(200);
         l_key       varchar2(70);
         l_ok        boolean := false;
+        l_closed    boolean := false;
         l_status    PLS_INTEGER;
         l_header    JSON_OBJ_LILAM;
         l_response  JSON_OBJ_LILAM;
@@ -6535,8 +6575,15 @@ AS
         l_claim := claimRoute(l_processId, l_oldPipe);
         if l_claim = 'OK' then
             -- Already here (restart under the same pipe name finds nothing; a repeated request does)
-            l_ok := v_indexSession.EXISTS(l_processId)
-                    or adoptSession(l_processId, l_tabName, jsonNumber(l_payload, 'sync_level'));
+            if v_indexSession.EXISTS(l_processId) then
+                l_ok := true;
+            else
+                l_ok := adoptSession(l_processId, l_tabName, jsonNumber(l_payload, 'sync_level'), l_closed);
+                if l_closed then
+                    -- claimRoute has created or moved the route: remove it again (with the watermarks)
+                    unregisterProcessRoute(l_processId);
+                end if;
+            end if;
         end if;
 
         if l_ok then
@@ -6560,6 +6607,9 @@ AS
             jsonPut(l_response, 'process_id',  l_processId);
             if l_claim like 'MOVED:%' then
                 jsonPut(l_response, 'moved_to', substr(l_claim, 7));
+            end if;
+            if l_closed then
+                jsonPut(l_response, 'closed', 1);   -- client: CLOSE committed, forget the ring buffer
             end if;
         end if;
 
@@ -7110,6 +7160,17 @@ AS
                 l_resp := JSON_QUERY(l_response, '$.payload');
             end if;
 
+            -- The CLOSE of the process was committed before the failure: nothing to repeat
+            if jsonNumber(l_resp, 'closed') = 1 then
+                g_in_failover := FALSE;
+                if g_closing.EXISTS(p_processId) then
+                    forgetClosing(p_processId);
+                else
+                    forgetRing(p_processId);
+                end if;
+                return true;
+            end if;
+
             if jsonNumber(l_resp, 'server_code') = NUM_ACK_SERVER_PROC then
                 setPerfLimit(p_processId, jsonNumber(l_resp, 'perf'));
                 setRemoteSync(p_processId, l_resp);
@@ -7145,6 +7206,89 @@ AS
 
     --------------------------------------------------------------------------
 
+    -- Closed remote processes whose CLOSE is not confirmed yet. Runs during later calls of this session
+    -- (sendNoWait, NEW_PROCESS), at most every C_RING_WATERMARK_CHECK_MS; never waits for the server.
+    --   process_end committed         -> everything of the process is written: forget the ring buffer
+    --   server alive (heartbeat)      -> wait (the CLOSE is still in the pipe or being processed)
+    --   server failed                 -> another worker takes over the process, the client repeats the
+    --                                    ring buffer including the CLOSE (at most every C_FAILED_SERVER_RECHECK_SEC)
+    --   no takeover for C_CLOSING_MAX_AGE_SEC -> give up the ring buffer
+    -- Limit: the ring buffer lives in the client session. Without a later call nobody checks, and it is lost
+    -- with the end of the session.
+    procedure checkClosing
+    as
+        l_pid    PLS_INTEGER;
+        l_next   PLS_INTEGER;
+        l_end    TIMESTAMP(6);
+        l_tab    varchar2(100);
+        l_count  PLS_INTEGER;
+        l_taken  BOOLEAN;
+    begin
+        if g_in_failover or g_closing.COUNT = 0 then
+            return;
+        end if;
+        if g_closing_check_cs is not null
+           and abs(dbms_utility.get_time - g_closing_check_cs) * 10 < C_RING_WATERMARK_CHECK_MS then
+            return;
+        end if;
+        g_closing_check_cs := dbms_utility.get_time;
+
+        l_pid := g_closing.FIRST;
+        while l_pid is not null loop
+            l_next := g_closing.NEXT(l_pid);
+            begin
+                l_end := null;
+                l_tab := 'LILAM';
+                if g_remote_info.EXISTS(l_pid) and g_remote_info(l_pid).tabname_master is not null then
+                    l_tab := g_remote_info(l_pid).tabname_master;
+                end if;
+                begin
+                    execute immediate replaceNameTable('select process_end from ' || C_PARAM_MASTER_TABLE || ' where id = :1',
+                                                       C_PARAM_MASTER_TABLE, C_SUFFIX_PROC_TABLE, l_tab)
+                        into l_end using l_pid;
+                exception
+                    when NO_DATA_FOUND then
+                        l_end := null;
+                end;
+
+                if l_end is not null then
+                    forgetClosing(l_pid);
+                else
+                    if not isProcessServerActive(l_pid)
+                       and (g_closing(l_pid).next_failover is null or systimestamp >= g_closing(l_pid).next_failover) then
+                        g_closing(l_pid).next_failover := systimestamp + numtodsinterval(C_FAILED_SERVER_RECHECK_SEC, 'SECOND');
+                        -- Taken over: the ring buffer with the CLOSE is repeated, a later check confirms it.
+                        -- Already closed: failoverProcess has removed everything.
+                        l_taken := failoverProcess(l_pid);
+                    end if;
+                    -- Not confirmed in time (no server took over, or the CLOSE was lost at a full pipe)
+                    if g_closing.EXISTS(l_pid)
+                       and systimestamp >= g_closing(l_pid).closed_at + numtodsinterval(C_CLOSING_MAX_AGE_SEC, 'SECOND') then
+                        l_count := 0;
+                        if g_ring.EXISTS(l_pid) then
+                            l_count := g_ring(l_pid).COUNT;
+                        end if;
+                        logLilamErr(NUM_ERR_PIPE_SERVER, 'Process ' || l_pid || ' was closed, but the CLOSE was not written within '
+                            || C_CLOSING_MAX_AGE_SEC || ' s (server failed and not taken over, or CLOSE lost). '
+                            || l_count || ' messages of the ring buffer including the CLOSE are given up.',
+                            'checkClosing', 'SERVER_FAILED');
+                        forgetClosing(l_pid);
+                    end if;
+                end if;
+            exception
+                when others then
+                    logLilamErr(sqlCode, sqlErrM, 'checkClosing');
+                    forgetClosing(l_pid);   -- STABILITY: no endless error per call
+            end;
+            l_pid := l_next;
+        end loop;
+    exception
+        when others then
+            logLilamErr(sqlCode, sqlErrM, 'checkClosing');
+    end;
+
+    --------------------------------------------------------------------------
+
     FUNCTION SERVER_NEW_PROCESS_JSON(p_jsonObject JSON_OBJ_LILAM) RETURN NUMBER
     as
         l_ProcessId number(19,0) := -500;   
@@ -7156,6 +7300,11 @@ AS
         -- This way no orphaned, never closed processes are created.
         -- In UTC, since client and server sessions can have different time zones.
         jsonPut(l_payload, 'expires_utc', sys_extract_utc(systimestamp) + numtodsinterval(C_TIMEOUT_NEW_PROCESS_SEC, 'SECOND'));
+
+        -- Closed processes whose CLOSE is not confirmed yet (PERFORMANCE: normally only COUNT on an empty array)
+        if g_closing.COUNT > 0 then
+            checkClosing;
+        end if;
 
         -- first check which servers are available
         l_response := waitForResponse(null, 'NEW_SESSION', l_payload, C_TIMEOUT_NEW_PROCESS_SEC);

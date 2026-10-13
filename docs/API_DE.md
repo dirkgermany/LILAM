@@ -354,6 +354,8 @@ Beendet einen LILAM Prozess. Optional können abschließende Prozessinformatione
 > Rufe `CLOSE_PROCESS` immer auf, wenn ein Prozess endet. LILAM puffert Daten aus Performancegründen. `CLOSE_PROCESS` stellt sicher, dass noch vorhandene gepufferte Daten persistiert werden.
 >
 > Daher sollte `CLOSE_PROCESS` auch Bestandteil der abschließenden Exception-Behandlung sein. Soll der Prozess nach der Exception weiterlaufen (z. B. eine AJAX-Seite arbeitet weiter), verwende stattdessen [`FLUSH`](#procedure-flush).
+>
+> Im entkoppelten Modus wartet `CLOSE_PROCESS` nicht auf den Server. Fällt der Server aus, bevor er den Prozess geschlossen hat, wiederholt der Client das Ungeschriebene samt `CLOSE_PROCESS` bei einem späteren LILAM-Aufruf derselben Session an einem anderen Worker (siehe Failover in „Architektur und Konzepte“).
 
 ```sql
 PROCEDURE CLOSE_PROCESS(

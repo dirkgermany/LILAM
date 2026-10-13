@@ -25,7 +25,7 @@ DECOUPLED/
 
 FEATURES/                   Funktionstests einzelner Merkmale (modusübergreifend)
   BASELINE_SCOPE/  LOGTEXT_GRENZEN/  DISPATCHER_APEX/  FEHLERFAELLE/  SERVERAUSWAHL/  SPEICHER/  REGELN/  REGELN_LAST/
-  RUECKSCHREIBUNG/  LEERLAUF_FLUSH/
+  RUECKSCHREIBUNG/  LEERLAUF_FLUSH/  FAILOVER/
 
 DAUERTEST/                  Dauertest über alle Modi gleichzeitig (Kombination der Tests)
 
@@ -66,6 +66,7 @@ So kann der Dauertest dieselben Tests wiederverwenden. FEHLERFAELLE und DISPATCH
 | FEATURES/LOGTEXT_GRENZEN | Kürzung langer Logtexte (1.500–5.000 Zeichen, Umlaute); INSESSION und SERVER | 9 Texte je Modus |
 | FEATURES/DISPATCHER_APEX | APEX/AJAX mit Connection Pool: jeder Request ein eigener Job mit leerem PGA, Trace über zwei Requests, parallele Requests, Request ohne Dispatcher, veraltete ID nach CLOSE | 13 Requests |
 | FEATURES/FEHLERFAELLE | Störungen ohne Wirkung auf die Anwendung: kein Server, negative/veraltete ID, Handshake über Dispatcher, verfallene NEW_PROCESS-Anfrage | 6 Fälle |
+| FEATURES/FAILOVER | `test_failover.sql`: ein Worker wird abgebrochen, ein zweiter übernimmt den Prozess (`ADOPT_PROCESS`), der Client wiederholt aus dem Ringpuffer; alle Logs genau einmal, Events lückenlos, offener Trace übernommen. `test_failover_close.sql` (FAILOVER_CLOSE): der Worker fällt unmittelbar vor `CLOSE_PROCESS` aus; `CLOSE_PROCESS` blockiert nicht, spätere Aufrufe derselben Session lösen die Übernahme aus, Daten und `CLOSE_PROCESS` werden nachgeholt; nur SERVER | 1 bzw. 2 Prozesse, je ca. 10–20 s |
 | FEATURES/SERVERAUSWAHL | Dispatcher wird nie als Ziel der Serverauswahl gewählt; Last verteilt sich auf die Worker (je Worker mind. 30 %), ohne und mit Dispatcher | 2 Clients × 20 Prozesse |
 | FEATURES/SPEICHER | kein Speicherverlust: PGA-Wachstum je Prozess von Session/Client, Workern und Dispatcher (Median aus 5 Messblöcken, max. 100 Byte); Fallback beim Schreiben (fehlerhafte Zeile übersprungen und protokolliert, übrige geschrieben); INSESSION, SERVER, DISPATCHER. Benötigt `00_grants_als_sys.sql` | je Modus 2.000 + 5 × 1.000 Prozesse, ca. 7 min |
 | FEATURES/REGELN | Rules Engine im SERVER- und INSESSION-Modus mit eigenem Rule Set `LT_REGELN`: Laden per API und nach Neustart, Server laden ein geändertes Rule Set auch ohne UPDATE_RULE-Nachricht (L6), Ablehnung ungültiger Rule Sets, Vorgänger/Nachfolger, Abstand, Dauer, Häufigkeit, Abweichung, Prozess- und Log-Regeln, Kontext-/Action-Regel, Drosselung, Alert-Zeile und Signal; INSESSION zusätzlich ohne Gruppe, Groß-/Kleinschreibung der Gruppe, Versionswechsel nach der 15-s-Prüfung, ungültiges und fehlendes Rule Set. Nur einzeln (ändert das Rule Set der Gruppe LT) | ca. 45 Prozesse, 2–3 Server, ca. 2,5 min |
