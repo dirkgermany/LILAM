@@ -72,6 +72,12 @@ AS
     -- Sending on held back messages takes at most this long per call; the rest follows with the next calls
     -- (test PIPE_VOLL run 2355: about 1,500 messages of 2 KB in one call took up to 3 s)
     C_PIPE_HELD_SEND_MS                CONSTANT PLS_INTEGER  := 100;
+    -- Gaps (befunde fallback A3): the client repeats from a gap reported by the server again if it is still
+    -- open after this time (the repetition may have been lost as well)
+    C_GAP_RESEND_SEC                   CONSTANT PLS_INTEGER  := 5;
+    -- Dispatcher (befunde fallback C1): a worker that failed is not tried for this time; messages for it are
+    -- discarded at once (the client repeats them after the takeover)
+    C_DISP_DEAD_SKIP_SEC               CONSTANT PLS_INTEGER  := 5;
     -- A closed remote process keeps its ring buffer until the CLOSE is committed (see checkClosing).
     -- If no server takes the process over within this time, the client gives up the ring buffer.
     C_CLOSING_MAX_AGE_SEC              CONSTANT PLS_INTEGER  := 600;
@@ -251,7 +257,12 @@ AS
         pause_until_cs  NUMBER,                  -- full pipe: no send attempt before this time (GET_TIME)
         last_full_cs    NUMBER,                  -- last failed send (GET_TIME)
         full_phases     PLS_INTEGER := 0,        -- number of failed sends (full pipe)
-        held_back       PLS_INTEGER := 0         -- messages held back in the ring buffer because of a full pipe
+        held_back       PLS_INTEGER := 0,        -- messages held back in the ring buffer because of a full pipe
+        -- Gaps reported by the server (befunde fallback A3, see resendFromGap)
+        resend_rp       BOOLEAN := FALSE,        -- the held back messages are sent marked as repetition ("rp")
+        gap_seen        NUMBER,                  -- gap the client repeats from
+        gap_resend_cs   NUMBER,                  -- start of that repetition (GET_TIME)
+        gaps            PLS_INTEGER := 0         -- number of repetitions because of gaps
     );
     TYPE t_ring_meta_tab IS TABLE OF t_ring_meta_rec INDEX BY BINARY_INTEGER;
     g_ring_meta t_ring_meta_tab;
@@ -259,6 +270,8 @@ AS
     -- sends them on (sendHeldOthers), not only the next call of the same process
     TYPE t_pid_set IS TABLE OF BOOLEAN INDEX BY BINARY_INTEGER;
     g_held_pids t_pid_set;
+    -- Server: processes taken over from another worker (ADOPT_PROCESS); no gap check for a new client of them
+    g_adopted_pids t_pid_set;
     -- Client: closed remote processes whose CLOSE is not confirmed yet (process_end not committed).
     -- Ring buffer, server pipe and takeover data stay until then (see checkClosing).
     TYPE t_closing_rec IS RECORD (
@@ -278,7 +291,12 @@ AS
         wm_log      NUMBER,                      -- highest number committed per buffer type
         wm_mon      NUMBER,
         wm_proc     NUMBER,
-        pending     BOOLEAN := FALSE             -- received numbers not yet committed
+        pending     BOOLEAN := FALSE,            -- received numbers not yet committed
+        -- Gaps (befunde fallback A3): highest number received over all buffer types. NULL = unknown
+        -- (process taken over: the ring buffer repeats only what is not committed, so numbers are missing there).
+        rcv_all     NUMBER,
+        gap_from    NUMBER,                      -- first missing number; later messages are discarded until it arrives
+        gap_dropped NUMBER := 0                  -- messages discarded because of the open gap
     );
     TYPE t_watermark_map IS TABLE OF t_watermark_rec INDEX BY VARCHAR2(70);
     g_watermarks t_watermark_map;
@@ -552,7 +570,15 @@ AS
     TYPE t_client_pipe IS TABLE OF VARCHAR2(128) INDEX BY BINARY_INTEGER;
     g_client_pipes t_client_pipe;
     g_dispatch_route_cache t_client_pipe;
-    
+    -- Dispatcher (befunde fallback C1): workers a forward to has failed (key: pipe name in upper case)
+    TYPE t_disp_target_rec IS RECORD (
+        dead_until_cs   NUMBER,                  -- worker failed: discard messages for it until then (GET_TIME)
+        nowait_until_cs NUMBER,                  -- pipe was full: forward without waiting until then (GET_TIME)
+        dropped         PLS_INTEGER := 0         -- messages discarded since the first failure
+    );
+    TYPE t_disp_target_tab IS TABLE OF t_disp_target_rec INDEX BY VARCHAR2(128);
+    g_disp_targets t_disp_target_tab;
+
     TYPE t_dispatcher_map IS TABLE OF VARCHAR2(50) INDEX BY VARCHAR2(50);
     g_dispatcher_config t_dispatcher_map;
 
@@ -2181,28 +2207,69 @@ AS
 
     --------------------------------------------------------------------------
 
+    -- Gaps (befunde fallback A3): the server misses message p_gapFrom of this client (e.g. discarded by the
+    -- dispatcher at a full pipe) and discards the following ones. The client repeats everything from there in
+    -- its order, marked as repetition, with the mechanism for held back messages (sendHeldBack, at most
+    -- C_PIPE_HELD_SEND_MS per call); new messages wait behind. Repeated again if the same gap is still open
+    -- after C_GAP_RESEND_SEC (the repetition may have been lost as well).
+    procedure resendFromGap(p_processId number, p_gapFrom number)
+    as
+        l_nowCs NUMBER := dbms_utility.get_time;
+    begin
+        if not g_ring.EXISTS(p_processId) or g_ring(p_processId).COUNT = 0 then
+            return;
+        end if;
+        if g_ring_meta(p_processId).gap_seen = p_gapFrom
+           and (l_nowCs - g_ring_meta(p_processId).gap_resend_cs) * 10 < C_GAP_RESEND_SEC * 1000 then
+            return;   -- repetition from this gap is running
+        end if;
+        g_ring_meta(p_processId).gaps          := g_ring_meta(p_processId).gaps + 1;
+        g_ring_meta(p_processId).gap_seen      := p_gapFrom;
+        g_ring_meta(p_processId).gap_resend_cs := l_nowCs;
+        g_ring_meta(p_processId).resend_rp     := TRUE;
+        g_ring_meta(p_processId).unsent_from   := p_gapFrom;
+        g_ring_meta(p_processId).pause_until_cs := l_nowCs;
+        g_held_pids(p_processId) := TRUE;
+        if g_ring_meta(p_processId).gaps = 1 then
+            logLilamErr(NUM_ERR_PIPE_SERVER, 'Client repeats the messages of process ' || p_processId || ' from ' || p_gapFrom
+                || ' out of its ring buffer (gap reported by the server, or CLOSE not confirmed).'
+                || ' Further cases are summed up when the process is closed.',
+                'resendFromGap', 'GAP');
+        end if;
+    exception
+        when others then
+            logLilamErr(sqlCode, sqlErrM, 'resendFromGap');
+    end;
+
+    --------------------------------------------------------------------------
+
     -- Reads the watermarks of the process for this client from LILAM_WATERMARK, trims the ring buffer
-    -- and measures the lag of the server (see measureLag)
+    -- and measures the lag of the server (see measureLag). A gap reported by the server starts a repetition.
     procedure refreshWatermarks(p_processId number)
     as
         l_log  NUMBER;
         l_mon  NUMBER;
         l_proc NUMBER;
+        l_gap  NUMBER;
         l_nowCs NUMBER := dbms_utility.get_time;
     begin
         g_ring_meta(p_processId).last_check_cs := l_nowCs;
         begin
-            execute immediate 'select wm_log, wm_mon, wm_proc from ' || C_LILAM_WATERMARK
+            execute immediate 'select wm_log, wm_mon, wm_proc, gap_from from ' || C_LILAM_WATERMARK
                            || ' where process_id = :1 and client_id = :2'
-                into l_log, l_mon, l_proc using p_processId, getClientId;
+                into l_log, l_mon, l_proc, l_gap using p_processId, getClientId;
         exception
             when NO_DATA_FOUND then   -- nothing committed yet
                 measureLag(p_processId, l_nowCs);
                 return;
             when others then
-                if sqlcode = -942 then return; end if;   -- table missing (server of an older version)
+                -- table or column GAP_FROM missing (server of an older version, the server adds it on NEW_PROCESS)
+                if sqlcode in (-942, -904) then return; end if;
                 raise;
         end;
+        if l_gap is not null then
+            resendFromGap(p_processId, l_gap);
+        end if;
         -- Nothing committed since the last check although messages are waiting: is the server still alive?
         -- (fire-and-forget gives no other sign of a failure; only a dead heartbeat leads to a takeover)
         if nvl(l_log, 0) <= g_ring_meta(p_processId).wm_log
@@ -2397,16 +2464,19 @@ AS
     as
     begin
         if g_ring_meta.EXISTS(p_processId)
-           and (g_ring_meta(p_processId).brakes > 0 or g_ring_meta(p_processId).full_phases > 0) then
+           and (g_ring_meta(p_processId).brakes > 0 or g_ring_meta(p_processId).full_phases > 0
+                or g_ring_meta(p_processId).gaps > 0) then
             logLilamErr(NUM_ERR_PIPE_SERVER, 'Process ' || p_processId || ' closed; the client braked '
-                || g_ring_meta(p_processId).brakes || ' times (' || g_ring_meta(p_processId).brake_ms || ' ms in total)'
-                || ' and found the server pipe full ' || g_ring_meta(p_processId).full_phases || ' times ('
-                || g_ring_meta(p_processId).held_back || ' messages held back in the ring buffer).',
+                || g_ring_meta(p_processId).brakes || ' times (' || g_ring_meta(p_processId).brake_ms || ' ms in total),'
+                || ' found the server pipe full ' || g_ring_meta(p_processId).full_phases || ' times ('
+                || g_ring_meta(p_processId).held_back || ' messages held back in the ring buffer) and repeated '
+                || g_ring_meta(p_processId).gaps || ' times from a gap reported by the server.',
                 'logBackpressureSum', 'BACKPRESSURE');
             g_ring_meta(p_processId).brakes      := 0;
             g_ring_meta(p_processId).brake_ms    := 0;
             g_ring_meta(p_processId).full_phases := 0;
             g_ring_meta(p_processId).held_back   := 0;
+            g_ring_meta(p_processId).gaps        := 0;
         end if;
     exception
         when others then
@@ -2545,7 +2615,13 @@ AS
                 return false;
             end if;
             DBMS_PIPE.RESET_BUFFER;
-            DBMS_PIPE.PACK_MESSAGE(g_ring(p_processId)(l_seq).msg);
+            if g_ring_meta(p_processId).resend_rp then
+                -- Repetition after a gap (resendFromGap): the server takes it without gap check.
+                -- Every message from sendNoWait starts with '{"header":{' (11 characters).
+                DBMS_PIPE.PACK_MESSAGE('{"header":{"rp":1,' || substr(g_ring(p_processId)(l_seq).msg, 12));
+            else
+                DBMS_PIPE.PACK_MESSAGE(g_ring(p_processId)(l_seq).msg);
+            end if;
             l_status := DBMS_PIPE.SEND_MESSAGE(p_pipe, timeout => 0);
             if l_status != 0 then
                 g_ring_meta(p_processId).unsent_from := l_seq;
@@ -2555,6 +2631,7 @@ AS
             l_seq := g_ring(p_processId).NEXT(l_seq);
         end loop;
         g_ring_meta(p_processId).unsent_from := null;
+        g_ring_meta(p_processId).resend_rp   := FALSE;
         g_held_pids.DELETE(p_processId);
         return true;
     exception
@@ -2866,10 +2943,20 @@ AS
                     wm_log      NUMBER,
                     wm_mon      NUMBER,
                     wm_proc     NUMBER,
+                    gap_from    NUMBER,
                     updated     TIMESTAMP(6) DEFAULT SYSTIMESTAMP,
                     CONSTRAINT pk_lilam_watermark PRIMARY KEY (process_id, client_id)
                 )';
         end if;
+        -- Gaps (befunde fallback A3): column added later
+        begin
+            execute immediate 'alter table ' || C_LILAM_WATERMARK || ' add (gap_from NUMBER)';
+        exception
+            when others then
+                if sqlcode not in (-1430, -54) then   -- column exists / table in use by another server
+                    raise;
+                end if;
+        end;
         g_watermark_table_ok := TRUE;
     exception
         when others then
@@ -2915,6 +3002,88 @@ AS
     exception
         when others then
             return JSON_VALUE(p_message, '$.payload.process_id' RETURNING NUMBER);
+    end;
+
+    --------------------------------------------------------------------------
+
+    -- Gaps (befunde fallback A3): stores the first missing number of a process and client in LILAM_WATERMARK
+    -- (NULL = no gap). The client reads it with the watermarks and repeats from there. Rare: own transaction.
+    procedure storeGapFrom(p_processId number, p_clientId varchar2, p_gapFrom number)
+    as
+        pragma autonomous_transaction;
+    begin
+        execute immediate '
+            merge into ' || C_LILAM_WATERMARK || ' w
+            using (select :1 pid, :2 cid, :3 gap from dual) s
+            on (w.process_id = s.pid and w.client_id = s.cid)
+            when matched then update set w.gap_from = s.gap, w.updated = systimestamp
+            when not matched then insert (process_id, client_id, wm_log, wm_mon, wm_proc, gap_from, updated)
+                values (s.pid, s.cid, 0, 0, 0, s.gap, systimestamp)'
+            using p_processId, p_clientId, p_gapFrom;
+        commit;
+    exception
+        when others then
+            rollback;
+            logLilamErr(sqlCode, sqlErrM, 'storeGapFrom');
+    end;
+
+    --------------------------------------------------------------------------
+
+    -- Gaps (befunde fallback A3): checks the number of a message against the last one received over all buffer
+    -- types. Returns FALSE if the message has to be discarded because a number before it is missing.
+    -- A missing message (e.g. discarded by the dispatcher at a full pipe) must not be passed over: the watermark
+    -- would rise above it and the client would remove it from its ring buffer. The server therefore takes
+    -- the numbers only in order ("go back n"): at a gap it discards the following messages, reports the gap
+    -- (storeGapFrom), and the client repeats everything from there, marked as repetition ("rp").
+    -- Repetitions are not checked: after a takeover the ring buffer lacks numbers that are already committed.
+    function checkSeqGap(p_key varchar2, p_seq number, p_replay boolean) return boolean
+    as
+    begin
+        if p_replay then
+            -- A repetition at or behind the gap closes it. Numbers between gap and repetition were given up
+            -- by the client (full ring buffer) and are lost.
+            if g_watermarks(p_key).gap_from is not null and p_seq >= g_watermarks(p_key).gap_from then
+                if p_seq > g_watermarks(p_key).gap_from then
+                    logLilamErr(NUM_ERR_PIPE_SERVER, 'Server ' || g_serverPipeName || ': messages ' || g_watermarks(p_key).gap_from
+                        || ' to ' || (p_seq - 1) || ' of process ' || g_watermarks(p_key).process_id || ' (client '
+                        || g_watermarks(p_key).client_id || ') are lost; the client repeated from ' || p_seq || '.',
+                        'checkSeqGap', 'GAP_LOST');
+                end if;
+                g_watermarks(p_key).gap_from := null;
+                storeGapFrom(g_watermarks(p_key).process_id, g_watermarks(p_key).client_id, null);
+            end if;
+            g_watermarks(p_key).rcv_all := greatest(nvl(g_watermarks(p_key).rcv_all, 0), p_seq);
+            return TRUE;
+        end if;
+
+        if g_watermarks(p_key).rcv_all is null then
+            g_watermarks(p_key).rcv_all := p_seq;   -- first message after a takeover
+            return TRUE;
+        end if;
+        if p_seq <= g_watermarks(p_key).rcv_all + 1 then
+            -- in order (or a repetition the buffer type check below discards)
+            if p_seq = g_watermarks(p_key).rcv_all + 1 then
+                g_watermarks(p_key).rcv_all := p_seq;
+                if g_watermarks(p_key).gap_from is not null then
+                    -- the missing message arrived without repetition flag: gap closed
+                    g_watermarks(p_key).gap_from := null;
+                    storeGapFrom(g_watermarks(p_key).process_id, g_watermarks(p_key).client_id, null);
+                end if;
+            end if;
+            return TRUE;
+        end if;
+
+        -- Gap: discard until the client repeats from the missing number
+        g_watermarks(p_key).gap_dropped := g_watermarks(p_key).gap_dropped + 1;
+        if g_watermarks(p_key).gap_from is null then
+            g_watermarks(p_key).gap_from := g_watermarks(p_key).rcv_all + 1;
+            storeGapFrom(g_watermarks(p_key).process_id, g_watermarks(p_key).client_id, g_watermarks(p_key).gap_from);
+            logLilamErr(NUM_ERR_PIPE_SERVER, 'Server ' || g_serverPipeName || ': message ' || g_watermarks(p_key).gap_from
+                || ' of process ' || g_watermarks(p_key).process_id || ' (client ' || g_watermarks(p_key).client_id
+                || ') is missing, received ' || p_seq || '. Following messages are discarded until the client repeats them.',
+                'checkSeqGap', 'GAP');
+        end if;
+        return FALSE;
     end;
 
     --------------------------------------------------------------------------
@@ -2975,7 +3144,16 @@ AS
         if not g_watermarks.EXISTS(l_key) then
             l_rec.process_id := l_pid;
             l_rec.client_id  := l_cid;
+            -- A client numbers the messages of a process from 1 (per session). Unknown for a process this
+            -- server does not hold (yet) or has taken over: no gap check before the first message (befunde fallback A3)
+            if v_indexSession.EXISTS(l_pid) and not g_adopted_pids.EXISTS(l_pid) then
+                l_rec.rcv_all := 0;
+            end if;
             g_watermarks(l_key) := l_rec;
+        end if;
+        -- Gaps (befunde fallback A3): take the numbers only in order
+        if v_indexSession.EXISTS(l_pid) and not checkSeqGap(l_key, l_seq, g_replay_check) then
+            return FALSE;
         end if;
         -- Per client and buffer type the numbers arrive in ascending order (one pipe, one sender):
         -- a number not above the last one received is a repetition
@@ -3016,6 +3194,7 @@ AS
             l_next := g_watermarks.NEXT(l_key);
 
             if not v_indexSession.EXISTS(g_watermarks(l_key).process_id) then
+                g_adopted_pids.DELETE(g_watermarks(l_key).process_id);
                 g_watermarks.DELETE(l_key);   -- process closed or not known on this server
             elsif g_watermarks(l_key).pending then
                 l_idx := v_indexSession(g_watermarks(l_key).process_id);
@@ -5687,6 +5866,11 @@ AS
         -- the full second, performance test 08.10.2026); the response was not evaluated anyway.
         -- The order is kept: CLOSE travels through the same pipe as the data of the process.
         -- Not via the control pipe (like NEW_PROCESS): CLOSE would overtake the data of its own process.
+        -- STABILITY (befunde fallback A3): last check for a gap reported by the server before the CLOSE; the
+        -- repetition including the CLOSE is sent by sendHeldOnClose. One query per CLOSE.
+        if g_ring_meta.EXISTS(p_processId) then
+            refreshWatermarks(p_processId);
+        end if;
         sendNoWait(p_processId, 'CLOSE_SESSION', 'P', l_payload, C_SEND_TIMEOUT_SEC);
         sendHeldOnClose(p_processId);
         logBackpressureSum(p_processId);
@@ -6817,15 +7001,23 @@ AS
         l_wmLog t_nums;
         l_wmMon t_nums;
         l_wmPrc t_nums;
+        l_gaps  t_nums;
         l_key   varchar2(70);
     begin
-        execute immediate 'select client_id, wm_log, wm_mon, wm_proc from ' || C_LILAM_WATERMARK || ' where process_id = :1'
-            bulk collect into l_cids, l_wmLog, l_wmMon, l_wmPrc using p_processId;
+        g_adopted_pids(p_processId) := TRUE;
+        execute immediate 'select client_id, wm_log, wm_mon, wm_proc, gap_from from ' || C_LILAM_WATERMARK || ' where process_id = :1'
+            bulk collect into l_cids, l_wmLog, l_wmMon, l_wmPrc, l_gaps using p_processId;
         for i in 1 .. l_cids.COUNT loop
             l_key := buildWatermarkKey(p_processId, l_cids(i));
             if not g_watermarks.EXISTS(l_key) then
                 g_watermarks(l_key).process_id := p_processId;
                 g_watermarks(l_key).client_id  := l_cids(i);
+            end if;
+            -- Gaps: the client repeats its ring buffer (marked as repetition); a gap of the failed worker is obsolete
+            g_watermarks(l_key).rcv_all  := null;
+            g_watermarks(l_key).gap_from := null;
+            if l_gaps(i) is not null then
+                storeGapFrom(p_processId, l_cids(i), null);
             end if;
             g_watermarks(l_key).wm_log   := greatest(nvl(g_watermarks(l_key).wm_log, 0),   nvl(l_wmLog(i), 0));
             g_watermarks(l_key).wm_mon   := greatest(nvl(g_watermarks(l_key).wm_mon, 0),   nvl(l_wmMon(i), 0));
@@ -7493,6 +7685,7 @@ AS
                 -- The rest is held back like at a full pipe and sent later in its order (see sendHeldBack)
                 g_held_pids(p_processId) := TRUE;
                 g_ring_meta(p_processId).unsent_from    := l_seq;
+                g_ring_meta(p_processId).resend_rp      := TRUE;   -- the rest is part of the repetition
                 g_ring_meta(p_processId).pause_until_cs := dbms_utility.get_time + C_PIPE_FULL_PAUSE_MS / 10;
                 return l_count;
             end if;
@@ -7503,6 +7696,7 @@ AS
         if g_ring_meta.EXISTS(p_processId) then
             g_held_pids.DELETE(p_processId);
             g_ring_meta(p_processId).unsent_from := null;
+            g_ring_meta(p_processId).resend_rp   := FALSE;
         end if;
         return l_count;
     exception
@@ -7672,12 +7866,22 @@ AS
                 if l_end is not null then
                     forgetClosing(l_pid);
                 else
-                    if not isProcessServerActive(l_pid, C_CLOSING_HEARTBEAT_AGE_SEC)
-                       and (g_closing(l_pid).next_failover is null or systimestamp >= g_closing(l_pid).next_failover) then
-                        g_closing(l_pid).next_failover := systimestamp + numtodsinterval(C_FAILED_SERVER_RECHECK_SEC, 'SECOND');
-                        -- Taken over: the ring buffer with the CLOSE is repeated, a later check confirms it.
-                        -- Already closed: failoverProcess has removed everything.
-                        l_taken := failoverProcess(l_pid);
+                    if not isProcessServerActive(l_pid, C_CLOSING_HEARTBEAT_AGE_SEC) then
+                        if g_closing(l_pid).next_failover is null or systimestamp >= g_closing(l_pid).next_failover then
+                            g_closing(l_pid).next_failover := systimestamp + numtodsinterval(C_FAILED_SERVER_RECHECK_SEC, 'SECOND');
+                            -- Taken over: the ring buffer with the CLOSE is repeated, a later check confirms it.
+                            -- Already closed: failoverProcess has removed everything.
+                            l_taken := failoverProcess(l_pid);
+                        end if;
+                    elsif g_ring.EXISTS(l_pid) and g_ring(l_pid).COUNT > 0 and g_ring_meta.EXISTS(l_pid) then
+                        -- Server alive (befunde fallback A3): a gap reported by the server starts a repetition.
+                        -- A lost last message (e.g. the CLOSE discarded by the dispatcher) leaves no gap the
+                        -- server could see: after C_GAP_RESEND_SEC the rest of the ring buffer is repeated.
+                        refreshWatermarks(l_pid);
+                        if g_ring.EXISTS(l_pid) and g_ring(l_pid).COUNT > 0 and g_ring_meta(l_pid).unsent_from is null
+                           and systimestamp >= g_closing(l_pid).closed_at + numtodsinterval(C_GAP_RESEND_SEC, 'SECOND') then
+                            resendFromGap(l_pid, g_ring(l_pid).FIRST);
+                        end if;
                     end if;
                     -- Not confirmed in time (no server took over, or the CLOSE was lost at a full pipe)
                     if g_closing.EXISTS(l_pid)
@@ -8881,6 +9085,87 @@ AS
 
     --------------------------------------------------------------------------
 
+    -- Dispatcher (befunde fallback C1): forwards the packed message to a worker and evaluates the result.
+    -- Previously every forward waited up to 1 s at a full worker pipe and the result was ignored: one worker
+    -- that failed or was overloaded stopped the dispatcher for all clients, and the message was lost.
+    --   failed worker (no heartbeat, no job)  -> discard its messages for C_DISP_DEAD_SKIP_SEC without trying;
+    --                                            the clients take the process over and repeat their ring buffers
+    --   full pipe of a living worker          -> forward without waiting for C_PIPE_FULL_RECENT_MS; a discarded
+    --                                            message leaves a gap the server reports, the client repeats (A3)
+    -- Logged at the first failure of a worker, the sum when forwarding to it works again.
+    -- PERFORMANCE: in normal operation only COUNT on an empty array.
+    function forwardToWorker(p_target varchar2) return PLS_INTEGER
+    as
+        l_key     varchar2(128) := upper(p_target);
+        l_nowCs   NUMBER;
+        l_timeout PLS_INTEGER := 1;
+        l_status  PLS_INTEGER;
+        l_rec     t_disp_target_rec;
+    begin
+        if g_disp_targets.COUNT > 0 and g_disp_targets.EXISTS(l_key) then
+            l_nowCs := dbms_utility.get_time;
+            if g_disp_targets(l_key).dead_until_cs > l_nowCs then
+                DBMS_PIPE.RESET_BUFFER;
+                g_disp_targets(l_key).dropped := g_disp_targets(l_key).dropped + 1;
+                return -1;
+            end if;
+            if g_disp_targets(l_key).nowait_until_cs > l_nowCs then
+                l_timeout := 0;
+            end if;
+        end if;
+
+        l_status := DBMS_PIPE.SEND_MESSAGE(p_target, timeout => l_timeout);
+
+        if l_status = 0 then
+            -- Works again: sum and forget the worker
+            if g_disp_targets.COUNT > 0 and g_disp_targets.EXISTS(l_key)
+               and g_disp_targets(l_key).nowait_until_cs <= l_nowCs then
+                logLilamErr(NUM_ERR_PIPE_SERVER, 'Dispatcher ' || g_serverPipeName || ': forwarding to worker ' || p_target
+                    || ' works again; ' || g_disp_targets(l_key).dropped || ' messages were discarded (the clients repeat them).',
+                    'forwardToWorker', 'BACKPRESSURE');
+                g_disp_targets.DELETE(l_key);
+            end if;
+            return 0;
+        end if;
+
+        DBMS_PIPE.RESET_BUFFER;
+        l_nowCs := dbms_utility.get_time;
+        if not g_disp_targets.EXISTS(l_key) then
+            l_rec.nowait_until_cs := 0;
+            l_rec.dead_until_cs   := 0;
+            g_disp_targets(l_key) := l_rec;
+        end if;
+        g_disp_targets(l_key).dropped := g_disp_targets(l_key).dropped + 1;
+
+        -- Already in the window without waiting: only count (no query per message)
+        if l_timeout = 0 then
+            return l_status;
+        end if;
+
+        if not isServerAlive(p_target, C_FAILOVER_HEARTBEAT_AGE_SEC) then
+            g_disp_targets(l_key).dead_until_cs   := l_nowCs + C_DISP_DEAD_SKIP_SEC * 100;
+            g_disp_targets(l_key).nowait_until_cs := l_nowCs + C_PIPE_FULL_RECENT_MS / 10;
+            logLilamErr(NUM_ERR_PIPE_SERVER, 'Dispatcher ' || g_serverPipeName || ': worker ' || p_target || ' has failed (pipe status '
+                || l_status || '). Its messages are discarded for ' || C_DISP_DEAD_SKIP_SEC
+                || ' s; the clients take its processes over and repeat them.',
+                'forwardToWorker', 'DISPATCH');
+        else
+            g_disp_targets(l_key).nowait_until_cs := l_nowCs + C_PIPE_FULL_RECENT_MS / 10;
+            logLilamErr(NUM_ERR_PIPE_SERVER, 'Dispatcher ' || g_serverPipeName || ': pipe of worker ' || p_target || ' is full (status '
+                || l_status || '). Forwarding without waiting for ' || C_PIPE_FULL_RECENT_MS / 1000
+                || ' s; discarded messages are repeated by the clients (gap).',
+                'forwardToWorker', 'BACKPRESSURE');
+        end if;
+        return l_status;
+    exception
+        when others then
+            DBMS_PIPE.RESET_BUFFER;
+            logLilamErr(sqlCode, sqlErrM, 'forwardToWorker');
+            return -1;
+    end;
+
+    --------------------------------------------------------------------------
+
     function processRequest(p_request varchar2, p_message varchar2, p_clientChannel varchar2, p_drain BOOLEAN DEFAULT FALSE) return boolean
     as
         l_targetPipe varchar2(100);
@@ -8936,7 +9221,8 @@ AS
                 l_status := DBMS_PIPE.SEND_MESSAGE(ctlPipe(l_targetPipe), timeout => 1);
                 sendPing(l_targetPipe);
             else
-                l_status := DBMS_PIPE.SEND_MESSAGE(l_targetPipe, timeout => 1);
+                -- STABILITY: evaluates the result, does not stop at a failed or full worker (befunde fallback C1)
+                l_status := forwardToWorker(l_targetPipe);
                 -- STABILITY: remove the route of the finished process from the cache, otherwise
                 -- g_dispatch_route_cache grows with every process that ever ran via the dispatcher.
                 -- Later messages for this ID fall back to LILAM_PROCESS_ROUTE (resolveDispatchTarget).
