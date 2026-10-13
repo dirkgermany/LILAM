@@ -48,7 +48,7 @@ AS
     -- the server to commit (reading LILAM_WATERMARK), and only if that does not help, the oldest messages are given up.
     C_CLIENT_RINGBUFF_MAX              CONSTANT PLS_INTEGER  := 20000;
     C_RING_FULL_MAX_WAIT_MS            CONSTANT PLS_INTEGER  := 1000;
-    -- The client reads the watermarks of a process at most every n ms (checked every C_RING_CHECK_EVERY_NO messages)
+    -- The client reads the watermarks of a process every n ms (on its next call); it may brake every n messages
     C_RING_WATERMARK_CHECK_MS          CONSTANT PLS_INTEGER  := 1000;
     C_RING_CHECK_EVERY_NO              CONSTANT PLS_INTEGER  := 100;
     -- Backpressure (befunde fallback A1/F4): the client never waits for an answer through the pipe (it would stand
@@ -232,7 +232,7 @@ AS
         msg          JSON_OBJ_LILAM,             -- complete message as sent
         trace_key    VARCHAR2(200),              -- TRACE_START: kept until its TRACE_STOP is committed
         unpin_seq    PLS_INTEGER,                -- TRACE_START: sequence number of the matching TRACE_STOP
-        kept_cs      NUMBER                      -- time of keeping (GET_TIME), only every C_RING_CHECK_EVERY_NO messages (lag)
+        kept_cs      NUMBER                      -- time of keeping (GET_TIME), for the lag
     );
     TYPE t_ring_tab IS TABLE OF t_ring_msg_rec INDEX BY PLS_INTEGER;
     TYPE t_ring_map IS TABLE OF t_ring_tab INDEX BY BINARY_INTEGER;
@@ -246,7 +246,7 @@ AS
         wm_log          NUMBER := 0,
         wm_mon          NUMBER := 0,
         wm_proc         NUMBER := 0,
-        since_check     PLS_INTEGER := 0,        -- messages since the last check of the time
+        since_check     PLS_INTEGER := 0,        -- messages since the last backpressure check (brakeOnBacklog)
         last_check_cs   NUMBER,                  -- last read of the watermarks (DBMS_UTILITY.GET_TIME)
         given_up        PLS_INTEGER := 0,        -- messages removed from the full ring buffer without commit
         -- Backpressure (see C_BRAKE_*, C_PIPE_FULL_*)
@@ -2186,7 +2186,7 @@ AS
     --------------------------------------------------------------------------
 
     -- Lag of the server for this client: age of the oldest message in the ring buffer that is not committed.
-    -- Only every C_RING_CHECK_EVERY_NO-th message carries its time (kept_cs); pinned TRACE_STARTs do not count.
+    -- Pinned TRACE_STARTs do not count.
     procedure measureLag(p_processId number, p_nowCs number)
     as
         l_seq PLS_INTEGER;
@@ -2276,8 +2276,7 @@ AS
         -- (fire-and-forget gives no other sign of a failure; only a dead heartbeat leads to a takeover)
         -- PERFORMANCE (befunde fallback D4): the heartbeat is only checked from a lag of C_FAILOVER_HEARTBEAT_AGE_SEC.
         -- Before that the server cannot count as failed (its heartbeat is younger); in normal operation the stall
-        -- between two flushes therefore costs no queries. Limit: the lag relies on every C_RING_CHECK_EVERY_NO-th
-        -- message, a failure may be noticed up to that many messages later. CLOSE checks at once (p_checkAlways):
+        -- between two flushes therefore costs no queries. CLOSE checks at once (p_checkAlways):
         -- after a long pause its messages are new, while the heartbeat of a failed server is already old.
         -- A full ring buffer as well: otherwise a fast client would give up messages before the lag reaches 5 s.
         if nvl(l_log, 0) <= g_ring_meta(p_processId).wm_log
@@ -2398,21 +2397,23 @@ AS
 
     -- Keeps a message in the ring buffer until it is committed. Called by sendNoWait before sending,
     -- so that also a message that cannot be sent (full pipe, failed server) can be repeated later.
-    -- PERFORMANCE: per message one entry in an associative array; the watermarks are read at most
-    -- every C_RING_WATERMARK_CHECK_MS, and the time is only checked every C_RING_CHECK_EVERY_NO messages.
+    -- The watermarks are read every C_RING_WATERMARK_CHECK_MS, independent of the number of messages (D5).
     -- p_ringType: buffer type on the server, L(og), M(onitor) or P(rocess), given by the caller (see sendNoWait)
     procedure keepInRing(p_processId number, p_seq PLS_INTEGER, p_request varchar2, p_ringType varchar2, p_msg varchar2, p_traceKey varchar2)
     as
         l_meta  t_ring_meta_rec;
         l_empty t_ring_tab;
         l_pins  t_trace_pin_tab;
+        l_nowCs NUMBER;
     begin
         if p_ringType is null then
             return;
         end if;
+        l_nowCs := dbms_utility.get_time;
 
         if not g_ring.EXISTS(p_processId) then
             g_ring(p_processId) := l_empty;
+            l_meta.last_check_cs := l_nowCs;   -- first read after C_RING_WATERMARK_CHECK_MS
             g_ring_meta(p_processId) := l_meta;
         end if;
 
@@ -2440,25 +2441,26 @@ AS
         end if;
 
         g_ring_meta(p_processId).since_check := g_ring_meta(p_processId).since_check + 1;
-        -- Time of the first message of each block of C_RING_CHECK_EVERY_NO messages: measures the lag (measureLag).
-        -- PERFORMANCE: not for every message.
-        if g_ring_meta(p_processId).since_check = 1 then
-            g_ring(p_processId)(p_seq).kept_cs := dbms_utility.get_time;
-        end if;
+        -- STABILITY (befunde fallback D5): every message carries its time (lag, measureLag), and the watermarks
+        -- are read by time; before, only every C_RING_CHECK_EVERY_NO messages, so a client sending once per second
+        -- noticed a failed server only after minutes.
+        g_ring(p_processId)(p_seq).kept_cs := l_nowCs;
         if g_ring(p_processId).COUNT >= C_CLIENT_RINGBUFF_MAX then
             refreshWatermarks(p_processId, p_checkAlways => TRUE);
             if g_ring(p_processId).COUNT >= C_CLIENT_RINGBUFF_MAX then
                 relieveRing(p_processId);
             end if;
             g_ring_meta(p_processId).since_check := 0;
-        elsif g_ring_meta(p_processId).since_check >= C_RING_CHECK_EVERY_NO then
-            g_ring_meta(p_processId).since_check := 0;
+        else
             if g_ring_meta(p_processId).last_check_cs is null
-               or abs(dbms_utility.get_time - g_ring_meta(p_processId).last_check_cs) * 10 >= C_RING_WATERMARK_CHECK_MS then
+               or abs(l_nowCs - g_ring_meta(p_processId).last_check_cs) * 10 >= C_RING_WATERMARK_CHECK_MS then
                 refreshWatermarks(p_processId);
             end if;
             -- Backpressure: brake briefly if the server lags behind (befunde fallback A1)
-            brakeOnBacklog(p_processId);
+            if g_ring_meta(p_processId).since_check >= C_RING_CHECK_EVERY_NO then
+                g_ring_meta(p_processId).since_check := 0;
+                brakeOnBacklog(p_processId);
+            end if;
         end if;
     exception
         when others then
