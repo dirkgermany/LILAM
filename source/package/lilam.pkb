@@ -305,6 +305,7 @@ AS
     g_wm_last_cid VARCHAR2(40);
     g_wm_last_key VARCHAR2(70);
     g_watermark_table_ok BOOLEAN := FALSE;       -- LILAM_WATERMARK checked/created in this session
+    g_route_table_ok     BOOLEAN := FALSE;       -- LILAM_PROCESS_ROUTE checked/created in this session (G2)
     -- Watermarks for the next flushBatch (same transaction as the data)
     TYPE t_watermark_batch_rec IS RECORD (
         pids     sys.odcinumberlist   := sys.odcinumberlist(),
@@ -2919,10 +2920,14 @@ AS
     
     --------------------------------------------------------------------------
 
+    -- PERFORMANCE (befunde fallback G2): checked once per session, not on every NEW_PROCESS
     procedure createDispatchTable
     as
         l_sql varchar2(1000);
     begin
+        if g_route_table_ok then
+            return;
+        end if;
         if not objectExists(C_LILAM_PROCESS_ROUTE, 'TABLE') then
             l_sql := '
                 CREATE TABLE ' || C_LILAM_PROCESS_ROUTE || '(
@@ -2932,8 +2937,13 @@ AS
                 )';
             execute immediate l_sql;
         end if;
+        g_route_table_ok := TRUE;
     EXCEPTION
         WHEN OTHERS THEN
+            if sqlcode = -955 then   -- created by another server at the same time
+                g_route_table_ok := TRUE;
+                return;
+            end if;
             dbms_output.enable(10000);
             dbms_output.put_line('LILAM INTERNAL ERROR in Procedure createDispatchTable: ' || substr(sqlErrM, 1, 1000) || chr(13) || chr(10) || l_sql);
     end;
@@ -6500,6 +6510,7 @@ AS
         g_scope_ids.DELETE;
         g_checked_masters.DELETE;
         g_safe_tables.DELETE;
+        g_route_table_ok := FALSE;
         g_last_baseline_sync := NULL;
 
         g_monitor_groups.delete;
@@ -7048,6 +7059,7 @@ AS
     exception
         when others then
             rollback;
+            if sqlcode = -942 then g_route_table_ok := FALSE; end if;   -- table dropped: check again
             logLilamErr(sqlCode, sqlErrM, 'claimRoute');
             return 'ERROR';
     end;
@@ -7557,6 +7569,8 @@ AS
         commit;
     exception
         when others then
+            -- table dropped: check again on the next NEW_PROCESS
+            if sqlcode = -942 then g_route_table_ok := FALSE; g_watermark_table_ok := FALSE; end if;
             logLilamErr(sqlCode, sqlErrM, 'registerProcessRoute');
     end;
 
