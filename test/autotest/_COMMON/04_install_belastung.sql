@@ -298,7 +298,8 @@ create or replace package body ltb as
     function internal_errors return number is
         l_n number;
     begin
-        execute immediate 'select count(*) from lilam_log_internal' into l_n;
+        -- Hinweise zum Rueckstau (Bremsen, volle Pipe) sind keine Fehler
+        execute immediate 'select count(*) from lilam_log_internal where nvl(log_operation, ''-'') != ''BACKPRESSURE''' into l_n;
         return l_n;
     exception
         when others then return 0;   -- Tabelle existiert erst nach dem ersten internen Fehler

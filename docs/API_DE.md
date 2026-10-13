@@ -827,7 +827,7 @@ PROCEDURE START_SERVER(
 | p_perfServer | pls_integer | Leistungsstufe des Servers, siehe [Leistungsstufe](#leistungsstufe-p_perfserver). `NULL` (Standard) = `C_SERVER_PERF_MID` |
 
 #### Leistungsstufe (p_perfServer)
-Damit ein Client den Server nicht mit Nachrichten überflutet, stimmt er sich nach einer bestimmten Anzahl Nachrichten je Prozess und Sekunde kurz mit dem Server ab und wartet, bis dieser aufgeholt hat. Diese Grenze legt `p_perfServer` fest. Der Server teilt sie dem Client bei `SERVER_NEW_PROCESS` (und beim automatischen Reconnect) mit; in der Anwendung ist dafür kein eigener Aufruf nötig.
+Damit ein Client den Server nicht mit Nachrichten überflutet, prüft er nach einer bestimmten Anzahl Nachrichten je Prozess und Sekunde, ob der Server mithält. Dazu liest er, bis zu welcher Nachricht der Server geschrieben hat (Tabelle `LILAM_WATERMARK`); auf eine Antwort über die Pipe wartet er nicht. Liegt der Server zurück, bremst der Client kurz: je 100 Nachrichten 20 bis 100 ms, je nach Rückstand. Hält der Server mit, wartet der Client nicht. Diese Grenze legt `p_perfServer` fest. Der Server teilt sie dem Client bei `SERVER_NEW_PROCESS` (und beim automatischen Reconnect) mit; in der Anwendung ist dafür kein eigener Aufruf nötig.
 
 | Konstante | Wert | Einsatz |
 | --- | --- | --- |
@@ -835,7 +835,7 @@ Damit ein Client den Server nicht mit Nachrichten überflutet, stimmt er sich na
 | `C_SERVER_PERF_MID` | 1500 | Standard; übliche Server |
 | `C_SERVER_PERF_HIGH` | 2500 | leistungsstarke Server |
 
-Beliebige andere Werte sind möglich. `0` schaltet die Abstimmung ab; `NULL` oder negative Werte gelten als `C_SERVER_PERF_MID`.
+Beliebige andere Werte sind möglich. `0` schaltet das Bremsen ab (nur ein voller Ringpuffer lässt den Client dann noch bis 1 s warten); `NULL` oder negative Werte gelten als `C_SERVER_PERF_MID`.
 
 > [!NOTE]
 > Die Grenze gilt je Prozess. Senden viele Anwendungen gleichzeitig an denselben Server, ist dessen Gesamtdurchsatz geringer als die Summe der Einzelwerte; dann eher `C_SERVER_PERF_LOW` oder `C_SERVER_PERF_MID` wählen oder weitere Server derselben Gruppe starten.

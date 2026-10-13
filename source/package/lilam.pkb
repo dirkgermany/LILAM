@@ -44,12 +44,31 @@ AS
     -- because the ring buffer repeats everything not committed; a wrong decision only costs a move.
     C_FAILOVER_HEARTBEAT_AGE_SEC       CONSTANT PLS_INTEGER  := 5;
     -- Failover: the client keeps the messages of a remote process that are not committed yet (ring buffer).
-    -- At most this many per process; when it is full, the client asks the server to flush (WATERMARK_REQUEST),
-    -- and only if that does not help, the oldest messages are given up.
+    -- At most this many per process; when it is full, the client waits at most C_RING_FULL_MAX_WAIT_MS for
+    -- the server to commit (reading LILAM_WATERMARK), and only if that does not help, the oldest messages are given up.
     C_CLIENT_RINGBUFF_MAX              CONSTANT PLS_INTEGER  := 20000;
+    C_RING_FULL_MAX_WAIT_MS            CONSTANT PLS_INTEGER  := 1000;
     -- The client reads the watermarks of a process at most every n ms (checked every C_RING_CHECK_EVERY_NO messages)
     C_RING_WATERMARK_CHECK_MS          CONSTANT PLS_INTEGER  := 1000;
     C_RING_CHECK_EVERY_NO              CONSTANT PLS_INTEGER  := 100;
+    -- Backpressure (befunde fallback A1/F4): the client never waits for an answer through the pipe (it would stand
+    -- behind the whole backlog). Every C_RING_CHECK_EVERY_NO messages it sleeps briefly if the server lags behind:
+    -- lag = age of the oldest message not committed yet (LILAM_WATERMARK), or fill level of the ring buffer.
+    -- Normal operation: the server commits at the latest after C_FLUSH_MILLIS_THRESHOLD_MS, the client reads
+    -- every C_RING_WATERMARK_CHECK_MS, so a lag up to about 2.5 s is no backlog.
+    C_BRAKE_LAG1_MS                    CONSTANT PLS_INTEGER  := 3000;    -- lag from which the client brakes ...
+    C_BRAKE_LAG2_MS                    CONSTANT PLS_INTEGER  := 5000;
+    C_BRAKE_LAG3_MS                    CONSTANT PLS_INTEGER  := 10000;
+    C_BRAKE_SLEEP1_MS                  CONSTANT PLS_INTEGER  := 20;      -- ... with this sleep per check
+    C_BRAKE_SLEEP2_MS                  CONSTANT PLS_INTEGER  := 50;
+    C_BRAKE_SLEEP3_MS                  CONSTANT PLS_INTEGER  := 100;
+    C_BRAKE_FILL2_PCT                  CONSTANT PLS_INTEGER  := 75;      -- ring buffer fill level: sleep 2
+    C_BRAKE_FILL3_PCT                  CONSTANT PLS_INTEGER  := 90;      -- ring buffer fill level: sleep 3
+    -- Full server pipe (befunde fallback A2): after a failed send the client holds back further messages of the
+    -- process in the ring buffer for this time and then sends them in order without waiting (timeout 0).
+    -- For C_PIPE_FULL_RECENT_MS after a full pipe also new messages are sent without waiting.
+    C_PIPE_FULL_PAUSE_MS               CONSTANT PLS_INTEGER  := 1000;
+    C_PIPE_FULL_RECENT_MS              CONSTANT PLS_INTEGER  := 10000;
     -- A closed remote process keeps its ring buffer until the CLOSE is committed (see checkClosing).
     -- If no server takes the process over within this time, the client gives up the ring buffer.
     C_CLOSING_MAX_AGE_SEC              CONSTANT PLS_INTEGER  := 600;
@@ -203,7 +222,8 @@ AS
         msg_type     VARCHAR2(1),                -- buffer type on the server: L(og), M(onitor), P(rocess)
         msg          JSON_OBJ_LILAM,             -- complete message as sent
         trace_key    VARCHAR2(200),              -- TRACE_START: kept until its TRACE_STOP is committed
-        unpin_seq    PLS_INTEGER                 -- TRACE_START: sequence number of the matching TRACE_STOP
+        unpin_seq    PLS_INTEGER,                -- TRACE_START: sequence number of the matching TRACE_STOP
+        kept_cs      NUMBER                      -- time of keeping (GET_TIME), only every C_RING_CHECK_EVERY_NO messages (lag)
     );
     TYPE t_ring_tab IS TABLE OF t_ring_msg_rec INDEX BY PLS_INTEGER;
     TYPE t_ring_map IS TABLE OF t_ring_tab INDEX BY BINARY_INTEGER;
@@ -219,7 +239,16 @@ AS
         wm_proc         NUMBER := 0,
         since_check     PLS_INTEGER := 0,        -- messages since the last check of the time
         last_check_cs   NUMBER,                  -- last read of the watermarks (DBMS_UTILITY.GET_TIME)
-        given_up        PLS_INTEGER := 0         -- messages removed from the full ring buffer without commit
+        given_up        PLS_INTEGER := 0,        -- messages removed from the full ring buffer without commit
+        -- Backpressure (see C_BRAKE_*, C_PIPE_FULL_*)
+        lag_ms          NUMBER := 0,             -- age of the oldest message not committed, at the last read
+        brakes          PLS_INTEGER := 0,        -- number of brakes (sleeps) of the client
+        brake_ms        NUMBER := 0,             -- total time of the brakes
+        unsent_from     PLS_INTEGER,             -- first sequence number held back (full pipe); null = all sent
+        pause_until_cs  NUMBER,                  -- full pipe: no send attempt before this time (GET_TIME)
+        last_full_cs    NUMBER,                  -- last failed send (GET_TIME)
+        full_phases     PLS_INTEGER := 0,        -- number of failed sends (full pipe)
+        held_back       PLS_INTEGER := 0         -- messages held back in the ring buffer because of a full pipe
     );
     TYPE t_ring_meta_tab IS TABLE OF t_ring_meta_rec INDEX BY BINARY_INTEGER;
     g_ring_meta t_ring_meta_tab;
@@ -2123,20 +2152,46 @@ AS
 
     --------------------------------------------------------------------------
 
-    -- Reads the watermarks of the process for this client from LILAM_WATERMARK and trims the ring buffer
+    -- Lag of the server for this client: age of the oldest message in the ring buffer that is not committed.
+    -- Only every C_RING_CHECK_EVERY_NO-th message carries its time (kept_cs); pinned TRACE_STARTs do not count.
+    procedure measureLag(p_processId number, p_nowCs number)
+    as
+        l_seq PLS_INTEGER;
+    begin
+        g_ring_meta(p_processId).lag_ms := 0;
+        if not g_ring.EXISTS(p_processId) then
+            return;
+        end if;
+        l_seq := g_ring(p_processId).FIRST;
+        while l_seq is not null loop
+            if g_ring(p_processId)(l_seq).kept_cs is not null and g_ring(p_processId)(l_seq).trace_key is null then
+                g_ring_meta(p_processId).lag_ms := greatest(0, (p_nowCs - g_ring(p_processId)(l_seq).kept_cs) * 10);
+                return;
+            end if;
+            l_seq := g_ring(p_processId).NEXT(l_seq);
+        end loop;
+    end;
+
+    --------------------------------------------------------------------------
+
+    -- Reads the watermarks of the process for this client from LILAM_WATERMARK, trims the ring buffer
+    -- and measures the lag of the server (see measureLag)
     procedure refreshWatermarks(p_processId number)
     as
         l_log  NUMBER;
         l_mon  NUMBER;
         l_proc NUMBER;
+        l_nowCs NUMBER := dbms_utility.get_time;
     begin
-        g_ring_meta(p_processId).last_check_cs := dbms_utility.get_time;
+        g_ring_meta(p_processId).last_check_cs := l_nowCs;
         begin
             execute immediate 'select wm_log, wm_mon, wm_proc from ' || C_LILAM_WATERMARK
                            || ' where process_id = :1 and client_id = :2'
                 into l_log, l_mon, l_proc using p_processId, getClientId;
         exception
-            when NO_DATA_FOUND then return;   -- nothing committed yet
+            when NO_DATA_FOUND then   -- nothing committed yet
+                measureLag(p_processId, l_nowCs);
+                return;
             when others then
                 if sqlcode = -942 then return; end if;   -- table missing (server of an older version)
                 raise;
@@ -2147,6 +2202,7 @@ AS
            and nvl(l_mon, 0) <= g_ring_meta(p_processId).wm_mon
            and nvl(l_proc, 0) <= g_ring_meta(p_processId).wm_proc
            and g_ring.EXISTS(p_processId) and g_ring(p_processId).COUNT > 0 then
+            measureLag(p_processId, l_nowCs);
             checkServerAfterTimeout(p_processId);
             return;
         end if;
@@ -2154,6 +2210,7 @@ AS
         g_ring_meta(p_processId).wm_mon  := greatest(g_ring_meta(p_processId).wm_mon,  nvl(l_mon, 0));
         g_ring_meta(p_processId).wm_proc := greatest(g_ring_meta(p_processId).wm_proc, nvl(l_proc, 0));
         trimRing(p_processId);
+        measureLag(p_processId, l_nowCs);
     exception
         when others then
             logLilamErr(sqlCode, sqlErrM, 'refreshWatermarks');
@@ -2161,25 +2218,74 @@ AS
 
     --------------------------------------------------------------------------
 
-    -- Ring buffer full: ask the server to write everything of the process now and report the watermarks
-    -- (synchronous, behind all messages already sent). If that does not help (server failed, timeout),
-    -- give up the oldest messages that are not pinned.
+    -- Backpressure: the client sleeps for p_ms. Counted per process; the first brake of a process is logged,
+    -- the sum when the process is closed (forgetRing).
+    procedure brake(p_processId number, p_ms PLS_INTEGER, p_reason varchar2)
+    as
+    begin
+        dbms_session.sleep(p_ms / 1000);
+        g_ring_meta(p_processId).brakes   := g_ring_meta(p_processId).brakes + 1;
+        g_ring_meta(p_processId).brake_ms := g_ring_meta(p_processId).brake_ms + p_ms;
+        if g_ring_meta(p_processId).brakes = 1 then
+            logLilamErr(NUM_ERR_PIPE_SERVER, 'Client brakes process ' || p_processId || ' because the server lags behind ('
+                || p_reason || '). Further brakes are summed up when the process is closed.',
+                'brake', 'BACKPRESSURE');
+        end if;
+    exception
+        when others then
+            logLilamErr(sqlCode, sqlErrM, 'brake');
+    end;
+
+    --------------------------------------------------------------------------
+
+    -- Backpressure (befunde fallback A1): sleeps briefly if the server lags behind, measured by the lag at the
+    -- last read of the watermarks and by the fill level of the ring buffer (see C_BRAKE_*). Never waits for the server.
+    procedure brakeOnBacklog(p_processId number)
+    as
+        l_fillPct NUMBER;
+        l_lagMs   NUMBER;
+        l_ms      PLS_INTEGER := 0;
+    begin
+        if not g_ring_meta.EXISTS(p_processId) or not g_ring.EXISTS(p_processId) then
+            return;
+        end if;
+        -- Server started with p_perfServer => 0: no throttling (only a full ring buffer waits, see relieveRing)
+        if g_local_throttle_cache.EXISTS(p_processId) and g_local_throttle_cache(p_processId).msg_limit = 0 then
+            return;
+        end if;
+        l_lagMs   := g_ring_meta(p_processId).lag_ms;
+        l_fillPct := g_ring(p_processId).COUNT * 100 / C_CLIENT_RINGBUFF_MAX;
+
+        if    l_lagMs >= C_BRAKE_LAG3_MS or l_fillPct >= C_BRAKE_FILL3_PCT then l_ms := C_BRAKE_SLEEP3_MS;
+        elsif l_lagMs >= C_BRAKE_LAG2_MS or l_fillPct >= C_BRAKE_FILL2_PCT then l_ms := C_BRAKE_SLEEP2_MS;
+        elsif l_lagMs >= C_BRAKE_LAG1_MS                                   then l_ms := C_BRAKE_SLEEP1_MS;
+        end if;
+
+        if l_ms > 0 then
+            brake(p_processId, l_ms, 'lag ' || round(l_lagMs) || ' ms, ring buffer ' || round(l_fillPct) || ' % full');
+        end if;
+    exception
+        when others then
+            logLilamErr(sqlCode, sqlErrM, 'brakeOnBacklog');
+    end;
+
+    --------------------------------------------------------------------------
+
+    -- Ring buffer full (befunde fallback F4): wait at most C_RING_FULL_MAX_WAIT_MS for the server to commit,
+    -- reading the watermarks from LILAM_WATERMARK (previously a synchronous WATERMARK_REQUEST, which stood behind
+    -- the whole backlog and ran into its 5 s timeout). If that does not help, give up the oldest messages that are not pinned.
     procedure relieveRing(p_processId number)
     as
-        l_response varchar2(1000);
         l_seq      PLS_INTEGER;
         l_next     PLS_INTEGER;
         l_given    PLS_INTEGER := 0;
+        l_startCs  NUMBER := dbms_utility.get_time;
     begin
-        l_response := waitForResponse(p_processId, 'WATERMARK_REQUEST',
-            '{"process_id":' || jNum(p_processId) || jStr('cid', getClientId) || '}', 5);
-        if l_response not like 'ERROR%' and l_response != 'TIMEOUT' then
-            g_ring_meta(p_processId).wm_log  := greatest(g_ring_meta(p_processId).wm_log,  nvl(jsonNumber(l_response, 'wm_log'), 0));
-            g_ring_meta(p_processId).wm_mon  := greatest(g_ring_meta(p_processId).wm_mon,  nvl(jsonNumber(l_response, 'wm_mon'), 0));
-            g_ring_meta(p_processId).wm_proc := greatest(g_ring_meta(p_processId).wm_proc, nvl(jsonNumber(l_response, 'wm_proc'), 0));
-            g_ring_meta(p_processId).last_check_cs := dbms_utility.get_time;
-            trimRing(p_processId);
-        end if;
+        while g_ring(p_processId).COUNT >= C_CLIENT_RINGBUFF_MAX
+              and (dbms_utility.get_time - l_startCs) * 10 < C_RING_FULL_MAX_WAIT_MS loop
+            brake(p_processId, C_BRAKE_SLEEP3_MS, 'ring buffer full');
+            refreshWatermarks(p_processId);
+        end loop;
 
         -- Still full: give up the oldest tenth (not pinned) so that the buffer does not grow without limit
         if g_ring(p_processId).COUNT >= C_CLIENT_RINGBUFF_MAX then
@@ -2250,6 +2356,11 @@ AS
         end if;
 
         g_ring_meta(p_processId).since_check := g_ring_meta(p_processId).since_check + 1;
+        -- Time of the first message of each block of C_RING_CHECK_EVERY_NO messages: measures the lag (measureLag).
+        -- PERFORMANCE: not for every message.
+        if g_ring_meta(p_processId).since_check = 1 then
+            g_ring(p_processId)(p_seq).kept_cs := dbms_utility.get_time;
+        end if;
         if g_ring(p_processId).COUNT >= C_CLIENT_RINGBUFF_MAX then
             refreshWatermarks(p_processId);
             if g_ring(p_processId).COUNT >= C_CLIENT_RINGBUFF_MAX then
@@ -2262,10 +2373,37 @@ AS
                or abs(dbms_utility.get_time - g_ring_meta(p_processId).last_check_cs) * 10 >= C_RING_WATERMARK_CHECK_MS then
                 refreshWatermarks(p_processId);
             end if;
+            -- Backpressure: brake briefly if the server lags behind (befunde fallback A1)
+            brakeOnBacklog(p_processId);
         end if;
     exception
         when others then
             logLilamErr(sqlCode, sqlErrM, 'keepInRing');
+    end;
+
+    --------------------------------------------------------------------------
+
+    -- Backpressure: logs the sum of the brakes and of the full pipes of a process (befunde fallback A1/A2)
+    -- and resets the counters. Called on CLOSE_PROCESS: the ring buffer is only removed when a later call
+    -- of the session finds the CLOSE committed (checkClosing), which may never happen.
+    procedure logBackpressureSum(p_processId number)
+    as
+    begin
+        if g_ring_meta.EXISTS(p_processId)
+           and (g_ring_meta(p_processId).brakes > 0 or g_ring_meta(p_processId).full_phases > 0) then
+            logLilamErr(NUM_ERR_PIPE_SERVER, 'Process ' || p_processId || ' closed; the client braked '
+                || g_ring_meta(p_processId).brakes || ' times (' || g_ring_meta(p_processId).brake_ms || ' ms in total)'
+                || ' and found the server pipe full ' || g_ring_meta(p_processId).full_phases || ' times ('
+                || g_ring_meta(p_processId).held_back || ' messages held back in the ring buffer).',
+                'logBackpressureSum', 'BACKPRESSURE');
+            g_ring_meta(p_processId).brakes      := 0;
+            g_ring_meta(p_processId).brake_ms    := 0;
+            g_ring_meta(p_processId).full_phases := 0;
+            g_ring_meta(p_processId).held_back   := 0;
+        end if;
+    exception
+        when others then
+            logLilamErr(sqlCode, sqlErrM, 'logBackpressureSum');
     end;
 
     --------------------------------------------------------------------------
@@ -2279,6 +2417,8 @@ AS
                 || ' messages had to be removed from the full ring buffer before they were committed.',
                 'forgetRing', 'RING_FULL');
         end if;
+        -- Backpressure after the CLOSE_PROCESS (normally logged there already, see logBackpressureSum)
+        logBackpressureSum(p_processId);
         g_ring.DELETE(p_processId);
         g_ring_meta.DELETE(p_processId);
         g_trace_pins.DELETE(p_processId);
@@ -2304,23 +2444,14 @@ AS
 
     --------------------------------------------------------------------------
 
-    procedure send_sync_signal(p_processId number)
-    as
-        l_response varchar2(1000);
-    begin
-        -- process_id in the payload: a dispatcher needs it to forward the request to the worker of the process.
-        -- Previously ('{}') the dispatcher discarded the request, and the client waited
-        -- for the full timeout every time (load test via dispatcher: 5.3 ms instead of 0.2 ms per call).
-        l_response := waitForResponse(p_processId, 'UNFREEZE_REQUEST', '{"process_id":' || jNum(p_processId) || '}', 10);
-
-    exception
-        when others then
-            logLilamErr(sqlCode, sqlErrM, 'send_sync_signal', 'waitForResponse');
-    end;
-
     --------------------------------------------------------------------------
     -- Hit the brakes when the client sends too fast
     --------------------------------------------------------------------------
+    -- After msg_limit messages within C_THROTTLE_INTERVAL_NO the client checks whether the server keeps up:
+    -- it reads the watermarks now (LILAM_WATERMARK), and keepInRing brakes if the server lags behind
+    -- (brakeOnBacklog). If the server keeps up, the client does not wait.
+    -- STABILITY: previously the client sent UNFREEZE_REQUEST and waited up to 10 s for the answer, which stood
+    -- behind the whole backlog in the pipe (befunde fallback A1, 9.9 s in the performance test of 08.10.).
     PROCEDURE stabilizeInLowPerfEnvironments(p_processId number)
     IS
         -- PERFORMANCE: SYSTIMESTAMP is only read when the time is needed
@@ -2343,10 +2474,10 @@ AS
             if g_local_throttle_cache(p_processId).msg_count >= g_local_throttle_cache(p_processId).msg_limit THEN        
                 l_now := SYSTIMESTAMP;
                 -- If messages were fired too fast
-                if get_ms_diff(g_local_throttle_cache(p_processId).last_check, l_now) < C_THROTTLE_INTERVAL_NO THEN
-                    -- Force synchronization (wait for the server response)
-                    -- This gives the remote server the necessary "breathing space"
-                    send_sync_signal(p_processId);
+                if get_ms_diff(g_local_throttle_cache(p_processId).last_check, l_now) < C_THROTTLE_INTERVAL_NO
+                   and g_ring_meta.EXISTS(p_processId) THEN
+                    -- Measure the lag of the server now; the next check in keepInRing brakes if necessary
+                    refreshWatermarks(p_processId);
                 end if ;
 
                 -- Reset for the next window
@@ -2355,6 +2486,66 @@ AS
             end if ;
         end if ;
     END;
+
+    --------------------------------------------------------------------------
+    -- Full server pipe (befunde fallback A2)
+    --------------------------------------------------------------------------
+    -- A message could not be sent (unsent_from is set by the caller). It and all following messages of the
+    -- process stay in the ring buffer for C_PIPE_FULL_PAUSE_MS and are then sent in their order (sendHeldBack),
+    -- so that no message overtakes a missing one. Logged once per process, the sum when it is closed (forgetRing).
+    procedure holdBack(p_processId number, p_pipe varchar2, p_status PLS_INTEGER)
+    as
+        l_nowCs NUMBER := dbms_utility.get_time;
+    begin
+        DBMS_PIPE.RESET_BUFFER;
+        g_ring_meta(p_processId).pause_until_cs := l_nowCs + C_PIPE_FULL_PAUSE_MS / 10;
+        g_ring_meta(p_processId).last_full_cs   := l_nowCs;
+        g_ring_meta(p_processId).full_phases    := g_ring_meta(p_processId).full_phases + 1;
+        if g_ring_meta(p_processId).full_phases = 1 then
+            logLilamErr(NUM_ERR_PIPE_SERVER, 'Server pipe ' || p_pipe || ' of process ' || p_processId || ' is full (status '
+                || p_status || '). Messages are held back in the ring buffer and sent later in their order.'
+                || ' Further cases are summed up when the process is closed.',
+                'holdBack', 'BACKPRESSURE');
+        end if;
+        -- The server may have failed: then another worker takes over the process and receives the ring buffer (replayRing)
+        checkServerAfterTimeout(p_processId);
+    exception
+        when others then
+            logLilamErr(sqlCode, sqlErrM, 'holdBack');
+    end;
+
+    --------------------------------------------------------------------------
+
+    -- Sends the messages held back because of a full pipe, in their order and without waiting (timeout 0).
+    -- Returns false if the pipe is still full; the rest stays held back for another pause.
+    function sendHeldBack(p_processId number, p_pipe varchar2) return boolean
+    as
+        l_seq    PLS_INTEGER;
+        l_status PLS_INTEGER;
+    begin
+        l_seq := g_ring_meta(p_processId).unsent_from;
+        if not g_ring(p_processId).EXISTS(l_seq) then
+            l_seq := g_ring(p_processId).NEXT(l_seq);   -- given up in the meantime (relieveRing)
+        end if;
+        while l_seq is not null loop
+            DBMS_PIPE.RESET_BUFFER;
+            DBMS_PIPE.PACK_MESSAGE(g_ring(p_processId)(l_seq).msg);
+            l_status := DBMS_PIPE.SEND_MESSAGE(p_pipe, timeout => 0);
+            if l_status != 0 then
+                g_ring_meta(p_processId).unsent_from := l_seq;
+                holdBack(p_processId, p_pipe, l_status);
+                return false;
+            end if;
+            l_seq := g_ring(p_processId).NEXT(l_seq);
+        end loop;
+        g_ring_meta(p_processId).unsent_from := null;
+        return true;
+    exception
+        when others then
+            DBMS_PIPE.RESET_BUFFER;
+            logLilamErr(sqlCode, sqlErrM, 'sendHeldBack');
+            return false;
+    end;
 
     --------------------------------------------------------------------------
     -- Message to server, fire & forget
@@ -2370,6 +2561,8 @@ AS
     as        
         l_pipeName      VARCHAR2(100);
         l_status        PLS_INTEGER;
+        l_timeout       PLS_INTEGER;
+        l_sent          BOOLEAN;
         l_jsonMain      JSON_OBJ_LILAM;   -- (unused variables l_now/l_retryInterval removed: saved one SYSTIMESTAMP per call)
     begin
         -- Closed processes whose CLOSE is not confirmed yet (PERFORMANCE: normally only COUNT on an empty array)
@@ -2397,24 +2590,43 @@ AS
         stabilizeInLowPerfEnvironments(p_processId);
 
         l_pipeName := getServerPipeForSession(p_processId, null);
-        DBMS_PIPE.PACK_MESSAGE(l_jsonMain);
-        for i in 1 .. 3 loop
-            l_status := DBMS_PIPE.SEND_MESSAGE(l_pipeName, timeout => p_timeoutSec);
-            if l_status = 0 THEN
-                exit;
-            end if ;
-            if l_status = 2 then
-                DBMS_PIPE.RESET_BUFFER;
-                DBMS_PIPE.PACK_MESSAGE(l_jsonMain);   -- previously l_msg (never filled): the retry sent an empty message
-            end if;
-            dbms_session.sleep(0.3);
-        end loop;
 
-        if l_status != 0 AND p_processId != g_serverProcessId then
-            -- Re-registration with an alternative server
-            DBMS_PIPE.RESET_BUFFER;
-            checkServerAfterTimeout(p_processId);
-            RAISE_APPLICATION_ERROR(-20006, 'LILAM: Client kann keine Nachrichten an Server senden:  ' || sqlErrM);
+        -- No ring buffer (should not happen, every caller passes p_ringType): send once
+        if not g_ring_meta.EXISTS(p_processId) then
+            DBMS_PIPE.PACK_MESSAGE(l_jsonMain);
+            l_status := DBMS_PIPE.SEND_MESSAGE(l_pipeName, timeout => p_timeoutSec);
+            if l_status != 0 then
+                DBMS_PIPE.RESET_BUFFER;
+                logLilamErr(NUM_ERR_PIPE_SERVER, 'Message of process ' || p_processId || ' could not be sent to server pipe '
+                    || l_pipeName || ' (status ' || l_status || ').', 'sendNoWait', 'PIPE_FULL');
+                checkServerAfterTimeout(p_processId);
+            end if;
+            return;
+        end if;
+
+        -- STABILITY: messages are held back because of a full pipe (befunde fallback A2). This message waits
+        -- behind them (order); after the pause all are sent without waiting.
+        if g_ring_meta(p_processId).unsent_from is not null then
+            g_ring_meta(p_processId).held_back := g_ring_meta(p_processId).held_back + 1;
+            if dbms_utility.get_time >= g_ring_meta(p_processId).pause_until_cs then
+                l_sent := sendHeldBack(p_processId, l_pipeName);   -- includes this message
+            end if;
+            return;
+        end if;
+
+        -- Shortly after a full pipe: do not wait for space in the pipe
+        l_timeout := p_timeoutSec;
+        if g_ring_meta(p_processId).last_full_cs is not null
+           and abs(dbms_utility.get_time - g_ring_meta(p_processId).last_full_cs) * 10 < C_PIPE_FULL_RECENT_MS then
+            l_timeout := 0;
+        end if;
+        -- STABILITY: one attempt. Previously three attempts with 1 s each plus 0.3 s pause, on every call (about 4 s).
+        DBMS_PIPE.PACK_MESSAGE(l_jsonMain);
+        l_status := DBMS_PIPE.SEND_MESSAGE(l_pipeName, timeout => l_timeout);
+        if l_status != 0 then
+            g_ring_meta(p_processId).held_back := g_ring_meta(p_processId).held_back + 1;
+            g_ring_meta(p_processId).unsent_from := g_msg_seq(p_processId);
+            holdBack(p_processId, l_pipeName, l_status);
         end if;
 
     exception
@@ -5390,6 +5602,7 @@ AS
         -- The order is kept: CLOSE travels through the same pipe as the data of the process.
         -- Not via the control pipe (like NEW_PROCESS): CLOSE would overtake the data of its own process.
         sendNoWait(p_processId, 'CLOSE_SESSION', 'P', l_payload, C_SEND_TIMEOUT_SEC);
+        logBackpressureSum(p_processId);
 
     EXCEPTION
         WHEN OTHERS THEN
@@ -6410,42 +6623,6 @@ AS
 
     --------------------------------------------------------------------------
 
-    -- Failover: the ring buffer of a client is full. Write everything buffered now and report the
-    -- watermarks of the process for this client. The request arrives behind all messages the client
-    -- sent before, so these are part of the flush.
-    procedure doRemote_watermarkRequest(p_clientChannel varchar2, p_message varchar2)
-    as
-        l_payload  JSON_OBJ_LILAM;
-        l_pid      number;
-        l_key      varchar2(70);
-        l_response varchar2(500);
-        l_status   PLS_INTEGER;
-    begin
-        l_payload := JSON_QUERY(p_message, '$.payload');
-        l_pid     := jsonNumber(l_payload, 'process_id');
-        l_key     := buildWatermarkKey(l_pid, jsonString(l_payload, 'cid'));
-
-        SYNC_ALL_DIRTY(p_force => TRUE, p_withBaselines => FALSE);
-
-        l_response := '{"process_id":' || jNum(l_pid);
-        if g_watermarks.EXISTS(l_key) then
-            l_response := l_response
-                       || jNum('wm_log',  nvl(g_watermarks(l_key).wm_log, 0))
-                       || jNum('wm_mon',  nvl(g_watermarks(l_key).wm_mon, 0))
-                       || jNum('wm_proc', nvl(g_watermarks(l_key).wm_proc, 0));
-        end if;
-        l_response := l_response || '}';
-
-        DBMS_PIPE.RESET_BUFFER;
-        DBMS_PIPE.PACK_MESSAGE(l_response);
-        l_status := DBMS_PIPE.SEND_MESSAGE(p_clientChannel, timeout => 1);
-    exception
-        when others then
-            logLilamErr(sqlCode, sqlErrM, 'doRemote_watermarkRequest');
-    end;
-
-    --------------------------------------------------------------------------
-
     procedure doRemote_reconnectProcess(p_clientChannel varchar2, p_message JSON_OBJ_LILAM)
     as
         l_status        PLS_INTEGER;
@@ -7024,41 +7201,6 @@ AS
             error(l_processId, 'Could not send process data to client: ' || sqlErrM);
     end;    
 
-    -------------------------------------------------------------------------- 
-
-    procedure doRemote_unfreezeClient(p_clientChannel varchar2, p_message VARCHAR2, p_shutdown BOOLEAN DEFAULT FALSE)
-    as
-        l_payload JSON_OBJ_LILAM;
-        l_status  PLS_INTEGER;
-        l_header  JSON_OBJ_LILAM;
-        l_meta    JSON_OBJ_LILAM;
-        l_msg     JSON_OBJ_LILAM;
-    begin
-        jsonPut(l_header, 'msg_type', 'SERVER_RESPONSE');
-        jsonPut(l_header, 'msg_name', 'UNFREEZE_CLIENT');
-        jsonPut(l_meta, 'server_version', LILAM_VERSION);
-        if p_shutdown then
-            jsonPut(l_payload, 'server_message', TXT_ACK_SHUTDOWN);
-            jsonPut(l_payload, 'server_code', get_serverCode(TXT_ACK_SHUTDOWN));
-        else
-            jsonPut(l_payload, 'server_message', TXT_ACK_OK);
-            jsonPut(l_payload, 'server_code', get_serverCode(TXT_ACK_OK));
-        end if;
-        jsonPut(l_msg, 'header', l_header);
-        jsonPut(l_msg, 'meta', l_meta);
-        jsonPut(l_msg, 'payload', l_payload);
-
-        -- no payload, client waits only for unfreezing
-        DBMS_PIPE.RESET_BUFFER; -- Empty the buffer
-        DBMS_PIPE.PACK_MESSAGE(l_msg);        
-        l_status := DBMS_PIPE.SEND_MESSAGE(p_clientChannel, timeout => 0);
-
-    exception
-        when others then
-            logLilamErr(sqlCode, sqlErrM, 'doRemote_unfreezeClient'); 
-            error(p_clientChannel, 'Could not send unlock signal to client: ' || sqlErrM);
-    end;    
-
     --------------------------------------------------------------------------
     
     procedure registerProcessRoute(p_processId number, p_pipeName varchar2)
@@ -7260,11 +7402,18 @@ AS
                 logLilamErr(NUM_ERR_PIPE_SERVER, 'Repeating the messages of process ' || p_processId || ' to server ' || l_pipe
                     || ' stopped at sequence number ' || l_seq || ' (pipe status ' || l_status || ').',
                     'replayRing', 'FAILOVER');
-                exit;
+                -- The rest is held back like at a full pipe and sent later in its order (see sendHeldBack)
+                g_ring_meta(p_processId).unsent_from    := l_seq;
+                g_ring_meta(p_processId).pause_until_cs := dbms_utility.get_time + C_PIPE_FULL_PAUSE_MS / 10;
+                return l_count;
             end if;
             l_count := l_count + 1;
             l_seq := g_ring(p_processId).NEXT(l_seq);
         end loop;
+        -- Everything held back because of a full pipe has been sent now
+        if g_ring_meta.EXISTS(p_processId) then
+            g_ring_meta(p_processId).unsent_from := null;
+        end if;
         return l_count;
     exception
         when others then
@@ -8638,7 +8787,7 @@ AS
 
     --------------------------------------------------------------------------
 
-    function processRequest(p_request varchar2, p_message varchar2, p_clientChannel varchar2, p_drain BOOLEAN DEFAULT FALSE, p_forceDrain BOOLEAN DEFAULT FALSE) return boolean
+    function processRequest(p_request varchar2, p_message varchar2, p_clientChannel varchar2, p_drain BOOLEAN DEFAULT FALSE) return boolean
     as
         l_targetPipe varchar2(100);
         l_processId  number (19,0);
@@ -8748,9 +8897,6 @@ AS
             WHEN 'RECONNECT_PROCESS' then
                 doRemote_reconnectProcess(p_clientChannel, p_message);
 
-            WHEN 'WATERMARK_REQUEST' then
-                doRemote_watermarkRequest(p_clientChannel, p_message);
-
             WHEN 'ADOPT_PROCESS' then
                 doRemote_adoptProcess(p_clientChannel, p_message);
 
@@ -8768,11 +8914,6 @@ AS
 
             WHEN 'GET_MONITOR_LAST_ENTRY' then
                 doRemote_getMonitorLastEntry(p_clientChannel, p_message);
-
-            WHEN 'UNFREEZE_REQUEST' then
-                if not p_forceDrain then
-                    doRemote_unfreezeClient(p_clientChannel, p_message, p_drain);
-                end if;
 
             ELSE 
                 -- Log unknown tag

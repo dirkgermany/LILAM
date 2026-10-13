@@ -383,7 +383,7 @@ flowchart LR
         direction TB
         A2["Anwendung<br/>SERVER_NEW_PROCESS"] -- "NEW_PROCESS über Steuer-Pipe<br/>(synchron, max. 3 s)" --> S2
         B2["log_any / MARK_EVENT / TRACE_*"] -- "sendNoWait<br/>Fire and Forget über Daten-Pipe" --> S2["LILAM Server<br/>(eigene DB-Session / Job)"]
-        B2 -. "Grenze je Sekunde erreicht:<br/>UNFREEZE_REQUEST (Backpressure)" .-> S2
+        B2 -. "Wasserstand lesen (LILAM_WATERMARK):<br/>bei Rückstau kurz bremsen (Backpressure)" .-> T2
         S2 --> C2["PGA-Puffer des Servers<br/>(alle seine Prozesse)"]
         C2 --> R2["Regelauswertung im Server<br/>Rule Set der Servergruppe"]
         C2 --> E2["SYNC_ALL_DIRTY<br/>Housekeeping alle 500 ms,<br/>auch unter Last"]
