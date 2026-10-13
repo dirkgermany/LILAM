@@ -510,7 +510,8 @@ create or replace package body lt as
     function internal_errors_since(p_ts timestamp) return number is
         l_n number;
     begin
-        execute immediate 'select count(*) from lilam_log_internal where log_timestamp >= :1' into l_n using p_ts;
+        execute immediate 'select count(*) from lilam_log_internal where log_timestamp >= :1
+                             and nvl(log_operation, ''-'') not in (''BACKPRESSURE'', ''GAP'')' into l_n using p_ts;   -- Hinweise, keine Fehler
         return l_n;
     exception
         when others then return 0;   -- Tabelle existiert erst nach dem ersten internen Fehler
@@ -1864,7 +1865,8 @@ create or replace package body lt as
             l_n number;
         begin
             execute immediate 'select count(*) from lilam_log_internal where log_timestamp >= :1
-                                 and not (error_code = -2290 and log_operation like ''row % skipped'')'
+                                 and not (error_code = -2290 and log_operation like ''row % skipped'')
+                                 and nvl(log_operation, ''-'') not in (''BACKPRESSURE'', ''GAP'')'
                 into l_n using run_started(l_run);
             check_that(l_run, 'Keine weiteren internen LILAM-Fehler', l_n = 0, l_n || ' Eintraege');
         exception
@@ -2572,7 +2574,8 @@ create or replace package body lt as
         end if;
         reset_rules;   -- sonst laden spaetere Server der Gruppe LT dieses Rule Set
         execute immediate 'select count(*) from lilam_log_internal where log_timestamp >= :1
-                              and not (module_name = ''refreshGroupRules'' and error_code = ''-20130'')'
+                              and not (module_name = ''refreshGroupRules'' and error_code = ''-20130'')
+                              and nvl(log_operation, ''-'') not in (''BACKPRESSURE'', ''GAP'')'
            into l_n using run_started(l_run);
         check_that(l_run, 'Keine weiteren internen LILAM-Fehler', l_n = 0, l_n);
         end_run(l_run);
