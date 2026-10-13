@@ -120,6 +120,11 @@ Rules on `MARK_EVENT` and `TRACE_STOP` are only evaluated if the log level of th
 | LOG_CONTAINS | `TEXT` or `LEVEL\|TEXT` | LOGGING | a log message contains the text (case-insensitive), optionally only for this level (`ERROR`, `WARN`, `MONITOR`, `INFO`, `DEBUG`; otherwise the whole value is the text)
 | TIME_MAX_DURATION_MS | milliseconds | MARK_EVENT, TRACE_STOP | duration of the trace, or for events the time since the previous event of the same action, is greater than the value
 | TIME_EWMA_DEVIATION_PCT_UP | `pct[\|warmup[\|alpha]]` | MARK_EVENT, TRACE_STOP | duration is more than `pct` percent above the moving average (EWMA); no evaluation while the average is below 1 ms (measurement resolution), see below
+| TIME_EWMA_DEVIATION_PCT_DOWN | `pct[\|warmup[\|alpha]]` | MARK_EVENT, TRACE_STOP | duration is more than `pct` percent below the moving average (EWMA); same 1 ms exception
+| VAL_EWMA_DEVIATION_PCT_UP | `pct[\|warmup[\|alpha]]` | MARK_EVENT | measured value (`p_value`) is above `EWMA + \|EWMA\| * pct / 100`; events without a value trigger nothing
+| VAL_EWMA_DEVIATION_PCT_DOWN | `pct[\|warmup[\|alpha]]` | MARK_EVENT | measured value is below `EWMA - \|EWMA\| * pct / 100`
+| VAL_MIN | number | MARK_EVENT | measured value is lower than the value (fixed limit)
+| VAL_MAX | number | MARK_EVENT | measured value is higher than the value (fixed limit)
 | MAX_OCCURRENCE | count | MARK_EVENT, TRACE_STOP, PROCESS_UPDATE, PROCESS_STOP | the action occurred more often than the value within the process (`ACTION_COUNT`); for processes: `STEPS_DONE` > value
 | TIME_MAX_GAP_SECONDS | seconds | MARK_EVENT, TRACE_START | time since the previous event (MARK_EVENT) or since the end of the previous trace (TRACE_START) of the same action is greater than the value
 | PRECEDED_BY | `ACTION` or `ACTION\|CONTEXT` | MARK_EVENT, TRACE_START, PROCESS_UPDATE, PROCESS_STOP | the previous signal of the process was **not** the expected action (and context, if given)⁴
@@ -130,6 +135,10 @@ Rules on `MARK_EVENT` and `TRACE_STOP` are only evaluated if the log level of th
 | SUCCESS_RATE_LOW | percent | PROCESS_START, PROCESS_UPDATE, PROCESS_STOP | `STEPS_DONE / STEPS_TODO * 100` < value
 | STATUS_EQUALS | number | PROCESS_START, PROCESS_UPDATE, PROCESS_STOP | process status = value
 | INFO_CONTAINS | text | PROCESS_START, PROCESS_UPDATE, PROCESS_STOP | process info contains the text (case-insensitive)
+
+Naming: operators evaluating times (event intervals, trace durations, process runtimes) start with `TIME_`, operators evaluating measured values from `MARK_EVENT(p_value)` with `VAL_`. Operators checking order, counts, status or text have no prefix.
+
+The EWMA deviation operators compare against the EWMA **before** the current measurement, so a new outlier does not weaken its own reference. `_UP` and `_DOWN` of the same series share `warmup` and `alpha`; give both the same values. The time and value series of an action/context are separate: `TIME_` rules never see the measured value, `VAL_` rules never see the interval.
 
 ⁴ Only events and traces (start and stop) count as predecessors, log messages do not. Without a context in the value, any context of the expected action is accepted. The order is checked when the action starts, not at TRACE_STOP (there the predecessor would usually be the own TRACE_START); loading rejects `PRECEDED_BY*` with TRACE_STOP.
 
@@ -176,7 +185,7 @@ Evaluating rules happens in RAM and is cheap: rules for other actions cost nothi
 
 ### Deep Dive: Anomaly Detection with EWMA
 
-The `TIME_EWMA_DEVIATION_PCT_UP` operator utilizes an **Exponentially Weighted Moving Average (EWMA)**. Unlike a simple arithmetic mean, the EWMA gives more weight to recent data points, allowing the system to adapt to shifting performance trends in real-time.
+The `TIME_EWMA_DEVIATION_PCT_*` and `VAL_EWMA_DEVIATION_PCT_*` operators utilize an **Exponentially Weighted Moving Average (EWMA)**. Unlike a simple arithmetic mean, the EWMA gives more weight to recent data points, allowing the system to adapt to shifting performance trends in real-time.
 
 #### What is EWMA?
 It is a statistical measure used to model time-series data. In LILAM, it creates a "moving baseline" for your business transactions. If a new event deviates significantly from this baseline, an alert is triggered.
@@ -193,3 +202,24 @@ When using `TIME_EWMA_DEVIATION_PCT_UP` with the value `20|100|0.1`, the paramet
 
 
 If `warmup` or `alpha` are omitted, LILAM uses warm-up 3 and alpha 0.1. During the warm-up the rule does not fire.
+
+#### Example: monitoring a share price
+
+The application reports the price with `lilam.mark_event(l_pid, 'SHARE', 'ARAL', 80.71)`. These rules raise an alert for a jump of more than 5 % against the EWMA in either direction, and when the price leaves the band 60 to 120:
+
+```json
+{ "id": "ARAL-UP",   "trigger_type": "MARK_EVENT", "action": "SHARE", "context": "ARAL",
+  "condition": { "operator": "VAL_EWMA_DEVIATION_PCT_UP",   "value": "5|20|0.2" },
+  "alert": { "handler": "LILAM_ALERT_MAIL_LOG", "severity": "WARN", "throttle_seconds": 300 } },
+{ "id": "ARAL-DOWN", "trigger_type": "MARK_EVENT", "action": "SHARE", "context": "ARAL",
+  "condition": { "operator": "VAL_EWMA_DEVIATION_PCT_DOWN", "value": "5|20|0.2" },
+  "alert": { "handler": "LILAM_ALERT_MAIL_LOG", "severity": "WARN", "throttle_seconds": 300 } },
+{ "id": "ARAL-MIN",  "trigger_type": "MARK_EVENT", "action": "SHARE", "context": "ARAL",
+  "condition": { "operator": "VAL_MIN", "value": "60" },
+  "alert": { "handler": "LILAM_ALERT_MAIL_LOG", "severity": "ERROR" } },
+{ "id": "ARAL-MAX",  "trigger_type": "MARK_EVENT", "action": "SHARE", "context": "ARAL",
+  "condition": { "operator": "VAL_MAX", "value": "120" },
+  "alert": { "handler": "LILAM_ALERT_MAIL_LOG", "severity": "ERROR" } }
+```
+
+`throttle_seconds` limits repeated alerts; it is not a hysteresis: once the lock period has passed, the next value outside the band raises the next alert.

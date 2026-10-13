@@ -206,6 +206,7 @@ LILAM is a specialized framework for deep process insights. Using `MARK_EVENT` a
 
 * **Independent Statistics:** Monitor multiple activities (e.g., XML_PARSING, FILE_UPLOAD) simultaneously.
 * **Point-in-Time Events:** Track milestones and calculate intervals between recurring steps using `MARK_EVENT`.
+* **Measured Values:** Pass a numeric value with `MARK_EVENT` (e.g. a share price: `lilam.mark_event(l_pid, 'SHARE', 'ARAL', 80.71)`). LILAM keeps a separate moving average for the values and checks them with `VAL_` rules (fixed limits and deviations from the trend).
 * **Transaction Tracing:** Use `TRACE_START` and `TRACE_STOP` for precise measurement of work blocks, ensuring clear visibility into long-running tasks.
 * **Moving Averages & Outliers:** LILAM maintains historical benchmarks to detect performance degradation or unusual execution times (outliers) in real-time.
 * **Minimal Client Overhead:** Metric calculations are buffered within the session to minimize database round-trips.

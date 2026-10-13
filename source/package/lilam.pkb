@@ -1113,7 +1113,7 @@ AS
     -- Millis between two timestamps
     --------------------------------------------------------------------------
     function get_ms_diff(p_start timestamp, p_end timestamp) return number is
-        -- STABILITY: day(9) instead of day(0), otherwise ORA-01873 from a difference of one day (e.g. RUNTIME_EXCEEDED)
+        -- STABILITY: day(9) instead of day(0), otherwise ORA-01873 from a difference of one day (e.g. TIME_RUNTIME_EXCEEDED)
         v_diff interval day(9) to second(3); -- Limit precision to ms
     begin
         v_diff := p_end - p_start;

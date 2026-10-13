@@ -702,14 +702,48 @@ Use `MARK_EVENT` for a single event at a specific point in time within the proce
 
 For repeated markers with the same action and the same context, LILAM tracks the time interval, number of occurrences, average duration and significant timing deviations.
 
+Optionally, `p_value` passes a numeric measurement, e.g. a share price, a temperature or a fill level. LILAM stores the value and calculates a separate EWMA for the value series, independent of the time interval. This way LILAM monitors not only process flows but also measurements defined by the application.
+
 ```sql
 PROCEDURE MARK_EVENT(
   p_processId   NUMBER,
   p_actionName  VARCHAR2,
-  p_contextName VARCHAR2 DEFAULT NULL,
+  p_contextName VARCHAR2  DEFAULT NULL,
+  p_value       NUMBER    DEFAULT NULL,
   p_timestamp   TIMESTAMP DEFAULT NULL
 )
 ```
+
+| Parameter | Type | Description | Required |
+| --- | --- | --- | --- |
+| `p_processId` | `NUMBER` | ID of the process | [`M`] |
+| `p_actionName` | `VARCHAR2` | Name of the action | [`M`] |
+| `p_contextName` | `VARCHAR2` | Context of the action | [`N`] |
+| `p_value` | `NUMBER` | Measured value; `NULL` = event without a value | [`N`] |
+| `p_timestamp` | `TIMESTAMP` | Time of the event; `NULL` = now | [`N`] |
+
+```sql
+-- Event without a value
+lilam.mark_event(l_processId, 'ORDER_RECEIVED');
+
+-- Event with a value: share price of ARAL
+lilam.mark_event(l_processId, 'SHARE', 'ARAL', 80.71);
+```
+
+**Measured value (`p_value`)**
+
+- Data type `NUMBER` without precision: up to 38 digits, magnitudes up to about 10^125, exact decimals (`80.71` stays `80.71`). Zero and negative values are valid measurements.
+- Each combination of action and context forms its own series with two metrics:
+  - **Time series** (as before): interval to the previous event (`USED_MILLIS`) and its EWMA (`USED_MILLIS_EWMA`).
+  - **Value series** (only with `p_value`): measured value (`USED_VALUE`) and its EWMA (`USED_VALUE_EWMA`).
+- The value EWMA follows the same rules as the time EWMA: the first value is the average, during warm-up the arithmetic mean applies, afterwards `old + alpha * (new - old)`. Warm-up and alpha come from the `VAL_EWMA_DEVIATION_PCT_UP`/`_DOWN` rules of the action (default: warm-up 3, alpha 0.1). The value series counts every event with a value, including the first; the time series counts intervals.
+- With a baseline scope the value EWMA continues across processes, like the time EWMA.
+- An EWMA is a reference. A deviation from it is a signal, not a diagnosis.
+
+> [!IMPORTANT]
+> Use a combination of action and context **either always with or always without** `p_value`. An event without a value does not change the value EWMA and gets no value in `_MON`. Mixing calls with and without a value for the same action and context is not supported; the same applies to all processes sharing a baseline scope.
+>
+> A series has exactly one unit and meaning. Do not report a price in euros one time and in cents the next.
 
 ### Procedure TRACE_START
 
@@ -748,6 +782,18 @@ Returns the average duration for the given metric.
 
 ```sql
 FUNCTION GET_METRIC_AVG_DURATION(
+  p_processId   NUMBER,
+  p_actionName  VARCHAR2,
+  p_contextName VARCHAR2 DEFAULT NULL
+) RETURN NUMBER
+```
+
+### Function GET_METRIC_AVG_VALUE
+
+Returns the EWMA of the measured values (`MARK_EVENT` with `p_value`) for the given metric; `NULL` as long as the series has no value. With a baseline scope this is the cross-process EWMA.
+
+```sql
+FUNCTION GET_METRIC_AVG_VALUE(
   p_processId   NUMBER,
   p_actionName  VARCHAR2,
   p_contextName VARCHAR2 DEFAULT NULL
@@ -925,7 +971,10 @@ Structure of the rule sets and operators: [Rules Engine](../rules/README.md). A 
 - **Context rules:** Rules with a context (`Action|Context`) apply in addition to the rules without a context for the same action; LILAM checks both.
 - **Logging rules:** Trigger `LOGGING` supports `SEVERITY` (exactly this level) and `LOG_CONTAINS` with the value `TEXT` or `LEVEL|TEXT`: the log message contains the text (case-insensitive), optionally only for this level. The first part only counts as a level if it is `ERROR`, `WARN`, `MONITOR`, `INFO` or `DEBUG`; otherwise the whole value is the text (max. 100 characters).
 - **`PRECEDED_BY`, `TIME_PRECEDED_BY_WITHIN_SECS`:** The order is checked when an action starts (`MARK_EVENT`, `TRACE_START`, `PROCESS_UPDATE`, `PROCESS_STOP`). With `TRACE_STOP`, the rule is rejected at load time, because there the predecessor would usually be its own `TRACE_START`.
-- **`TIME_EWMA_DEVIATION_PCT_UP`:** As long as the average is below 1 ms (measurement resolution), no evaluation takes place.
+- **Naming:** Operators evaluating times start with `TIME_`, operators for measured values from `MARK_EVENT(p_value)` with `VAL_`.
+- **`TIME_EWMA_DEVIATION_PCT_UP` / `_DOWN`:** Deviation upwards or downwards from the EWMA before the measurement. As long as the average is below 1 ms (measurement resolution), no evaluation takes place.
+- **`VAL_EWMA_DEVIATION_PCT_UP` / `_DOWN`:** the same for measured values, band `|EWMA| * PCT / 100` (also for negative values), without the 1 ms exception. Events without a value trigger nothing.
+- **`VAL_MIN` / `VAL_MAX`:** fixed limit; alert if the value is lower or higher (the limit itself does not trigger). Trigger `MARK_EVENT` only.
 - **No time-based check:** Rules are evaluated when a signal arrives. Missing signals (a hanging process, an event that never comes) are not detected.
 
 ### Rules in INSESSION Mode
@@ -936,7 +985,7 @@ Processes in INSESSION mode also evaluate rules if `NEW_SESSION` receives a grou
 - **Invalid rule set:** It is rejected and logged once per version in `LILAM_LOG_INTERNAL`; the previous rules remain active. The application does not notice any of this.
 - **Alerts:** A triggered alert is written immediately and synchronously (`LILAM_ALERTS` and `DBMS_ALERT` signal, own transaction). This costs the application one commit per alert; `throttle_seconds` limits the frequency. `GROUP_NAME` in the alert is the group from `NEW_SESSION`.
 - **Memory per session:** Throttling (`throttle_seconds`) and the predecessor for `PRECEDED_BY` apply per database session. With a connection pool (e.g. APEX), the same alert can therefore be triggered once per pool connection.
-- **Baseline parameters:** `warmup` and `alpha` from `TIME_EWMA_DEVIATION_PCT_UP` rules also apply to the average values of the process, just as in the server.
+- **Baseline parameters:** `warmup` and `alpha` from `TIME_EWMA_DEVIATION_PCT_*` rules (time series) and `VAL_EWMA_DEVIATION_PCT_*` rules (value series) also apply to the average values of the process, just as in the server.
 
 ```sql
 l_processId := lilam.new_session('IMPORT_CUSTOMERS', p_groupName => 'METRO');
@@ -1119,7 +1168,7 @@ LILAM JSON requests consist of a header and a parameter object. The header conta
 | `PROC_STEP_DONE` | `PROC_STEP_DONE` | `process_id` |
 | `SET_PROC_IMMORTAL` | `SET_PROC_IMMORTAL` | `process_id`, `process_immortal` |
 | `INFO`, `DEBUG`, `WARN`, `ERROR` | Logging | `process_id`, `process_info` (log text) |
-| `MARK_EVENT`, `TRACE_START`, `TRACE_STOP` | Metrics | `process_id`, `action_name`, `context_name`, `timestamp` |
+| `MARK_EVENT`, `TRACE_START`, `TRACE_STOP` | Metrics | `process_id`, `action_name`, `context_name`, `timestamp`; for `MARK_EVENT` also `value` (measured value) |
 | `SERVER_SHUTDOWN` | `SERVER_SHUTDOWN` | `process_id`, `pipe_name`, `password` |
 
 The response contains the header of the request, `status` (`SUCCESS` or `ERROR`) and a `payload` with `returns` and `value`, e.g. `"returns": "PROCESS_ID", "value": 4711`. For an unknown `api_call`, `value` = `NUM_ERR_ILLEGAL_REQ` (-20010). If `p_callObject` is not valid JSON, the call ends with the exception -20005.

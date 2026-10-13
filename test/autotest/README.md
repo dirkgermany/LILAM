@@ -24,7 +24,7 @@ DECOUPLED/
     LASTTEST/  MASSENTEST/  PARALLELBETRIEB/  PROZESSZYKLEN/  DAUERTEST/  WAKEUP/  LASTSPITZE/
 
 FEATURES/                   Funktionstests einzelner Merkmale (modusübergreifend)
-  BASELINE_SCOPE/  LOGTEXT_GRENZEN/  DISPATCHER_APEX/  FEHLERFAELLE/  SERVERAUSWAHL/  SPEICHER/  REGELN/  REGELN_LAST/
+  BASELINE_SCOPE/  MESSWERTE/  LOGTEXT_GRENZEN/  DISPATCHER_APEX/  FEHLERFAELLE/  SERVERAUSWAHL/  SPEICHER/  REGELN/  REGELN_LAST/
   RUECKSCHREIBUNG/  LEERLAUF_FLUSH/  FAILOVER/  RUECKSTAU/
 
 DAUERTEST/                  Dauertest über alle Modi gleichzeitig (Kombination der Tests)
@@ -62,6 +62,7 @@ So kann der Dauertest dieselben Tests wiederverwenden. FEHLERFAELLE und DISPATCH
 | WAKEUP | Aufrufe nach Ruhephasen des Servers von 5, 16, 30 und 65 s; das INFO muss höchstens 1 s nach dem Aufruf in der Tabelle stehen | nur DECOUPLED |
 | LASTSPITZE | mehrere Clients senden eine Zeit lang ohne Pause; danach Erholung: alle Daten vollständig, Prozesse geschlossen, keine Routen übrig, ein neuer Prozess arbeitet wieder normal | 6 Clients × 30 s, nur DECOUPLED |
 | FEATURES/BASELINE_SCOPE | prozessübergreifende Baseline: Default-Scope, `#NONE`, frei gewählter gemeinsamer Scope; INSESSION und SERVER | je Modus 7 kurze Prozesse |
+| FEATURES/MESSWERTE | `MARK_EVENT` mit Messwert (`p_value`): Wert und Wert-EWMA unabhängig nachgerechnet, Trennung von Zeit- und Wertreihe, Baseline Scope über neue Process IDs, Isolation (Kontext, Scope), Event ohne Wert, Nachkommastellen und Wertebereich, `GET_METRIC_AVG_VALUE`, Regeln `VAL_EWMA_DEVIATION_PCT_UP/_DOWN`, `VAL_MIN`, `VAL_MAX`, `TIME_EWMA_DEVIATION_PCT_DOWN`; INSESSION zusätzlich `CALL_BY_JSON` und Ablehnung ungültiger Regeln, SERVER zusätzlich Reconnect über den Dispatcher aus einer anderen Session und 3 parallele Prozesse in einem Scope. Nur einzeln (ändert das Rule Set der Gruppe LT) | je Modus ca. 5 Prozesse, ca. 15 s |
 | FEATURES/RUECKSCHREIBUNG | Sichtbarkeit vor `CLOSE_PROCESS`: Prozesse ohne Log-Aufruf (nur Traces, nur Events, nur Fortschritt, nur Baseline); nach Aufruf, Pause 2 s und weiterem Aufruf prüft ein Job aus fremder Session `LILAM_MON`, `LILAM_PROC` und `LILAM_BASELINES`. INSESSION-Gegenprobe: ein Aufruf in der 500-ms-Sperre bleibt im Puffer (kein Timer); `FLUSH` (direkt und per `CALL_BY_JSON`) schreibt ihn sofort, der Prozess bleibt offen und zählt weiter; INSESSION und SERVER | je Modus 4 Prozesse, ca. 55 s |
 | FEATURES/LOGTEXT_GRENZEN | Kürzung langer Logtexte (1.500–5.000 Zeichen, Umlaute); INSESSION und SERVER | 9 Texte je Modus |
 | FEATURES/DISPATCHER_APEX | APEX/AJAX mit Connection Pool: jeder Request ein eigener Job mit leerem PGA, Trace über zwei Requests, parallele Requests, Request ohne Dispatcher, veraltete ID nach CLOSE | 13 Requests |
