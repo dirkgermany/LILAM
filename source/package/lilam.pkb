@@ -523,6 +523,14 @@ AS
     ---------------------------------------------------------------
     -- Rules
     ---------------------------------------------------------------
+    -- Time window of a silence rule: days as 7 flags Mon..Sun, minutes after midnight (to <= from: ends next day)
+    TYPE t_window_rec IS RECORD (
+        days      VARCHAR2(7),
+        from_min  PLS_INTEGER,
+        to_min    PLS_INTEGER
+    );
+    TYPE t_window_list IS TABLE OF t_window_rec;
+
     -- Type definition for the rule details (from the JSON)
     TYPE t_rule_rec IS RECORD (
         rule_id             VARCHAR2(50),
@@ -539,7 +547,9 @@ AS
         cond_num            NUMBER,        -- Numeric value (NLS-independent), e.g. limit in ms
         cond_action         VARCHAR2(100), -- PRECEDED_BY*: expected predecessor action
         cond_context        VARCHAR2(100), -- PRECEDED_BY*: expected context (NULL = any)
-        cond_upper          VARCHAR2(100)  -- SEVERITY, INFO_CONTAINS: value in upper case
+        cond_upper          VARCHAR2(100), -- SEVERITY, INFO_CONTAINS: value in upper case
+        win_tz              VARCHAR2(64),  -- TIME_MAX_SILENCE_SECONDS: time zone of the windows
+        windows             t_window_list  -- NULL = always checked
     );
     TYPE t_rule_list IS TABLE OF t_rule_rec;
     TYPE t_rule_map IS TABLE OF t_rule_list INDEX BY VARCHAR2(300);
@@ -1805,7 +1815,7 @@ AS
             RETURN;
         END IF;
         l_idx := v_indexSession(p_processId);
-        IF g_sessionList(l_idx).silence_gen != g_rules_gen THEN
+        IF nvl(g_sessionList(l_idx).silence_gen, -1) != g_rules_gen THEN
             g_sessionList(l_idx).silence_gen     := g_rules_gen;
             g_sessionList(l_idx).silence_run_key := NULL;
             l_group := g_sessionList(l_idx).rule_group;
@@ -1884,6 +1894,62 @@ AS
         rollback;
         g_seen.DELETE;
         logLilamErr(sqlCode, sqlErrM, 'flushSeen');
+    END;
+
+    ------------------------------------------------------------
+    -- Time windows of a silence rule. p_open: a window is open now (always without windows).
+    -- Returns the start of the open window in UTC (earliest if several), NULL without windows:
+    -- the silence counts at most from the opening of the window.
+    ------------------------------------------------------------
+    FUNCTION windowSince(p_rule t_rule_rec, p_nowUtc TIMESTAMP, p_open OUT BOOLEAN) RETURN TIMESTAMP IS
+        l_local  TIMESTAMP;
+        l_day    DATE;
+        l_dow    PLS_INTEGER;   -- 1 = Monday
+        l_prev   PLS_INTEGER;
+        l_min    PLS_INTEGER;
+        l_start  TIMESTAMP;
+        l_best   TIMESTAMP;
+    BEGIN
+        p_open := TRUE;
+        IF p_rule.windows IS NULL OR p_rule.windows.COUNT = 0 THEN
+            RETURN NULL;
+        END IF;
+        p_open  := FALSE;
+        l_local := CAST(from_tz(p_nowUtc, 'UTC') AT TIME ZONE p_rule.win_tz AS TIMESTAMP);
+        l_day   := trunc(l_local);
+        l_dow   := l_day - trunc(l_local, 'IW') + 1;   -- ISO week: independent of NLS_TERRITORY
+        l_prev  := mod(l_dow + 5, 7) + 1;
+        l_min   := extract(hour from l_local) * 60 + extract(minute from l_local);
+
+        FOR i IN 1 .. p_rule.windows.COUNT LOOP
+            l_start := NULL;
+            IF p_rule.windows(i).from_min < p_rule.windows(i).to_min THEN
+                IF substr(p_rule.windows(i).days, l_dow, 1) = '1'
+                   AND l_min >= p_rule.windows(i).from_min AND l_min < p_rule.windows(i).to_min THEN
+                    l_start := l_day + p_rule.windows(i).from_min / 1440;
+                END IF;
+            -- over midnight: starts on a listed day, ends on the next day
+            ELSIF substr(p_rule.windows(i).days, l_dow, 1) = '1' AND l_min >= p_rule.windows(i).from_min THEN
+                l_start := l_day + p_rule.windows(i).from_min / 1440;
+            ELSIF substr(p_rule.windows(i).days, l_prev, 1) = '1' AND l_min < p_rule.windows(i).to_min THEN
+                l_start := l_day - 1 + p_rule.windows(i).from_min / 1440;
+            END IF;
+            IF l_start IS NOT NULL AND (l_best IS NULL OR l_start < l_best) THEN
+                l_best := l_start;
+            END IF;
+        END LOOP;
+
+        IF l_best IS NULL THEN
+            RETURN NULL;
+        END IF;
+        p_open := TRUE;
+        BEGIN
+            RETURN sys_extract_utc(from_tz(l_best, p_rule.win_tz));
+        EXCEPTION
+            WHEN OTHERS THEN
+                -- start in the gap of the clock change: count from now
+                RETURN p_nowUtc;
+        END;
     END;
 
     ------------------------------------------------------------
@@ -5792,6 +5858,9 @@ AS
         g_sessionList(v_new_idx).last_log_flush     := systimestamp;
         g_sessionList(v_new_idx).monitor_dirty_count := 0;
         g_sessionList(v_new_idx).log_dirty_count := 0;
+        -- silence rule for running processes: determined on the first signal (touchRun)
+        g_sessionList(v_new_idx).silence_run_key := NULL;
+        g_sessionList(v_new_idx).silence_gen     := -1;
 
         v_indexSession(p_processId) := v_new_idx;
 
@@ -9046,6 +9115,121 @@ AS
             RETURN l_val IS NOT NULL AND NOT l_val.is_null
                    AND NOT (l_val.is_string AND nvl(dbms_lob.getlength(l_val.to_clob), 0) IN (0, 2)); -- "" counts as missing
         END;
+
+        -- Day list 'MON-FRI', 'MON,WED,FRI', 'FRI-MON' (wraps) => 7 flags Mon..Sun; NULL if invalid
+        FUNCTION parseDays(p_days VARCHAR2) RETURN VARCHAR2 IS
+            C_NAMES CONSTANT VARCHAR2(30) := 'MON,TUE,WED,THU,FRI,SAT,SUN,';
+            l_days  VARCHAR2(4000) := upper(replace(p_days, ' '));
+            l_flags VARCHAR2(7)    := '0000000';
+            l_part  VARCHAR2(4000);
+            l_from  PLS_INTEGER;
+            l_to    PLS_INTEGER;
+            l_d     PLS_INTEGER;
+            FUNCTION dayNo(p_name VARCHAR2) RETURN PLS_INTEGER IS
+            BEGIN
+                IF length(p_name) != 3 OR instr(C_NAMES, p_name || ',') = 0 THEN
+                    RETURN NULL;
+                END IF;
+                RETURN (instr(C_NAMES, p_name || ',') + 3) / 4;
+            END;
+        BEGIN
+            IF l_days IS NULL OR length(l_days) > 100 OR regexp_like(l_days, '(^|,)(,|$)') THEN
+                RETURN NULL;
+            END IF;
+            FOR i IN 1 .. regexp_count(l_days, ',') + 1 LOOP
+                l_part := regexp_substr(l_days, '[^,]+', 1, i);
+                IF regexp_count(l_part, '-') > 1 THEN
+                    RETURN NULL;
+                END IF;
+                l_from := dayNo(regexp_substr(l_part, '[^-]+', 1, 1));
+                l_to   := CASE WHEN instr(l_part, '-') > 0 THEN dayNo(regexp_substr(l_part, '[^-]+', 1, 2)) ELSE l_from END;
+                IF l_from IS NULL OR l_to IS NULL THEN
+                    RETURN NULL;
+                END IF;
+                l_d := l_from;
+                LOOP
+                    l_flags := substr(l_flags, 1, l_d - 1) || '1' || substr(l_flags, l_d + 1);
+                    EXIT WHEN l_d = l_to;
+                    l_d := mod(l_d, 7) + 1;
+                END LOOP;
+            END LOOP;
+            RETURN l_flags;
+        END;
+
+        -- 'HH:MI' => minutes after midnight; '24:00' only as end (p_isEnd); NULL if invalid
+        FUNCTION parseTime(p_time VARCHAR2, p_isEnd BOOLEAN) RETURN PLS_INTEGER IS
+        BEGIN
+            IF p_isEnd AND p_time = '24:00' THEN
+                RETURN 1440;
+            END IF;
+            IF NOT regexp_like(p_time, '^([01][0-9]|2[0-3]):[0-5][0-9]$') THEN
+                RETURN NULL;
+            END IF;
+            RETURN to_number(substr(p_time, 1, 2)) * 60 + to_number(substr(p_time, 4, 2));
+        END;
+
+        -- "windows" and "time_zone" of a rule (only TIME_MAX_SILENCE_SECONDS); NULL = valid
+        FUNCTION parseWindows RETURN VARCHAR2 IS
+            l_win   JSON_ELEMENT_T := l_obj.get('windows');
+            l_tz    JSON_ELEMENT_T := l_obj.get('time_zone');
+            l_arr   JSON_ARRAY_T;
+            l_w     JSON_OBJECT_T;
+            l_rec   t_window_rec;
+            l_txt   VARCHAR2(4000);
+            l_check TIMESTAMP WITH TIME ZONE;
+            FUNCTION strVal(p_obj JSON_OBJECT_T, p_key VARCHAR2) RETURN VARCHAR2 IS
+                l_e JSON_ELEMENT_T := p_obj.get(p_key);
+            BEGIN
+                IF l_e IS NULL OR NOT l_e.is_string THEN
+                    RETURN NULL;
+                END IF;
+                RETURN substr(p_obj.get_string(p_key), 1, 200);
+            END;
+        BEGIN
+            IF (l_win IS NULL OR l_win.is_null) AND (l_tz IS NULL OR l_tz.is_null) THEN
+                RETURN NULL;
+            END IF;
+            IF l_op != 'TIME_MAX_SILENCE_SECONDS' THEN
+                RETURN fail('"windows" and "time_zone" only for TIME_MAX_SILENCE_SECONDS');
+            END IF;
+            IF l_win IS NULL OR NOT l_win.is_array OR TREAT(l_win AS JSON_ARRAY_T).get_size = 0 THEN
+                RETURN fail('"windows" must be a non-empty array');
+            END IF;
+            l_txt := strVal(l_obj, 'time_zone');
+            IF l_txt IS NULL OR length(l_txt) > 64 THEN
+                RETURN fail('"windows" need "time_zone" (region name, e.g. Europe/Berlin)');
+            END IF;
+            BEGIN
+                l_check := from_tz(TIMESTAMP '2000-01-01 12:00:00', l_txt);
+            EXCEPTION
+                WHEN OTHERS THEN
+                    RETURN fail('unknown "time_zone" ' || l_txt);
+            END;
+            l_rule.win_tz  := l_txt;
+            l_rule.windows := t_window_list();
+            l_arr := TREAT(l_win AS JSON_ARRAY_T);
+            FOR i IN 0 .. l_arr.get_size - 1 LOOP
+                IF NOT l_arr.get(i).is_object THEN
+                    RETURN fail('window #' || (i + 1) || ' is not an object');
+                END IF;
+                l_w := TREAT(l_arr.get(i) AS JSON_OBJECT_T);
+                l_txt := unknownKey(l_w, ',days,from,to,');
+                IF l_txt IS NOT NULL THEN
+                    RETURN fail('unknown key "windows.' || substr(l_txt, 1, 100) || '"');
+                END IF;
+                l_rec.days     := parseDays(strVal(l_w, 'days'));
+                l_rec.from_min := parseTime(strVal(l_w, 'from'), FALSE);
+                l_rec.to_min   := parseTime(strVal(l_w, 'to'), TRUE);
+                IF l_rec.days IS NULL THEN
+                    RETURN fail('window #' || (i + 1) || ': "days" needs e.g. MON-FRI or MON,WED');
+                ELSIF l_rec.from_min IS NULL OR l_rec.to_min IS NULL OR l_rec.from_min = l_rec.to_min THEN
+                    RETURN fail('window #' || (i + 1) || ': "from"/"to" need HH:MI (to 24:00 allowed, from != to)');
+                END IF;
+                l_rule.windows.EXTEND;
+                l_rule.windows(l_rule.windows.LAST) := l_rec;
+            END LOOP;
+            RETURN NULL;
+        END;
     BEGIN
         BEGIN
             l_doc := JSON_OBJECT_T.parse(p_ruleSet);
@@ -9097,7 +9281,7 @@ AS
             IF NOT l_ok THEN
                 RETURN fail('"alert" is not an object');
             END IF;
-            l_bad := unknownKey(l_obj, ',id,trigger_type,action,context,condition,alert,');
+            l_bad := unknownKey(l_obj, ',id,trigger_type,action,context,condition,alert,windows,time_zone,');
             IF l_bad IS NOT NULL THEN
                 RETURN fail('unknown key "' || substr(l_bad, 1, 100) || '"');
             END IF;
@@ -9287,6 +9471,11 @@ AS
                         END IF;
                     END IF;
             END CASE;
+
+            l_bad := parseWindows;
+            IF l_bad IS NOT NULL THEN
+                RETURN l_bad;
+            END IF;
 
             -- Classify: context rule or general action rule
             IF l_rule.target_context IS NOT NULL THEN
@@ -9594,6 +9783,8 @@ AS
         l_group   VARCHAR2(50) := upper(trim(p_group));
         l_nowUtc  TIMESTAMP;
         l_limit   TIMESTAMP;
+        l_since   TIMESTAMP;
+        l_open    BOOLEAN;
         l_kinds   sys.odcivarchar2list;
         l_keys    sys.odcivarchar2list;
         l_ts      t_ts_list;
@@ -9608,6 +9799,8 @@ AS
         IF l_group IS NULL THEN
             RETURN;
         END IF;
+        -- fixed tables (LILAM_ALERT_STATE, LILAM_ALERTS) also before the first process; checked once per session
+        createLogTables(C_DIRECT_WRITE_MASTER);
         refreshGroupRules(l_group, p_force => FALSE);
         flushSeen(p_force => TRUE);   -- own signals first
         l_nowUtc := sys_extract_utc(SYSTIMESTAMP);
@@ -9623,6 +9816,8 @@ AS
             FOR i IN 1 .. g_silence_rules(l_group).COUNT LOOP
                 l_rule  := g_silence_rules(l_group)(i);
                 l_limit := l_nowUtc - numtodsinterval(l_rule.cond_num, 'SECOND');
+                -- outside its windows the rule is not checked; inside, the silence counts at most from the opening
+                l_since := windowSince(l_rule, l_nowUtc, l_open);
 
                 IF l_rule.trigger_type = C_PROCESS_UPDATE THEN
                     -- running processes of this name (an entry exists from the first signal until the end)
@@ -9630,7 +9825,7 @@ AS
                     FOR j IN 1 .. l_keys.COUNT LOOP
                         IF l_kinds(j) = C_STATE_RUN AND substr(l_keys(j), 1, length(l_prefix)) = l_prefix THEN
                             l_used(j) := TRUE;
-                            IF l_ts(j) < l_limit THEN
+                            IF l_open AND greatest(l_ts(j), coalesce(l_since, l_ts(j))) < l_limit THEN
                                 fireSilence(l_group, l_rule, to_number(substr(l_keys(j), length(l_prefix) + 1)), l_nowUtc);
                             END IF;
                         END IF;
@@ -9655,7 +9850,7 @@ AS
                         l_j := l_rows(l_kind || '|' || l_key);
                         IF l_j > 0 THEN
                             l_used(l_j) := TRUE;
-                            IF l_ts(l_j) < l_limit THEN
+                            IF l_open AND greatest(l_ts(l_j), coalesce(l_since, l_ts(l_j))) < l_limit THEN
                                 fireSilence(l_group, l_rule, NULL, l_nowUtc);
                             END IF;
                         END IF;

@@ -71,6 +71,8 @@ Rules are organized into Rule Sets, stored as JSON documents in the `LILAM_RULES
 | rules.alert.handler | string | yes | name of the `DBMS_ALERT` signal the consumer listens to, max. 30 characters
 | rules.alert.severity | string | no | severity passed to the consumer, max. 30 characters
 | rules.alert.throttle_seconds | number | no | minimum seconds before the same rule fires again for the same action, context and baseline scope (default 0)⁴
+| rules.windows | array | no | only `TIME_MAX_SILENCE_SECONDS`: times in which the rule is checked, see [Silence Rules](#silence-rules)
+| rules.time_zone | string | with `windows` | time zone of the windows (region name, e.g. `Europe/Berlin`)
 
 ¹ The trigger type maps to the LILAM API call that produced the signal, see [Hooks / Trigger Types](#hooks--trigger-types).
 
@@ -171,7 +173,21 @@ The EWMA deviation operators compare against the EWMA **before** the current mea
 - **"Last seen"** is stored per group and target in `LILAM_ALERT_STATE` and survives restarts. The time is that of the processing (server: when the worker handles the message).
 - **Limits:** signals are written buffered, about every 1.5 seconds (In-Session: at the next write point of the session, at the latest `CLOSE_SESSION`); with the check interval a silence is reported up to about 12 seconds (server) or one job interval late. Silence times should therefore be well above that. A process that ends without `CLOSE_PROCESS` (session killed) keeps its entry and is reported as silent until the rule is removed. Changed rule sets reach the checkers as for other rules (servers at once or after 15 s, In-Session checkers on the next call); entries without rule are removed.
 - **Watching the checker:** if no checker runs (server stopped, job disabled), nothing is reported. LILAM cannot detect that itself; the application watches its job in `DBMS_SCHEDULER` (state, failures) or a second, independent checker.
-- **Time windows** (e.g. only during trading hours) are not supported yet; the application activates a rule set without silence rules outside its windows.
+- **Time windows** (optional): `windows` restricts the check to times of day, e.g. trading hours. Outside all windows nothing is reported. When a window opens, the silence counts from its opening, so the evening's last signal does not raise an alert at 09:00 (also after a break between two windows). Several windows are allowed; the rule is checked while at least one is open (overlapping windows simply add up). `time_zone` (region name such as `Europe/Berlin`, also across daylight saving time) applies to all windows of the rule and is required with `windows`. Holidays remain with the application.
+
+  ```json
+  { "id": "SAP-SILENT", "trigger_type": "MARK_EVENT", "action": "SHARE_PRICE", "context": "SAP",
+    "condition": { "operator": "TIME_MAX_SILENCE_SECONDS", "value": "3600" },
+    "windows": [ { "days": "MON-FRI", "from": "09:00", "to": "13:00" },
+                 { "days": "MON-FRI", "from": "15:00", "to": "19:00" } ],
+    "time_zone": "Europe/Berlin",
+    "alert": { "handler": "LILAM_ALERT_MAIL_LOG", "severity": "WARN", "throttle_seconds": 3600 } }
+  ```
+
+  | Key | Content |
+  | --- | --- |
+  | `days` | `MON`…`SUN`, ranges and lists: `MON-FRI`, `MON,WED,FRI`, `FRI-MON` (wraps over the weekend) |
+  | `from`, `to` | `HH:MI` (24 h); `to` may be `24:00`. `to` before `from` means over midnight: the window starts on a listed day and ends on the next day (`22:00`–`06:00`) |
 
 ---
 ## Table: LILAM_RULES
