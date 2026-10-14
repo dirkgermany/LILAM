@@ -1,7 +1,7 @@
 -- =====================================================================
 -- LILAM Test: FEATURES / DROSSELUNG
 --
--- Prueft die Drosselung von Alerts (throttle_seconds) mit der Sperrtabelle LILAM_ALERT_LOCKS:
+-- Prueft die Drosselung von Alerts (throttle_seconds) mit den Sperren in LILAM_ALERT_STATE (Art LOCK):
 -- Sperre je Gruppe, Scope bzw. Prozess, Regel, Action und Context; gueltig ueber Sessions,
 -- Server-Worker und Neustarts.
 --
@@ -12,11 +12,11 @@
 --
 --   INSESSION:
 --   D1  Context im Schluessel: SAP zweimal, SIE einmal => je 1 Alert
---   D2  Sperre steht in LILAM_ALERT_LOCKS (Schluessel GRUPPE|S<scope_id>|D-MAX|DR_V|SAP)
+--   D2  Sperre steht in LILAM_ALERT_STATE (Gruppe, Schluessel S<scope_id>|D-MAX|DR_V|SAP)
 --   D3  andere DB-Session (Job), neuer Prozess im selben Scope: SAP und SIE gesperrt, BMW loest aus
 --   D4  ohne Scope (#NONE): Sperre je Prozess (P<process_id>), ein zweiter Prozess loest erneut aus
 --   D5  Sperrzeit laeuft ab (D-SHORT, 2 s): danach neuer Alert, weiter nur eine Zeile je Schluessel
---   D6  throttle_seconds 0: jeder Treffer ein Alert, keine Zeile in LILAM_ALERT_LOCKS
+--   D6  throttle_seconds 0: jeder Treffer ein Alert, keine Sperre in LILAM_ALERT_STATE
 --   D7  Housekeeping: der Job (frische Session) loescht abgelaufene Sperren, laufende bleiben
 --   SERVER (Worker LT_S1, LT_S2, Dispatcher LT_DISP):
 --   S1  zwei Prozesse eines Scopes auf verschiedenen Workern: SAP nur 1 Alert, SIE eigener Alert
@@ -85,9 +85,13 @@ declare
     return q('select max(scope_id) from lilam_scopes where scope_name = upper(:1)', p_scope);
   end;
 
+  -- p_key: GRUPPE|Sperrschluessel
   function locks(p_key varchar2) return number is
+    l_n number;
   begin
-    return q('select count(*) from lilam_alert_locks where lock_key = :1', p_key);
+    execute immediate 'select count(*) from lilam_alert_state where group_name = :1 and state_kind = ''LOCK'' and state_key = :2'
+      into l_n using substr(p_key, 1, instr(p_key, '|') - 1), substr(p_key, instr(p_key, '|') + 1);
+    return l_n;
   end;
 
   function newp(p_suffix varchar2, p_scope varchar2 default null) return number is
@@ -145,16 +149,16 @@ declare
     chk('D1 SIE nicht durch SAP gesperrt: 1 Alert', l_n = 1, l_n);
     l_sid := scope_id(l_scope);
     l_n := locks(l_grp || '|S' || l_sid || '|D-MAX|DR_V|SAP');
-    chk('D2 Sperre in LILAM_ALERT_LOCKS (Scope, Context SAP)', l_n = 1, l_n);
+    chk('D2 Sperre in LILAM_ALERT_STATE (Scope, Context SAP)', l_n = 1, l_n);
     l_n := locks(l_grp || '|S' || l_sid || '|D-MAX|DR_V|SIE');
     chk('D2 eigene Sperre fuer Context SIE', l_n = 1, l_n);
 
     -- D7 vorbereiten: eine abgelaufene und eine laufende Sperre (die Hauptsession hat in D1 schon
     -- aufgeraeumt und raeumt erst nach 60 s wieder auf; der Job in D3 raeumt sofort auf)
-    execute immediate 'insert into lilam_alert_locks(lock_key, last_alert_utc, throttle_seconds) values (:1, sys_extract_utc(systimestamp) - interval ''1'' hour, 1)'
-      using 'LT_DR_PURGE|' || l_run || '|OLD';
-    execute immediate 'insert into lilam_alert_locks(lock_key, last_alert_utc, throttle_seconds) values (:1, sys_extract_utc(systimestamp), 3600)'
-      using 'LT_DR_PURGE|' || l_run || '|KEEP';
+    execute immediate 'insert into lilam_alert_state(group_name, state_kind, state_key, ts_utc, hold_seconds) values (''LT_DR_PURGE'', ''LOCK'', :1, sys_extract_utc(systimestamp) - interval ''1'' hour, 1)'
+      using l_run || '|OLD';
+    execute immediate 'insert into lilam_alert_state(group_name, state_kind, state_key, ts_utc, hold_seconds) values (''LT_DR_PURGE'', ''LOCK'', :1, sys_extract_utc(systimestamp), 3600)'
+      using l_run || '|KEEP';
     commit;
 
     -- D3: andere DB-Session, neuer Prozess im selben Scope
@@ -179,7 +183,7 @@ declare
     chk('D7 abgelaufene Sperre geloescht', l_n = 0, l_n);
     l_n := locks('LT_DR_PURGE|' || l_run || '|KEEP');
     chk('D7 laufende Sperre bleibt', l_n = 1, l_n);
-    execute immediate 'delete from lilam_alert_locks where lock_key like :1' using 'LT\_DR\_PURGE|' || l_run || '|%';
+    execute immediate 'delete from lilam_alert_state where group_name = ''LT_DR_PURGE'' and state_key like :1' using l_run || '|%';
     commit;
 
     -- D4: ohne Scope, Sperre je Prozess
@@ -191,7 +195,7 @@ declare
     l_n := alerts(l_p || '_N', 'D-MAX', 'SAP');
     chk('D4 ohne Scope: je Prozess 1 Alert (2 Prozesse => 2)', l_n = 2, l_n);
     l_n := locks(l_grp || '|P' || l_pid2 || '|D-MAX|DR_V|SAP');
-    chk('D4 Sperre mit P<process_id> in LILAM_ALERT_LOCKS', l_n = 1, l_n);
+    chk('D4 Sperre mit P<process_id> in LILAM_ALERT_STATE', l_n = 1, l_n);
 
     -- D5: Sperrzeit laeuft ab
     lilam.mark_event(l_pid1, 'DR_S', 'X', 150);
@@ -210,7 +214,7 @@ declare
     lilam.mark_event(l_pid1, 'DR_Z', 'X', 150);
     l_n := alerts(l_p || '_SA', 'D-NULL', 'X');
     chk('D6 throttle_seconds 0: jeder Treffer ein Alert (2)', l_n = 2, l_n);
-    l_n := q('select count(*) from lilam_alert_locks where lock_key like :1', '%|D-NULL|%');
+    l_n := q('select count(*) from lilam_alert_state where state_kind = ''LOCK'' and state_key like :1', '%|D-NULL|%');
     chk('D6 throttle_seconds 0: keine Sperre gespeichert', l_n = 0, l_n);
 
     lt.close_wait(l_pid1);

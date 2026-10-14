@@ -846,6 +846,7 @@ Sind die ersten beiden Kriterien gleich, wechselt der Aufrufer zwischen den Serv
 | `GET_SERVER_PIPE` | Liefert die Server-Pipe eines verbundenen Clients |
 | `SERVER_UPDATE_RULES` | Aktiviert ein aktualisiertes Rule Set |
 | `CHECK_RULE_SET` | Prüft ein Rule Set, ohne es zu speichern oder zu aktivieren |
+| `CHECK_SILENCE` | Prüft die Schweige-Regeln (`TIME_MAX_SILENCE_SECONDS`) einer Gruppe, z. B. aus einem Job der Anwendung |
 | `SET_DISPATCHER_PIPE` | Konfiguriert einen Dispatcher für automatisches Routing und Reconnect |
 
 ### Procedure START_SERVER
@@ -942,6 +943,29 @@ FUNCTION CHECK_RULE_SET(
 SELECT LILAM.CHECK_RULE_SET('{"rules":[ ... ]}') FROM dual;
 ```
 
+### Procedure CHECK_SILENCE
+Prüft die Schweige-Regeln (`TIME_MAX_SILENCE_SECONDS`) der Gruppe und schreibt für jedes Ziel, das länger als erlaubt kein Signal hatte, einen Alert. Server der Gruppe prüfen selbst alle 10 Sekunden. Ohne Server (nur INSESSION) ruft die Anwendung die Prozedur regelmäßig auf, z. B. aus einem eigenen `DBMS_SCHEDULER`-Job; das Intervall sollte deutlich unter der kleinsten Schweigezeit liegen. Mehrere Prüfer (Server, Jobs) lösen zusammen nur einen Alert aus. Die Prozedur wirft keine Exceptions und schreibt in einer eigenen Transaktion.
+
+```sql
+PROCEDURE CHECK_SILENCE(
+  p_groupName VARCHAR2
+)
+```
+
+```sql
+BEGIN
+  DBMS_SCHEDULER.CREATE_JOB(
+    job_name        => 'SPM_SILENCE_CHECK',
+    job_type        => 'PLSQL_BLOCK',
+    job_action      => 'BEGIN LILAM.CHECK_SILENCE(''STOCK_MONITORING''); END;',
+    repeat_interval => 'FREQ=MINUTELY',
+    enabled         => TRUE);
+END;
+/
+```
+
+Ob der Job selbst läuft, prüft LILAM nicht (siehe [Rules Engine](../rules/README.md#silence-rules)).
+
 ### Procedure SERVER_UPDATE_RULES
 Rule Sets werden als JSON-Objekte in `LILAM_RULES` gespeichert, jeweils für eine Gruppe (`GROUP_NAME`, Name, Version). Dasselbe Rule Set kann für mehrere Gruppen eingetragen sein. Je Gruppe ist genau ein Rule Set aktiv (`IS_ACTIVE = 1`); es gilt für alle Server der Gruppe und für alle INSESSION-Prozesse, die mit dieser Gruppe gestartet wurden. Gruppe, Name und Version sind Pflicht und zusammen eindeutig, die Gruppe ohne Unterscheidung von Groß- und Kleinschreibung; die Version ist ganzzahlig, `IS_ACTIVE` ist 0 oder 1.
 
@@ -977,7 +1001,7 @@ Aufbau der Rule Sets und Operatoren: [Rules Engine](../rules/README.md). Einige 
 - **`TIME_EWMA_DEVIATION_PCT_UP` / `_DOWN`:** Abweichung nach oben bzw. unten vom EWMA vor der Messung. Solange der Durchschnitt unter 1 ms liegt (Messauflösung), wird nicht ausgewertet.
 - **`VAL_EWMA_DEVIATION_PCT_UP` / `_DOWN`:** dasselbe für Messwerte, Band `|EWMA| * PCT / 100` (auch für negative Werte). Ohne die 1-ms-Ausnahme. Events ohne Wert lösen nichts aus.
 - **`VAL_MIN` / `VAL_MAX`:** fester Grenzwert; Alert, wenn der Wert kleiner bzw. größer ist (die Grenze selbst löst nicht aus). Nur mit Trigger `MARK_EVENT`.
-- **Keine zeitgesteuerte Prüfung:** Regeln werden ausgewertet, wenn ein Signal eintrifft. Ausbleibende Signale (ein hängender Prozess, ein Event, das nie kommt) werden nicht erkannt.
+- **Ausbleibende Signale:** Alle anderen Regeln werden ausgewertet, wenn ein Signal eintrifft. `TIME_MAX_SILENCE_SECONDS` meldet dagegen, dass seit X Sekunden kein Signal kam: kein Start eines Prozesses (`PROCESS_START`), keine Events oder Traces einer Action (`MARK_EVENT`, `TRACE_START`, optional je Context) oder nichts mehr von einem laufenden Prozess (`PROCESS_UPDATE`). Geprüft wird je Gruppe durch die Server bzw. [`CHECK_SILENCE`](#procedure-check_silence). Das ist die Grundlage für einen Watchdog der Anwendung; Planung und Überwachung des Prüfjobs bleiben bei ihr. Alerts ohne Prozess haben `PROCESS_ID` NULL. Details und Grenzen: [Rules Engine](../rules/README.md#silence-rules).
 
 ### Regeln im INSESSION-Modus
 Auch Prozesse im INSESSION-Modus werten Regeln aus, wenn `NEW_PROCESS` eine Gruppe erhält (`p_groupName` bzw. `t_process_init.groupName`). Sie nutzen dann dasselbe aktive Rule Set der Gruppe aus `LILAM_RULES` wie die Server dieser Gruppe. Ohne Gruppe gibt es keine Regeln.
@@ -986,7 +1010,7 @@ Auch Prozesse im INSESSION-Modus werten Regeln aus, wenn `NEW_PROCESS` eine Grup
 - **Änderungen:** Höchstens alle 15 Sekunden prüft LILAM bei einem API-Aufruf, ob sich Name oder Version des aktiven Rule Sets der Gruppe geändert haben, und lädt es dann neu. `SERVER_UPDATE_RULES` wirkt also auch hier, spätestens beim ersten API-Aufruf nach 15 Sekunden. Wird ein Rule Set direkt in der Tabelle geändert, ohne dass sich Name oder Version ändern, bemerkt das eine laufende Session nicht.
 - **Ungültiges Rule Set:** Es wird abgelehnt und einmal je Version in `LILAM_LOG_INTERNAL` protokolliert; die bisherigen Regeln bleiben aktiv. Die Anwendung bemerkt davon nichts.
 - **Alerts:** Ein ausgelöster Alert wird sofort und synchron geschrieben (`LILAM_ALERTS` und `DBMS_ALERT`-Signal, eigene Transaktion). Das kostet die Anwendung pro Alert einen Commit; `throttle_seconds` begrenzt die Häufigkeit. `GROUP_NAME` im Alert ist die Gruppe aus `NEW_PROCESS`.
-- **Gedächtnis je Session:** Der Vorgänger für `PRECEDED_BY` gilt je Datenbank-Session; mit einem Connection-Pool (z. B. APEX) kennt eine andere Pool-Verbindung ihn nicht. Die Drosselung (`throttle_seconds`) gilt dagegen über Sessions, Pool-Verbindungen, Server-Worker und Neustarts hinweg (Tabelle `LILAM_ALERT_LOCKS`), je Regel, Action, Context und Baseline Scope bzw. Prozess.
+- **Gedächtnis je Session:** Der Vorgänger für `PRECEDED_BY` gilt je Datenbank-Session; mit einem Connection-Pool (z. B. APEX) kennt eine andere Pool-Verbindung ihn nicht. Die Drosselung (`throttle_seconds`) gilt dagegen über Sessions, Pool-Verbindungen, Server-Worker und Neustarts hinweg (Tabelle `LILAM_ALERT_STATE`), je Regel, Action, Context und Baseline Scope bzw. Prozess.
 - **Baseline-Parameter:** `warmup` und `alpha` aus `TIME_EWMA_DEVIATION_PCT_*`-Regeln (Zeitreihe) bzw. `VAL_EWMA_DEVIATION_PCT_*`-Regeln (Wertreihe) gelten wie im Server auch für die Durchschnittswerte des Prozesses.
 
 ```sql

@@ -98,8 +98,18 @@ AS
     -- INSESSION: check for a changed active rule set of the group at most every n ms
     -- (triggered by API calls; servers are notified via SERVER_UPDATE_RULES and check themselves in the housekeeping)
     C_RULES_CHECK_INTERVAL_MS          CONSTANT PLS_INTEGER := 15000;
-    -- Expired alert locks (LILAM_ALERT_LOCKS) are deleted at most every n ms per session
+    -- Expired alert locks (LILAM_ALERT_STATE, kind LOCK) are deleted at most every n ms per session
     C_ALERT_LOCK_PURGE_MS              CONSTANT PLS_INTEGER := 60000;
+    -- Silence rules (TIME_MAX_SILENCE_SECONDS): server check every n ms; "last seen" written at most every n ms
+    C_SILENCE_CHECK_MS                 CONSTANT PLS_INTEGER := 10000;
+    C_SEEN_FLUSH_MS                    CONSTANT PLS_INTEGER := 1500;
+
+    -- Kinds in LILAM_ALERT_STATE: alert lock and "last seen" per target of a silence rule
+    C_STATE_LOCK                       CONSTANT VARCHAR2(10) := 'LOCK';
+    C_STATE_START                      CONSTANT VARCHAR2(10) := 'START';  -- process start, key = process name
+    C_STATE_EVENT                      CONSTANT VARCHAR2(10) := 'EVENT';  -- key = action|context
+    C_STATE_TRACE                      CONSTANT VARCHAR2(10) := 'TRACE';  -- key = action|context
+    C_STATE_RUN                        CONSTANT VARCHAR2(10) := 'RUN';    -- running process, key = process name|process_id
 
     ---------------------------------------------------------------
     -- Placeholders for tables
@@ -113,7 +123,7 @@ AS
     C_LILAM_WATERMARK               CONSTANT VARCHAR2(50) := 'LILAM_WATERMARK';
     C_LILAM_SCOPES_TABLE            CONSTANT VARCHAR2(30) := 'LILAM_SCOPES';
     C_LILAM_BASELINES_TABLE         CONSTANT VARCHAR2(30) := 'LILAM_BASELINES';
-    C_LILAM_ALERT_LOCKS_TABLE       CONSTANT VARCHAR2(30) := 'LILAM_ALERT_LOCKS';
+    C_LILAM_ALERT_STATE_TABLE       CONSTANT VARCHAR2(30) := 'LILAM_ALERT_STATE';
 
     ---------------------------------------------------------------
     -- Other general Parameters
@@ -170,7 +180,11 @@ AS
         rule_group          VARCHAR2(50),  -- upper(group_name): key of the rules; NULL = no rules
         tabName_master      VARCHAR2(100),
         scope_id            NUMBER(19,0),  -- NULL = no cross-process scope
-        sync_level          PLS_INTEGER := 1  -- logLevelError: entries up to this level are written synchronously
+        sync_level          PLS_INTEGER := 1, -- logLevelError: entries up to this level are written synchronously
+        -- Silence rule for running processes (PROCESS_UPDATE): key in LILAM_ALERT_STATE (kind RUN), NULL = none.
+        -- PERFORMANCE: determined again only when g_rules_gen changes (see touchRun)
+        silence_run_key     VARCHAR2(200),
+        silence_gen         PLS_INTEGER := -1
     );
 
     -- Table for several processes
@@ -542,7 +556,8 @@ AS
         set_version  NUMBER := 0,
         seen_name    VARCHAR2(30),      -- last seen active rule set, even if rejected
         seen_version NUMBER,            -- (a rejected set is not parsed again on every check)
-        last_check_cs NUMBER            -- INSESSION and server housekeeping (checkServerRules): last check for a changed active rule set (DBMS_UTILITY.GET_TIME)
+        last_check_cs NUMBER,            -- INSESSION and server housekeeping (checkServerRules): last check for a changed active rule set (DBMS_UTILITY.GET_TIME)
+        rules_read    BOOLEAN := FALSE  -- LILAM_RULES was read at least once (checkSilence: remove entries without rule)
     );
     TYPE t_rule_group_map IS TABLE OF t_rule_group_rec INDEX BY VARCHAR2(50);
     g_rule_groups t_rule_group_map;
@@ -556,7 +571,7 @@ AS
     g_avg_params t_avg_params_map;
     g_val_params t_avg_params_map;   -- same for the value series (VAL_EWMA_DEVIATION_PCT_*)
 
-    -- Throttling: session memory as prefilter for LILAM_ALERT_LOCKS (last alert in UTC, as read
+    -- Throttling: session memory as prefilter for LILAM_ALERT_STATE (last alert in UTC, as read
     -- from or written to the table). Key = lock key, see fire_alert.
     TYPE t_alert_history IS TABLE OF TIMESTAMP INDEX BY VARCHAR2(1000);
     g_alert_history t_alert_history;
@@ -565,6 +580,41 @@ AS
     TYPE t_alert_history_proc IS TABLE OF t_alert_history INDEX BY PLS_INTEGER;
     g_alert_history_proc t_alert_history_proc;
     g_lastLockPurgeCs NUMBER;   -- last purgeAlertLocks (DBMS_UTILITY.GET_TIME)
+
+    -- Content of an alert (LILAM_ALERTS); process_id NULL = no process (silence rule "no start")
+    TYPE t_alert_out IS RECORD (
+        process_id    NUMBER(19,0),
+        process_name  VARCHAR2(100),
+        action_name   VARCHAR2(100),
+        context_name  VARCHAR2(100),
+        action_count  NUMBER,
+        tab_master    VARCHAR2(100),
+        tab_monitor   VARCHAR2(100),
+        tab_logging   VARCHAR2(100),
+        group_name    VARCHAR2(100),
+        set_name      VARCHAR2(30),
+        set_version   NUMBER
+    );
+
+    -- Silence rules (TIME_MAX_SILENCE_SECONDS) per group, for checkSilence
+    TYPE t_silence_map IS TABLE OF t_rule_list INDEX BY VARCHAR2(50);
+    g_silence_rules t_silence_map;
+    -- Groups with a silence rule for running processes: key GROUP|PROCESS_NAME
+    TYPE t_flag_map IS TABLE OF BOOLEAN INDEX BY VARCHAR2(300);
+    g_silence_run t_flag_map;
+    g_rules_gen   PLS_INTEGER := 0;   -- incremented whenever rules of a group change
+
+    -- "Last seen" of silence targets, buffered until flushSeen (key GROUP|KIND|STATE_KEY)
+    TYPE t_seen_rec IS RECORD (
+        group_name  VARCHAR2(50),
+        state_kind  VARCHAR2(10),
+        state_key   VARCHAR2(250),
+        seen_cs     NUMBER,          -- DBMS_UTILITY.GET_TIME of the last signal
+        remove      BOOLEAN := FALSE -- process ended: delete the entry
+    );
+    TYPE t_seen_map IS TABLE OF t_seen_rec INDEX BY VARCHAR2(320);
+    g_seen            t_seen_map;
+    g_lastSeenFlushCs NUMBER;
 
     ----------
     -- TRIGGER
@@ -1482,31 +1532,31 @@ AS
     END;
 
     ------------------------------------------------------------
-    -- Takes the alert lock in LILAM_ALERT_LOCKS (within the caller's transaction).
+    -- Takes the alert lock in LILAM_ALERT_STATE (kind LOCK) within the caller's transaction.
     -- TRUE: lock taken, p_lastAlert = p_nowUtc. FALSE: locked by an earlier alert,
     -- p_lastAlert = its time (NULL if the row vanished in between).
     -- STABILITY: race-free across sessions; the conditional UPDATE and the primary key let
     -- only one session take an expired or new lock.
     ------------------------------------------------------------
-    FUNCTION acquireAlertLock(p_lockKey VARCHAR2, p_throttleSec NUMBER, p_nowUtc TIMESTAMP,
+    FUNCTION acquireAlertLock(p_group VARCHAR2, p_lockKey VARCHAR2, p_throttleSec NUMBER, p_nowUtc TIMESTAMP,
                               p_lastAlert OUT TIMESTAMP) RETURN BOOLEAN IS
     BEGIN
-        EXECUTE IMMEDIATE 'update ' || C_LILAM_ALERT_LOCKS_TABLE || '
-                              set last_alert_utc = :1, throttle_seconds = :2
-                            where lock_key = :3
-                              and last_alert_utc + numtodsinterval(:4, ''SECOND'') <= :5'
-            USING p_nowUtc, p_throttleSec, p_lockKey, p_throttleSec, p_nowUtc;
+        EXECUTE IMMEDIATE 'update ' || C_LILAM_ALERT_STATE_TABLE || '
+                              set ts_utc = :1, hold_seconds = :2
+                            where group_name = :3 and state_kind = :4 and state_key = :5
+                              and ts_utc + numtodsinterval(:6, ''SECOND'') <= :7'
+            USING p_nowUtc, p_throttleSec, p_group, C_STATE_LOCK, p_lockKey, p_throttleSec, p_nowUtc;
         IF SQL%ROWCOUNT = 0 THEN
             BEGIN
-                EXECUTE IMMEDIATE 'insert into ' || C_LILAM_ALERT_LOCKS_TABLE || '
-                                   (lock_key, last_alert_utc, throttle_seconds) values (:1, :2, :3)'
-                    USING p_lockKey, p_nowUtc, p_throttleSec;
+                EXECUTE IMMEDIATE 'insert into ' || C_LILAM_ALERT_STATE_TABLE || '
+                                   (group_name, state_kind, state_key, ts_utc, hold_seconds) values (:1, :2, :3, :4, :5)'
+                    USING p_group, C_STATE_LOCK, p_lockKey, p_nowUtc, p_throttleSec;
             EXCEPTION
                 WHEN DUP_VAL_ON_INDEX THEN
                     BEGIN
-                        EXECUTE IMMEDIATE 'select last_alert_utc from ' || C_LILAM_ALERT_LOCKS_TABLE || '
-                                            where lock_key = :1'
-                            INTO p_lastAlert USING p_lockKey;
+                        EXECUTE IMMEDIATE 'select ts_utc from ' || C_LILAM_ALERT_STATE_TABLE || '
+                                            where group_name = :1 and state_kind = :2 and state_key = :3'
+                            INTO p_lastAlert USING p_group, C_STATE_LOCK, p_lockKey;
                     EXCEPTION
                         WHEN NO_DATA_FOUND THEN p_lastAlert := NULL;
                     END;
@@ -1522,15 +1572,74 @@ AS
     -- TRUE if the alert was written. With p_lockKey the alert lock is taken first
     -- (acquireAlertLock); p_lastAlert then returns the time of the last alert for the key.
     ------------------------------------------------------------
-    FUNCTION persist_alert(p_rule t_rule_rec, p_rec t_monitor_buffer_rec,
-                           p_lockKey VARCHAR2, p_throttleSec NUMBER, p_nowUtc TIMESTAMP,
-                           p_lastAlert OUT TIMESTAMP) RETURN BOOLEAN IS
+    FUNCTION writeAlert(p_rule t_rule_rec, p_alert t_alert_out,
+                        p_lockGroup VARCHAR2, p_lockKey VARCHAR2, p_throttleSec NUMBER, p_nowUtc TIMESTAMP,
+                        p_lastAlert OUT TIMESTAMP) RETURN BOOLEAN IS
         pragma autonomous_transaction;
-        v_idx_session   PLS_INTEGER;
-        v_channel_name  VARCHAR2(30); -- max. length of Alert-Name
         v_payload       VARCHAR2(1000);
-        v_sqlStmt       VARCHAR2(2000);
         v_alert_id      NUMBER;
+    BEGIN
+        p_lastAlert := p_nowUtc;
+
+        -- Lock and alert are committed together
+        IF p_lockKey IS NOT NULL AND NOT acquireAlertLock(p_lockGroup, p_lockKey, p_throttleSec, p_nowUtc, p_lastAlert) THEN
+            ROLLBACK;
+            RETURN FALSE;
+        END IF;
+
+        EXECUTE IMMEDIATE '
+        INSERT INTO ' || C_LILAM_ALERTS_TABLE || '(
+            process_id, process_name, action_name, master_table_name, monitor_table_name, logging_table_name, context_name, action_count,
+            rule_set_name, rule_id, rule_set_version, alert_severity, handler_type, group_name
+        ) VALUES (
+            :1, :2, :3, :4, :5, :6, :7, :8, :9, :10, :11, :12, :13, :14
+        ) RETURNING alert_id into :15'
+        USING p_alert.process_id, p_alert.process_name, p_alert.action_name,
+              p_alert.tab_master, p_alert.tab_monitor, p_alert.tab_logging,
+              p_alert.context_name, p_alert.action_count, p_alert.set_name, p_rule.rule_id, p_alert.set_version,
+              p_rule.alert_severity, p_rule.alert_handler, p_alert.group_name
+        RETURNING INTO v_alert_id;
+
+        v_payload := JSON_OBJECT(
+            'alert_id'         VALUE v_alert_id,
+            'process_id'       VALUE p_alert.process_id,
+            'tab_name_process' VALUE p_alert.tab_master,
+            'tab_name_monitor' VALUE p_alert.tab_monitor,
+            'tab_name_logging' VALUE p_alert.tab_logging,
+            'action_name'      VALUE p_alert.action_name,
+            'context_name'     VALUE p_alert.context_name,
+            'action_count'     VALUE p_alert.action_count,
+            'group_name'       VALUE p_alert.group_name,
+            'rule_set_name'    VALUE p_alert.set_name,
+            'rule_id'          VALUE p_rule.rule_id,
+            'rule_set_version' VALUE p_alert.set_version,
+            'alert_severity'   VALUE p_rule.alert_severity,
+            'timestamp'        VALUE TO_CHAR(SYSTIMESTAMP, 'YYYY-MM-DD"T"HH24:MI:SS.FF6')
+        );
+
+        -- p_rule.alert_handler would be e.g. 'MAIL', 'REST', 'PROCESS' here
+        dbms_alert.signal(p_rule.alert_handler, v_payload);
+        COMMIT; -- !!!
+        RETURN TRUE;
+
+    exception
+        when others then
+        -- STABILITY: end the autonomous transaction, otherwise ORA-06519 on exit
+        logLilamErr(sqlCode, sqlErrM, 'writeAlert', 'rule ' || p_rule.rule_id);
+        rollback;
+        p_lastAlert := NULL;
+        RETURN FALSE;
+    END;
+
+    ------------------------------------------------------------
+    -- Alert of a signal of a process (see writeAlert)
+    ------------------------------------------------------------
+    FUNCTION persist_alert(p_rule t_rule_rec, p_rec t_monitor_buffer_rec,
+                           p_lockGroup VARCHAR2, p_lockKey VARCHAR2, p_throttleSec NUMBER, p_nowUtc TIMESTAMP,
+                           p_lastAlert OUT TIMESTAMP) RETURN BOOLEAN IS
+        v_idx_session   PLS_INTEGER;
+        v_found         NUMBER;
+        v_alert         t_alert_out;
         v_group         t_rule_group_rec;
     BEGIN
         p_lastAlert   := p_nowUtc;
@@ -1544,64 +1653,30 @@ AS
                                where process_id = :1 and rule_id = :2 and action_name = :3
                                  and (context_name = :4 or (context_name is null and :5 is null))
                                  and action_count = :6 and rownum = 1'
-                INTO v_alert_id
+                INTO v_found
                 USING p_rec.process_id, p_rule.rule_id, p_rec.action_name, p_rec.context_name, p_rec.context_name, p_rec.action_count;
-            IF v_alert_id > 0 THEN
-                ROLLBACK;
+            IF v_found > 0 THEN
                 RETURN TRUE;
             END IF;
         END IF;
 
-        -- Lock and alert are committed together
-        IF p_lockKey IS NOT NULL AND NOT acquireAlertLock(p_lockKey, p_throttleSec, p_nowUtc, p_lastAlert) THEN
-            ROLLBACK;
-            RETURN FALSE;
-        END IF;
+        v_alert.process_id   := p_rec.process_id;
+        v_alert.process_name := g_process_cache(p_rec.process_id).processName;
+        v_alert.action_name  := p_rec.action_name;
+        v_alert.context_name := p_rec.context_name;
+        v_alert.action_count := p_rec.action_count;
+        v_alert.tab_master   := g_sessionList(v_idx_session).tabName_master || C_SUFFIX_PROC_TABLE;
+        v_alert.tab_monitor  := g_sessionList(v_idx_session).tabName_master || C_SUFFIX_MON_TABLE;
+        v_alert.tab_logging  := g_sessionList(v_idx_session).tabName_master || C_SUFFIX_LOG_TABLE;
+        v_alert.group_name   := g_sessionList(v_idx_session).group_name;
+        v_alert.set_name     := v_group.set_name;
+        v_alert.set_version  := v_group.set_version;
 
-        v_sqlStmt := '
-        INSERT INTO ' || C_LILAM_ALERTS_TABLE || '(
-            process_id, process_name, action_name, master_table_name, monitor_table_name, logging_table_name, context_name, action_count, 
-            rule_set_name, rule_id, rule_set_version, alert_severity, handler_type, group_name
-        ) VALUES (
-            :1, :2, :3, :4, :5, :6, :7, :8, :9, :10, :11, :12, :13, :14
-        ) RETURNING alert_id into :15';
-
-        EXECUTE IMMEDIATE v_sqlStmt
-        USING p_rec.process_id, g_process_cache(p_rec.process_id).processName, p_rec.action_Name, 
-        g_sessionList(v_idx_session).tabName_master || C_SUFFIX_PROC_TABLE, g_sessionList(v_idx_session).tabName_master || C_SUFFIX_MON_TABLE,
-        g_sessionList(v_idx_session).tabName_master || C_SUFFIX_LOG_TABLE, 
-        p_rec.context_name, p_rec.action_count, v_group.set_name, p_rule.rule_id, v_group.set_version,
-        p_rule.alert_severity, p_rule.alert_handler, g_sessionList(v_idx_session).group_name
-        RETURNING INTO v_alert_id;
-
-        v_payload := JSON_OBJECT(
-            'alert_id'         VALUE v_alert_id,
-            'process_id'       VALUE p_rec.process_id,
-            'tab_name_process' VALUE g_sessionList(v_idx_session).tabName_master || C_SUFFIX_PROC_TABLE,
-            'tab_name_monitor' VALUE g_sessionList(v_idx_session).tabName_master || C_SUFFIX_MON_TABLE,
-            'tab_name_logging' VALUE g_sessionList(v_idx_session).tabName_master || C_SUFFIX_LOG_TABLE,
-            'action_name'      VALUE p_rec.action_name,
-            'context_name'     VALUE p_rec.context_name,
-            'action_count'     VALUE p_rec.action_count,
-            'group_name'       VALUE g_sessionList(v_idx_session).group_name,
-            'rule_set_name'    VALUE v_group.set_name,
-            'rule_id'          VALUE p_rule.rule_id,
-            'rule_set_version' VALUE v_group.set_version,
-            'alert_severity'   VALUE p_rule.alert_severity,
-            'timestamp'        VALUE TO_CHAR(SYSTIMESTAMP, 'YYYY-MM-DD"T"HH24:MI:SS.FF6')
-        );
-
-        -- p_rule.alert_handler would be e.g. 'MAIL', 'REST', 'PROCESS' here
-        v_channel_name := p_rule.alert_handler;
-        dbms_alert.signal(v_channel_name, v_payload);
-        COMMIT; -- !!!
-        RETURN TRUE;
+        RETURN writeAlert(p_rule, v_alert, p_lockGroup, p_lockKey, p_throttleSec, p_nowUtc, p_lastAlert);
 
     exception
         when others then
-        -- STABILITY: end the autonomous transaction, otherwise ORA-06519 on exit
         logLilamErr(sqlCode, sqlErrM, 'fire_alert', 'rule ' || p_rule.rule_id);
-        rollback;
         p_lastAlert := NULL;
         RETURN FALSE;
     END;
@@ -1620,9 +1695,10 @@ AS
         END IF;
         g_lastLockPurgeCs := dbms_utility.get_time;
 
-        EXECUTE IMMEDIATE 'delete from ' || C_LILAM_ALERT_LOCKS_TABLE || '
-                            where last_alert_utc + numtodsinterval(throttle_seconds, ''SECOND'') < :1'
-            USING sys_extract_utc(SYSTIMESTAMP);
+        EXECUTE IMMEDIATE 'delete from ' || C_LILAM_ALERT_STATE_TABLE || '
+                            where state_kind = :1
+                              and ts_utc + numtodsinterval(hold_seconds, ''SECOND'') < :2'
+            USING C_STATE_LOCK, sys_extract_utc(SYSTIMESTAMP);
         COMMIT;
     exception
         when others then
@@ -1636,54 +1712,57 @@ AS
     ------------------------------------------------------------
     -- Alert taking throttling into account (throttle_seconds).
     -- Lock per GROUP | scope (S<scope_id>) or process (P<process_id>) | RULE | ACTION | CONTEXT,
-    -- stored in LILAM_ALERT_LOCKS so that it holds across sessions, workers and restarts.
+    -- stored in LILAM_ALERT_STATE so that it holds across sessions, workers and restarts.
     -- PERFORMANCE: the session memory filters first; the table is only read when a rule hits
     -- and the memory knows no running lock. Times in UTC (independent of the session time zone).
     ------------------------------------------------------------
     PROCEDURE fire_alert(p_rule t_rule_rec, p_rec t_monitor_buffer_rec) IS
         v_throttle_sec  NUMBER := coalesce(p_rule.throttle_seconds, 0);
         v_scope_id      NUMBER;
+        v_group         VARCHAR2(50);
         v_lock_key      VARCHAR2(1000);
+        v_mem_key       VARCHAR2(1000);
         v_now_utc       TIMESTAMP := sys_extract_utc(SYSTIMESTAMP);
         v_last_alert    TIMESTAMP;
         v_empty         t_alert_history;
     BEGIN
         IF v_throttle_sec <= 0 THEN
             -- without throttling no lock is needed
-            IF persist_alert(p_rule, p_rec, NULL, NULL, v_now_utc, v_last_alert) THEN NULL; END IF;
+            IF persist_alert(p_rule, p_rec, NULL, NULL, NULL, v_now_utc, v_last_alert) THEN NULL; END IF;
             RETURN;
         END IF;
 
         -- Group first: rule IDs are only unique per rule set (see also installGroupRules)
         v_scope_id := getScopeId(p_rec.process_id);
-        v_lock_key := g_sessionList(v_indexSession(p_rec.process_id)).rule_group
-                      || CASE WHEN v_scope_id IS NOT NULL THEN '|S' || v_scope_id ELSE '|P' || p_rec.process_id END
+        v_group    := g_sessionList(v_indexSession(p_rec.process_id)).rule_group;
+        v_lock_key := CASE WHEN v_scope_id IS NOT NULL THEN 'S' || v_scope_id ELSE 'P' || p_rec.process_id END
                       || '|' || p_rule.rule_id || '|' || p_rec.action_name || '|' || p_rec.context_name;
+        v_mem_key  := v_group || '|' || v_lock_key;
 
         -- Prefilter: lock period known to this session has not yet expired -> do nothing
         IF v_scope_id IS NOT NULL THEN
-            IF g_alert_history.EXISTS(v_lock_key) THEN
-                v_last_alert := g_alert_history(v_lock_key);
+            IF g_alert_history.EXISTS(v_mem_key) THEN
+                v_last_alert := g_alert_history(v_mem_key);
             END IF;
         ELSIF g_alert_history_proc.EXISTS(p_rec.process_id)
-              AND g_alert_history_proc(p_rec.process_id).EXISTS(v_lock_key) THEN
-            v_last_alert := g_alert_history_proc(p_rec.process_id)(v_lock_key);
+              AND g_alert_history_proc(p_rec.process_id).EXISTS(v_mem_key) THEN
+            v_last_alert := g_alert_history_proc(p_rec.process_id)(v_mem_key);
         END IF;
         IF v_last_alert + numtodsinterval(v_throttle_sec, 'SECOND') > v_now_utc THEN
             RETURN;
         END IF;
 
         -- Table decides; afterwards remember the last alert for the key (own or foreign)
-        IF persist_alert(p_rule, p_rec, v_lock_key, v_throttle_sec, v_now_utc, v_last_alert) THEN NULL; END IF;
+        IF persist_alert(p_rule, p_rec, v_group, v_lock_key, v_throttle_sec, v_now_utc, v_last_alert) THEN NULL; END IF;
         IF v_last_alert IS NOT NULL THEN
             IF v_scope_id IS NOT NULL THEN
-                g_alert_history(v_lock_key) := v_last_alert;
+                g_alert_history(v_mem_key) := v_last_alert;
             ELSE
                 -- STABILITY: see g_alert_history_proc
                 IF NOT g_alert_history_proc.EXISTS(p_rec.process_id) THEN
                     g_alert_history_proc(p_rec.process_id) := v_empty;
                 END IF;
-                g_alert_history_proc(p_rec.process_id)(v_lock_key) := v_last_alert;
+                g_alert_history_proc(p_rec.process_id)(v_mem_key) := v_last_alert;
             END IF;
         END IF;
 
@@ -1693,6 +1772,149 @@ AS
     exception
         when others then
         logLilamErr(sqlCode, sqlErrM, 'fire_alert', 'rule ' || p_rule.rule_id);
+    END;
+
+    ------------------------------------------------------------
+    -- Silence rules (TIME_MAX_SILENCE_SECONDS): "last seen" of their targets.
+    -- The time is buffered in the PGA (GET_TIME) and written by flushSeen.
+    ------------------------------------------------------------
+    PROCEDURE markSeen(p_group VARCHAR2, p_kind VARCHAR2, p_key VARCHAR2, p_remove BOOLEAN := FALSE) IS
+        l_key VARCHAR2(320) := p_group || '|' || p_kind || '|' || p_key;
+    BEGIN
+        g_seen(l_key).group_name := p_group;
+        g_seen(l_key).state_kind := p_kind;
+        g_seen(l_key).state_key  := p_key;
+        g_seen(l_key).seen_cs    := dbms_utility.get_time;
+        g_seen(l_key).remove     := p_remove;
+    exception
+        when others then
+        logLilamErr(sqlCode, sqlErrM, 'markSeen', p_kind || '|' || p_key);
+    END;
+
+    ------------------------------------------------------------
+    -- Sign of life of a running process for a silence rule with PROCESS_UPDATE (any signal counts).
+    -- p_ended: process ended, its entry is deleted.
+    -- PERFORMANCE: per signal only an integer comparison unless the rules have changed.
+    ------------------------------------------------------------
+    PROCEDURE touchRun(p_processId NUMBER, p_ended BOOLEAN := FALSE) IS
+        l_idx   PLS_INTEGER;
+        l_group VARCHAR2(50);
+        l_name  VARCHAR2(100);
+    BEGIN
+        IF NOT v_indexSession.EXISTS(p_processId) THEN
+            RETURN;
+        END IF;
+        l_idx := v_indexSession(p_processId);
+        IF g_sessionList(l_idx).silence_gen != g_rules_gen THEN
+            g_sessionList(l_idx).silence_gen     := g_rules_gen;
+            g_sessionList(l_idx).silence_run_key := NULL;
+            l_group := g_sessionList(l_idx).rule_group;
+            IF l_group IS NOT NULL AND g_process_cache.EXISTS(p_processId) THEN
+                l_name := g_process_cache(p_processId).processName;
+                IF g_silence_run.EXISTS(l_group || '|' || l_name) THEN
+                    g_sessionList(l_idx).silence_run_key := l_name || '|' || p_processId;
+                END IF;
+            END IF;
+        END IF;
+        IF g_sessionList(l_idx).silence_run_key IS NOT NULL THEN
+            markSeen(g_sessionList(l_idx).rule_group, C_STATE_RUN, g_sessionList(l_idx).silence_run_key, p_ended);
+        END IF;
+    exception
+        when others then
+        logLilamErr(sqlCode, sqlErrM, 'touchRun', 'process ' || p_processId);
+    END;
+
+    ------------------------------------------------------------
+    -- Writes the buffered "last seen" times to LILAM_ALERT_STATE (later time wins),
+    -- without p_force at most every C_SEEN_FLUSH_MS.
+    -- STABILITY: rows in key order (as syncBaselines); on errors the buffer is dropped (no growth),
+    -- the next signal sets the time again.
+    ------------------------------------------------------------
+    PROCEDURE flushSeen(p_force BOOLEAN := FALSE) IS
+        pragma autonomous_transaction;
+        l_nowCs  CONSTANT NUMBER    := dbms_utility.get_time;
+        l_nowUtc CONSTANT TIMESTAMP := sys_extract_utc(SYSTIMESTAMP);
+        l_key    VARCHAR2(320);
+        l_ts     TIMESTAMP;
+    BEGIN
+        IF g_seen.COUNT = 0 THEN
+            RETURN;
+        END IF;
+        -- ABS: on overflow of GET_TIME there is at most one additional run
+        IF NOT p_force AND g_lastSeenFlushCs IS NOT NULL
+           AND abs(l_nowCs - g_lastSeenFlushCs) * 10 < C_SEEN_FLUSH_MS THEN
+            RETURN;
+        END IF;
+        g_lastSeenFlushCs := l_nowCs;
+
+        l_key := g_seen.FIRST;
+        WHILE l_key IS NOT NULL LOOP
+            IF g_seen(l_key).remove THEN
+                EXECUTE IMMEDIATE 'delete from ' || C_LILAM_ALERT_STATE_TABLE || '
+                                    where group_name = :1 and state_kind = :2 and state_key = :3'
+                    USING g_seen(l_key).group_name, g_seen(l_key).state_kind, g_seen(l_key).state_key;
+            ELSE
+                -- time of the signal; on overflow of GET_TIME (negative difference) the current time
+                l_ts := l_nowUtc - numtodsinterval(greatest(l_nowCs - g_seen(l_key).seen_cs, 0) / 100, 'SECOND');
+                EXECUTE IMMEDIATE 'update ' || C_LILAM_ALERT_STATE_TABLE || '
+                                      set ts_utc = greatest(ts_utc, :1)
+                                    where group_name = :2 and state_kind = :3 and state_key = :4'
+                    USING l_ts, g_seen(l_key).group_name, g_seen(l_key).state_kind, g_seen(l_key).state_key;
+                IF SQL%ROWCOUNT = 0 THEN
+                    BEGIN
+                        EXECUTE IMMEDIATE 'insert into ' || C_LILAM_ALERT_STATE_TABLE || '
+                                           (group_name, state_kind, state_key, ts_utc) values (:1, :2, :3, :4)'
+                            USING g_seen(l_key).group_name, g_seen(l_key).state_kind, g_seen(l_key).state_key, l_ts;
+                    EXCEPTION
+                        WHEN DUP_VAL_ON_INDEX THEN
+                            -- created by another session in the meantime
+                            EXECUTE IMMEDIATE 'update ' || C_LILAM_ALERT_STATE_TABLE || '
+                                                  set ts_utc = greatest(ts_utc, :1)
+                                                where group_name = :2 and state_kind = :3 and state_key = :4'
+                                USING l_ts, g_seen(l_key).group_name, g_seen(l_key).state_kind, g_seen(l_key).state_key;
+                    END;
+                END IF;
+            END IF;
+            l_key := g_seen.NEXT(l_key);
+        END LOOP;
+        COMMIT;
+        g_seen.DELETE;
+    exception
+        when others then
+        rollback;
+        g_seen.DELETE;
+        logLilamErr(sqlCode, sqlErrM, 'flushSeen');
+    END;
+
+    ------------------------------------------------------------
+    -- Alert of a silence rule. p_processId: running process (PROCESS_UPDATE), otherwise NULL (no process).
+    -- Lock group-wide (G|...) or per process (P<process_id>|...); without throttle_seconds
+    -- the silence time is the lock period, otherwise every check would raise an alert.
+    ------------------------------------------------------------
+    PROCEDURE fireSilence(p_group VARCHAR2, p_rule t_rule_rec, p_processId NUMBER, p_nowUtc TIMESTAMP) IS
+        v_alert      t_alert_out;
+        v_lock_key   VARCHAR2(1000);
+        v_last_alert TIMESTAMP;
+    BEGIN
+        v_alert.process_id   := p_processId;
+        v_alert.process_name := CASE WHEN p_rule.trigger_type IN (C_PROCESS_START, C_PROCESS_UPDATE) THEN p_rule.target_action END;
+        v_alert.action_name  := p_rule.target_action;
+        v_alert.context_name := p_rule.target_context;
+        v_alert.action_count := 0;
+        v_alert.group_name   := p_group;
+        v_alert.set_name     := g_rule_groups(p_group).set_name;
+        v_alert.set_version  := g_rule_groups(p_group).set_version;
+
+        v_lock_key := CASE WHEN p_processId IS NOT NULL THEN 'P' || p_processId ELSE 'G' END
+                      || '|' || p_rule.rule_id || '|' || p_rule.target_action || '|' || p_rule.target_context;
+        IF writeAlert(p_rule, v_alert, p_group, v_lock_key,
+                      CASE WHEN coalesce(p_rule.throttle_seconds, 0) > 0 THEN p_rule.throttle_seconds ELSE p_rule.cond_num END,
+                      p_nowUtc, v_last_alert) THEN
+            NULL;
+        END IF;
+    exception
+        when others then
+        logLilamErr(sqlCode, sqlErrM, 'fireSilence', 'rule ' || p_rule.rule_id);
     END;
     
     ------------------------------------------------------------
@@ -1835,6 +2057,18 @@ AS
                         WHEN 'INFO_CONTAINS' THEN
                             fire := instr(upper(p_ctx.info), p_list(i).cond_upper) > 0;
 
+                        -- =====================================================
+                        -- SILENCE: never fires on a signal; the signal only renews "last seen"
+                        -- (checkSilence). PROCESS_UPDATE (running process): see touchRun.
+                        -- =====================================================
+                        WHEN 'TIME_MAX_SILENCE_SECONDS' THEN
+                            IF p_trigger = C_PROCESS_START THEN
+                                markSeen(l_group, C_STATE_START, p_list(i).target_action);
+                            ELSIF p_trigger IN (C_MARK_EVENT, C_TRACE_START) THEN
+                                markSeen(l_group, CASE p_trigger WHEN C_MARK_EVENT THEN C_STATE_EVENT ELSE C_STATE_TRACE END,
+                                         p_list(i).target_action || '|' || p_list(i).target_context);
+                            END IF;
+
                         ELSE
                             NULL; -- loading rejects unknown operators
                     END CASE;
@@ -1949,6 +2183,10 @@ AS
         l_ctx      := mapMonitorRecToContextRec(p_monitorRec);
         l_ctx.info := substr(p_info, 1, 4000);
         evaluateRules_internal(l_ctx, p_trigger, p_check_context => TRUE);
+        -- sign of life for silence rules (logs: see log_any)
+        IF p_trigger != C_LOGGING THEN
+            touchRun(p_monitorRec.process_id);
+        END IF;
         -- Remember the predecessor for PRECEDED_BY: only events and traces, no logs
         IF p_trigger != C_LOGGING THEN
             g_last_action_per_process(p_monitorRec.process_id).action_name  := p_monitorRec.action_name;
@@ -1975,6 +2213,8 @@ AS
         l_ctx := mapProcessRecToContextRec(p_processRec);
         l_ctx.last_update := coalesce(p_signalTime, l_ctx.last_update);
         evaluateRules_internal(l_ctx, p_trigger, p_check_context => FALSE);
+        -- after the rules: INSESSION loads them on the first signal of the process
+        touchRun(p_processRec.id, p_ended => p_trigger = C_PROCESS_STOP);
     END evaluateRules;
 
     --------------------------------------------------------------------------
@@ -3648,7 +3888,7 @@ AS
             sqlStmt := '
             CREATE TABLE ' || C_LILAM_ALERTS_TABLE || ' (
                 alert_id           NUMBER GENERATED BY DEFAULT AS IDENTITY,
-                process_id         NUMBER(19,0) NOT NULL,
+                process_id         NUMBER(19,0),
                 process_name       VARCHAR2(100),
                 master_table_name  VARCHAR2(50), 
                 monitor_table_name VARCHAR2(50), 
@@ -3676,6 +3916,12 @@ AS
              where table_name = upper(C_LILAM_ALERTS_TABLE) and column_name = 'PROCESS_NAME' and char_length < 100;
             if l_regCols > 0 then
                 run_sql('ALTER TABLE ' || C_LILAM_ALERTS_TABLE || ' MODIFY (process_name VARCHAR2(100))');
+            end if;
+            -- Existing table: alerts of silence rules may have no process
+            select count(*) into l_regCols from user_tab_columns
+             where table_name = upper(C_LILAM_ALERTS_TABLE) and column_name = 'PROCESS_ID' and nullable = 'N';
+            if l_regCols > 0 then
+                run_ddl('ALTER TABLE ' || C_LILAM_ALERTS_TABLE || ' MODIFY (process_id NULL)', -1451);   -- already nullable (other session)
             end if;
         end if;
 
@@ -3716,14 +3962,17 @@ AS
             end if;
         end if;
 
-        -- Alert locks (throttle_seconds): last alert per lock key, see fire_alert
-        if not objectExists(C_LILAM_ALERT_LOCKS_TABLE, 'TABLE') then
+        -- Alert state: locks of the throttling (kind LOCK, see fire_alert/fireSilence) and
+        -- "last seen" of the targets of silence rules (kinds START, EVENT, TRACE, RUN, see checkSilence)
+        if not objectExists(C_LILAM_ALERT_STATE_TABLE, 'TABLE') then
             sqlStmt := '
-            CREATE TABLE ' || C_LILAM_ALERT_LOCKS_TABLE || ' (
-                lock_key          VARCHAR2(1000) NOT NULL,
-                last_alert_utc    TIMESTAMP(6)   NOT NULL,
-                throttle_seconds  NUMBER         NOT NULL,
-                CONSTRAINT pk_lilam_alert_locks PRIMARY KEY (lock_key)
+            CREATE TABLE ' || C_LILAM_ALERT_STATE_TABLE || ' (
+                group_name    VARCHAR2(50)   NOT NULL,
+                state_kind    VARCHAR2(10)   NOT NULL,
+                state_key     VARCHAR2(1000) NOT NULL,
+                ts_utc        TIMESTAMP(6)   NOT NULL,
+                hold_seconds  NUMBER,
+                CONSTRAINT pk_lilam_alert_state PRIMARY KEY (group_name, state_kind, state_key)
             ) ORGANIZATION INDEX';
             run_ddl(sqlStmt, -955);   -- created by another session at the same time
         end if;
@@ -4658,6 +4907,8 @@ AS
         -- ======================================================================
         if p_withBaselines then
             syncBaselines(p_force OR p_isShutdown);
+            -- "last seen" of silence rules (own interval C_SEEN_FLUSH_MS)
+            flushSeen(p_force OR p_isShutdown);
         end if;
 
     EXCEPTION
@@ -6444,6 +6695,8 @@ AS
 
         if v_indexSession.EXISTS(p_processId) then
             l_syncLevel := g_sessionList(v_indexSession(p_processId)).sync_level;
+            -- sign of life for silence rules, also below the log level
+            touchRun(p_processId);
         end if;
 
         -- Continue here only if not remote
@@ -7054,6 +7307,8 @@ AS
             if p_processStatus is not null then g_process_cache(p_processId).status    := p_processStatus; end if;
 
             evaluateRules(g_process_cache(p_processId), C_PROCESS_STOP);
+            -- "last seen" incl. removal of the running process: the session may end now
+            flushSeen(p_force => TRUE);
 
             v_idx := v_indexSession(p_processId);
             persist_close_process(p_processId,  g_sessionList(v_idx).tabName_master, p_procStepsToDo, p_procStepsDone, p_processInfo, p_processStatus);
@@ -8938,6 +9193,9 @@ AS
                      l_trig IN (C_MARK_EVENT, C_TRACE_START, C_PROCESS_UPDATE, C_PROCESS_STOP)
                 WHEN l_op = 'TIME_RUNTIME_EXCEEDED' THEN l_trig = C_PROCESS_UPDATE
                 WHEN l_op = 'TIME_MAX_RUNTIME_EXCEEDED' THEN l_trig = C_PROCESS_STOP
+                -- PROCESS_START: no start; MARK_EVENT/TRACE_START: series; PROCESS_UPDATE: running process
+                WHEN l_op = 'TIME_MAX_SILENCE_SECONDS' THEN
+                     l_trig IN (C_PROCESS_START, C_PROCESS_UPDATE, C_MARK_EVENT, C_TRACE_START)
                 WHEN l_op IN ('STEPS_LEFT_HIGH', 'SUCCESS_RATE_LOW', 'STATUS_EQUALS', 'INFO_CONTAINS') THEN
                      l_trig IN (C_PROCESS_START, C_PROCESS_UPDATE, C_PROCESS_STOP)
                 ELSE NULL
@@ -9018,6 +9276,15 @@ AS
                            (regexp_substr(r.value, '[^|]+', 1, 2) IS NOT NULL AND ruleNumber(r.value, 2) IS NULL)
                         OR (regexp_substr(r.value, '[^|]+', 1, 3) IS NOT NULL AND ruleNumber(r.value, 3) IS NULL)) THEN
                         RETURN fail(l_op || ' needs PCT[|WARMUP[|ALPHA]]');
+                    END IF;
+                    IF l_op = 'TIME_MAX_SILENCE_SECONDS' THEN
+                        IF l_rule.cond_num <= 0 THEN
+                            RETURN fail('TIME_MAX_SILENCE_SECONDS needs a number of seconds > 0');
+                        END IF;
+                        -- process triggers have no context (the rule would never see a signal)
+                        IF l_trig IN (C_PROCESS_START, C_PROCESS_UPDATE) AND l_rule.target_context IS NOT NULL THEN
+                            RETURN fail('TIME_MAX_SILENCE_SECONDS with ' || l_trig || ' takes no "context"');
+                        END IF;
                     END IF;
             END CASE;
 
@@ -9113,6 +9380,41 @@ AS
             END LOOP;
             l_pid := g_alert_history_proc.NEXT(l_pid);
         END LOOP;
+
+        -- Silence rules
+        g_silence_rules.DELETE(p_group);
+        l_key := g_silence_run.FIRST;
+        WHILE l_key IS NOT NULL LOOP
+            l_next := g_silence_run.NEXT(l_key);
+            IF substr(l_key, 1, l_len) = l_prefix THEN g_silence_run.DELETE(l_key); END IF;
+            l_key := l_next;
+        END LOOP;
+        g_rules_gen := g_rules_gen + 1;
+    end;
+
+    --------------------------------------------------------------------------
+    -- Collect the silence rules (TIME_MAX_SILENCE_SECONDS) of a rule map for checkSilence/touchRun
+    --------------------------------------------------------------------------
+    procedure collectSilenceRules(p_group varchar2, p_map t_rule_map)
+    as
+        l_key VARCHAR2(300);
+    begin
+        l_key := p_map.FIRST;
+        WHILE l_key IS NOT NULL LOOP
+            FOR i IN 1 .. p_map(l_key).COUNT LOOP
+                IF p_map(l_key)(i).condition_operator = 'TIME_MAX_SILENCE_SECONDS' THEN
+                    IF NOT g_silence_rules.EXISTS(p_group) THEN
+                        g_silence_rules(p_group) := t_rule_list();
+                    END IF;
+                    g_silence_rules(p_group).EXTEND;
+                    g_silence_rules(p_group)(g_silence_rules(p_group).LAST) := p_map(l_key)(i);
+                    IF p_map(l_key)(i).trigger_type = C_PROCESS_UPDATE THEN
+                        g_silence_run(p_group || '|' || p_map(l_key)(i).target_action) := TRUE;
+                    END IF;
+                END IF;
+            END LOOP;
+            l_key := p_map.NEXT(l_key);
+        END LOOP;
     end;
 
     --------------------------------------------------------------------------
@@ -9148,6 +9450,9 @@ AS
             g_val_params(p_group || '|' || l_key) := p_val(l_key);
             l_key := p_val.NEXT(l_key);
         END LOOP;
+
+        collectSilenceRules(p_group, p_byCtx);
+        collectSilenceRules(p_group, p_byAction);
 
         -- Name/version as in LILAM_RULES (SET_NAME/VERSION); the consumer finds the rule through it
         g_rule_groups(p_group).set_name    := p_ruleSetName;
@@ -9193,6 +9498,7 @@ AS
                 INTO l_ruleSet, l_name, l_version USING p_group;
         EXCEPTION
             WHEN NO_DATA_FOUND THEN
+                g_rule_groups(p_group).rules_read := TRUE;
                 -- no active rule set for the group: no rules
                 IF p_force OR g_rule_groups(p_group).set_name IS NOT NULL THEN
                     removeGroupRules(p_group);
@@ -9203,6 +9509,7 @@ AS
                 g_rule_groups(p_group).seen_version := NULL;
                 RETURN;
         END;
+        g_rule_groups(p_group).rules_read := TRUE;
 
         -- unchanged (also an already rejected rule set): nothing to do
         IF NOT p_force
@@ -9269,6 +9576,128 @@ AS
            or abs(dbms_utility.get_time - g_rule_groups(l_group).last_check_cs) >= C_RULES_CHECK_INTERVAL_MS / 10 then
             refreshGroupRules(l_group, p_force => FALSE);
         end if;
+    end;
+
+    --------------------------------------------------------------------------
+    -- Check of the silence rules (TIME_MAX_SILENCE_SECONDS) of a group: alert for every target
+    -- whose last signal is older than the silence time. A target without entry counts from the
+    -- first check after the rule was activated (entry with the current time).
+    -- Entries no rule refers to any more are removed. Several checkers (servers, CHECK_SILENCE)
+    -- raise only one alert (lock in LILAM_ALERT_STATE). Errors never reach the caller.
+    --------------------------------------------------------------------------
+    procedure checkSilence(p_group varchar2)
+    as
+        pragma autonomous_transaction;
+        TYPE t_ts_list  IS TABLE OF TIMESTAMP;
+        TYPE t_idx_map  IS TABLE OF PLS_INTEGER INDEX BY VARCHAR2(320);
+        TYPE t_used_map IS TABLE OF BOOLEAN INDEX BY PLS_INTEGER;
+        l_group   VARCHAR2(50) := upper(trim(p_group));
+        l_nowUtc  TIMESTAMP;
+        l_limit   TIMESTAMP;
+        l_kinds   sys.odcivarchar2list;
+        l_keys    sys.odcivarchar2list;
+        l_ts      t_ts_list;
+        l_rows    t_idx_map;    -- KIND|KEY -> row (0 = created in this check)
+        l_used    t_used_map;   -- rows a rule refers to
+        l_rule    t_rule_rec;
+        l_kind    VARCHAR2(10);
+        l_key     VARCHAR2(250);
+        l_prefix  VARCHAR2(110);
+        l_j       PLS_INTEGER;
+    begin
+        IF l_group IS NULL THEN
+            RETURN;
+        END IF;
+        refreshGroupRules(l_group, p_force => FALSE);
+        flushSeen(p_force => TRUE);   -- own signals first
+        l_nowUtc := sys_extract_utc(SYSTIMESTAMP);
+
+        EXECUTE IMMEDIATE 'select state_kind, state_key, ts_utc from ' || C_LILAM_ALERT_STATE_TABLE || '
+                            where group_name = :1 and state_kind != :2'
+            BULK COLLECT INTO l_kinds, l_keys, l_ts USING l_group, C_STATE_LOCK;
+        FOR j IN 1 .. l_keys.COUNT LOOP
+            l_rows(l_kinds(j) || '|' || l_keys(j)) := j;
+        END LOOP;
+
+        IF g_silence_rules.EXISTS(l_group) THEN
+            FOR i IN 1 .. g_silence_rules(l_group).COUNT LOOP
+                l_rule  := g_silence_rules(l_group)(i);
+                l_limit := l_nowUtc - numtodsinterval(l_rule.cond_num, 'SECOND');
+
+                IF l_rule.trigger_type = C_PROCESS_UPDATE THEN
+                    -- running processes of this name (an entry exists from the first signal until the end)
+                    l_prefix := l_rule.target_action || '|';
+                    FOR j IN 1 .. l_keys.COUNT LOOP
+                        IF l_kinds(j) = C_STATE_RUN AND substr(l_keys(j), 1, length(l_prefix)) = l_prefix THEN
+                            l_used(j) := TRUE;
+                            IF l_ts(j) < l_limit THEN
+                                fireSilence(l_group, l_rule, to_number(substr(l_keys(j), length(l_prefix) + 1)), l_nowUtc);
+                            END IF;
+                        END IF;
+                    END LOOP;
+                ELSE
+                    l_kind := CASE l_rule.trigger_type WHEN C_PROCESS_START THEN C_STATE_START
+                                                       WHEN C_MARK_EVENT    THEN C_STATE_EVENT
+                                                       ELSE C_STATE_TRACE END;
+                    l_key  := CASE WHEN l_kind = C_STATE_START THEN l_rule.target_action
+                                   ELSE l_rule.target_action || '|' || l_rule.target_context END;
+                    IF NOT l_rows.EXISTS(l_kind || '|' || l_key) THEN
+                        -- new rule: count from now on (no alert right after activation)
+                        BEGIN
+                            EXECUTE IMMEDIATE 'insert into ' || C_LILAM_ALERT_STATE_TABLE || '
+                                               (group_name, state_kind, state_key, ts_utc) values (:1, :2, :3, :4)'
+                                USING l_group, l_kind, l_key, l_nowUtc;
+                        EXCEPTION
+                            WHEN DUP_VAL_ON_INDEX THEN NULL;   -- another checker or a signal was faster
+                        END;
+                        l_rows(l_kind || '|' || l_key) := 0;
+                    ELSE
+                        l_j := l_rows(l_kind || '|' || l_key);
+                        IF l_j > 0 THEN
+                            l_used(l_j) := TRUE;
+                            IF l_ts(l_j) < l_limit THEN
+                                fireSilence(l_group, l_rule, NULL, l_nowUtc);
+                            END IF;
+                        END IF;
+                    END IF;
+                END IF;
+            END LOOP;
+        END IF;
+        COMMIT;
+
+        -- Remove entries without rule, but only if the loaded rules are those of LILAM_RULES
+        -- (not after a read error or with a rejected rule set)
+        IF g_rule_groups.EXISTS(l_group) AND g_rule_groups(l_group).rules_read
+           AND (   (g_rule_groups(l_group).seen_name IS NULL AND g_rule_groups(l_group).set_name IS NULL)
+                OR (g_rule_groups(l_group).seen_name = g_rule_groups(l_group).set_name
+                    AND g_rule_groups(l_group).seen_version = g_rule_groups(l_group).set_version)) THEN
+            FOR j IN 1 .. l_keys.COUNT LOOP
+                IF NOT l_used.EXISTS(j) THEN
+                    -- only if unchanged since reading
+                    EXECUTE IMMEDIATE 'delete from ' || C_LILAM_ALERT_STATE_TABLE || '
+                                        where group_name = :1 and state_kind = :2 and state_key = :3 and ts_utc = :4'
+                        USING l_group, l_kinds(j), l_keys(j), l_ts(j);
+                END IF;
+            END LOOP;
+            COMMIT;
+        END IF;
+    exception
+        when others then
+        rollback;
+        -- ORA-00942: table not yet created (no process in this installation so far)
+        IF sqlcode != -942 THEN
+            logLilamErr(sqlCode, sqlErrM, 'checkSilence', 'group ' || l_group);
+        END IF;
+    end;
+
+    --------------------------------------------------------------------------
+    -- API: check of the silence rules of a group, e.g. from a scheduler job of the application
+    -- (without a server of the group). Servers check their group themselves.
+    --------------------------------------------------------------------------
+    procedure CHECK_SILENCE(p_groupName varchar2)
+    as
+    begin
+        checkSilence(p_groupName);
     end;
 
     --------------------------------------------------------------------------
@@ -9767,6 +10196,7 @@ AS
         l_windowMs       NUMBER;
         l_drainStartCs   NUMBER;
         l_lastIdleFlushCs NUMBER;
+        l_lastSilenceCs  NUMBER := dbms_utility.get_time;   -- last checkSilence
         l_msgCnt         PLS_INTEGER := 0;
         l_serverTimeout  PLS_INTEGER := 0;
         l_ctlPipe        VARCHAR2(150);
@@ -9845,6 +10275,11 @@ AS
                 checkServerRules;
                 if not g_serverIsDispatcher then
                     purgeAlertLocks;   -- internally at most every C_ALERT_LOCK_PURGE_MS
+                    -- silence rules of the group: every C_SILENCE_CHECK_MS
+                    if abs(dbms_utility.get_time - l_lastSilenceCs) * 10 >= C_SILENCE_CHECK_MS then
+                        checkSilence(g_serverGroupName);
+                        l_lastSilenceCs := dbms_utility.get_time;
+                    end if;
                 end if;
                 l_lastSyncCs := dbms_utility.get_time;
                 l_msgCnt := 0;

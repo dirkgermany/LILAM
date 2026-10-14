@@ -67,7 +67,9 @@ create or replace PACKAGE BODY LILAM_GRAFANA AS
                || l_alert.action_name || nvl2(l_alert.context_name, ' ' || l_alert.context_name, '')
                || nvl2(l_used, ', ' || to_char(round(l_used), 'FM999999999990') || ' ms', '')
                || nvl2(l_value, ', value ' || to_char(l_value, 'TM9', 'NLS_NUMERIC_CHARACTERS=''.,'''), '')
-               || ' - ' || l_alert.process_name || ' (process ' || l_alert.process_id || ', alert ' || l_alert.alert_id || ')';
+               -- process_id NULL: silence rule without process (e.g. no start)
+               || CASE WHEN l_alert.process_id IS NULL THEN ' - no process (alert ' || l_alert.alert_id || ')'
+                       ELSE ' - ' || l_alert.process_name || ' (process ' || l_alert.process_id || ', alert ' || l_alert.alert_id || ')' END;
 
         IF p_dashboardUid IS NOT NULL THEN
             l_obj.put('dashboardUID', p_dashboardUid);

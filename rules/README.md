@@ -78,7 +78,7 @@ Rules are organized into Rule Sets, stored as JSON documents in the `LILAM_RULES
 
 ³ The context allows different thresholds for instances of the same action, e.g. a speed limit only for track section `SECTION_400_001`. A rule with context applies only to this context; a rule without context applies to **all** contexts of the action. If both exist, both are evaluated.
 
-⁴ The lock period applies per rule, action, context and baseline scope (without scope: per process). A rule without context therefore throttles each context separately: an alert for `SAP` does not suppress one for `SIE`. LILAM stores the lock in the table `LILAM_ALERT_LOCKS`, so it holds across database sessions, pooled connections, server workers and restarts; simultaneous hits in several sessions raise only one alert. Expired locks are deleted about once a minute.
+⁴ The lock period applies per rule, action, context and baseline scope (without scope: per process). A rule without context therefore throttles each context separately: an alert for `SAP` does not suppress one for `SIE`. LILAM stores the lock in the table `LILAM_ALERT_STATE`, so it holds across database sessions, pooled connections, server workers and restarts; simultaneous hits in several sessions raise only one alert. Expired locks are deleted about once a minute.
 
 ```json
     {
@@ -129,6 +129,7 @@ Rules on `MARK_EVENT` and `TRACE_STOP` are only evaluated if the log level of th
 | VAL_MAX | number | MARK_EVENT | measured value is higher than the value (fixed limit)
 | MAX_OCCURRENCE | count | MARK_EVENT, TRACE_STOP, PROCESS_UPDATE, PROCESS_STOP | the action occurred more often than the value within the process (`ACTION_COUNT`); for processes: `STEPS_DONE` > value
 | TIME_MAX_GAP_SECONDS | seconds | MARK_EVENT, TRACE_START | time since the previous event (MARK_EVENT) or since the end of the previous trace (TRACE_START) of the same action is greater than the value
+| TIME_MAX_SILENCE_SECONDS | seconds (> 0) | PROCESS_START, MARK_EVENT, TRACE_START, PROCESS_UPDATE | no signal for longer than the value; checked by time, not by a signal, see [Silence Rules](#silence-rules)
 | PRECEDED_BY | `ACTION` or `ACTION\|CONTEXT` | MARK_EVENT, TRACE_START, PROCESS_UPDATE, PROCESS_STOP | the previous signal of the process was **not** the expected action (and context, if given)⁴
 | TIME_PRECEDED_BY_WITHIN_SECS | `ACTION\|SECONDS` or `ACTION\|CONTEXT\|SECONDS` | like PRECEDED_BY | like PRECEDED_BY, or the expected predecessor ended more than the given seconds ago
 | TIME_RUNTIME_EXCEEDED | milliseconds | PROCESS_UPDATE | the running process is older than the value
@@ -145,7 +146,32 @@ The EWMA deviation operators compare against the EWMA **before** the current mea
 ⁴ Only events and traces (start and stop) count as predecessors, log messages do not. Without a context in the value, any context of the expected action is accepted. The order is checked when the action starts, not at TRACE_STOP (there the predecessor would usually be the own TRACE_START); loading rejects `PRECEDED_BY*` with TRACE_STOP.
 
 > [!NOTE]
-> Rules are evaluated when a signal arrives. LILAM has no timer-based evaluation: a process that hangs without sending signals, or an event that never arrives ("B must follow A within X seconds" when B never comes), is not detected. The order "B follows A within X seconds" can be checked when B arrives, with `TIME_PRECEDED_BY_WITHIN_SECS` on B.
+> All other rules are evaluated when a signal arrives. The order "B follows A within X seconds" can be checked when B arrives, with `TIME_PRECEDED_BY_WITHIN_SECS` on B. Signals that do not arrive at all are covered by the silence rules below.
+
+### Silence Rules
+
+`TIME_MAX_SILENCE_SECONDS` reports that a signal has **not** arrived for longer than the value. It is the basis for an application watchdog: LILAM detects and reports the silence; scheduling the check and watching the checker remain with the application. The trigger type selects what has to stay silent:
+
+| trigger_type | Silent when | Alert |
+| --- | --- | --- |
+| PROCESS_START | no process named `action` has started | `process_id` NULL (no process), `process_name` = `action` |
+| MARK_EVENT, TRACE_START | no event or trace start of `action`; with `context` only for this context, without `context` any context counts | `process_id` NULL, `action`/`context` of the rule |
+| PROCESS_UPDATE | a running process named `action` has sent nothing (log, event, trace, status) | `process_id` of the process |
+
+```json
+{ "id": "POLL-SILENT", "trigger_type": "PROCESS_START", "action": "SPM_POLL",
+  "condition": { "operator": "TIME_MAX_SILENCE_SECONDS", "value": "900" },
+  "alert": { "handler": "LILAM_ALERT_MAIL_LOG", "severity": "ERROR", "throttle_seconds": 3600 } }
+```
+
+- **Scope:** per rule group, across all processes, sessions and servers of the group (also processes without baseline scope). Process triggers take no `context`.
+- **Who checks:** every server of the group every 10 seconds. Without a server (In-Session only) the application calls `LILAM.CHECK_SILENCE(p_groupName)`, e.g. from its own `DBMS_SCHEDULER` job. Several checkers raise only one alert.
+- **Start:** a target without any signal so far counts from the first check after the rule was activated, so a job that never starts is reported, but activating a rule does not raise an alert at once.
+- **Repetition:** while the silence lasts, `throttle_seconds` controls repetitions across sessions and checkers; with `throttle_seconds` 0 the silence time is the lock period. There is no alert when signals return.
+- **"Last seen"** is stored per group and target in `LILAM_ALERT_STATE` and survives restarts. The time is that of the processing (server: when the worker handles the message).
+- **Limits:** signals are written buffered, about every 1.5 seconds (In-Session: at the next write point of the session, at the latest `CLOSE_SESSION`); with the check interval a silence is reported up to about 12 seconds (server) or one job interval late. Silence times should therefore be well above that. A process that ends without `CLOSE_PROCESS` (session killed) keeps its entry and is reported as silent until the rule is removed. Changed rule sets reach the checkers as for other rules (servers at once or after 15 s, In-Session checkers on the next call); entries without rule are removed.
+- **Watching the checker:** if no checker runs (server stopped, job disabled), nothing is reported. LILAM cannot detect that itself; the application watches its job in `DBMS_SCHEDULER` (state, failures) or a second, independent checker.
+- **Time windows** (e.g. only during trading hours) are not supported yet; the application activates a rule set without silence rules outside its windows.
 
 ---
 ## Table: LILAM_RULES

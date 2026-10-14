@@ -165,7 +165,7 @@ begin
 
     -- fixed tables
     drop_table('LILAM_ALERTS');
-    drop_table('LILAM_ALERT_LOCKS');
+    drop_table('LILAM_ALERT_STATE');
     drop_table('LILAM_RULES');
     drop_table('LILAM_BASELINES');
     drop_table('LILAM_SCOPES');

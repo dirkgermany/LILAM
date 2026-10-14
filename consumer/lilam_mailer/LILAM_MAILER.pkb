@@ -74,7 +74,9 @@ create or replace PACKAGE BODY LILAM_MAILER AS
                   '<h3 style="color: ' || v_color || ';">Prozess-Status</h3>' ||
                   '<table style="width: 100%; border-collapse: collapse; margin-bottom: 20px;">' ||
                   '<tr><td style="width: 200px; font-weight: bold; border-bottom: 1px solid #ddd; padding: 8px;">Prozess Name (ID):</td>' ||
-                  '<td style="border-bottom: 1px solid #ddd; padding: 8px;">' || l_lilam_rec.processName || ' (' || l_lilam_rec.processId || ')</td></tr>' ||
+                  '<td style="border-bottom: 1px solid #ddd; padding: 8px;">' || CASE WHEN l_lilam_rec.processId IS NOT NULL THEN l_lilam_rec.processName || ' (' || l_lilam_rec.processId || ')'
+                                                                    WHEN p_alertRec.process_id IS NOT NULL THEN p_alertRec.action_name || ' (' || p_alertRec.process_id || ')'
+                                                                    ELSE 'kein Prozess' END || '</td></tr>' ||
                   '<tr><td style="font-weight: bold; border-bottom: 1px solid #ddd; padding: 8px;">Fortschritt / Status:</td>' ||
                   '<td style="border-bottom: 1px solid #ddd; padding: 8px;">' || l_lilam_rec.stepsDone || ' von ' || l_lilam_rec.stepsTodo || ' erledigt (Status: ' || l_lilam_rec.status || ')</td></tr>' ||
                   '<tr><td style="font-weight: bold; border-bottom: 1px solid #ddd; padding: 8px;">Info:</td>' ||
@@ -166,6 +168,7 @@ create or replace PACKAGE BODY LILAM_MAILER AS
         l_alert_rec   t_alert_rec;
         l_json_rec    t_json_rec;
         l_lilam_rec   t_lilam_rec;
+        l_no_data     t_lilam_rec;
     BEGIN
         SELECT alert_id BULK COLLECT INTO l_ids
           FROM LILAM_ALERTS
@@ -197,7 +200,11 @@ create or replace PACKAGE BODY LILAM_MAILER AS
 
                     -- 2. Load data
                     l_json_rec := LILAM_CONSUMER.readJsonRule(l_alert_rec);
-                    l_lilam_rec := LILAM_CONSUMER.readProcessData(l_alert_rec.process_id, l_alert_rec.action_name, l_alert_rec.action_count, l_alert_rec.master_table_name, l_alert_rec.monitor_table_name, l_alert_rec.context_name);
+                    -- Silence rules: no process data (process_id NULL = no process, tables unknown)
+                    l_lilam_rec := l_no_data;
+                    IF l_alert_rec.master_table_name IS NOT NULL THEN
+                        l_lilam_rec := LILAM_CONSUMER.readProcessData(l_alert_rec.process_id, l_alert_rec.action_name, l_alert_rec.action_count, l_alert_rec.master_table_name, l_alert_rec.monitor_table_name, l_alert_rec.context_name);
+                    END IF;
 
                     -- 3. Build body & send
                     v_mail_body := prepareMailBodyHtml(l_lilam_rec, l_alert_rec, l_json_rec);
