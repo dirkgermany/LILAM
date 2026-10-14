@@ -234,6 +234,8 @@ create or replace PACKAGE LILAM AS
     FUNCTION  GET_METRIC_AVG_DURATION(p_processId NUMBER, p_actionName VARCHAR2, p_contextName VARCHAR2 default null) return NUMBER;
     FUNCTION  GET_METRIC_AVG_VALUE(p_processId NUMBER, p_actionName VARCHAR2, p_contextName VARCHAR2 default null) return NUMBER;
     FUNCTION  GET_METRIC_STEPS(p_processId NUMBER, p_actionName VARCHAR2, p_contextName VARCHAR2 default null) return NUMBER;
+    -- Reset the baseline (time and value EWMA, counters) of a scope; context NULL = only without context (never raises)
+    PROCEDURE RESET_BASELINE(p_scopeName VARCHAR2, p_actionName VARCHAR2, p_contextName VARCHAR2 default null);
 
     -----------------
     -- Server control

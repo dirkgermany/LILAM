@@ -813,6 +813,35 @@ FUNCTION GET_METRIC_STEPS(
 ) RETURN NUMBER
 ```
 
+### Procedure RESET_BASELINE
+
+Setzt die prozessübergreifende Baseline einer Metrik in einem [Baseline Scope](#function-new_process--server_new_process) zurück, z. B. nach einer Systemumstellung, nach der die bisherigen Durchschnitte nicht mehr gelten. Zeit- und Wertreihe werden gemeinsam zurückgesetzt: Die Durchschnitte (EWMA) werden `NULL`, die Zähler 0. Die nächste Messung beginnt eine neue Reihe, und die Aufwärmphase (`warmup`) der `*_EWMA_DEVIATION_PCT_*`-Regeln beginnt neu.
+
+```sql
+PROCEDURE RESET_BASELINE(
+  p_scopeName   VARCHAR2,
+  p_actionName  VARCHAR2,
+  p_contextName VARCHAR2 DEFAULT NULL
+)
+```
+
+| Parameter | Beschreibung |
+| --- | --- |
+| `p_scopeName` | Name des Baseline Scopes (Groß-/Kleinschreibung egal); ohne eigenen Scope ist das der Prozessname |
+| `p_actionName` | Action der Metrik |
+| `p_contextName` | Context der Metrik; `NULL` betrifft nur die Metrik ohne Context, nicht alle Contexts der Action |
+
+- Zurückgesetzt wird genau die Kombination aus Scope, Action und Context. Andere Contexts derselben Action bleiben unverändert.
+- Ein unbekannter Scope oder `p_actionName` = `NULL` ändert nichts. Die Prozedur löst keine Exception aus; Fehler stehen in `LILAM_LOG_INTERNAL`.
+- Die aufrufende Session rechnet sofort mit der zurückgesetzten Baseline. Andere Sessions und LILAM-Server übernehmen sie bei ihrem nächsten Abgleich mit `LILAM_BASELINES`, spätestens nach etwa 1,5 Sekunden; im In-Session-Modus beim nächsten LILAM-Aufruf dieser Session danach. Messungen in diesem Zeitfenster können noch mit dem alten Durchschnitt verglichen werden; ihre Werte gehen nicht in die neue Baseline ein.
+- Die Messwerte in `_MON` bleiben erhalten, ebenso der Durchschnitt, den `GET_METRIC_AVG_DURATION` und `GET_METRIC_AVG_VALUE` bis zur nächsten Messung des Prozesses liefern.
+- Prozesse ohne Baseline Scope (`#NONE`) führen ihre Durchschnitte nur im Prozess; sie werden nicht zurückgesetzt.
+
+```sql
+-- nach dem Wechsel des Kursanbieters neu lernen
+lilam.reset_baseline('KURSABRUF', 'SHARE_PRICE', 'SAP');
+```
+
 ---
 
 ## Serversteuerung
@@ -1195,6 +1224,7 @@ LILAM JSON Requests bestehen aus einem Header und einem Parameterobjekt. Der Hea
 | `SET_PROC_IMMORTAL` | `SET_PROC_IMMORTAL` | `process_id`, `process_immortal` |
 | `INFO`, `DEBUG`, `WARN`, `ERROR` | Logging | `process_id`, `process_info` (Logtext) |
 | `MARK_EVENT`, `TRACE_START`, `TRACE_STOP` | Metriken | `process_id`, `action_name`, `context_name`, `timestamp`; bei `MARK_EVENT` zusätzlich `value` (Messwert) |
+| `RESET_BASELINE` | `RESET_BASELINE` | `scope_name`, `action_name`, `context_name` |
 | `SERVER_SHUTDOWN` | `SERVER_SHUTDOWN` | `process_id`, `pipe_name`, `password` |
 
 Die Antwort enthält den Header der Anfrage, `status` (`SUCCESS` oder `ERROR`) und eine `payload` mit `returns` und `value`, z. B. `"returns": "PROCESS_ID", "value": 4711`. Bei einem unbekannten `api_call` ist `value` = `NUM_ERR_ILLEGAL_REQ` (-20010). Ist `p_callObject` kein gültiges JSON, endet der Aufruf mit der Exception -20005.

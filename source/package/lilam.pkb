@@ -141,6 +141,7 @@ AS
     C_BASELINE_NULL_CONTEXT             CONSTANT VARCHAR2(1)  := '-';      -- Replacement for NULL context in the PK
     C_BASELINE_SYNC_INTERVAL_MS         CONSTANT PLS_INTEGER  := 1500;     -- Sync PGA <-> LILAM_BASELINES
     C_BASELINE_IDLE_EVICT_SEC           CONSTANT PLS_INTEGER  := 900;      -- Remove unused baselines from the PGA
+    C_BASELINE_RESET_LOOKBACK_SEC       CONSTANT PLS_INTEGER  := 60;       -- Margin when searching for reset baselines
 
     -- Pipe handling
     C_PIPE_ID_PENDING               CONSTANT BINARY_INTEGER := -1; 
@@ -417,11 +418,13 @@ AS
         base_val_count  NUMBER := 0,
         in_db           BOOLEAN := FALSE,
         dirty           BOOLEAN := FALSE,
-        last_touch_cs   NUMBER          -- last use (DBMS_UTILITY.GET_TIME), for eviction
+        last_touch_cs   NUMBER,         -- last use (DBMS_UTILITY.GET_TIME), for eviction
+        reset_ts        TIMESTAMP(6)    -- LILAM_BASELINES.RESET_TS when loaded (RESET_BASELINE)
     );
     TYPE t_baseline_map IS TABLE OF t_baseline_rec INDEX BY VARCHAR2(250);
     g_baselines t_baseline_map;
     g_last_baseline_sync TIMESTAMP(6);
+    g_last_reset_check   TIMESTAMP(6);  -- UTC, last search for reset baselines (syncBaselines)
 
     -- Cache scope name -> scope ID
     TYPE t_scope_id_map IS TABLE OF NUMBER INDEX BY VARCHAR2(100);
@@ -1459,9 +1462,9 @@ AS
 
         BEGIN
             EXECUTE IMMEDIATE
-                'select avg_ms, action_count, avg_val, val_count from ' || C_LILAM_BASELINES_TABLE ||
+                'select avg_ms, action_count, avg_val, val_count, reset_ts from ' || C_LILAM_BASELINES_TABLE ||
                 ' where scope_id = :1 and action_name = :2 and context_name = :3'
-                INTO l_rec.avg_ms, l_rec.action_count, l_rec.avg_val, l_rec.val_count
+                INTO l_rec.avg_ms, l_rec.action_count, l_rec.avg_val, l_rec.val_count, l_rec.reset_ts
                 USING p_scopeId, p_actionName, nvl(p_contextName, C_BASELINE_NULL_CONTEXT);
             l_rec.in_db := TRUE;
         EXCEPTION
@@ -4016,6 +4019,7 @@ AS
                 avg_val       NUMBER,
                 val_count     NUMBER(19,0)  DEFAULT 0 NOT NULL,
                 last_update   TIMESTAMP(6),
+                reset_ts      TIMESTAMP(6),   -- UTC, last RESET_BASELINE
                 CONSTRAINT pk_lilam_baselines PRIMARY KEY (scope_id, action_name, context_name)
             ) ORGANIZATION INDEX';
             run_sql(sqlStmt);
@@ -4026,7 +4030,14 @@ AS
             if l_regCols = 0 then
                 add_columns('ALTER TABLE ' || C_LILAM_BASELINES_TABLE || ' ADD (avg_val NUMBER, val_count NUMBER(19,0) DEFAULT 0 NOT NULL)');
             end if;
+            -- Existing table: RESET_BASELINE
+            select count(*) into l_regCols from user_tab_columns
+             where table_name = upper(C_LILAM_BASELINES_TABLE) and column_name = 'RESET_TS';
+            if l_regCols = 0 then
+                add_columns('ALTER TABLE ' || C_LILAM_BASELINES_TABLE || ' ADD (reset_ts TIMESTAMP(6))');
+            end if;
         end if;
+        createIndexIfMissing('IDX_LILAM_BASELINES_RESET', C_LILAM_BASELINES_TABLE, 'reset_ts');
 
         -- Alert state: locks of the throttling (kind LOCK, see fire_alert/fireSilence) and
         -- "last seen" of the targets of silence rules (kinds START, EVENT, TRACE, RUN, see checkSilence)
@@ -4629,6 +4640,47 @@ AS
     end;
 
     --------------------------------------------------------------------
+    -- Removes PGA entries whose baseline was reset by RESET_BASELINE after they were loaded
+    -- (also clean ones and their unsynced deltas). They are reloaded on next use.
+    -- Searches only resets since the last search (index on RESET_TS).
+    --------------------------------------------------------------------
+    PROCEDURE dropResetBaselines
+    AS
+        TYPE t_ts_list IS TABLE OF TIMESTAMP(6);
+        l_now    CONSTANT TIMESTAMP(6) := sys_extract_utc(systimestamp);
+        l_scope  sys.odcinumberlist;
+        l_action sys.odcivarchar2list;
+        l_ctx    sys.odcivarchar2list;
+        l_ts     t_ts_list;
+        l_key    VARCHAR2(250);
+    BEGIN
+        IF g_baselines.COUNT = 0 THEN
+            g_last_reset_check := l_now;
+            RETURN;
+        END IF;
+
+        EXECUTE IMMEDIATE
+            'select scope_id, action_name, context_name, reset_ts from ' || C_LILAM_BASELINES_TABLE ||
+            ' where reset_ts >= :1'
+            BULK COLLECT INTO l_scope, l_action, l_ctx, l_ts
+            USING coalesce(g_last_reset_check, l_now) - numtodsinterval(C_BASELINE_RESET_LOOKBACK_SEC, 'SECOND');
+        g_last_reset_check := l_now;
+
+        FOR i IN 1 .. l_scope.COUNT LOOP
+            l_key := buildBaselineKey(l_scope(i), l_action(i),
+                                      CASE WHEN l_ctx(i) = C_BASELINE_NULL_CONTEXT THEN NULL ELSE l_ctx(i) END);
+            IF g_baselines.EXISTS(l_key) THEN
+                IF g_baselines(l_key).reset_ts IS NULL OR g_baselines(l_key).reset_ts < l_ts(i) THEN
+                    g_baselines.DELETE(l_key);
+                END IF;
+            END IF;
+        END LOOP;
+    EXCEPTION
+        WHEN OTHERS THEN
+            logLilamErr(sqlCode, sqlErrM, 'dropResetBaselines');
+    END;
+
+    --------------------------------------------------------------------
     -- Sync the baselines (PGA) with LILAM_BASELINES via delta merge:
     -- Each session writes only its own change since the last
     -- sync (avg - base_avg, count - base_count) and then takes over
@@ -4663,6 +4715,8 @@ AS
         l_upd_dVal   sys.odcinumberlist   := sys.odcinumberlist();
         l_upd_dVCnt  sys.odcinumberlist   := sys.odcinumberlist();
         l_upd_val    sys.odcinumberlist   := sys.odcinumberlist();
+        TYPE t_ts_list IS TABLE OF TIMESTAMP(6);
+        l_upd_reset  t_ts_list            := t_ts_list();
 
         -- Return the new DB values
         l_ret_scope  sys.odcinumberlist   := sys.odcinumberlist();
@@ -4713,6 +4767,12 @@ AS
         END IF;
         g_last_baseline_sync := l_now;
 
+        -- 0. Discard entries reset by RESET_BASELINE (also clean ones, so no session keeps the old average)
+        dropResetBaselines;
+        IF g_baselines.COUNT = 0 THEN
+            RETURN;
+        END IF;
+
         -- 1. Collect dirty entries, remove unused clean entries
         l_key := g_baselines.FIRST;
         WHILE l_key IS NOT NULL LOOP
@@ -4732,6 +4792,7 @@ AS
                     l_upd_dVal.EXTEND;   l_upd_dVal(l_upd_dVal.LAST)     := l_rec.avg_val - l_rec.base_val;
                     l_upd_dVCnt.EXTEND;  l_upd_dVCnt(l_upd_dVCnt.LAST)   := l_rec.val_count - l_rec.base_val_count;
                     l_upd_val.EXTEND;    l_upd_val(l_upd_val.LAST)       := l_rec.avg_val;
+                    l_upd_reset.EXTEND;  l_upd_reset(l_upd_reset.LAST)   := l_rec.reset_ts;
                     l_lookup(dbKey(l_rec.scope_id, l_rec.action_name, nvl(l_rec.context_name, C_BASELINE_NULL_CONTEXT))) := l_key;
                 ELSE
                     l_ins_keys.EXTEND;   l_ins_keys(l_ins_keys.LAST)     := l_key;
@@ -4770,14 +4831,16 @@ AS
                            val_count    = val_count + :10,
                            last_update  = SYSTIMESTAMP
                      where scope_id = :11 and action_name = :12 and context_name = :13
+                       and decode(reset_ts, :14, 1, 0) = 1
                     returning scope_id, action_name, context_name, avg_ms, action_count, avg_val, val_count
-                         into :14, :15, :16, :17, :18, :19, :20'
+                         into :15, :16, :17, :18, :19, :20, :21'
                 USING l_upd_dCnt(i), l_upd_dAvg(i), l_upd_dAvg(i), l_upd_avg(i), l_upd_dCnt(i),
                       l_upd_dVCnt(i), l_upd_dVal(i), l_upd_val(i), l_upd_dVal(i), l_upd_dVCnt(i),
-                      l_upd_scope(i), l_upd_action(i), l_upd_ctx(i)
+                      l_upd_scope(i), l_upd_action(i), l_upd_ctx(i), l_upd_reset(i)
                 RETURNING BULK COLLECT INTO l_ret_scope, l_ret_action, l_ret_ctx, l_ret_avg, l_ret_cnt, l_ret_val, l_ret_vcnt;
 
-            -- No longer present in the DB (e.g. deleted manually) => create again
+            -- No longer present in the DB (e.g. deleted manually) => create again.
+            -- Reset in the meantime (RESET_TS differs): step 3 finds the row and discards the entry.
             FOR i IN 1 .. l_upd_keys.COUNT LOOP
                 IF SQL%BULK_ROWCOUNT(i) = 0 THEN
                     l_ins_keys.EXTEND; l_ins_keys(l_ins_keys.LAST) := l_upd_keys(i);
@@ -4817,11 +4880,11 @@ AS
             BEGIN
                 EXECUTE IMMEDIATE
                     'insert into ' || C_LILAM_BASELINES_TABLE ||
-                    ' (scope_id, action_name, context_name, avg_ms, action_count, avg_val, val_count, last_update)' ||
-                    ' values (:1, :2, :3, :4, :5, :6, :7, SYSTIMESTAMP)'
+                    ' (scope_id, action_name, context_name, avg_ms, action_count, avg_val, val_count, reset_ts, last_update)' ||
+                    ' values (:1, :2, :3, :4, :5, :6, :7, :8, SYSTIMESTAMP)'
                     USING l_rec.scope_id, l_rec.action_name, nvl(l_rec.context_name, C_BASELINE_NULL_CONTEXT),
                           l_rec.avg_ms, l_rec.action_count - l_rec.base_count,
-                          l_rec.avg_val, l_rec.val_count - l_rec.base_val_count;
+                          l_rec.avg_val, l_rec.val_count - l_rec.base_val_count, l_rec.reset_ts;
                 l_dbAvg  := l_rec.avg_ms;
                 l_dbCnt  := l_rec.action_count - l_rec.base_count;
                 l_dbVal  := l_rec.avg_val;
@@ -4839,15 +4902,20 @@ AS
                                val_count    = val_count + :11,
                                last_update  = SYSTIMESTAMP
                          where scope_id = :12 and action_name = :13 and context_name = :14
-                        returning avg_ms, action_count, avg_val, val_count into :15, :16, :17, :18'
+                           and decode(reset_ts, :15, 1, 0) = 1
+                        returning avg_ms, action_count, avg_val, val_count into :16, :17, :18, :19'
                         USING l_rec.action_count - l_rec.base_count,
                               l_rec.avg_ms, l_rec.action_count - l_rec.base_count, l_rec.action_count - l_rec.base_count,
                               l_rec.action_count - l_rec.base_count,
                               l_rec.val_count - l_rec.base_val_count, l_rec.avg_val,
                               l_rec.avg_val, l_rec.val_count - l_rec.base_val_count, l_rec.val_count - l_rec.base_val_count,
                               l_rec.val_count - l_rec.base_val_count,
-                              l_rec.scope_id, l_rec.action_name, nvl(l_rec.context_name, C_BASELINE_NULL_CONTEXT)
+                              l_rec.scope_id, l_rec.action_name, nvl(l_rec.context_name, C_BASELINE_NULL_CONTEXT), l_rec.reset_ts
                         RETURNING INTO l_dbAvg, l_dbCnt, l_dbVal, l_dbVCnt;
+                    -- no row: reset in the meantime, the entry is discarded in step 4
+                    IF SQL%ROWCOUNT = 0 THEN
+                        l_dbCnt := NULL;
+                    END IF;
             END;
             -- Remember values; they are taken over only after a successful commit
             l_ins_avg.EXTEND;  l_ins_avg(l_ins_avg.LAST)   := l_dbAvg;
@@ -4860,7 +4928,11 @@ AS
 
         -- 4. Take over the overall state from the DB (new base for the next delta; updated entries in step 2)
         FOR i IN 1 .. l_ins_keys.COUNT LOOP
-            takeOver(l_ins_keys(i), l_ins_avg(i), l_ins_cnt(i), l_ins_val(i), l_ins_vcnt(i));
+            IF l_ins_cnt(i) IS NULL THEN
+                g_baselines.DELETE(l_ins_keys(i));   -- reset in the meantime: reloaded on next use
+            ELSE
+                takeOver(l_ins_keys(i), l_ins_avg(i), l_ins_cnt(i), l_ins_val(i), l_ins_vcnt(i));
+            END IF;
         END LOOP;
 
     EXCEPTION
@@ -5772,6 +5844,68 @@ AS
         when others then
             logLilamErr(sqlCode, sqlErrM, 'GET_METRIC_AVG_VALUE');
             return null;
+    end;
+
+    --------------------------------------------------------------------------
+
+    -- Resets the baseline (time and value series) of scope/action/context: average NULL, counters 0,
+    -- warm-up starts again. NULL context = only the baseline without context. RESET_TS tells the PGA
+    -- copies of other sessions and servers to reload (dropResetBaselines, at most C_BASELINE_SYNC_INTERVAL_MS).
+    -- MERGE: also when the row does not exist yet, so unsynced first measurements are discarded too.
+    PROCEDURE RESET_BASELINE(p_scopeName VARCHAR2, p_actionName VARCHAR2, p_contextName VARCHAR2)
+    as
+        pragma autonomous_transaction;
+        l_scope   CONSTANT VARCHAR2(100) := upper(trim(p_scopeName));
+        l_scopeId NUMBER;
+        l_ts      TIMESTAMP(6);
+    begin
+        if l_scope is null or p_actionName is null then
+            return;
+        end if;
+
+        begin
+            execute immediate 'select scope_id from ' || C_LILAM_SCOPES_TABLE || ' where scope_name = :1'
+                into l_scopeId using l_scope;
+        exception
+            when NO_DATA_FOUND then
+                return;   -- unknown scope: no baseline
+        end;
+
+        for l_try in 1 .. 2 loop   -- 2nd attempt: row inserted by a sync at the same time (ORA-00001)
+            begin
+                l_ts := sys_extract_utc(systimestamp);
+                execute immediate
+                    'merge into ' || C_LILAM_BASELINES_TABLE || ' b
+                     using (select :1 scope_id, :2 action_name, :3 context_name from dual) s
+                        on (b.scope_id = s.scope_id and b.action_name = s.action_name and b.context_name = s.context_name)
+                      when matched then update
+                           set avg_ms = NULL, action_count = 0, avg_val = NULL, val_count = 0,
+                               reset_ts = :4, last_update = SYSTIMESTAMP
+                      when not matched then insert
+                           (scope_id, action_name, context_name, avg_ms, action_count, avg_val, val_count, reset_ts, last_update)
+                           values (s.scope_id, s.action_name, s.context_name, NULL, 0, NULL, 0, :5, SYSTIMESTAMP)'
+                    using l_scopeId, p_actionName, nvl(p_contextName, C_BASELINE_NULL_CONTEXT), l_ts, l_ts;
+                commit;
+                exit;
+            exception
+                when DUP_VAL_ON_INDEX then
+                    rollback;
+                    if l_try = 2 then
+                        raise;
+                    end if;
+            end;
+        end loop;
+
+        -- own session: at once
+        if g_baselines.EXISTS(buildBaselineKey(l_scopeId, p_actionName, p_contextName)) then
+            g_baselines.DELETE(buildBaselineKey(l_scopeId, p_actionName, p_contextName));
+        end if;
+    exception
+        when others then
+            rollback;
+            if sqlcode != -942 then   -- no tables yet: nothing to reset
+                logLilamErr(sqlCode, sqlErrM, 'RESET_BASELINE', l_scope || '|' || p_actionName || '|' || p_contextName);
+            end if;
     end;
 
     --------------------------------------------------------------------------
@@ -10648,6 +10782,10 @@ BEGIN
 
         when 'FLUSH' THEN
             FLUSH;
+            jsonPut(l_jsonHeader, 'status', 'SUCCESS');
+
+        when 'RESET_BASELINE' THEN
+            RESET_BASELINE(jsonString(l_jsonParams, 'scope_name'), jsonString(l_jsonParams, 'action_name'), jsonString(l_jsonParams, 'context_name'));
             jsonPut(l_jsonHeader, 'status', 'SUCCESS');
 
         when 'SET_PROCESS_STATUS' THEN
