@@ -233,7 +233,7 @@ Auch INSESSION-Prozesse werten Regeln aus, wenn `NEW_PROCESS` eine Gruppe erhäl
 *   **Änderungen:** Es gibt keinen Timer. Höchstens alle 15 Sekunden (`C_RULES_CHECK_INTERVAL_MS`) prüft ein API-Aufruf Name und Version des aktiven Rule Sets mit einer kleinen indizierten Abfrage und lädt nur neu, wenn sie sich geändert haben. Server werden durch `SERVER_UPDATE_RULES` benachrichtigt und führen zusätzlich dieselbe Prüfung in ihrem Housekeeping aus, sodass ein Server, der die Benachrichtigung verpasst hat (z. B. volle Pipe), innerhalb von etwa 20 Sekunden nachzieht.
 *   **Ungültige Rule Sets** werden abgelehnt, einmal je Version in `LILAM_LOG_INTERNAL` protokolliert, und die bisherigen Regeln bleiben aktiv. Fehler erreichen die Anwendung nie.
 *   **Latenz:** Ohne Treffer besteht eine Regelprüfung aus einigen Zugriffen auf assoziative Arrays; Actions ohne Regeln kosten ein `EXISTS`, Prozesse ohne Gruppe nichts. Ein ausgelöster Alert wird synchron geschrieben (`LILAM_ALERTS`, `DBMS_ALERT`-Signal, autonome Transaktion), was die Anwendung einen Commit je Alert kostet. `throttle_seconds` begrenzt, wie oft das geschieht.
-*   **Zustand je Session:** Die Drosselung und der Vorgänger für `PRECEDED_BY` liegen in der Datenbanksession. Mit Connection-Pools (z. B. APEX) kann derselbe Alert daher einmal je Pool-Verbindung ausgelöst werden.
+*   **Zustand je Session:** Der Vorgänger für `PRECEDED_BY` liegt in der Datenbanksession; mit Connection-Pools (z. B. APEX) kennt eine andere Pool-Verbindung ihn nicht. Die Drosselung (`throttle_seconds`) gilt dagegen sessionübergreifend, siehe **Drosselung** unter dem Rule-Set-Beispiel.
 
 ### Trigger und Filter
 Jede Regel ist einem **Trigger-Typ** zugeordnet, der das Signal festlegt, das die Auswertung startet.
@@ -287,6 +287,7 @@ Regeln für andere Actions kosten nichts. Derselben Action und demselben Trigger
 | **Messwert**    | `VAL_MIN`, `VAL_MAX`           | `used_value < value` bzw. `used_value > value` (MARK_EVENT) | Feste Grenzen, z. B. Mindestbestand. |
 | **Häufigkeit**  | `MAX_OCCURRENCE`      | `action_count > value` (MARK_EVENT, TRACE_STOP) | Flutschutz / Erkennung von Endlosschleifen.   |
 | **Intervall**   | `TIME_MAX_GAP_SECONDS`     | Zeit seit dem vorherigen Event (MARK_EVENT) oder dem Ende des vorherigen Trace (TRACE_START) > value | Stillstand zwischen zwei Signalen erkennen. |
+| **Ausbleiben**  | `TIME_MAX_SILENCE_SECONDS` | seit `value` Sekunden kein Signal (PROCESS_START, MARK_EVENT, TRACE_START, PROCESS_UPDATE); zeitgesteuert geprüft, nicht beim Signal | Grundlage für einen Watchdog: Job startet nicht, Reihe liefert nichts, Prozess hängt. |
 | **Abhängigkeit** | `PRECEDED_BY`        | letztes Event/letzter Trace des Prozesses ≠ `ACTION[\|CONTEXT]` (MARK_EVENT, TRACE_START; nicht TRACE_STOP) | Prüft den Vorgänger.                |
 | **Abhängigkeit** | `TIME_PRECEDED_BY_WITHIN_SECS` | wie `PRECEDED_BY`, zusätzlich maximale Verzögerung in Sekunden | Prüft Vorgänger und max. Verzögerung. |
 
@@ -333,6 +334,10 @@ Das JSON-Objekt gliedert sich in einen Header für Metadaten und ein Array mit d
 ```
 
 Ein Server prüft ein Rule Set vollständig, bevor er es verwendet. Ist eine Regel ungültig, wird das gesamte Rule Set abgelehnt, und die zuvor geladenen Regeln bleiben aktiv. Werte aus mehreren durch `|` getrennten Teilen dürfen keine leeren Teile enthalten (`|C1`, `A|`, `20||0.3`); unbekannte Eigenschaften (außer solchen, die mit `_` beginnen) sowie Felder, die Objekte, Arrays oder Texte über 4000 Zeichen sind, werden abgelehnt. `CHECK_RULE_SET` führt dieselbe Prüfung durch, ohne das Rule Set zu speichern oder zu aktivieren.
+
+**Drosselung (`throttle_seconds`):** Nach einem Alert löst dieselbe Regel für dieselbe Kombination aus Action und Context frühestens nach Ablauf der Sperrzeit erneut aus. Die Sperre gilt je Baseline Scope, bei Prozessen ohne Scope je Prozess. Eine Regel ohne Context drosselt damit jeden Context für sich: Ein Alert für `SAP` unterdrückt keinen für `SIE`. LILAM speichert die Sperre in der Tabelle `LILAM_ALERT_STATE` (Art `LOCK`, ein Eintrag je Gruppe, Scope bzw. Prozess, Regel, Action und Context); sie gilt deshalb über Datenbanksessions, Pool-Verbindungen, Server-Worker und Neustarts hinweg, und gleichzeitige Treffer in mehreren Sessions lösen nur einen Alert aus. Bekannte Sperren merkt sich die Session zusätzlich im Speicher; die Tabelle wird nur gelesen, wenn eine Regel zutrifft. Abgelaufene Sperren löscht das Housekeeping der Server, im INSESSION-Modus das Auslösen eines Alerts, jeweils höchstens einmal je Minute und Session.
+
+**Ausbleibende Signale (`TIME_MAX_SILENCE_SECONDS`):** Diese Regeln werden nicht beim Eintreffen eines Signals ausgewertet, sondern zeitgesteuert: von jedem Server der Gruppe alle 10 Sekunden im Housekeeping, ohne Server durch `CHECK_SILENCE`, das die Anwendung z. B. aus einem eigenen Scheduler-Job aufruft. Ein Signal erneuert nur den Zeitpunkt „zuletzt gesehen“ je Gruppe und Ziel (Prozessstart, Event- bzw. Trace-Reihe, laufender Prozess); er wird gepuffert etwa alle 1,5 Sekunden in `LILAM_ALERT_STATE` geschrieben und übersteht Neustarts. Ein Ziel ohne bisheriges Signal zählt ab der ersten Prüfung nach dem Aktivieren der Regel. Mehrere Prüfer lösen über die Sperre nur einen Alert aus; ohne `throttle_seconds` gilt die Schweigezeit als Sperrzeit. Zeitfenster (`windows`, `time_zone`) beschränken die Prüfung auf Tageszeiten, auch mehrere je Regel; beim Öffnen eines Fensters zählt das Schweigen neu. Alerts ohne Prozess haben `PROCESS_ID` NULL. LILAM liefert damit die Grundlage für einen Watchdog; ob der Prüfjob selbst läuft, überwacht die Anwendung.
 
 ---
 ## Betriebsmodi
@@ -494,7 +499,7 @@ flowchart TD
     DB -- "Gesamtstand als neue Basis" --> SYNC
 ```
 
-`syncBaselines` schreibt nur die eigene Änderung der Session seit dem letzten Abgleich (Delta-Merge) und übernimmt anschließend den Gesamtstand aus der Tabelle. Mit einem Schreiber ist das Ergebnis exakt; mit mehreren parallelen Schreibern (z. B. mehreren Servern oder In-Session-Prozessen mit demselben Scope) ist es eine gute Näherung ohne verlorene Updates. Damit sich parallele Schreiber nicht über Kreuz blockieren (Deadlock), laufen die Updates bestehender Zeilen und die Inserts neuer Zeilen in zwei getrennten Transaktionen, jeweils in aufsteigender Schlüsselreihenfolge. Baselines, die 15 Minuten lang nicht verwendet wurden, werden aus dem PGA entfernt. Auch die Drosselung von Alerts (`throttle_seconds`) wird je Scope geführt, sodass ein Neustart sie nicht zurücksetzt.
+`syncBaselines` schreibt nur die eigene Änderung der Session seit dem letzten Abgleich (Delta-Merge) und übernimmt anschließend den Gesamtstand aus der Tabelle. Mit einem Schreiber ist das Ergebnis exakt; mit mehreren parallelen Schreibern (z. B. mehreren Servern oder In-Session-Prozessen mit demselben Scope) ist es eine gute Näherung ohne verlorene Updates. Damit sich parallele Schreiber nicht über Kreuz blockieren (Deadlock), laufen die Updates bestehender Zeilen und die Inserts neuer Zeilen in zwei getrennten Transaktionen, jeweils in aufsteigender Schlüsselreihenfolge. Baselines, die 15 Minuten lang nicht verwendet wurden, werden aus dem PGA entfernt. Auch die Drosselung von Alerts (`throttle_seconds`) wird je Scope geführt und in `LILAM_ALERT_STATE` gespeichert, sodass weder ein Neustart noch ein anderer Server sie aufhebt.
 
 ---
 ## Tabellen
@@ -531,6 +536,7 @@ Zusätzlich zu den prozessspezifischen Tabellen verwendet LILAM interne Tabellen
 | --- | --- |
 | `LILAM_SERVER_REGISTRY` | Verwaltet Serverregistrierung, Verfügbarkeit, Heartbeat, Last und Informationen zum aktuell aktiven Rule Set. |
 | `LILAM_RULES` | Speichert versionierte Rule Sets je Gruppe (Server und INSESSION-Prozesse), davon je Gruppe eines aktiv. |
+| `LILAM_ALERT_STATE` | Zustand der Alerts je Gruppe: Sperren der Drosselung (`throttle_seconds`, Art `LOCK`: je Scope bzw. Prozess, Regel, Action und Context der Zeitpunkt des letzten Alerts) und „zuletzt gesehen“ der Ziele von Schweige-Regeln (Arten `START`, `EVENT`, `TRACE`, `RUN`). Zeiten in UTC. Abgelaufene Sperren löscht das Housekeeping, Einträge ohne Regel die Prüfung der Schweige-Regeln. |
 | `LILAM_WATERMARK` | Wasserstände für das Failover: je Prozess und Client-Session die höchste Laufnummer, bis zu der Logs, Metriken und Prozessdaten committet sind. Der Server schreibt sie im selben Commit wie die Daten. |
 | `LILAM_LOG_INTERNAL` | Bietet ein unabhängiges Rückfall-Logging für interne Fehler des LILAM-Frameworks. |
 
@@ -739,4 +745,5 @@ Die LILAM API besteht aus rund 35 Prozeduren und Funktionen, von denen einige ü
 * **GET_SERVER_PIPE:** Liefert den Namen der Pipe, über die mit dem Server kommuniziert wird.
 * **SERVER_UPDATE_RULES:** Setzt das verwendete Rule Set ein oder ändert es
 * **CHECK_RULE_SET:** Prüft ein Rule Set, ohne es zu speichern oder zu aktivieren (`NULL` = gültig, sonst die Begründung)
+* **CHECK_SILENCE:** Prüft die Schweige-Regeln (`TIME_MAX_SILENCE_SECONDS`) einer Gruppe, z. B. aus einem Scheduler-Job der Anwendung
 

@@ -77,7 +77,7 @@ LILAM is developed by a developer who hates over-engineered tools. Focus: 5 minu
     ```
 
 ## Key features
-1. **Lightweight:** One Package, a handful of Tables, one Sequence. That's it!
+1. **Self-Installing:** One package and one sequence; all tables are created by LILAM itself when they are first needed: three per application (`_PROC`, `_LOG`, `_MON`) plus nine internal tables for rules, alerts, baselines and the server infrastructure (see [Tables](docs/architecture%20and%20concepts.md#tables)). No install scripts, no schedulers required for in-session use
 2. **Concurrent Logging:** Supports multiple, simultaneous log entries from the same or different sessions without blocking
 3. **Runtime Observability:** Captures and correlates logs, events and business transactions in near real-time, providing deep, fluent performance tracing across application sessions
 4. **Rule-Based Orchestration:** Evaluates versioned JSON rule-sets against observability data to automatically trigger alerts or execute decoupled consumers for reactive error-handling and workflow control
@@ -86,7 +86,7 @@ LILAM is developed by a developer who hates over-engineered tools. Focus: 5 minu
 7. **Smart Context Capture:** Automatically records ERR_STACK,  ERR_BACKTRACE, and ERR_CALLSTACK based on log level—deep insights with zero manual effort
 8. **Optional self-cleaning:** Automatically purges expired logs per application during session start—no background jobs or schedulers required
 9. **Future Ready:** Built and tested in latest Oracle 26ai (2026) and 19c environment
-10. **Small Footprint:**  <5k lines of logical PL/SQL code ensures simple quality and security control, fast compilation, zero bloat and minimal Shared Pool utilization (reducing memory pressure and fragmentation)
+10. **Self-Contained:** One package without dependencies on other packages or external libraries; it uses only Oracle built-ins such as `DBMS_PIPE`, `DBMS_ALERT` and `DBMS_SCHEDULER`. With server failover, measured values and the rule engine the code has grown to about 7,800 lines of logical PL/SQL code (without blank and comment lines); quality and security reviews still cover a single package
 
 ---
 ## Comparison
@@ -157,7 +157,8 @@ LILAM introduces a high-performance Client-Server architecture using **Oracle Pi
 * **Hybrid Execution:** Combine direct API calls within your session with decoupled processing via dedicated LILAM servers. Choose the optimal execution path for each log level or event type in real-time
 * **Load-Aware Discovery:** Clients automatically identify and connect to the least-loaded server within their group
 * **Auto-Synchronization:** Servers dynamically claim communication pipes, ensuring a zero-config setup
-* **Congestion Control (Throttling):** Optional protection layer that pauses hyperactive clients to ensure server stability during high-load peaks
+* **Backpressure:** If a server falls behind, its clients slow down in short steps until it has caught up. The server's performance level (`p_perfServer`) is not a hard limit: as long as the server keeps up, nothing is slowed down
+* **Automatic Failover:** If a server fails, its clients switch to another server of the group and resend the messages the failed server had not yet committed
 
 
 #### How it works
@@ -176,8 +177,8 @@ LILAM offers two execution models that can be used interchangeably:
 ### Performance & Safety
 LILAM prioritizes the stability of your application. It uses a Hybrid Model to balance speed and system integrity:
 * Logs, metrics, and status updates are handled via Fire-and-Forget to minimize overhead.
-* Active Throttling
-* As an optional safeguard, LILAM rate-limits hyperactive clients during load peaks to prevent pipe flooding until the bottleneck is cleared.
+* A client never waits for a reply from the server. Only if the server falls behind does the client slow down briefly (backpressure); if the pipe is full, it holds messages back for up to one second and resends them in order.
+* Messages the server has not yet committed stay in the client's ring buffer. If the server fails, the client repeats them on another server of the group (failover).
 
 ### Technology
 #### Autonomous Persistence
@@ -355,25 +356,18 @@ Locations of the core components:
 
 ---
 ## Performance Benchmark
-LILAM is designed for high-concurrency environments. The following results were achieved on standard **Consumer Hardware** (Fujitsu LIFEBOOK A-Series) running an **Oracle Database inside VirtualBox**. This demonstrates the massive efficiency of the Pipe-to-Bulk architecture, even when facing significant virtualization overhead (I/O emulation and CPU scheduling):
-*   **Total Messages:** 9,000,000 (Logs, Metrics, and Status Updates)
-*   **Clients:** 3 parallel sessions (3M messages each)
-*   **LILAM-Servers:** 2 active instances
-*   **Total Duration:** ~45 minutes
-*   **Peak Throughput:** ~3,300 - 5,000 messages per second
+LILAM was measured on a consumer laptop (Fujitsu LIFEBOOK A357, Intel Core i5-7200U, 16 GB RAM) running **Oracle AI Database 26ai Free** in a VirtualBox VM. The Free edition allows at most **2 CPU threads** for all sessions together (applications, LILAM servers and the measurement), so the absolute numbers are a lower bound; on a database server with more CPU threads and fast redo storage they are expected to be considerably better.
 
-| Configuration | Throughput | Status |
-| :--- | :--- | :--- |
-| **Exclusive Server (1 Client)** | ~1.6k msg/s | Finished in 30m |
-| **Shared Server (2 Clients)** | ~2.2k msg/s | Finished in 45m |
+*   **Cost per call:** a LILAM call costs the application **25–100 µs** (median) in both modes.
+*   **Comparison:** for the same INFO entry LILAM needed **26 µs** (in-session) or **50 µs** (decoupled), OraOpenSource Logger 3.1.1 needed **1.4 ms** (median). Both follow different goals: Logger commits every entry before the call returns, LILAM buffers or decouples.
+*   **Completeness:** no entry was lost in any of the 13 variants of the performance test (up to 3 clients × 100,000 calls, 1–3 servers, in-session and decoupled).
+*   **Visibility:** under normal load all data is in the database a few tenths of a second up to about 2 seconds after the last call.
 
-> **Key Takeaway:** Even on mobile hardware, LILAM handles millions of records without blocking the application sessions. On enterprise-grade server hardware with NVMe storage, throughput is expected to scale significantly higher.
+The long single calls under overload described in the report have since been fixed: the client no longer waits for replies from the server.
 
-LILAM was developed and stress-tested on a consumer-grade laptop using Oracle Database 23ai Free. To provide a realistic assessment of its capabilities, a rigorous test scenario was designed to push the entire system to its physical limits under these conditions.
-
-For a detailed analysis of throughput, y, and resource efficiency, please refer to the full reports:
-*   [Performance & Stress-Test Report (English Version)](./performance-report-eng.md)
-*   [Performance- & Belastungstest-Bericht (Deutsche Version)](./performance-report-deu.md)
+For details (call types, latency percentiles, cost of the failover) see the full report:
+*   [Performance-Bericht (German)](./performance-report-deu.md)
+*   The [English report](./performance-report-eng.md) describes an earlier stress test (before failover and measured values).
 
 ---
 ## License
@@ -385,10 +379,9 @@ This project is dual-licensed:
 
 ---
 ## Roadmap
-- [ ] **Automatic Fallback:**
-    * switch to the next available server or
-    * graceful degradation from Decoupled to  mode
-- [ ] **Process Resumption:** Reconnect to aborted processes via `process_id`
+- [X] **Automatic Failover:** Clients switch to the next available server of the group and resend messages not yet committed
+- [ ] **Graceful Degradation:** Fall back from Decoupled to In-Session mode if no server is available
+- [X] **Process Resumption:** Continue an open process via `process_id` from another database session (e.g. APEX/ORDS requests via the dispatcher)
 - [X] **Retention:** Process data can be protected from deletion using the 'immortal' flag
 - [ ] **Adaptive Batching:** Dynamically adjust buffer sizes and flush intervals based on server load to ensure near real-time visibility during low traffic and maximum throughput during peaks
 - [ ] **Zombie Session Handling:** Detect inactive clients, release allocated memory, and update process statuses automatically

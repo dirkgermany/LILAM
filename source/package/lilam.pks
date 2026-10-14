@@ -248,6 +248,9 @@ create or replace PACKAGE LILAM AS
     PROCEDURE SERVER_UPDATE_RULES(p_groupName VARCHAR2, p_ruleSetName VARCHAR2, p_ruleSetVersion PLS_INTEGER);
     -- Check a rule set without storing or activating it: NULL = valid, otherwise the reason (never raises)
     FUNCTION CHECK_RULE_SET(p_ruleSet CLOB) RETURN VARCHAR2;
+    -- Check the silence rules (TIME_MAX_SILENCE_SECONDS) of a group, e.g. from a scheduler job of the
+    -- application; servers of the group check themselves every 10 s (never raises)
+    PROCEDURE CHECK_SILENCE(p_groupName VARCHAR2);
     -- Dispatcher of this session. Default: used for NEW_PROCESS without group or of the dispatcher's group (registry),
     -- other groups go to their own servers; p_groupName = group: only for NEW_PROCESS of this group; p_pipeName NULL removes it
     PROCEDURE SET_DISPATCHER_PIPE(p_pipeName varchar2, p_groupName varchar2 DEFAULT 'DEFAULT_DISPATCHER', p_processId number DEFAULT null);

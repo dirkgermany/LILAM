@@ -207,7 +207,7 @@ INSESSION processes evaluate rules too if `NEW_SESSION` receives a group (`p_gro
 *   **Changes:** there is no timer. At most every 15 seconds (`C_RULES_CHECK_INTERVAL_MS`) an API call checks name and version of the active rule set with one small indexed query and reloads only if they changed. Servers are notified by `SERVER_UPDATE_RULES` and, in addition, run the same check in their housekeeping, so a server that missed the notification (e.g. full pipe) catches up within about 20 seconds.
 *   **Invalid rule sets** are rejected, logged once per version in `LILAM_LOG_INTERNAL`, and the previous rules stay active. Errors never reach the application.
 *   **Latency:** without a match a rule check is a few lookups in associative arrays; actions without rules cost one `EXISTS`, processes without a group nothing. A fired alert is written synchronously (`LILAM_ALERTS`, `DBMS_ALERT` signal, autonomous transaction), which costs the application one commit per alert. `throttle_seconds` limits how often this happens.
-*   **Session-local state:** throttling and the predecessor for `PRECEDED_BY` live in the database session. With connection pools (e.g. APEX) the same alert can therefore fire once per pooled connection.
+*   **Session-local state:** the predecessor for `PRECEDED_BY` lives in the database session; with connection pools (e.g. APEX) another pooled connection does not know it. Throttling (`throttle_seconds`), in contrast, applies across sessions, see **Throttling** below the rule set example.
 
 ### Trigger and Filter
 Each rule is assigned to a **Trigger Type**, which defines the signal that starts the evaluation.
@@ -261,6 +261,7 @@ Rules for other actions cost nothing. Multiple rules can be assigned to the same
 | **Value**       | `VAL_MIN`, `VAL_MAX`           | `used_value < value` or `used_value > value` (MARK_EVENT) | Fixed limits, e.g. minimum stock. |
 | **Frequency**   | `MAX_OCCURRENCE`      | `action_count > value` (MARK_EVENT, TRACE_STOP) | Flood protection / infinite loop detection.   |
 | **Interval**    | `TIME_MAX_GAP_SECONDS`     | time since previous event (MARK_EVENT) or end of previous trace (TRACE_START) > value | Detect stall between two signals. |
+| **Silence**     | `TIME_MAX_SILENCE_SECONDS` | no signal for `value` seconds (PROCESS_START, MARK_EVENT, TRACE_START, PROCESS_UPDATE); checked by time, not on a signal | Basis for a watchdog: job does not start, series delivers nothing, process hangs. |
 | **Dependency**  | `PRECEDED_BY`         | last event/trace of the process ≠ `ACTION[\|CONTEXT]` (MARK_EVENT, TRACE_START; not TRACE_STOP) | Validates predecessor.                  |
 | **Dependency**  | `TIME_PRECEDED_BY_WITHIN_SECS` | like `PRECEDED_BY`, plus maximum delay in seconds | Validates predecessor and max. delay.   |
 
@@ -307,6 +308,10 @@ The JSON object is divided into a header for metadata and an array of individual
 ```
 
 A server checks a rule set completely before it uses it. If one rule is invalid, the whole rule set is rejected and the previously loaded rules stay active. Values made of several parts separated by `|` must not contain empty parts (`|C1`, `A|`, `20||0.3`); unknown properties (except those starting with `_`) and fields that are objects, arrays or texts over 4000 characters are rejected. `CHECK_RULE_SET` performs the same check without storing or activating the rule set.
+
+**Throttling (`throttle_seconds`):** after an alert, the same rule fires again for the same combination of action and context only once the lock period has passed. The lock applies per baseline scope, for processes without a scope per process. A rule without context therefore throttles each context separately: an alert for `SAP` does not suppress one for `SIE`. LILAM stores the lock in the table `LILAM_ALERT_STATE` (kind `LOCK`, one row per group, scope or process, rule, action and context); it therefore holds across database sessions, pooled connections, server workers and restarts, and simultaneous hits in several sessions raise only one alert. The session additionally keeps known locks in memory; the table is read only when a rule matches. Expired locks are deleted by the server housekeeping, in INSESSION mode when an alert fires, in both cases at most once per minute and session.
+
+**Missing signals (`TIME_MAX_SILENCE_SECONDS`):** these rules are not evaluated when a signal arrives but by time: by every server of the group every 10 seconds in the housekeeping, without a server by `CHECK_SILENCE`, which the application calls e.g. from its own scheduler job. A signal only renews the "last seen" time per group and target (process start, event or trace series, running process); it is written buffered about every 1.5 seconds to `LILAM_ALERT_STATE` and survives restarts. A target without any signal so far counts from the first check after the rule was activated. Several checkers raise only one alert through the lock; without `throttle_seconds` the silence time is the lock period. Time windows (`windows`, `time_zone`) restrict the check to times of day, also several per rule; when a window opens, the silence counts anew. Alerts without a process have `PROCESS_ID` NULL. LILAM thus provides the basis for a watchdog; whether the check job itself runs is watched by the application.
 
 ---
 ## Operating Modes
@@ -468,7 +473,7 @@ flowchart TD
     DB -- "total state as the new base" --> SYNC
 ```
 
-`syncBaselines` writes only the session's own change since the last synchronisation (delta merge) and then takes over the total state from the table. With one writer the result is exact; with several parallel writers (e.g. several servers or In-Session processes with the same scope) it is a good approximation without lost updates. To keep parallel writers from blocking each other crosswise (deadlock), the updates of existing rows and the inserts of new rows run in two separate transactions, each in ascending key order. Baselines unused for 15 minutes are removed from the PGA. The alert throttling (`throttle_seconds`) is also kept per scope, so a restart does not reset it.
+`syncBaselines` writes only the session's own change since the last synchronisation (delta merge) and then takes over the total state from the table. With one writer the result is exact; with several parallel writers (e.g. several servers or In-Session processes with the same scope) it is a good approximation without lost updates. To keep parallel writers from blocking each other crosswise (deadlock), the updates of existing rows and the inserts of new rows run in two separate transactions, each in ascending key order. Baselines unused for 15 minutes are removed from the PGA. The alert throttling (`throttle_seconds`) is also kept per scope and stored in `LILAM_ALERT_STATE`, so neither a restart nor another server lifts it.
 
 ---
 ## Tables
@@ -505,6 +510,7 @@ In addition to the process-specific tables, LILAM uses internal tables whose nam
 | --- | --- |
 | `LILAM_SERVER_REGISTRY` | Maintains server registration, availability, heartbeat, load, and currently active Rule Set information. |
 | `LILAM_RULES` | Stores versioned Rule Sets per group (servers and INSESSION processes), one of them active per group. |
+| `LILAM_ALERT_STATE` | State of the alerts per group: locks of the throttling (`throttle_seconds`, kind `LOCK`: per scope or process, rule, action and context the time of the last alert) and "last seen" of the targets of silence rules (kinds `START`, `EVENT`, `TRACE`, `RUN`). Times in UTC. Expired locks are deleted by the housekeeping, rows without rule by the check of the silence rules. |
 | `LILAM_WATERMARK` | Watermarks for failover: per process and client session the highest sequence number up to which logs, metrics and process data are committed. The server writes them in the same commit as the data. |
 | `LILAM_LOG_INTERNAL` | Provides independent fallback logging for internal LILAM framework errors. |
 
@@ -713,4 +719,5 @@ The LILAM API consists of approximately 35 procedures and functions, some of whi
 * **GET_SERVER_PIPE:** Returns the name of the pipe used to communicate with the server.
 * **SERVER_UPDATE_RULES:** Implements or changes the used rule set
 * **CHECK_RULE_SET:** Checks a rule set without storing or activating it (`NULL` = valid, otherwise the reason)
+* **CHECK_SILENCE:** Checks the silence rules (`TIME_MAX_SILENCE_SECONDS`) of a group, e.g. from a scheduler job of the application
 

@@ -70,13 +70,17 @@ Rules are organized into Rule Sets, stored as JSON documents in the `LILAM_RULES
 | rules.condition.metric | string | no | informational only
 | rules.alert.handler | string | yes | name of the `DBMS_ALERT` signal the consumer listens to, max. 30 characters
 | rules.alert.severity | string | no | severity passed to the consumer, max. 30 characters
-| rules.alert.throttle_seconds | number | no | minimum seconds before the same rule fires again for the same action and baseline scope (default 0)
+| rules.alert.throttle_seconds | number | no | minimum seconds before the same rule fires again for the same action, context and baseline scope (default 0)⁴
+| rules.windows | array | no | only `TIME_MAX_SILENCE_SECONDS`: times in which the rule is checked, see [Silence Rules](#silence-rules)
+| rules.time_zone | string | with `windows` | time zone of the windows (region name, e.g. `Europe/Berlin`)
 
 ¹ The trigger type maps to the LILAM API call that produced the signal, see [Hooks / Trigger Types](#hooks--trigger-types).
 
 ² For process triggers the action is the process name. For `LOGGING` rules the action may be omitted (it is always `LOGGING`).
 
 ³ The context allows different thresholds for instances of the same action, e.g. a speed limit only for track section `SECTION_400_001`. A rule with context applies only to this context; a rule without context applies to **all** contexts of the action. If both exist, both are evaluated.
+
+⁴ The lock period applies per rule, action, context and baseline scope (without scope: per process). A rule without context therefore throttles each context separately: an alert for `SAP` does not suppress one for `SIE`. LILAM stores the lock in the table `LILAM_ALERT_STATE`, so it holds across database sessions, pooled connections, server workers and restarts; simultaneous hits in several sessions raise only one alert. Expired locks are deleted about once a minute.
 
 ```json
     {
@@ -127,6 +131,7 @@ Rules on `MARK_EVENT` and `TRACE_STOP` are only evaluated if the log level of th
 | VAL_MAX | number | MARK_EVENT | measured value is higher than the value (fixed limit)
 | MAX_OCCURRENCE | count | MARK_EVENT, TRACE_STOP, PROCESS_UPDATE, PROCESS_STOP | the action occurred more often than the value within the process (`ACTION_COUNT`); for processes: `STEPS_DONE` > value
 | TIME_MAX_GAP_SECONDS | seconds | MARK_EVENT, TRACE_START | time since the previous event (MARK_EVENT) or since the end of the previous trace (TRACE_START) of the same action is greater than the value
+| TIME_MAX_SILENCE_SECONDS | seconds (> 0) | PROCESS_START, MARK_EVENT, TRACE_START, PROCESS_UPDATE | no signal for longer than the value; checked by time, not by a signal, see [Silence Rules](#silence-rules)
 | PRECEDED_BY | `ACTION` or `ACTION\|CONTEXT` | MARK_EVENT, TRACE_START, PROCESS_UPDATE, PROCESS_STOP | the previous signal of the process was **not** the expected action (and context, if given)⁴
 | TIME_PRECEDED_BY_WITHIN_SECS | `ACTION\|SECONDS` or `ACTION\|CONTEXT\|SECONDS` | like PRECEDED_BY | like PRECEDED_BY, or the expected predecessor ended more than the given seconds ago
 | TIME_RUNTIME_EXCEEDED | milliseconds | PROCESS_UPDATE | the running process is older than the value
@@ -143,7 +148,46 @@ The EWMA deviation operators compare against the EWMA **before** the current mea
 ⁴ Only events and traces (start and stop) count as predecessors, log messages do not. Without a context in the value, any context of the expected action is accepted. The order is checked when the action starts, not at TRACE_STOP (there the predecessor would usually be the own TRACE_START); loading rejects `PRECEDED_BY*` with TRACE_STOP.
 
 > [!NOTE]
-> Rules are evaluated when a signal arrives. LILAM has no timer-based evaluation: a process that hangs without sending signals, or an event that never arrives ("B must follow A within X seconds" when B never comes), is not detected. The order "B follows A within X seconds" can be checked when B arrives, with `TIME_PRECEDED_BY_WITHIN_SECS` on B.
+> All other rules are evaluated when a signal arrives. The order "B follows A within X seconds" can be checked when B arrives, with `TIME_PRECEDED_BY_WITHIN_SECS` on B. Signals that do not arrive at all are covered by the silence rules below.
+
+### Silence Rules
+
+`TIME_MAX_SILENCE_SECONDS` reports that a signal has **not** arrived for longer than the value. It is the basis for an application watchdog: LILAM detects and reports the silence; scheduling the check and watching the checker remain with the application. The trigger type selects what has to stay silent:
+
+| trigger_type | Silent when | Alert |
+| --- | --- | --- |
+| PROCESS_START | no process named `action` has started | `process_id` NULL (no process), `process_name` = `action` |
+| MARK_EVENT, TRACE_START | no event or trace start of `action`; with `context` only for this context, without `context` any context counts | `process_id` NULL, `action`/`context` of the rule |
+| PROCESS_UPDATE | a running process named `action` has sent nothing (log, event, trace, status) | `process_id` of the process |
+
+```json
+{ "id": "POLL-SILENT", "trigger_type": "PROCESS_START", "action": "SPM_POLL",
+  "condition": { "operator": "TIME_MAX_SILENCE_SECONDS", "value": "900" },
+  "alert": { "handler": "LILAM_ALERT_MAIL_LOG", "severity": "ERROR", "throttle_seconds": 3600 } }
+```
+
+- **Scope:** per rule group, across all processes, sessions and servers of the group (also processes without baseline scope). Process triggers take no `context`.
+- **Who checks:** every server of the group every 10 seconds. Without a server (In-Session only) the application calls `LILAM.CHECK_SILENCE(p_groupName)`, e.g. from its own `DBMS_SCHEDULER` job. Several checkers raise only one alert.
+- **Start:** a target without any signal so far counts from the first check after the rule was activated, so a job that never starts is reported, but activating a rule does not raise an alert at once.
+- **Repetition:** while the silence lasts, `throttle_seconds` controls repetitions across sessions and checkers; with `throttle_seconds` 0 the silence time is the lock period. There is no alert when signals return.
+- **"Last seen"** is stored per group and target in `LILAM_ALERT_STATE` and survives restarts. The time is that of the processing (server: when the worker handles the message).
+- **Limits:** signals are written buffered, about every 1.5 seconds (In-Session: at the next write point of the session, at the latest `CLOSE_SESSION`); with the check interval a silence is reported up to about 12 seconds (server) or one job interval late. Silence times should therefore be well above that. A process that ends without `CLOSE_PROCESS` (session killed) keeps its entry and is reported as silent until the rule is removed. Changed rule sets reach the checkers as for other rules (servers at once or after 15 s, In-Session checkers on the next call); entries without rule are removed.
+- **Watching the checker:** if no checker runs (server stopped, job disabled), nothing is reported. LILAM cannot detect that itself; the application watches its job in `DBMS_SCHEDULER` (state, failures) or a second, independent checker.
+- **Time windows** (optional): `windows` restricts the check to times of day, e.g. trading hours. Outside all windows nothing is reported. When a window opens, the silence counts from its opening, so the evening's last signal does not raise an alert at 09:00 (also after a break between two windows). Several windows are allowed; the rule is checked while at least one is open (overlapping windows simply add up). `time_zone` (region name such as `Europe/Berlin`, also across daylight saving time) applies to all windows of the rule and is required with `windows`. Holidays remain with the application.
+
+  ```json
+  { "id": "SAP-SILENT", "trigger_type": "MARK_EVENT", "action": "SHARE_PRICE", "context": "SAP",
+    "condition": { "operator": "TIME_MAX_SILENCE_SECONDS", "value": "3600" },
+    "windows": [ { "days": "MON-FRI", "from": "09:00", "to": "13:00" },
+                 { "days": "MON-FRI", "from": "15:00", "to": "19:00" } ],
+    "time_zone": "Europe/Berlin",
+    "alert": { "handler": "LILAM_ALERT_MAIL_LOG", "severity": "WARN", "throttle_seconds": 3600 } }
+  ```
+
+  | Key | Content |
+  | --- | --- |
+  | `days` | `MON`…`SUN`, ranges and lists: `MON-FRI`, `MON,WED,FRI`, `FRI-MON` (wraps over the weekend) |
+  | `from`, `to` | `HH:MI` (24 h); `to` may be `24:00`. `to` before `from` means over midnight: the window starts on a listed day and ends on the next day (`22:00`–`06:00`) |
 
 ---
 ## Table: LILAM_RULES
