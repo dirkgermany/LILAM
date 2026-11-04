@@ -1,5 +1,5 @@
 create or replace PACKAGE LILAM AS
-    /* Complete Doc and last version see https://github.com/dirkgermany/LILA/docs */
+    /* Complete Doc and last version see https://github.com/dirkgermany/LILAM/docs */
     LILAM_VERSION constant varchar2(20) := 'v2.3';
 
     -- =====================================
