@@ -1,7 +1,7 @@
 # LILAM_GRAFANA – Beispiel-Consumer für Grafana
 
 Reicht LILAM-Alerts als **Grafana-Annotationen** weiter. Gebaut für das U-Bahn-Beispiel aus
-`docs/architecture and concepts.md` (Rule Set `SUBWAY_PROD`, Regel `R-001`, Kanal `LILAM_ALERT_MAIL_LOG`, Gruppe `SUBWAY`),
+`docs/Architektur und Konzepte.md` (Rule Set `SUBWAY_PROD`, Regel `R-001`, Kanal `LILAM_ALERT_MAIL_LOG`, Gruppe `SUBWAY`),
 aber über Kanal und Gruppe für jedes Rule Set nutzbar.
 
 ## Ablauf

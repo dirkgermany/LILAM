@@ -322,7 +322,7 @@ end if;
 
 > [!NOTE]
 > Durch den Baseline-Scope baut auch eine Anwendung, die häufig neu gestartet wird, eine stabile Vergleichsbasis für ihre Laufzeiten auf. Die Durchschnittswerte werden in den Tabellen `LILAM_SCOPES` und `LILAM_BASELINES` gespeichert.
-> Den Ablauf (Auflösung des Scopes, Laden und Abgleich mit `LILAM_BASELINES`) zeigt ein Diagramm in [Architektur und Konzepte.md](Architektur%20und%20Konzepte.md#baseline-scope).
+> Den Ablauf (Auflösung des Scopes, Laden und Abgleich mit `LILAM_BASELINES`) zeigt ein Diagramm in [Architektur und Konzepte.md](Architektur%20und%20Konzepte.md#baseline-scope-1).
 
 #### Beispiele
 
@@ -741,7 +741,7 @@ lilam.mark_event(l_processId, 'SHARE', 'ARAL', 80.71);
   - **Zeitreihe** (wie bisher): Abstand zum vorherigen Event (`USED_MILLIS`) und dessen EWMA (`USED_MILLIS_EWMA`).
   - **Wertreihe** (nur mit `p_value`): Messwert (`USED_VALUE`) und dessen EWMA (`USED_VALUE_EWMA`).
 - Der EWMA der Werte folgt denselben Regeln wie der zeitliche: Der erste Wert ist der Mittelwert, bis zum Ende des Warm-ups gilt das arithmetische Mittel, danach `alt + alpha * (neu - alt)`. Warm-up und Alpha kommen aus den Regeln `VAL_EWMA_DEVIATION_PCT_UP`/`_DOWN` der Action (sonst Standard: Warm-up 3, Alpha 0,1). Die Wertreihe zählt jedes Event mit Wert, auch das erste; die Zeitreihe zählt Abstände.
-- Mit [Baseline Scope](#baseline-scope) läuft der Wert-EWMA wie der zeitliche über Prozessgrenzen weiter.
+- Mit [Baseline Scope](#function-new_process--server_new_process) läuft der Wert-EWMA wie der zeitliche über Prozessgrenzen weiter.
 - Ein EWMA ist ein Vergleichswert. Eine Abweichung davon ist ein Signal, keine Diagnose.
 
 > [!IMPORTANT]
@@ -996,7 +996,7 @@ END;
 /
 ```
 
-Ob der Job selbst läuft, prüft LILAM nicht (siehe [Rules Engine](../rules/README.md#silence-rules)).
+Ob der Job selbst läuft, prüft LILAM nicht (siehe [Rules Engine](../rules/README_DE.md#schweige-regeln)).
 
 ### Procedure SERVER_UPDATE_RULES
 Rule Sets werden als JSON-Objekte in `LILAM_RULES` gespeichert, jeweils für eine Gruppe (`GROUP_NAME`, Name, Version). Dasselbe Rule Set kann für mehrere Gruppen eingetragen sein. Je Gruppe ist genau ein Rule Set aktiv (`IS_ACTIVE = 1`); es gilt für alle Server der Gruppe und für alle INSESSION-Prozesse, die mit dieser Gruppe gestartet wurden. Gruppe, Name und Version sind Pflicht und zusammen eindeutig, die Gruppe ohne Unterscheidung von Groß- und Kleinschreibung; die Version ist ganzzahlig, `IS_ACTIVE` ist 0 oder 1.
@@ -1024,7 +1024,7 @@ VALUES ('METRO', 'METRO_RULES', 2, systimestamp, 'Dirk', '{"rules":[ ... ]}');
 exec LILAM.SERVER_UPDATE_RULES('METRO', 'METRO_RULES', 2);
 ```
 
-Aufbau der Rule Sets und Operatoren: [Rules Engine](../rules/README.md). Einige Punkte vorab:
+Aufbau der Rule Sets und Operatoren: [Rules Engine](../rules/README_DE.md). Einige Punkte vorab:
 
 - **Kontext-Regeln:** Regeln mit Kontext (`Action|Context`) wirken zusätzlich zu den Regeln ohne Kontext derselben Action; LILAM prüft beide.
 - **Logging-Regeln:** Trigger `LOGGING` kennt `SEVERITY` (genau dieser Level) und `LOG_CONTAINS` mit dem Wert `TEXT` oder `LEVEL|TEXT`: Die Log-Meldung enthält den Text (ohne Unterscheidung von Groß-/Kleinschreibung), wahlweise nur für diesen Level. Der erste Teil gilt nur als Level, wenn er `ERROR`, `WARN`, `MONITOR`, `INFO` oder `DEBUG` ist; sonst ist der ganze Wert der Text (max. 100 Zeichen).
@@ -1033,8 +1033,8 @@ Aufbau der Rule Sets und Operatoren: [Rules Engine](../rules/README.md). Einige 
 - **`TIME_EWMA_DEVIATION_PCT_UP` / `_DOWN`:** Abweichung nach oben bzw. unten vom EWMA vor der Messung. Solange der Durchschnitt unter 1 ms liegt (Messauflösung), wird nicht ausgewertet.
 - **`VAL_EWMA_DEVIATION_PCT_UP` / `_DOWN`:** dasselbe für Messwerte, Band `|EWMA| * PCT / 100` (auch für negative Werte). Ohne die 1-ms-Ausnahme. Events ohne Wert lösen nichts aus.
 - **`VAL_MIN` / `VAL_MAX`:** fester Grenzwert; Alert, wenn der Wert kleiner bzw. größer ist (die Grenze selbst löst nicht aus). Nur mit Trigger `MARK_EVENT`.
-- **`VAL_CROSS_ABOVE` / `VAL_CROSS_BELOW`:** Schwelle mit Zustand, Wert `schwelle[|rückkehr]`; genau ein Alert beim Überqueren, danach still, bis der Wert zurückgekehrt ist (Rückkehr ohne Alert). Ohne Rückkehrgrenze gilt die Schwelle. Der Zustand gilt je Gruppe, Baseline Scope, Regel, Action und Context und überdauert Sessions und Server-Neustarts; ohne Scope nur je Prozess, jeder Lauf meldet dann neu. Anders als bei `VAL_MIN`/`VAL_MAX` meldet ein Wert, der jenseits bleibt, nach Ablauf von `throttle_seconds` nicht erneut. Unterdrückt die Sperrfrist den Alert, bleibt die Regel scharf. Melden zwei Sessions dieselbe Reihe mit gegenläufigen Werten, gewinnt der zuletzt committete Zustandswechsel. Nur mit Trigger `MARK_EVENT`. Details: `rules/README.md`, [Threshold Rules](../rules/README.md#threshold-rules).
-- **Ausbleibende Signale:** Alle anderen Regeln werden ausgewertet, wenn ein Signal eintrifft. `TIME_MAX_SILENCE_SECONDS` meldet dagegen, dass seit X Sekunden kein Signal kam: kein Start eines Prozesses (`PROCESS_START`), keine Events oder Traces einer Action (`MARK_EVENT`, `TRACE_START`, optional je Context) oder nichts mehr von einem laufenden Prozess (`PROCESS_UPDATE`). Geprüft wird je Gruppe durch die Server bzw. [`CHECK_SILENCE`](#procedure-check_silence). Das ist die Grundlage für einen Watchdog der Anwendung; Planung und Überwachung des Prüfjobs bleiben bei ihr. Optional begrenzen Zeitfenster (`windows` mit `time_zone`, z. B. Mo–Fr 09:00–13:00 und 15:00–19:00) die Prüfung; beim Öffnen eines Fensters zählt das Schweigen neu. Alerts ohne Prozess haben `PROCESS_ID` NULL. Details und Grenzen: [Rules Engine](../rules/README.md#silence-rules).
+- **`VAL_CROSS_ABOVE` / `VAL_CROSS_BELOW`:** Schwelle mit Zustand, Wert `schwelle[|rückkehr]`; genau ein Alert beim Überqueren, danach still, bis der Wert zurückgekehrt ist (Rückkehr ohne Alert). Ohne Rückkehrgrenze gilt die Schwelle. Der Zustand gilt je Gruppe, Baseline Scope, Regel, Action und Context und überdauert Sessions und Server-Neustarts; ohne Scope nur je Prozess, jeder Lauf meldet dann neu. Anders als bei `VAL_MIN`/`VAL_MAX` meldet ein Wert, der jenseits bleibt, nach Ablauf von `throttle_seconds` nicht erneut. Unterdrückt die Sperrfrist den Alert, bleibt die Regel scharf. Melden zwei Sessions dieselbe Reihe mit gegenläufigen Werten, gewinnt der zuletzt committete Zustandswechsel. Nur mit Trigger `MARK_EVENT`. Details: `rules/README_DE.md`, [Schwellen-Regeln](../rules/README_DE.md#schwellen-regeln).
+- **Ausbleibende Signale:** Alle anderen Regeln werden ausgewertet, wenn ein Signal eintrifft. `TIME_MAX_SILENCE_SECONDS` meldet dagegen, dass seit X Sekunden kein Signal kam: kein Start eines Prozesses (`PROCESS_START`), keine Events oder Traces einer Action (`MARK_EVENT`, `TRACE_START`, optional je Context) oder nichts mehr von einem laufenden Prozess (`PROCESS_UPDATE`). Geprüft wird je Gruppe durch die Server bzw. [`CHECK_SILENCE`](#procedure-check_silence). Das ist die Grundlage für einen Watchdog der Anwendung; Planung und Überwachung des Prüfjobs bleiben bei ihr. Optional begrenzen Zeitfenster (`windows` mit `time_zone`, z. B. Mo–Fr 09:00–13:00 und 15:00–19:00) die Prüfung; beim Öffnen eines Fensters zählt das Schweigen neu. Alerts ohne Prozess haben `PROCESS_ID` NULL. Details und Grenzen: [Rules Engine](../rules/README_DE.md#schweige-regeln).
 
 ### Regeln im INSESSION-Modus
 Auch Prozesse im INSESSION-Modus werten Regeln aus, wenn `NEW_PROCESS` eine Gruppe erhält (`p_groupName` bzw. `t_process_init.groupName`). Sie nutzen dann dasselbe aktive Rule Set der Gruppe aus `LILAM_RULES` wie die Server dieser Gruppe. Ohne Gruppe gibt es keine Regeln.

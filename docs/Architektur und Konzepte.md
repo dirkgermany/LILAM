@@ -27,7 +27,7 @@
   - [In-Session und Entkoppelt im Vergleich](#in-session-und-entkoppelt-im-vergleich)
   - [Wie ein API-Aufruf sein Ziel findet](#wie-ein-api-aufruf-sein-ziel-findet)
   - [Ablauf im Dispatcher](#ablauf-im-dispatcher)
-  - [Baseline-Scope](#baseline-scope)
+  - [Baseline-Scope](#baseline-scope-1)
 - [Tabellen](#tabellen)
   - [Anwendungsspezifische Tabellen](#anwendungsspezifische-tabellen)
   - [Feste interne Tabellen](#feste-interne-tabellen)
@@ -222,7 +222,7 @@ Ein Prozess überwacht die Actions **'A'** und **'B'**:
 
 ---
 ## Regelverwaltung & Reaktion auf Ereignisse
-**Regeln** legen fest, wie LILAM Server auf eingehende **Signale** reagieren, und machen LILAM so von einem passiven Monitoring-Werkzeug zu einem aktiven **Orchestrator**. Die vollständige Referenz (Eigenschaften, Operatoren, Beispiele) steht in [Rules Engine](../rules/README.md).
+**Regeln** legen fest, wie LILAM Server auf eingehende **Signale** reagieren, und machen LILAM so von einem passiven Monitoring-Werkzeug zu einem aktiven **Orchestrator**. Die vollständige Referenz (Eigenschaften, Operatoren, Beispiele) steht in [Rules Engine](../rules/README_DE.md).
 
 Regeln sind in **Rule Sets** organisiert, die als JSON-Objekte aufgebaut sind. Die zentrale Tabelle `LILAM_RULES` speichert jedes Rule Set mit seiner **Gruppe**, seinem Namen und seiner **Version**. Je Gruppe ist genau ein Rule Set aktiv (`IS_ACTIVE`). Jeder LILAM Server lädt beim Start und beim Aufruf von `SERVER_UPDATE_RULES` das aktive Rule Set seiner Gruppe; ein neuer Server der Gruppe verwendet daher automatisch dieselben Regeln.
 

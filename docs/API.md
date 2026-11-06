@@ -13,7 +13,7 @@
   - [Process Progress vs. Metrics](#process-progress-vs-metrics)
   - [Events vs. Traces](#events-vs-traces)
 - [Functions and Procedures](#functions-and-procedures)
-  - [Session Handling](#session-handling)
+  - [Process Management](#process-management)
   - [Process Control](#process-control)
   - [Logging](#logging)
   - [Metrics](#metrics)
@@ -22,7 +22,7 @@
 - [Appendix](#appendix)
   - [Parameter Requirements](#parameter-requirements-1)
   - [Log Levels](#log-levels)
-  - [Record Type t_session_init](#record-type-t_session_init)
+  - [Record Type t_process_init](#record-type-t_process_init)
   - [Record Type t_process_rec](#record-type-t_process_rec)
   - [Procedure IS_ALIVE](#procedure-is_alive)
   - [JSON API Interface](#json-api-interface)
@@ -49,15 +49,15 @@ The following example initializes LILAM, writes a log entry and records two occu
 ```sql
 DECLARE
   l_processId   NUMBER;
-  l_sessionInit lilam.t_session_init;
+  l_processInit lilam.t_process_init;
 BEGIN
-  -- 1. Configure the session
-  l_sessionInit.processName := 'MY_FIRST_SYNC';
-  l_sessionInit.logLevel    := lilam.logLevelInfo; -- default: logLevelMonitor
+  -- 1. Configure the process
+  l_processInit.processName := 'MY_FIRST_SYNC';
+  l_processInit.logLevel    := lilam.logLevelInfo; -- default: logLevelMonitor
 
-  -- 2. Initialize LILAM
-  l_processId := lilam.new_session(
-    p_session_init => l_sessionInit
+  -- 2. Start the process
+  l_processId := lilam.new_process(
+    p_process_init => l_processInit
   );
 
   -- 3. Write a log entry
@@ -79,8 +79,8 @@ BEGIN
     p_actionName => 'DATA_LOAD'
   );
 
-  -- 5. Finalize the session
-  lilam.close_session(l_processId);
+  -- 5. Close the process
+  lilam.close_process(l_processId);
 END;
 /
 ```
@@ -116,7 +116,7 @@ DECLARE
   l_processId NUMBER;
 BEGIN
   -- Connect to an available server
-  l_processId := lilam.server_new_session(
+  l_processId := lilam.server_new_process(
     p_processName => 'DECOUPLED_SYNC',
     p_logLevel    => lilam.logLevelInfo
   );
@@ -148,7 +148,7 @@ BEGIN
   lilam.proc_step_done(p_processId => l_processId);
 
   -- Flush remaining buffered data
-  lilam.close_session(l_processId);
+  lilam.close_process(l_processId);
 END;
 /
 ```
@@ -162,7 +162,7 @@ DECLARE
   l_processId NUMBER;
   l_serverPipe VARCHAR2(100);
 BEGIN
-  l_processId := lilam.server_new_session(
+  l_processId := lilam.server_new_process(
     p_processName => 'SHUT DOWN SERVER',
     p_logLevel    => lilam.logLevelInfo
   );
@@ -175,7 +175,7 @@ BEGIN
     'SECURE PASSWORD'
   );
 
-  lilam.close_session(l_processId);
+  lilam.close_process(l_processId);
 END;
 /
 ```
@@ -223,29 +223,31 @@ These terms are deliberately kept in English because they refer directly to the 
 
 ---
 
-## Session Handling
+## Process Management
 
-Session handling controls the life cycle of a LILAM process.
+Process management controls the life cycle of a LILAM process.
 
 | API | Purpose |
 | --- | --- |
-| `NEW_SESSION` | Starts a LILAM process in in-session mode |
-| `SERVER_NEW_SESSION` | Starts a process connected to a LILAM server |
-| `CLOSE_SESSION` | Ends a process and writes buffered data |
+| `NEW_PROCESS` | Starts a LILAM process in in-session mode |
+| `SERVER_NEW_PROCESS` | Starts a process connected to a LILAM server |
+| `SERVER_CONNECT_PROCESS` | Connects to the active process of this name or creates it, see [Finding a Process by Name](#finding-a-process-by-name) |
+| `GET_ACTIVE_PROCESSES` | Returns the IDs of the active processes of a name |
+| `CLOSE_PROCESS` | Ends a process and writes buffered data |
 | `FLUSH` | Immediately writes all buffered data of the database session; the processes stay open |
 
-### Function NEW_SESSION / SERVER_NEW_SESSION
+### Function NEW_PROCESS / SERVER_NEW_PROCESS
 
 Both functions start a LILAM process and return its process ID. This ID is required for all subsequent API calls.
 
-- `NEW_SESSION` starts the process in in-session mode.
-- `SERVER_NEW_SESSION` starts the process in decoupled mode via a LILAM server. The parameters are the same; `p_groupName` is in second position here, and in last position for `NEW_SESSION`.
-- Alternatively, all settings can be combined in a [`t_session_init`](#record-type-t_session_init) record (`NEW_SESSION` only).
+- `NEW_PROCESS` starts the process in in-session mode.
+- `SERVER_NEW_PROCESS` starts the process in decoupled mode via a LILAM server. The parameters are the same; `p_groupName` is in second position here, and in last position for `NEW_PROCESS`.
+- Alternatively, all settings can be combined in a [`t_process_init`](#record-type-t_process_init) record (`NEW_PROCESS` only).
 
 Each parameter is always in the same position. All parameters except `p_processName` have a default and can therefore be omitted or passed by name.
 
 ```sql
-FUNCTION NEW_SESSION(
+FUNCTION NEW_PROCESS(
   p_processName   VARCHAR2,
   p_logLevel      PLS_INTEGER DEFAULT logLevelMonitor,
   p_procStepsToDo PLS_INTEGER DEFAULT NULL,
@@ -258,13 +260,13 @@ FUNCTION NEW_SESSION(
 ```
 
 ```sql
-FUNCTION NEW_SESSION(
-  p_session_init t_session_init
+FUNCTION NEW_PROCESS(
+  p_process_init t_process_init
 ) RETURN NUMBER
 ```
 
 ```sql
-FUNCTION SERVER_NEW_SESSION(
+FUNCTION SERVER_NEW_PROCESS(
   p_processName   VARCHAR2,
   p_groupName     VARCHAR2    DEFAULT NULL,
   p_logLevel      PLS_INTEGER DEFAULT logLevelMonitor,
@@ -277,19 +279,19 @@ FUNCTION SERVER_NEW_SESSION(
 ```
 
 ```sql
-FUNCTION SERVER_NEW_SESSION_JSON(
+FUNCTION SERVER_NEW_PROCESS_JSON(
   p_jsonObject VARCHAR2
 ) RETURN NUMBER
 ```
 
-`SERVER_NEW_SESSION_JSON` accepts the same parameters as a JSON object (see the table for the keys).
+`SERVER_NEW_PROCESS_JSON` accepts the same parameters as a JSON object (see the table for the keys).
 
 #### Parameters
 
 | Parameter | JSON | Default | Description |
 | --- | --- | --- | --- |
 | `p_processName` | `process_name` | – | Name used to identify the process |
-| `p_groupName` | `group_name` | `NULL` | `SERVER_NEW_SESSION`: restricts the server selection to the given group; `NULL` = any available server. `NEW_SESSION`: the process uses the active rule set of this group from `LILAM_RULES` (see [Rules in INSESSION Mode](#rules-in-insession-mode)); `NULL` = no rules |
+| `p_groupName` | `group_name` | `NULL` | `SERVER_NEW_PROCESS`: restricts the server selection to the given group; `NULL` = any available server. `NEW_PROCESS`: the process uses the active rule set of this group from `LILAM_RULES` (see [Rules in INSESSION Mode](#rules-in-insession-mode)); `NULL` = no rules |
 | `p_logLevel` | `log_level` | `logLevelMonitor` | Level of logging detail, see [Log Levels](#log-levels) |
 | `p_procStepsToDo` | `steps_todo` | `NULL` | Planned number of process steps |
 | `p_daysToKeep` | `days_to_keep` | `NULL` | `NULL` = no automatic cleanup. Otherwise, at start, completed processes with the same name that are older than the given number of days are deleted together with their logs and metrics (except processes with `procImmortal = 1`) |
@@ -299,19 +301,19 @@ FUNCTION SERVER_NEW_SESSION_JSON(
 
 **Return value:** `NUMBER`, the process ID.
 
-If `SERVER_NEW_SESSION` cannot create a process, the function does **not raise an exception** but returns a negative value. All further API calls with this ID are ignored without error; the application keeps running, just without logging and monitoring for this process. The cause is logged in `LILAM_LOG_INTERNAL`.
+If `SERVER_NEW_PROCESS` cannot create a process, the function does **not raise an exception** but returns a negative value. All further API calls with this ID are ignored without error; the application keeps running, just without logging and monitoring for this process. The cause is logged in `LILAM_LOG_INTERNAL`.
 
 | Constant | Value | Meaning |
 | --- | --- | --- |
-| `NUM_ERR_SESSION_TIMEOUT` | -20110 | The server did not respond in time |
-| `NUM_ERR_SESSION_THROTTLED` | -20120 | The server rejected the request (overload) |
+| `NUM_ERR_PROCESS_TIMEOUT` | -20110 | The server did not respond in time |
+| `NUM_ERR_PROCESS_THROTTLED` | -20120 | The server rejected the request (overload) |
 | `NUM_COMM_ERR` | -20003 | Communication error, e.g. no active server found |
 
 ```sql
-l_processId := lilam.server_new_session('IMPORT_CUSTOMERS', 'BATCH');
+l_processId := lilam.server_new_process('IMPORT_CUSTOMERS', 'BATCH');
 if l_processId < 0 then
   -- optional: custom reaction, e.g. notify operations
-  null;   -- l_processId = lilam.NUM_ERR_SESSION_TIMEOUT, ...
+  null;   -- l_processId = lilam.NUM_ERR_PROCESS_TIMEOUT, ...
 end if;
 ```
 
@@ -320,43 +322,45 @@ end if;
 
 > [!NOTE]
 > Thanks to the baseline scope, even an application that is restarted frequently builds up a stable basis for comparing its run times. The average values are stored in the tables `LILAM_SCOPES` and `LILAM_BASELINES`.
-> The flow (resolution of the scope, loading and reconciliation with `LILAM_BASELINES`) is shown in a diagram in [architecture and concepts.md](architecture%20and%20concepts.md#baseline-scope).
+> The flow (resolution of the scope, loading and reconciliation with `LILAM_BASELINES`) is shown in a diagram in [architecture and concepts.md](architecture%20and%20concepts.md#baseline-scope-1).
 
 #### Examples
 
 ```sql
 -- name only, all other values by default
-l_processId := lilam.new_session('IMPORT_CUSTOMERS');
+l_processId := lilam.new_process('IMPORT_CUSTOMERS');
 
 -- log level INFO and 500 planned steps
-l_processId := lilam.new_session('IMPORT_CUSTOMERS', lilam.logLevelInfo, 500);
+l_processId := lilam.new_process('IMPORT_CUSTOMERS', lilam.logLevelInfo, 500);
 
 -- individual parameters by name
-l_processId := lilam.new_session('IMPORT_CUSTOMERS', p_daysToKeep => 30);
-l_processId := lilam.new_session('IMPORT_CUSTOMERS', p_baselineScope => '#NONE');
+l_processId := lilam.new_process('IMPORT_CUSTOMERS', p_daysToKeep => 30);
+l_processId := lilam.new_process('IMPORT_CUSTOMERS', p_baselineScope => '#NONE');
 
 -- in-session with the rules of group BATCH
-l_processId := lilam.new_session('IMPORT_CUSTOMERS', p_groupName => 'BATCH');
+l_processId := lilam.new_process('IMPORT_CUSTOMERS', p_groupName => 'BATCH');
 
 -- also write WARN immediately and durably
-l_processId := lilam.new_session('IMPORT_CUSTOMERS', p_syncLevel => lilam.logLevelWarn);
+l_processId := lilam.new_process('IMPORT_CUSTOMERS', p_syncLevel => lilam.logLevelWarn);
 
 -- decoupled: any available server or a server of group BATCH
-l_processId := lilam.server_new_session('IMPORT_CUSTOMERS');
-l_processId := lilam.server_new_session('IMPORT_CUSTOMERS', 'BATCH', lilam.logLevelInfo);
+l_processId := lilam.server_new_process('IMPORT_CUSTOMERS');
+l_processId := lilam.server_new_process('IMPORT_CUSTOMERS', 'BATCH', lilam.logLevelInfo);
 ```
 
-### Procedure CLOSE_SESSION
+### Procedure CLOSE_PROCESS
 
 Ends a LILAM process. Optionally, final process information, status and progress can be passed.
 
 > [!IMPORTANT]
-> Always call `CLOSE_SESSION` when a process ends. LILAM buffers data for performance reasons. `CLOSE_SESSION` ensures that any remaining buffered data is persisted.
+> Always call `CLOSE_PROCESS` when a process ends. LILAM buffers data for performance reasons. `CLOSE_PROCESS` ensures that any remaining buffered data is persisted.
 >
-> `CLOSE_SESSION` should therefore also be part of the final exception handling. If the process is to continue after the exception (e.g. an AJAX page keeps working), use [`FLUSH`](#procedure-flush) instead.
+> `CLOSE_PROCESS` should therefore also be part of the final exception handling. If the process is to continue after the exception (e.g. an AJAX page keeps working), use [`FLUSH`](#procedure-flush) instead.
+>
+> In decoupled mode, `CLOSE_PROCESS` does not wait for the server. If the server fails before it has closed the process, the client repeats everything not yet written, including `CLOSE_PROCESS`, on another worker during a later LILAM call of the same session (see Failover in "Architecture and Concepts").
 
 ```sql
-PROCEDURE CLOSE_SESSION(
+PROCEDURE CLOSE_PROCESS(
   p_processId     NUMBER,
   p_processInfo   VARCHAR2    DEFAULT NULL,
   p_processStatus PLS_INTEGER DEFAULT NULL,
@@ -367,7 +371,7 @@ PROCEDURE CLOSE_SESSION(
 
 | Parameter | Description |
 | --- | --- |
-| `p_processId` | Process ID from `NEW_SESSION` or `SERVER_NEW_SESSION` |
+| `p_processId` | Process ID from `NEW_PROCESS` or `SERVER_NEW_PROCESS` |
 | `p_processInfo` | Final information about the process |
 | `p_processStatus` | Final status |
 | `p_procStepsDone` | Number of completed steps |
@@ -376,9 +380,9 @@ PROCEDURE CLOSE_SESSION(
 Parameters that remain `NULL` do not change the existing value of the process.
 
 ```sql
-lilam.close_session(l_processId);
-lilam.close_session(l_processId, 'Import completed', 1);
-lilam.close_session(l_processId, 'Import completed', 1, 500);
+lilam.close_process(l_processId);
+lilam.close_process(l_processId, 'Import completed', 1);
+lilam.close_process(l_processId, 'Import completed', 1, 500);
 ```
 
 Example of exception handling:
@@ -386,7 +390,7 @@ Example of exception handling:
 ```sql
 EXCEPTION
   WHEN OTHERS THEN
-    lilam.close_session(
+    lilam.close_process(
       p_processId     => l_proc_id,
       p_processInfo   => SQLERRM,
       p_processStatus => -1
@@ -398,7 +402,7 @@ EXCEPTION
 
 LILAM buffers logging, monitoring and process data for performance reasons and writes them on a time-controlled basis (see [When are metrics and process data written?](#when-are-metrics-and-process-data-written)).
 
-`FLUSH` immediately writes all buffered data of all open processes of the current database session, including baselines. Unlike `CLOSE_SESSION`, `FLUSH` does not end any process: the processes stay open, open traces keep running, and counters and averages keep counting.
+`FLUSH` immediately writes all buffered data of all open processes of the current database session, including baselines. Unlike `CLOSE_PROCESS`, `FLUSH` does not end any process: the processes stay open, open traces keep running, and counters and averages keep counting.
 
 ```sql
 PROCEDURE FLUSH
@@ -406,7 +410,7 @@ PROCEDURE FLUSH
 
 Typical uses:
 
-- Exception handlers when the process is to continue afterwards (e.g. an AJAX page keeps working). If the process ends, use `CLOSE_SESSION`.
+- Exception handlers when the process is to continue afterwards (e.g. an AJAX page keeps working). If the process ends, use `CLOSE_PROCESS`.
 - A long-running in-session process is to be visible from outside immediately before a longer pause without LILAM calls.
 
 ```sql
@@ -498,7 +502,7 @@ PROCEDURE SET_PROC_STEPS_DONE(
 
 ### Procedure SET_PROC_IMMORTAL
 
-Marks a process to be kept permanently (`1`) or removes the marking (`0`). Processes with `procImmortal = 1` are not deleted by the automatic cleanup via `p_daysToKeep`. At start, the value can also be set via `t_session_init.procImmortal`.
+Marks a process to be kept permanently (`1`) or removes the marking (`0`). Processes with `procImmortal = 1` are not deleted by the automatic cleanup via `p_daysToKeep`. At start, the value can also be set via `t_process_init.procImmortal`.
 
 ```sql
 PROCEDURE SET_PROC_IMMORTAL(
@@ -535,7 +539,7 @@ FUNCTION GET_PROCESS_START(
 ) RETURN TIMESTAMP
 ```
 
-Returns the point in time at which the process was started by `NEW_SESSION` or `SERVER_NEW_SESSION`.
+Returns the point in time at which the process was started by `NEW_PROCESS` or `SERVER_NEW_PROCESS`.
 
 ### Function GET_PROCESS_END
 
@@ -545,7 +549,7 @@ FUNCTION GET_PROCESS_END(
 ) RETURN TIMESTAMP
 ```
 
-Returns the point in time at which the process was ended by `CLOSE_SESSION`.
+Returns the point in time at which the process was ended by `CLOSE_PROCESS`.
 
 ### Function GET_PROCESS_STATUS
 
@@ -649,7 +653,7 @@ LILAM buffers log entries for performance reasons. Entries up to the **sync leve
 | In-Session | are committed in an autonomous transaction before the call returns. In doing so, LILAM also writes out all other buffered data of the database session. | remain in the buffer for up to about 1.5 seconds, longer if the session no longer calls LILAM (log calls, `MARK_EVENT`, `TRACE_STOP` and process control trigger the write-back, see [When are metrics and process data written?](#when-are-metrics-and-process-data-written)) |
 | Decoupled | go to the server as usual and are written to the working table there. As a **safety net**, the client additionally writes them itself in an autonomous transaction before the call returns, always into **`LILAM_LOG`** in the client's schema (created if needed), with the process ID and the value `-1` in the column `NO`. | go to the server via pipe and are buffered there |
 
-A synchronously written entry thus survives an aborted session and, in decoupled mode, a failure of the LILAM server. Buffered entries are lost if a session ends without `CLOSE_SESSION` or `FLUSH`. Therefore, call `CLOSE_SESSION` in the central exception handler, or `FLUSH` if the process is to continue.
+A synchronously written entry thus survives an aborted session and, in decoupled mode, a failure of the LILAM server. Buffered entries are lost if a session ends without `CLOSE_PROCESS` or `FLUSH`. Therefore, call `CLOSE_PROCESS` in the central exception handler, or `FLUSH` if the process is to continue.
 
 > [!NOTE]
 > In decoupled mode, synchronous entries are normally stored twice in the database: in the working table (written by the server) and in `LILAM_LOG` in the client's schema (`NO = -1`). If the LILAM server fails, the entry can still be found in `LILAM_LOG`. `LILAM_LOG` is used because the working table may reside in the server's schema, which the client has no access to.
@@ -689,12 +693,12 @@ Metrics capture events and logical transactions within a process.
 LILAM also buffers metrics and process data (status, progress). In in-session mode, `MARK_EVENT`, `TRACE_STOP` and the procedures of [process control](#process-control) (`SET_PROCESS_STATUS`, `SET_PROC_STEPS_TODO`, `SET_PROC_STEPS_DONE`, `PROC_STEP_DONE`, `SET_PROC_IMMORTAL`) – like every log call – trigger the time-controlled write-back: data of a process older than about 1.5 seconds is written out, and cross-process baselines (`LILAM_BASELINES`) are likewise written at intervals of about 1.5 seconds. At least 500 ms pass between two check runs of the same database session, so a single call usually costs only a time comparison. `TRACE_START` does not trigger a write-back. This way, even pure monitoring applications that never log get their measurements and progress into the database promptly. Queries via the API (e.g. `GET_PROC_STEPS_DONE`) in the same session read the current state from the buffer anyway. With [`FLUSH`](#procedure-flush) you write the buffer immediately without ending the process.
 
 > [!IMPORTANT]
-> There is no timer in in-session mode. Data is only written when the session calls LILAM. Whatever is still in the buffer after the last call stays there until the session calls LILAM again. **Writing is guaranteed only with `CLOSE_SESSION` (process ends) or `FLUSH` (process stays open).**
+> There is no timer in in-session mode. Data is only written when the session calls LILAM. Whatever is still in the buffer after the last call stays there until the session calls LILAM again. **Writing is guaranteed only with `CLOSE_PROCESS` (process ends) or `FLUSH` (process stays open).**
 >
-> **AJAX and connection pool (e.g. APEX/ORDS):** An in-session process lives only in the database session that called `NEW_SESSION`. In the pool, the next request usually runs in a different session; there the process ID is unknown, and LILAM silently ignores the calls. A `CLOSE_SESSION` on a final page then does not reach the process, and its buffer remains in the original pool session.
+> **AJAX and connection pool (e.g. APEX/ORDS):** An in-session process lives only in the database session that called `NEW_PROCESS`. In the pool, the next request usually runs in a different session; there the process ID is unknown, and LILAM silently ignores the calls. A `CLOSE_PROCESS` on a final page then does not reach the process, and its buffer remains in the original pool session.
 >
-> - **One process per request:** `NEW_SESSION` at the beginning and `CLOSE_SESSION` at the end of the same request. Then in-session mode also works in a connection pool.
-> - **Processes spanning several requests** (e.g. AJAX pages that only trace or report progress, while only a final page calls `CLOSE_SESSION`): only with the [decoupled server mode](#decoupled-server-mode) together with the [dispatcher](#dispatcher-mode).
+> - **One process per request:** `NEW_PROCESS` at the beginning and `CLOSE_PROCESS` at the end of the same request. Then in-session mode also works in a connection pool.
+> - **Processes spanning several requests** (e.g. AJAX pages that only trace or report progress, while only a final page calls `CLOSE_PROCESS`): only with the [decoupled server mode](#decoupled-server-mode) together with the [dispatcher](#dispatcher-mode).
 
 ### Procedure MARK_EVENT
 
@@ -702,7 +706,7 @@ Use `MARK_EVENT` for a single event at a specific point in time within the proce
 
 For repeated markers with the same action and the same context, LILAM tracks the time interval, number of occurrences, average duration and significant timing deviations.
 
-Optionally, `p_value` passes a numeric measurement, e.g. a share price, a temperature or a fill level. LILAM stores the value and calculates a separate EWMA for the value series, independent of the time interval. This way LILAM monitors not only process flows but also measurements defined by the application.
+Optionally, you pass a numeric measurement with `p_value`, e.g. a share price, a temperature or a fill level. LILAM stores the value and calculates a separate EWMA for the value series, independent of the time interval. This way LILAM monitors not only process flows but also measurements defined by the application.
 
 ```sql
 PROCEDURE MARK_EVENT(
@@ -772,9 +776,9 @@ PROCEDURE TRACE_STOP(
 ```
 
 > [!IMPORTANT]
-> When the session ends, open traces are checked. A trace that has not been completed is logged as a warning.
+> When the process is closed (`CLOSE_PROCESS`), open traces are checked. A trace that has not been completed is logged as a warning.
 >
-> Therefore, also call `CLOSE_SESSION` in the final exception handling so that this check can take place.
+> Therefore, also call `CLOSE_PROCESS` in the final exception handling so that this check can take place.
 
 ### Function GET_METRIC_AVG_DURATION
 
@@ -811,6 +815,36 @@ FUNCTION GET_METRIC_STEPS(
 ) RETURN NUMBER
 ```
 
+### Procedure RESET_BASELINE
+
+Resets the cross-process baseline of a metric in a [baseline scope](#function-new_process--server_new_process), e.g. after a system migration after which the previous averages no longer apply. The time and value series are reset together: the averages (EWMA) become `NULL`, the counters 0. The next measurement starts a new series, and the warm-up (`warmup`) of the `*_EWMA_DEVIATION_PCT_*` rules starts anew.
+
+```sql
+PROCEDURE RESET_BASELINE(
+  p_scopeName   VARCHAR2,
+  p_actionName  VARCHAR2,
+  p_contextName VARCHAR2 DEFAULT NULL
+)
+```
+
+| Parameter | Description |
+| --- | --- |
+| `p_scopeName` | Name of the baseline scope (case-insensitive); without a scope of its own, this is the process name |
+| `p_actionName` | Action of the metric |
+| `p_contextName` | Context of the metric; `NULL` affects only the metric without a context, not all contexts of the action |
+
+- Exactly the combination of scope, action and context is reset. Other contexts of the same action remain unchanged.
+- An unknown scope or `p_actionName` = `NULL` changes nothing. The procedure raises no exception; errors are recorded in `LILAM_LOG_INTERNAL`.
+- The calling session works with the reset baseline immediately. Other sessions and LILAM servers take it over at their next synchronization with `LILAM_BASELINES`, at the latest after about 1.5 seconds; in in-session mode at the next LILAM call of that session afterwards. Measurements in this time window may still be compared with the old average; their values do not enter the new baseline.
+- The measurements in `_MON` are preserved, as is the average that `GET_METRIC_AVG_DURATION` and `GET_METRIC_AVG_VALUE` return until the next measurement of the process.
+- Processes without a baseline scope (`#NONE`) keep their averages only within the process; they are not reset.
+- The state of `VAL_CROSS_ABOVE`/`VAL_CROSS_BELOW` for this series is deleted in the same transaction, across all rules and groups of the scope. The next value beyond the threshold therefore reports again.
+
+```sql
+-- learn anew after switching the price provider
+lilam.reset_baseline('PRICE_FEED', 'SHARE_PRICE', 'SAP');
+```
+
 ---
 
 ## Server Control
@@ -824,7 +858,7 @@ Servers are identified by their pipe names and can optionally be assigned to gro
 A server uses two pipes:
 
 - **Data pipe** (`<pipe name>`): all logs, traces, events, status updates and queries in the order of their arrival.
-- **Control pipe** (`<pipe name>_CTL`): only the creation of new processes (`SERVER_NEW_SESSION`). The server polls it before every data message, without waiting. As a result, creating a process does not have to wait behind the messages of other applications, even under high load. A short wake-up call into the data pipe ensures that even an idle server notices the request immediately.
+- **Control pipe** (`<pipe name>_CTL`): only the creation of new processes (`SERVER_NEW_PROCESS`). The server polls it before every data message, without waiting. As a result, creating a process does not have to wait behind the messages of other applications, even under high load. A short wake-up call into the data pipe ensures that even an idle server notices the request immediately.
 
 **Server selection:** A client without a dispatcher and a dispatcher choose a server of the group for each new process according to these criteria:
 
@@ -872,7 +906,7 @@ PROCEDURE START_SERVER(
 | p_perfServer | pls_integer | Performance level of the server, see [Performance Level](#performance-level-p_perfserver). `NULL` (default) = `C_SERVER_PERF_MID` |
 
 #### Performance Level (p_perfServer)
-To prevent a client from flooding the server with messages, after a certain number of messages per process and second the client briefly synchronizes with the server and waits until it has caught up. `p_perfServer` sets this limit. The server communicates it to the client at `SERVER_NEW_SESSION` (and at automatic reconnect); no separate call is needed in the application.
+To prevent a client from flooding the server with messages, after a certain number of messages per process and second it checks whether the server is keeping up. To do so, it reads up to which message the server has written (table `LILAM_WATERMARK`); it does not wait for a reply via the pipe. If the server has fallen behind, the client slows down briefly: 20 to 100 ms per 100 messages, depending on the backlog. If the server keeps up, the client does not wait. `p_perfServer` sets this limit. The server communicates it to the client at `SERVER_NEW_PROCESS` (and at automatic reconnect); no separate call is needed in the application.
 
 | Constant | Value | Use |
 | --- | --- | --- |
@@ -880,7 +914,7 @@ To prevent a client from flooding the server with messages, after a certain numb
 | `C_SERVER_PERF_MID` | 1500 | default; typical servers |
 | `C_SERVER_PERF_HIGH` | 2500 | high-performance servers |
 
-Any other values are possible. `0` switches the synchronization off; `NULL` or negative values are treated as `C_SERVER_PERF_MID`.
+Any other values are possible. `0` switches the slowdown off (only a full ring buffer can then still make the client wait for up to 1 s); `NULL` or negative values are treated as `C_SERVER_PERF_MID`.
 
 > [!NOTE]
 > The limit applies per process. If many applications send to the same server at the same time, its total throughput is lower than the sum of the individual values; in that case, rather choose `C_SERVER_PERF_LOW` or `C_SERVER_PERF_MID`, or start additional servers in the same group.
@@ -1000,26 +1034,26 @@ Structure of the rule sets and operators: [Rules Engine](../rules/README.md). A 
 - **`VAL_EWMA_DEVIATION_PCT_UP` / `_DOWN`:** the same for measured values, band `|EWMA| * PCT / 100` (also for negative values), without the 1 ms exception. Events without a value trigger nothing.
 - **`VAL_MIN` / `VAL_MAX`:** fixed limit; alert if the value is lower or higher (the limit itself does not trigger). Trigger `MARK_EVENT` only.
 - **`VAL_CROSS_ABOVE` / `VAL_CROSS_BELOW`:** threshold with state, value `threshold[|return]`; exactly one alert when crossing, then silent until the value has returned (no alert on return). Without a return limit the threshold applies. The state applies per group, baseline scope, rule, action and context and survives sessions and server restarts; without a scope only per process, so every run reports anew. Unlike `VAL_MIN`/`VAL_MAX`, a value that stays beyond the threshold does not report again after `throttle_seconds`. If the lock period suppresses the alert, the rule stays armed. If two sessions report contrary values for a series, the state change committed last wins. Trigger `MARK_EVENT` only. Details: `rules/README.md`, [Threshold Rules](../rules/README.md#threshold-rules).
-- **Missing signals:** All other rules are evaluated when a signal arrives. `TIME_MAX_SILENCE_SECONDS`, in contrast, reports that no signal has arrived for X seconds: no start of a process (`PROCESS_START`), no events or traces of an action (`MARK_EVENT`, `TRACE_START`, optionally per context) or nothing more from a running process (`PROCESS_UPDATE`). The servers of the group or [`CHECK_SILENCE`](#procedure-check_silence) check it. This is the basis for a watchdog of the application; scheduling and watching the check job remain with the application. Optional time windows (`windows` with `time_zone`, e.g. Mon–Fri 09:00–13:00 and 15:00–19:00) restrict the check; when a window opens, the silence counts anew. Alerts without a process have `PROCESS_ID` NULL. Details and limits: [Rules Engine](../rules/README.md#silence-rules).
+- **Missing signals:** All other rules are evaluated when a signal arrives. `TIME_MAX_SILENCE_SECONDS`, in contrast, reports that no signal has arrived for X seconds: no start of a process (`PROCESS_START`), no events or traces of an action (`MARK_EVENT`, `TRACE_START`, optionally per context) or nothing more from a running process (`PROCESS_UPDATE`). It is checked per group by the servers or by [`CHECK_SILENCE`](#procedure-check_silence). This is the basis for a watchdog of the application; scheduling and watching the check job remain with the application. Optional time windows (`windows` with `time_zone`, e.g. Mon–Fri 09:00–13:00 and 15:00–19:00) restrict the check; when a window opens, the silence counts anew. Alerts without a process have `PROCESS_ID` NULL. Details and limits: [Rules Engine](../rules/README.md#silence-rules).
 
 ### Rules in INSESSION Mode
-Processes in INSESSION mode also evaluate rules if `NEW_SESSION` receives a group (`p_groupName` or `t_session_init.groupName`). They then use the same active rule set of the group from `LILAM_RULES` as the servers of this group. Without a group there are no rules.
+Processes in INSESSION mode also evaluate rules if `NEW_PROCESS` receives a group (`p_groupName` or `t_process_init.groupName`). They then use the same active rule set of the group from `LILAM_RULES` as the servers of this group. Without a group there are no rules.
 
 - **Loading:** The first rule check of a process of the group loads the active rule set into the memory of the database session. Further processes of the same group in this session share it. Different groups in one session are possible and remain separate.
 - **Changes:** At most every 15 seconds, LILAM checks on an API call whether the name or version of the group's active rule set has changed, and then reloads it. `SERVER_UPDATE_RULES` therefore also takes effect here, at the latest with the first API call after 15 seconds. If a rule set is changed directly in the table without its name or version changing, a running session does not notice.
 - **Invalid rule set:** It is rejected and logged once per version in `LILAM_LOG_INTERNAL`; the previous rules remain active. The application does not notice any of this.
-- **Alerts:** A triggered alert is written immediately and synchronously (`LILAM_ALERTS` and `DBMS_ALERT` signal, own transaction). This costs the application one commit per alert; `throttle_seconds` limits the frequency. `GROUP_NAME` in the alert is the group from `NEW_SESSION`.
+- **Alerts:** A triggered alert is written immediately and synchronously (`LILAM_ALERTS` and `DBMS_ALERT` signal, own transaction). This costs the application one commit per alert; `throttle_seconds` limits the frequency. `GROUP_NAME` in the alert is the group from `NEW_PROCESS`.
 - **Memory per session:** The predecessor for `PRECEDED_BY` applies per database session; with a connection pool (e.g. APEX) another pooled connection does not know it. Throttling (`throttle_seconds`), in contrast, applies across sessions, pooled connections, server workers and restarts (table `LILAM_ALERT_STATE`), per rule, action, context and baseline scope or process.
 - **Baseline parameters:** `warmup` and `alpha` from `TIME_EWMA_DEVIATION_PCT_*` rules (time series) and `VAL_EWMA_DEVIATION_PCT_*` rules (value series) also apply to the average values of the process, just as in the server.
 
 ```sql
-l_processId := lilam.new_session('IMPORT_CUSTOMERS', p_groupName => 'METRO');
+l_processId := lilam.new_process('IMPORT_CUSTOMERS', p_groupName => 'METRO');
 ```
 
 ## Dispatcher Mode
 A server started with p_isDispatcher => 1 (dispatcher) does not process any requests itself, but forwards them unchanged to a suitable server.
 
-For NEW_SESSION/SERVER_NEW_SESSION, the dispatcher uses the same load-based mechanism as the regular server selection and passes the request on to the control pipe of the selected server;
+For NEW_PROCESS/SERVER_NEW_PROCESS, the dispatcher uses the same load-based mechanism as the regular server selection and passes the request on to the control pipe of the selected server;
 for all other requests, it uses the already assigned process_id to determine the server responsible for the application's process and forwards the request there.
 
 The response of the responsible server goes directly back to the client, not via the dispatcher. A sequence diagram of the flow can be found in [architecture and concepts.md](architecture%20and%20concepts.md#dispatcher-flow).
@@ -1039,9 +1073,9 @@ If this fails (no dispatcher configured, dispatcher not reachable, or the proces
 
 The following applies:
 
-- No reconnect is attempted for negative process_ids (e.g. `NUM_ERR_SESSION_TIMEOUT`).
+- No reconnect is attempted for negative process_ids (e.g. `NUM_ERR_PROCESS_TIMEOUT`).
 - If the dispatcher does not find a responsible server, it responds immediately with an error; the application does not wait.
-- A failed reconnect is remembered for the physical session: if the server does not know the process (e.g. after `CLOSE_SESSION`), further calls with this process_id are ignored without a new request. In case of temporary disruptions (dispatcher not reachable), the next attempt is made after 10 seconds at the earliest.
+- A failed reconnect is remembered for the physical session: if the server does not know the process (e.g. after `CLOSE_PROCESS`), further calls with this process_id are ignored without a new request. In case of temporary disruptions (dispatcher not reachable), the next attempt is made after 10 seconds at the earliest.
 
 ### Prewarming
 The automatic reconnect attempt costs a one-time pipe round trip. Without prewarming, the first API call after a session change bears this additional latency.
@@ -1050,7 +1084,7 @@ If p_processId is passed, this round trip already takes place when SET_DISPATCHE
 ### Procedure SET_DISPATCHER_PIPE
 Tells LILAM via which pipe a dispatcher can be reached. This information is held exclusively in the memory of the current physical database session.
 
-A dispatcher only forwards to the servers of its own group. Therefore `SERVER_NEW_SESSION` uses the default dispatcher only if no group is given or the dispatcher's group (according to `LILAM_SERVER_REGISTRY`) matches the given group. Processes of other groups get a server of their group directly, as without a dispatcher. A dispatcher set with `p_groupName` applies only to `SERVER_NEW_SESSION` of this group. `SET_DISPATCHER_PIPE(NULL)` removes the setting again.
+A dispatcher only forwards to the servers of its own group. Therefore `SERVER_NEW_PROCESS` uses the default dispatcher only if no group is given or the dispatcher's group (according to `LILAM_SERVER_REGISTRY`) matches the given group. Processes of other groups get a server of their group directly, as without a dispatcher. A dispatcher set with `p_groupName` applies only to `SERVER_NEW_PROCESS` of this group. `SET_DISPATCHER_PIPE(NULL)` removes the setting again.
 
 > [!IMPORTANT]
 > Since the configuration only applies to the current physical session, SET_DISPATCHER_PIPE must be called again every time a new connection is established – with connection pooling, potentially on every page, not just once on the first page call.
@@ -1068,7 +1102,7 @@ PROCEDURE SET_DISPATCHER_PIPE(
 | Parameter | Type | Meaning |
 | --------- | --- | --------- |
 | p_pipeName | varchar2 | Pipe name of the dispatcher. `NULL` removes the setting for the given identifier |
-| p_groupName | varchar2 | Optional. Name of a server group in case several dispatchers are used in parallel: the dispatcher then applies only to `SERVER_NEW_SESSION` of this group. [Automatic Reconnect](#automatic-reconnect) uses only the default identifier 'DEFAULT_DISPATCHER' |
+| p_groupName | varchar2 | Optional. Name of a server group in case several dispatchers are used in parallel: the dispatcher then applies only to `SERVER_NEW_PROCESS` of this group. [Automatic Reconnect](#automatic-reconnect) uses only the default identifier 'DEFAULT_DISPATCHER' |
 | p_processId | number | Optional. If a process_id is already known, LILAM restores the connection to it immediately (see [Prewarming](#prewarming)) instead of only at the next API call |
 
 ```sql
@@ -1081,6 +1115,101 @@ BEGIN
 END;
 /
 ```
+
+### Finding a Process by Name
+With connection pooling, almost every request runs in a different physical session. An application that does not manage the process_id itself finds the process by its name: `SERVER_CONNECT_PROCESS` connects to the active process or creates it, `GET_ACTIVE_PROCESSES` only returns the IDs.
+
+A process is active as long as it is in the process administration of a running worker. The Oracle session that created it plays no role. A process that no running worker holds any more counts as ended, even if it still looks open in `<Master>_PROC`.
+
+The request goes to the dispatcher, which forwards it to all workers of its group. The workers answer the client directly. An in-session process lives only in the memory of its session and therefore cannot be continued from another session.
+
+> [!NOTE]
+> Any number of clients may connect to the same process and feed it with data together; there is no reservation. The process name does not have to be unique per client for this.
+> `CLOSE_PROCESS` of one client ends the process for all: messages of the other clients are then ignored without an error, and the next `SERVER_CONNECT_PROCESS` creates a new process.
+> Throttling (`p_perfServer`) applies per client, so many clients together can send correspondingly more.
+
+### Function SERVER_CONNECT_PROCESS
+Connects the current session to the active process of this name. If there is none, the function creates it like `SERVER_NEW_PROCESS`. It applies to decoupled mode only.
+
+If no dispatcher is set for the group in this session, the function looks it up in `LILAM_SERVER_REGISTRY` and sets it itself. A prior `SET_DISPATCHER_PIPE` is not needed.
+
+```sql
+FUNCTION SERVER_CONNECT_PROCESS(
+  p_processName   VARCHAR2,
+  p_groupName     VARCHAR2,
+  p_logLevel      PLS_INTEGER DEFAULT logLevelMonitor,
+  p_procStepsToDo PLS_INTEGER DEFAULT NULL,
+  p_daysToKeep    PLS_INTEGER DEFAULT NULL,
+  p_tabNameMaster VARCHAR2    DEFAULT 'LILAM',
+  p_baselineScope VARCHAR2    DEFAULT NULL,
+  p_syncLevel     PLS_INTEGER DEFAULT logLevelError,
+  p_maxWaitMs     PLS_INTEGER DEFAULT C_ACTIVE_WAIT_MS
+) RETURN NUMBER
+```
+
+#### Parameters
+| Parameter | Type | Meaning |
+| --------- | --- | --------- |
+| p_processName | varchar2 | Process name; case does not matter |
+| p_groupName | varchar2 | Server group. LILAM uses it to find the dispatcher |
+| p_logLevel … p_syncLevel | | As for `SERVER_NEW_PROCESS`. They apply only if a new process is created and do not change an existing one |
+| p_maxWaitMs | pls_integer | Maximum wait per search for the answers of the workers in milliseconds. `NULL` or ≤ 0 = `C_ACTIVE_WAIT_MS` (2000) |
+
+`p_maxWaitMs` limits only the search. The reconnect (up to 5 s) and the creation (up to 3 s) keep their own time limits, and several searches can run in one call. DBMS_PIPE only waits in whole seconds; the wait is therefore checked at intervals of 10 ms and not kept to the exact millisecond.
+
+#### Return Value
+The process_id or, as with `SERVER_NEW_PROCESS`, a negative code without an exception. All further calls with a negative value are ignored.
+
+| Value | Meaning |
+| ---- | --------- |
+| > 0 | Connected or newly created |
+| `NUM_ERR_NO_SERVER` | No active dispatcher found for the group |
+| `NUM_ERR_PROCESS_TIMEOUT` | No hit, but not all workers answered, or a parallel request did not create the process in time |
+| `NUM_ERR_SERVER_PROC`, `NUM_ERR_PIPE_SERVER` | Hit found, but the reconnect failed |
+| `NUM_ERR_ILLEGAL_REQ` | No process name given |
+
+The following applies:
+
+- With several hits, the function connects to the lowest ID. This way all clients end up at the same process.
+- A new process is created only if all workers have answered. A worker without an answer could hold the process; a second process of the same name would then be a duplicate.
+- Parallel requests create the process only once: a lock per group and process name in `LILAM_ALERT_STATE` lets one request create it, the others keep searching until the process exists. If the holder fails, the lock expires by itself.
+
+```sql
+-- Example: APEX, in every request; the application manages no process_id
+DECLARE
+  l_processId NUMBER;
+BEGIN
+  l_processId := lilam.server_connect_process('SALES_IMPORT', 'SALES');
+  lilam.info(l_processId, 'Page ' || :APP_PAGE_ID);
+END;
+/
+```
+
+### Function GET_ACTIVE_PROCESSES
+Returns the IDs of the active processes of this name, sorted in ascending order. The function connects nothing and reserves nothing; several clients may receive the same IDs.
+
+```sql
+FUNCTION GET_ACTIVE_PROCESSES(
+  p_processName VARCHAR2,
+  p_maxWaitMs   PLS_INTEGER DEFAULT C_ACTIVE_WAIT_MS
+) RETURN SYS.ODCINUMBERLIST
+```
+
+| Parameter | Type | Meaning |
+| --------- | --- | --------- |
+| p_processName | varchar2 | Process name; case does not matter |
+| p_maxWaitMs | pls_integer | As for `SERVER_CONNECT_PROCESS` |
+
+- The own session is searched and, if `SET_DISPATCHER_PIPE` is set, the workers of the default dispatcher. Without a dispatcher the function returns only processes of the own session.
+- No hit results in an empty list, never an exception. If a worker does not answer in time, what has arrived until then counts; if the list stays empty in that case, this is recorded in `LILAM_LOG_INTERNAL`.
+- The list is a snapshot. A process can be closed right afterwards.
+- One worker answer holds a few hundred IDs; anything beyond that is missing from the list. One hit is enough for a reconnect.
+
+```sql
+SELECT column_value AS process_id
+  FROM TABLE(lilam.get_active_processes('SALES_IMPORT'));
+```
+
 ---
 
 ## Appendix
@@ -1116,12 +1245,12 @@ logLevelInfo    CONSTANT PLS_INTEGER := 4;
 logLevelDebug   CONSTANT PLS_INTEGER := 8;
 ```
 
-### Record Type t_session_init
+### Record Type t_process_init
 
-Use `t_session_init` to combine the initialization settings and then pass them to the record-based `NEW_SESSION` overload.
+Use `t_process_init` to combine the initialization settings and then pass them to the record-based `NEW_PROCESS` overload.
 
 ```sql
-TYPE t_session_init IS RECORD (
+TYPE t_process_init IS RECORD (
   processName   VARCHAR2(100),
   logLevel      PLS_INTEGER := logLevelMonitor,
   stepsToDo     PLS_INTEGER,
@@ -1183,9 +1312,11 @@ LILAM JSON requests consist of a header and a parameter object. The header conta
 
 | `api_call` | corresponds to | Parameters (`params`) |
 | --- | --- | --- |
-| `NEW_SESSION` | `NEW_SESSION` (record) | `process_name`, `log_level`, `steps_todo`, `days_to_keep`, `process_immortal`, `tabname_master`, `baseline_scope`, `group_name` |
-| `SERVER_NEW_SESSION` | `SERVER_NEW_SESSION_JSON` | as for `SERVER_NEW_SESSION`, see the table there |
-| `CLOSE_SESSION` | `CLOSE_SESSION` | `process_id` |
+| `NEW_PROCESS` | `NEW_PROCESS` (record) | `process_name`, `log_level`, `steps_todo`, `days_to_keep`, `process_immortal`, `tabname_master`, `baseline_scope`, `group_name` |
+| `SERVER_NEW_PROCESS` | `SERVER_NEW_PROCESS_JSON` | as for `SERVER_NEW_PROCESS`, see the table there |
+| `SERVER_CONNECT_PROCESS` | `SERVER_CONNECT_PROCESS` | as for `SERVER_NEW_PROCESS`, plus `max_wait_ms` |
+| `GET_ACTIVE_PROCESSES` | `GET_ACTIVE_PROCESSES` | `process_name`, `max_wait_ms`; `returns` = `PROCESS_IDS`, `value` is a JSON array of IDs |
+| `CLOSE_PROCESS` | `CLOSE_PROCESS` | `process_id` |
 | `FLUSH` | `FLUSH` | none |
 | `SET_PROCESS_STATUS` | `SET_PROCESS_STATUS` | `process_id`, `process_status`, `process_info` |
 | `SET_STEP_TODO` | `SET_PROC_STEPS_TODO` | `process_id`, `steps_todo` |
@@ -1194,18 +1325,19 @@ LILAM JSON requests consist of a header and a parameter object. The header conta
 | `SET_PROC_IMMORTAL` | `SET_PROC_IMMORTAL` | `process_id`, `process_immortal` |
 | `INFO`, `DEBUG`, `WARN`, `ERROR` | Logging | `process_id`, `process_info` (log text) |
 | `MARK_EVENT`, `TRACE_START`, `TRACE_STOP` | Metrics | `process_id`, `action_name`, `context_name`, `timestamp`; for `MARK_EVENT` also `value` (measured value) |
+| `RESET_BASELINE` | `RESET_BASELINE` | `scope_name`, `action_name`, `context_name` |
 | `SERVER_SHUTDOWN` | `SERVER_SHUTDOWN` | `process_id`, `pipe_name`, `password` |
 
 The response contains the header of the request, `status` (`SUCCESS` or `ERROR`) and a `payload` with `returns` and `value`, e.g. `"returns": "PROCESS_ID", "value": 4711`. For an unknown `api_call`, `value` = `NUM_ERR_ILLEGAL_REQ` (-20010). If `p_callObject` is not valid JSON, the call ends with the exception -20005.
 
-Example for `SERVER_NEW_SESSION`:
+Example for `SERVER_NEW_PROCESS`:
 
 ```json
 {
   "header": {
     "version": "v1.x.x",
     "client_id": "GATE_15",
-    "api_call": "SERVER_NEW_SESSION"
+    "api_call": "SERVER_NEW_PROCESS"
   },
   "params": {
     "process_name": "Your Process Name",

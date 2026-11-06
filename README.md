@@ -136,7 +136,7 @@ It combines process lifecycle tracking, metrics, and rule-based reactions into a
 
 ## Architecture at a Glance
 
-![LILAM Architektur](./images/LILAM%20Application%20Context.svg)
+![LILAM Architecture](./images/LILAM%20Application%20Context.svg)
 
 ---
 ## Fast integration
@@ -366,8 +366,7 @@ LILAM was measured on a consumer laptop (Fujitsu LIFEBOOK A357, Intel Core i5-72
 The long single calls under overload described in the report have since been fixed: the client no longer waits for replies from the server.
 
 For details (call types, latency percentiles, cost of the failover) see the full report:
-*   [Performance-Bericht (German)](./performance-report-deu.md)
-*   The [English report](./performance-report-eng.md) describes an earlier stress test (before failover and measured values).
+*   [Performance report](./performance-report-eng.md)
 
 ---
 ## License
