@@ -129,6 +129,8 @@ Rules on `MARK_EVENT` and `TRACE_STOP` are only evaluated if the log level of th
 | VAL_EWMA_DEVIATION_PCT_DOWN | `pct[\|warmup[\|alpha]]` | MARK_EVENT | measured value is below `EWMA - \|EWMA\| * pct / 100`
 | VAL_MIN | number | MARK_EVENT | measured value is lower than the value (fixed limit)
 | VAL_MAX | number | MARK_EVENT | measured value is higher than the value (fixed limit)
+| VAL_CROSS_ABOVE | `threshold[|return]` | MARK_EVENT | value rises above the threshold: one alert, then silent until it has returned, see [Threshold Rules](#threshold-rules)
+| VAL_CROSS_BELOW | `threshold[|return]` | MARK_EVENT | value falls below the threshold: one alert, then silent until it has returned, see [Threshold Rules](#threshold-rules)
 | MAX_OCCURRENCE | count | MARK_EVENT, TRACE_STOP, PROCESS_UPDATE, PROCESS_STOP | the action occurred more often than the value within the process (`ACTION_COUNT`); for processes: `STEPS_DONE` > value
 | TIME_MAX_GAP_SECONDS | seconds | MARK_EVENT, TRACE_START | time since the previous event (MARK_EVENT) or since the end of the previous trace (TRACE_START) of the same action is greater than the value
 | TIME_MAX_SILENCE_SECONDS | seconds (> 0) | PROCESS_START, MARK_EVENT, TRACE_START, PROCESS_UPDATE | no signal for longer than the value; checked by time, not by a signal, see [Silence Rules](#silence-rules)
@@ -149,6 +151,39 @@ The EWMA deviation operators compare against the EWMA **before** the current mea
 
 > [!NOTE]
 > All other rules are evaluated when a signal arrives. The order "B follows A within X seconds" can be checked when B arrives, with `TIME_PRECEDED_BY_WITHIN_SECS` on B. Signals that do not arrive at all are covered by the silence rules below.
+
+### Threshold Rules
+
+`VAL_MIN` and `VAL_MAX` have no state: every value beyond the limit is a violation, and only `throttle_seconds` spaces out the alerts. A value that stays beyond the limit is reported again after every lock period. `VAL_CROSS_ABOVE` and `VAL_CROSS_BELOW` report **once** when the threshold is crossed and are armed again only after the value has returned.
+
+```json
+{
+  "id": "SAP-MAX",
+  "trigger_type": "MARK_EVENT",
+  "action": "SHARE_PRICE",
+  "context": "SAP",
+  "condition": { "operator": "VAL_CROSS_ABOVE", "value": "185|180" },
+  "alert": { "handler": "MAIL", "severity": "WARN", "throttle_seconds": 0 }
+}
+```
+
+| State | Value | Effect |
+| --- | --- | --- |
+| armed | beyond the threshold (`ABOVE`: `value > threshold`, `BELOW`: `value < threshold`) | alert, rule has fired |
+| fired | returned (`ABOVE`: `value <= return`, `BELOW`: `value >= return`) | armed again, **no alert** |
+| any other case | | nothing |
+
+- **Value:** `threshold` or `threshold|return` (hysteresis). Without a return limit it equals the threshold. With `ABOVE` the return limit must not be above the threshold, with `BELOW` not below it.
+- **Series:** The state applies per group, baseline scope (without scope: process), rule, action and context. A rule without context therefore keeps one state per context.
+- **First value:** A series without state is armed. If its first value is already beyond the threshold, the rule fires.
+- **Durable:** The state is stored in `LILAM_ALERT_STATE` and holds across sessions, processes of the scope, and server restarts. State and alert are committed together; of several sessions only one fires, and if writing the alert fails, the rule stays armed.
+- **Without a scope** (`#NONE`) the state applies per process and ends with it: every run reports again. A scope is needed for crossing across runs. If a process without scope never closes, its row is deleted after 30 days.
+- **`throttle_seconds`:** If a lock period suppresses the alert, the rule stays armed and fires after the period if the value is still beyond the threshold. No violation is lost.
+- **Changed rule:** The state remembers its operator and limits. If they no longer match the rule, the rule counts as armed. A new rule set version in which this rule is unchanged keeps the state. While sessions still hold the old rules (up to about 15 s), two sessions reporting the same series can raise additional alerts.
+- **`RESET_BASELINE`** deletes the state of the series, for all rules and groups of the scope.
+- **Removed rules:** `SERVER_UPDATE_RULES` deletes the state of rules no longer in the rule set; if the rule comes back, it starts armed.
+- **Several sources of a series:** If two sessions report contrary values, the state change committed last wins. There is no global order of signals.
+- **Cost:** A value beyond the threshold or returned costs one read of `LILAM_ALERT_STATE` per rule, a value between return limit and threshold none. Rule sets without these operators do not read the table.
 
 ### Silence Rules
 

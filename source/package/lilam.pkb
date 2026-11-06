@@ -103,6 +103,8 @@ AS
     -- Silence rules (TIME_MAX_SILENCE_SECONDS): server check every n ms; "last seen" written at most every n ms
     C_SILENCE_CHECK_MS                 CONSTANT PLS_INTEGER := 10000;
     C_SEEN_FLUSH_MS                    CONSTANT PLS_INTEGER := 1500;
+    -- VAL_CROSS_*: state of processes without scope that never closed is deleted after n days
+    C_CROSS_PROC_KEEP_DAYS             CONSTANT PLS_INTEGER := 30;
 
     -- Kinds in LILAM_ALERT_STATE: alert lock and "last seen" per target of a silence rule
     C_STATE_LOCK                       CONSTANT VARCHAR2(10) := 'LOCK';
@@ -110,6 +112,7 @@ AS
     C_STATE_EVENT                      CONSTANT VARCHAR2(10) := 'EVENT';  -- key = action|context
     C_STATE_TRACE                      CONSTANT VARCHAR2(10) := 'TRACE';  -- key = action|context
     C_STATE_RUN                        CONSTANT VARCHAR2(10) := 'RUN';    -- running process, key = process name|process_id
+    C_STATE_CROSS                      CONSTANT VARCHAR2(10) := 'CROSS';  -- VAL_CROSS_* fired, key as alert lock
 
     ---------------------------------------------------------------
     -- Placeholders for tables
@@ -548,6 +551,7 @@ AS
         throttle_seconds    NUMBER,        -- Wait until the next alert
         -- PERFORMANCE: values prepared at load time (no conversion per signal)
         cond_num            NUMBER,        -- Numeric value (NLS-independent), e.g. limit in ms
+        cond_rearm          NUMBER,        -- VAL_CROSS_*: return limit (without one: cond_num)
         cond_action         VARCHAR2(100), -- PRECEDED_BY*: expected predecessor action
         cond_context        VARCHAR2(100), -- PRECEDED_BY*: expected context (NULL = any)
         cond_upper          VARCHAR2(100), -- SEVERITY, INFO_CONTAINS: value in upper case
@@ -570,7 +574,8 @@ AS
         seen_name    VARCHAR2(30),      -- last seen active rule set, even if rejected
         seen_version NUMBER,            -- (a rejected set is not parsed again on every check)
         last_check_cs NUMBER,            -- INSESSION and server housekeeping (checkServerRules): last check for a changed active rule set (DBMS_UTILITY.GET_TIME)
-        rules_read    BOOLEAN := FALSE  -- LILAM_RULES was read at least once (checkSilence: remove entries without rule)
+        rules_read    BOOLEAN := FALSE, -- LILAM_RULES was read at least once (checkSilence: remove entries without rule)
+        has_cross     BOOLEAN := FALSE  -- loaded rules contain VAL_CROSS_*
     );
     TYPE t_rule_group_map IS TABLE OF t_rule_group_rec INDEX BY VARCHAR2(50);
     g_rule_groups t_rule_group_map;
@@ -628,6 +633,19 @@ AS
     TYPE t_seen_map IS TABLE OF t_seen_rec INDEX BY VARCHAR2(320);
     g_seen            t_seen_map;
     g_lastSeenFlushCs NUMBER;
+
+    -- Row of a fired VAL_CROSS_* rule in LILAM_ALERT_STATE; state_key NULL = other operator
+    TYPE t_cross_state IS RECORD (
+        group_name   VARCHAR2(50),
+        state_key    VARCHAR2(1000),
+        scope_id     NUMBER,
+        rule_id      VARCHAR2(50),
+        action_name  VARCHAR2(100),
+        context_name VARCHAR2(100),
+        operator     VARCHAR2(50),
+        threshold    NUMBER,
+        rearm        NUMBER
+    );
 
     ----------
     -- TRIGGER
@@ -1581,18 +1599,85 @@ AS
     END;
 
     ------------------------------------------------------------
+    -- Marks a VAL_CROSS_* rule as fired within the caller's transaction.
+    -- FALSE: already fired for the current limits. A row of other limits or another operator is taken over.
+    -- STABILITY: race-free like acquireAlertLock, only one session wins.
+    ------------------------------------------------------------
+    FUNCTION takeCrossState(p_state t_cross_state, p_nowUtc TIMESTAMP) RETURN BOOLEAN IS
+    BEGIN
+        EXECUTE IMMEDIATE 'update ' || C_LILAM_ALERT_STATE_TABLE || '
+                              set ts_utc = :1, cond_operator = :2, cond_threshold = :3, cond_rearm = :4
+                            where group_name = :5 and state_kind = :6 and state_key = :7
+                              and (cond_operator != :8 or cond_threshold != :9 or cond_rearm != :10)'
+            USING p_nowUtc, p_state.operator, p_state.threshold, p_state.rearm,
+                  p_state.group_name, C_STATE_CROSS, p_state.state_key,
+                  p_state.operator, p_state.threshold, p_state.rearm;
+        IF SQL%ROWCOUNT = 0 THEN
+            BEGIN
+                EXECUTE IMMEDIATE 'insert into ' || C_LILAM_ALERT_STATE_TABLE || '
+                                   (group_name, state_kind, state_key, ts_utc, rule_id, scope_id, action_name, context_name,
+                                    cond_operator, cond_threshold, cond_rearm)
+                                   values (:1, :2, :3, :4, :5, :6, :7, :8, :9, :10, :11)'
+                    USING p_state.group_name, C_STATE_CROSS, p_state.state_key, p_nowUtc, p_state.rule_id, p_state.scope_id,
+                          p_state.action_name, p_state.context_name, p_state.operator, p_state.threshold, p_state.rearm;
+            EXCEPTION
+                WHEN DUP_VAL_ON_INDEX THEN
+                    RETURN FALSE;
+            END;
+        END IF;
+        RETURN TRUE;
+    END;
+
+    ------------------------------------------------------------
+    -- Failover: the alert already exists, only its state is missing (replayed return before the crossing)
+    ------------------------------------------------------------
+    PROCEDURE markCrossFired(p_state t_cross_state, p_nowUtc TIMESTAMP) IS
+        pragma autonomous_transaction;
+    BEGIN
+        IF takeCrossState(p_state, p_nowUtc) THEN NULL; END IF;
+        COMMIT;
+    exception
+        when others then
+        logLilamErr(sqlCode, sqlErrM, 'markCrossFired', 'rule ' || p_state.rule_id);
+        rollback;
+    END;
+
+    ------------------------------------------------------------
+    -- Value has returned: the rule is armed again, silently
+    ------------------------------------------------------------
+    PROCEDURE rearmCross(p_state t_cross_state) IS
+        pragma autonomous_transaction;
+    BEGIN
+        EXECUTE IMMEDIATE 'delete from ' || C_LILAM_ALERT_STATE_TABLE || '
+                            where group_name = :1 and state_kind = :2 and state_key = :3'
+            USING p_state.group_name, C_STATE_CROSS, p_state.state_key;
+        COMMIT;
+    exception
+        when others then
+        logLilamErr(sqlCode, sqlErrM, 'rearmCross', 'rule ' || p_state.rule_id);
+        rollback;
+    END;
+
+    ------------------------------------------------------------
     -- Write and signal the alert (own transaction, write-then-signal).
     -- TRUE if the alert was written. With p_lockKey the alert lock is taken first
     -- (acquireAlertLock); p_lastAlert then returns the time of the last alert for the key.
+    -- p_cross: state of a VAL_CROSS_* rule; state, lock and alert are committed together.
     ------------------------------------------------------------
     FUNCTION writeAlert(p_rule t_rule_rec, p_alert t_alert_out,
-                        p_lockGroup VARCHAR2, p_lockKey VARCHAR2, p_throttleSec NUMBER, p_nowUtc TIMESTAMP,
+                        p_lockGroup VARCHAR2, p_lockKey VARCHAR2, p_throttleSec NUMBER, p_cross t_cross_state, p_nowUtc TIMESTAMP,
                         p_lastAlert OUT TIMESTAMP) RETURN BOOLEAN IS
         pragma autonomous_transaction;
         v_payload       VARCHAR2(1000);
         v_alert_id      NUMBER;
     BEGIN
         p_lastAlert := p_nowUtc;
+
+        IF p_cross.state_key IS NOT NULL AND NOT takeCrossState(p_cross, p_nowUtc) THEN
+            ROLLBACK;
+            p_lastAlert := NULL;
+            RETURN FALSE;
+        END IF;
 
         -- Lock and alert are committed together
         IF p_lockKey IS NOT NULL AND NOT acquireAlertLock(p_lockGroup, p_lockKey, p_throttleSec, p_nowUtc, p_lastAlert) THEN
@@ -1648,7 +1733,7 @@ AS
     -- Alert of a signal of a process (see writeAlert)
     ------------------------------------------------------------
     FUNCTION persist_alert(p_rule t_rule_rec, p_rec t_monitor_buffer_rec,
-                           p_lockGroup VARCHAR2, p_lockKey VARCHAR2, p_throttleSec NUMBER, p_nowUtc TIMESTAMP,
+                           p_lockGroup VARCHAR2, p_lockKey VARCHAR2, p_throttleSec NUMBER, p_cross t_cross_state, p_nowUtc TIMESTAMP,
                            p_lastAlert OUT TIMESTAMP) RETURN BOOLEAN IS
         v_idx_session   PLS_INTEGER;
         v_found         NUMBER;
@@ -1669,6 +1754,9 @@ AS
                 INTO v_found
                 USING p_rec.process_id, p_rule.rule_id, p_rec.action_name, p_rec.context_name, p_rec.context_name, p_rec.action_count;
             IF v_found > 0 THEN
+                IF p_cross.state_key IS NOT NULL THEN
+                    markCrossFired(p_cross, p_nowUtc);
+                END IF;
                 RETURN TRUE;
             END IF;
         END IF;
@@ -1685,7 +1773,7 @@ AS
         v_alert.set_name     := v_group.set_name;
         v_alert.set_version  := v_group.set_version;
 
-        RETURN writeAlert(p_rule, v_alert, p_lockGroup, p_lockKey, p_throttleSec, p_nowUtc, p_lastAlert);
+        RETURN writeAlert(p_rule, v_alert, p_lockGroup, p_lockKey, p_throttleSec, p_cross, p_nowUtc, p_lastAlert);
 
     exception
         when others then
@@ -1712,6 +1800,11 @@ AS
                             where state_kind = :1
                               and ts_utc + numtodsinterval(hold_seconds, ''SECOND'') < :2'
             USING C_STATE_LOCK, sys_extract_utc(SYSTIMESTAMP);
+        -- closed processes delete their state themselves (dropProcessCross)
+        EXECUTE IMMEDIATE 'delete from ' || C_LILAM_ALERT_STATE_TABLE || '
+                            where state_kind = :1 and scope_id is null
+                              and ts_utc + numtodsinterval(:2, ''DAY'') < :3'
+            USING C_STATE_CROSS, C_CROSS_PROC_KEEP_DAYS, sys_extract_utc(SYSTIMESTAMP);
         COMMIT;
     exception
         when others then
@@ -1720,6 +1813,87 @@ AS
         IF sqlcode != -942 THEN
             logLilamErr(sqlCode, sqlErrM, 'purgeAlertLocks');
         END IF;
+    END;
+
+    ------------------------------------------------------------
+    -- State row of a VAL_CROSS_* rule for a series; key as the alert lock (see fire_alert)
+    ------------------------------------------------------------
+    FUNCTION crossState(p_rule t_rule_rec, p_processId NUMBER, p_action VARCHAR2, p_context VARCHAR2) RETURN t_cross_state IS
+        l_state t_cross_state;
+    BEGIN
+        l_state.group_name   := g_sessionList(v_indexSession(p_processId)).rule_group;
+        l_state.scope_id     := getScopeId(p_processId);
+        l_state.rule_id      := p_rule.rule_id;
+        l_state.action_name  := p_action;
+        l_state.context_name := p_context;
+        l_state.operator     := p_rule.condition_operator;
+        l_state.threshold    := p_rule.cond_num;
+        l_state.rearm        := p_rule.cond_rearm;
+        l_state.state_key    := CASE WHEN l_state.scope_id IS NOT NULL THEN 'S' || l_state.scope_id ELSE 'P' || p_processId END
+                                || '|' || p_rule.rule_id || '|' || p_action || '|' || p_context;
+        RETURN l_state;
+    END;
+
+    ------------------------------------------------------------
+    -- VAL_CROSS_ABOVE/BELOW. TRUE: armed and the value is beyond the threshold (the state is set with
+    -- the alert, see writeAlert). A row for other limits counts as armed, so a changed rule starts anew.
+    -- PERFORMANCE: between return limit and threshold nothing can change, no table access.
+    -- STABILITY: no session memory; it could miss the state of another session.
+    ------------------------------------------------------------
+    FUNCTION crossFires(p_rule t_rule_rec, p_ctx t_eval_context_rec) RETURN BOOLEAN IS
+        l_above  CONSTANT BOOLEAN := p_rule.condition_operator = 'VAL_CROSS_ABOVE';
+        l_beyond BOOLEAN := CASE WHEN l_above THEN p_ctx.used_value > p_rule.cond_num
+                                 ELSE p_ctx.used_value < p_rule.cond_num END;
+        l_back   BOOLEAN := CASE WHEN l_above THEN p_ctx.used_value <= p_rule.cond_rearm
+                                 ELSE p_ctx.used_value >= p_rule.cond_rearm END;
+        l_state  t_cross_state;
+        l_rows   NUMBER;
+        l_valid  NUMBER;
+    BEGIN
+        IF p_ctx.used_value IS NULL OR NOT (l_beyond OR l_back) THEN
+            RETURN FALSE;
+        END IF;
+
+        l_state := crossState(p_rule, p_ctx.process_id, p_ctx.action_name, p_ctx.context_name);
+        EXECUTE IMMEDIATE 'select count(*), count(case when cond_operator = :1 and cond_threshold = :2 and cond_rearm = :3 then 1 end)
+                             from ' || C_LILAM_ALERT_STATE_TABLE || '
+                            where group_name = :4 and state_kind = :5 and state_key = :6'
+            INTO l_rows, l_valid
+            USING l_state.operator, l_state.threshold, l_state.rearm, l_state.group_name, C_STATE_CROSS, l_state.state_key;
+
+        IF l_beyond THEN
+            RETURN l_valid = 0;
+        END IF;
+        IF l_rows > 0 THEN
+            rearmCross(l_state);
+        END IF;
+        RETURN FALSE;
+    END;
+
+    ------------------------------------------------------------
+    -- Process without scope closes: its VAL_CROSS_* state ends with it
+    ------------------------------------------------------------
+    PROCEDURE dropProcessCross(p_processId NUMBER) IS
+        pragma autonomous_transaction;
+        l_group VARCHAR2(50);
+    BEGIN
+        IF NOT v_indexSession.EXISTS(p_processId) OR getScopeId(p_processId) IS NOT NULL THEN
+            ROLLBACK;
+            RETURN;
+        END IF;
+        l_group := g_sessionList(v_indexSession(p_processId)).rule_group;
+        IF l_group IS NULL OR NOT g_rule_groups.EXISTS(l_group) OR NOT g_rule_groups(l_group).has_cross THEN
+            ROLLBACK;
+            RETURN;
+        END IF;
+        EXECUTE IMMEDIATE 'delete from ' || C_LILAM_ALERT_STATE_TABLE || '
+                            where group_name = :1 and state_kind = :2 and state_key like :3'
+            USING l_group, C_STATE_CROSS, 'P' || p_processId || '|%';
+        COMMIT;
+    exception
+        when others then
+        logLilamErr(sqlCode, sqlErrM, 'dropProcessCross', 'process ' || p_processId);
+        rollback;
     END;
 
     ------------------------------------------------------------
@@ -1738,10 +1912,18 @@ AS
         v_now_utc       TIMESTAMP := sys_extract_utc(SYSTIMESTAMP);
         v_last_alert    TIMESTAMP;
         v_empty         t_alert_history;
+        v_cross         t_cross_state;
     BEGIN
+        IF p_rule.condition_operator LIKE 'VAL_CROSS%' THEN
+            v_cross := crossState(p_rule, p_rec.process_id, p_rec.action_name, p_rec.context_name);
+        END IF;
+
         IF v_throttle_sec <= 0 THEN
             -- without throttling no lock is needed
-            IF persist_alert(p_rule, p_rec, NULL, NULL, NULL, v_now_utc, v_last_alert) THEN NULL; END IF;
+            IF persist_alert(p_rule, p_rec, NULL, NULL, NULL, v_cross, v_now_utc, v_last_alert) THEN NULL; END IF;
+            IF v_cross.state_key IS NOT NULL AND g_serverPipeName IS NULL THEN
+                purgeAlertLocks;
+            END IF;
             RETURN;
         END IF;
 
@@ -1761,12 +1943,14 @@ AS
               AND g_alert_history_proc(p_rec.process_id).EXISTS(v_mem_key) THEN
             v_last_alert := g_alert_history_proc(p_rec.process_id)(v_mem_key);
         END IF;
-        IF v_last_alert + numtodsinterval(v_throttle_sec, 'SECOND') > v_now_utc THEN
+        -- Failover: persist_alert has to restore the state of a VAL_CROSS_* rule
+        IF v_last_alert + numtodsinterval(v_throttle_sec, 'SECOND') > v_now_utc
+           AND NOT (g_replay_check AND v_cross.state_key IS NOT NULL) THEN
             RETURN;
         END IF;
 
         -- Table decides; afterwards remember the last alert for the key (own or foreign)
-        IF persist_alert(p_rule, p_rec, v_group, v_lock_key, v_throttle_sec, v_now_utc, v_last_alert) THEN NULL; END IF;
+        IF persist_alert(p_rule, p_rec, v_group, v_lock_key, v_throttle_sec, v_cross, v_now_utc, v_last_alert) THEN NULL; END IF;
         IF v_last_alert IS NOT NULL THEN
             IF v_scope_id IS NOT NULL THEN
                 g_alert_history(v_mem_key) := v_last_alert;
@@ -1964,6 +2148,7 @@ AS
         v_alert      t_alert_out;
         v_lock_key   VARCHAR2(1000);
         v_last_alert TIMESTAMP;
+        v_cross      t_cross_state;
     BEGIN
         v_alert.process_id   := p_processId;
         v_alert.process_name := CASE WHEN p_rule.trigger_type IN (C_PROCESS_START, C_PROCESS_UPDATE) THEN p_rule.target_action END;
@@ -1978,7 +2163,7 @@ AS
                       || '|' || p_rule.rule_id || '|' || p_rule.target_action || '|' || p_rule.target_context;
         IF writeAlert(p_rule, v_alert, p_group, v_lock_key,
                       CASE WHEN coalesce(p_rule.throttle_seconds, 0) > 0 THEN p_rule.throttle_seconds ELSE p_rule.cond_num END,
-                      p_nowUtc, v_last_alert) THEN
+                      v_cross, p_nowUtc, v_last_alert) THEN
             NULL;
         END IF;
     exception
@@ -2089,6 +2274,12 @@ AS
 
                         WHEN 'VAL_MAX' THEN
                             fire := p_ctx.used_value > p_list(i).cond_num;
+
+                        WHEN 'VAL_CROSS_ABOVE' THEN
+                            fire := crossFires(p_list(i), p_ctx);
+
+                        WHEN 'VAL_CROSS_BELOW' THEN
+                            fire := crossFires(p_list(i), p_ctx);
 
                         WHEN 'TIME_MAX_GAP_SECONDS' THEN
                             -- Events: distance to the previous event; traces (TRACE_START): distance to the end of the previous trace
@@ -2284,6 +2475,9 @@ AS
         evaluateRules_internal(l_ctx, p_trigger, p_check_context => FALSE);
         -- after the rules: INSESSION loads them on the first signal of the process
         touchRun(p_processRec.id, p_ended => p_trigger = C_PROCESS_STOP);
+        IF p_trigger = C_PROCESS_STOP THEN
+            dropProcessCross(p_processRec.id);
+        END IF;
     END evaluateRules;
 
     --------------------------------------------------------------------------
@@ -4040,7 +4234,8 @@ AS
         createIndexIfMissing('IDX_LILAM_BASELINES_RESET', C_LILAM_BASELINES_TABLE, 'reset_ts');
 
         -- Alert state: locks of the throttling (kind LOCK, see fire_alert/fireSilence) and
-        -- "last seen" of the targets of silence rules (kinds START, EVENT, TRACE, RUN, see checkSilence)
+        -- "last seen" of the targets of silence rules (kinds START, EVENT, TRACE, RUN, see checkSilence),
+        -- fired VAL_CROSS_* rules (kind CROSS, columns from rule_id on, see takeCrossState)
         if not objectExists(C_LILAM_ALERT_STATE_TABLE, 'TABLE') then
             sqlStmt := '
             CREATE TABLE ' || C_LILAM_ALERT_STATE_TABLE || ' (
@@ -4049,9 +4244,25 @@ AS
                 state_key     VARCHAR2(1000) NOT NULL,
                 ts_utc        TIMESTAMP(6)   NOT NULL,
                 hold_seconds  NUMBER,
+                rule_id        VARCHAR2(50),
+                scope_id       NUMBER(19,0),
+                action_name    VARCHAR2(100),
+                context_name   VARCHAR2(100),
+                cond_operator  VARCHAR2(50),
+                cond_threshold NUMBER,
+                cond_rearm     NUMBER,
                 CONSTRAINT pk_lilam_alert_state PRIMARY KEY (group_name, state_kind, state_key)
             ) ORGANIZATION INDEX';
             run_ddl(sqlStmt, -955);   -- created by another session at the same time
+        else
+            -- Existing table: VAL_CROSS_*
+            select count(*) into l_regCols from user_tab_columns
+             where table_name = upper(C_LILAM_ALERT_STATE_TABLE) and column_name = 'COND_REARM';
+            if l_regCols = 0 then
+                add_columns('ALTER TABLE ' || C_LILAM_ALERT_STATE_TABLE || ' ADD (rule_id VARCHAR2(50), scope_id NUMBER(19,0),
+                             action_name VARCHAR2(100), context_name VARCHAR2(100),
+                             cond_operator VARCHAR2(50), cond_threshold NUMBER, cond_rearm NUMBER)');
+            end if;
         end if;
 
         -- Indexes of the master tables: names are derived from the master name,
@@ -5852,6 +6063,7 @@ AS
     -- warm-up starts again. NULL context = only the baseline without context. RESET_TS tells the PGA
     -- copies of other sessions and servers to reload (dropResetBaselines, at most C_BASELINE_SYNC_INTERVAL_MS).
     -- MERGE: also when the row does not exist yet, so unsynced first measurements are discarded too.
+    -- The VAL_CROSS_* state of the series goes with it, for all rules and groups of the scope.
     PROCEDURE RESET_BASELINE(p_scopeName VARCHAR2, p_actionName VARCHAR2, p_contextName VARCHAR2)
     as
         pragma autonomous_transaction;
@@ -5862,6 +6074,7 @@ AS
         if l_scope is null or p_actionName is null then
             return;
         end if;
+        createLogTables(C_DIRECT_WRITE_MASTER);   -- LILAM_ALERT_STATE may still lack the columns
 
         begin
             execute immediate 'select scope_id from ' || C_LILAM_SCOPES_TABLE || ' where scope_name = :1'
@@ -5885,6 +6098,10 @@ AS
                            (scope_id, action_name, context_name, avg_ms, action_count, avg_val, val_count, reset_ts, last_update)
                            values (s.scope_id, s.action_name, s.context_name, NULL, 0, NULL, 0, :5, SYSTIMESTAMP)'
                     using l_scopeId, p_actionName, nvl(p_contextName, C_BASELINE_NULL_CONTEXT), l_ts, l_ts;
+                execute immediate 'delete from ' || C_LILAM_ALERT_STATE_TABLE || '
+                                    where state_kind = :1 and scope_id = :2 and action_name = :3
+                                      and (context_name = :4 or (context_name is null and :5 is null))'
+                    using C_STATE_CROSS, l_scopeId, p_actionName, p_contextName, p_contextName;
                 commit;
                 exit;
             exception
@@ -9502,7 +9719,8 @@ AS
                 WHEN l_op IN ('TIME_MAX_DURATION_MS', 'TIME_EWMA_DEVIATION_PCT_UP', 'TIME_EWMA_DEVIATION_PCT_DOWN') THEN
                      l_trig IN (C_MARK_EVENT, C_TRACE_STOP)
                 WHEN l_op = 'TIME_MAX_GAP_SECONDS' THEN l_trig IN (C_MARK_EVENT, C_TRACE_START)
-                WHEN l_op IN ('VAL_EWMA_DEVIATION_PCT_UP', 'VAL_EWMA_DEVIATION_PCT_DOWN', 'VAL_MIN', 'VAL_MAX') THEN
+                WHEN l_op IN ('VAL_EWMA_DEVIATION_PCT_UP', 'VAL_EWMA_DEVIATION_PCT_DOWN', 'VAL_MIN', 'VAL_MAX',
+                              'VAL_CROSS_ABOVE', 'VAL_CROSS_BELOW') THEN
                      l_trig = C_MARK_EVENT
                 WHEN l_op = 'MAX_OCCURRENCE' THEN l_trig IN (C_MARK_EVENT, C_TRACE_STOP, C_PROCESS_UPDATE, C_PROCESS_STOP)
                 -- No TRACE_STOP: the order is decided when the action starts;
@@ -9553,6 +9771,18 @@ AS
                         RETURN fail('LOG_CONTAINS needs TEXT or LEVEL|TEXT (text max. 100)');
                     END IF;
                     l_rule.cond_upper := upper(substr(r.value, l_parts + 1));
+                WHEN l_op IN ('VAL_CROSS_ABOVE', 'VAL_CROSS_BELOW') THEN
+                    -- 'threshold[|return]'; without a return limit the threshold is the return limit
+                    l_rule.cond_num   := ruleNumber(r.value, 1);
+                    l_rule.cond_rearm := CASE WHEN instr(r.value, '|') > 0 THEN ruleNumber(r.value, 2) ELSE l_rule.cond_num END;
+                    IF regexp_like(r.value, C_EMPTY_PART) OR regexp_count(r.value, '\|') > 1
+                       OR l_rule.cond_num IS NULL OR l_rule.cond_rearm IS NULL THEN
+                        RETURN fail(l_op || ' needs THRESHOLD[|RETURN] (decimal point ".")');
+                    END IF;
+                    IF (l_op = 'VAL_CROSS_ABOVE' AND l_rule.cond_rearm > l_rule.cond_num)
+                       OR (l_op = 'VAL_CROSS_BELOW' AND l_rule.cond_rearm < l_rule.cond_num) THEN
+                        RETURN fail(l_op || ': return limit on the wrong side of the threshold');
+                    END IF;
                 WHEN l_op IN ('PRECEDED_BY', 'TIME_PRECEDED_BY_WITHIN_SECS') THEN
                     -- PRECEDED_BY: ACTION[|CONTEXT]; TIME_PRECEDED_BY_WITHIN_SECS: ACTION[|CONTEXT]|SECONDS
                     -- STABILITY: empty parts ('|C1', 'A|') would otherwise be skipped and change the meaning
@@ -9704,6 +9934,10 @@ AS
             l_pid := g_alert_history_proc.NEXT(l_pid);
         END LOOP;
 
+        IF g_rule_groups.EXISTS(p_group) THEN
+            g_rule_groups(p_group).has_cross := FALSE;
+        END IF;
+
         -- Silence rules
         g_silence_rules.DELETE(p_group);
         l_key := g_silence_run.FIRST;
@@ -9716,7 +9950,8 @@ AS
     end;
 
     --------------------------------------------------------------------------
-    -- Collect the silence rules (TIME_MAX_SILENCE_SECONDS) of a rule map for checkSilence/touchRun
+    -- Collect the silence rules (TIME_MAX_SILENCE_SECONDS) of a rule map for checkSilence/touchRun;
+    -- also notes whether the group has VAL_CROSS_* rules
     --------------------------------------------------------------------------
     procedure collectSilenceRules(p_group varchar2, p_map t_rule_map)
     as
@@ -9725,6 +9960,9 @@ AS
         l_key := p_map.FIRST;
         WHILE l_key IS NOT NULL LOOP
             FOR i IN 1 .. p_map(l_key).COUNT LOOP
+                IF p_map(l_key)(i).condition_operator LIKE 'VAL_CROSS%' THEN
+                    g_rule_groups(p_group).has_cross := TRUE;
+                END IF;
                 IF p_map(l_key)(i).condition_operator = 'TIME_MAX_SILENCE_SECONDS' THEN
                     IF NOT g_silence_rules.EXISTS(p_group) THEN
                         g_silence_rules(p_group) := t_rule_list();
@@ -9940,8 +10178,8 @@ AS
         l_nowUtc := sys_extract_utc(SYSTIMESTAMP);
 
         EXECUTE IMMEDIATE 'select state_kind, state_key, ts_utc from ' || C_LILAM_ALERT_STATE_TABLE || '
-                            where group_name = :1 and state_kind != :2'
-            BULK COLLECT INTO l_kinds, l_keys, l_ts USING l_group, C_STATE_LOCK;
+                            where group_name = :1 and state_kind not in (:2, :3)'
+            BULK COLLECT INTO l_kinds, l_keys, l_ts USING l_group, C_STATE_LOCK, C_STATE_CROSS;
         FOR j IN 1 .. l_keys.COUNT LOOP
             l_rows(l_kinds(j) || '|' || l_keys(j)) := j;
         END LOOP;
@@ -10051,6 +10289,45 @@ AS
     end;
 
     --------------------------------------------------------------------------
+    -- Removes VAL_CROSS_* state of rules the activated rule set no longer contains (rule, action and
+    -- context as in the rule; a rule without context covers all contexts). Errors never reach the caller.
+    --------------------------------------------------------------------------
+    procedure purgeCrossStates(p_group varchar2, p_byCtx t_rule_map, p_byAction t_rule_map)
+    as
+        pragma autonomous_transaction;
+        l_keep sys.odcivarchar2list := sys.odcivarchar2list();
+
+        procedure collect(p_map t_rule_map) is
+            l_key VARCHAR2(300) := p_map.FIRST;
+        begin
+            WHILE l_key IS NOT NULL LOOP
+                FOR i IN 1 .. p_map(l_key).COUNT LOOP
+                    IF p_map(l_key)(i).condition_operator LIKE 'VAL_CROSS%' THEN
+                        l_keep.EXTEND;
+                        l_keep(l_keep.LAST) := p_map(l_key)(i).rule_id || chr(1) || p_map(l_key)(i).target_action
+                                               || chr(1) || p_map(l_key)(i).target_context;
+                    END IF;
+                END LOOP;
+                l_key := p_map.NEXT(l_key);
+            END LOOP;
+        end;
+    begin
+        createLogTables(C_DIRECT_WRITE_MASTER);
+        collect(p_byCtx);
+        collect(p_byAction);
+        EXECUTE IMMEDIATE 'delete from ' || C_LILAM_ALERT_STATE_TABLE || '
+                            where group_name = :1 and state_kind = :2
+                              and rule_id || chr(1) || action_name || chr(1) || context_name not in (select column_value from table(:3))
+                              and rule_id || chr(1) || action_name || chr(1) not in (select column_value from table(:4))'
+            USING upper(trim(p_group)), C_STATE_CROSS, l_keep, l_keep;
+        commit;
+    exception
+        when others then
+        rollback;
+        logLilamErr(sqlCode, sqlErrM, 'purgeCrossStates', 'group ' || p_group);
+    end;
+
+    --------------------------------------------------------------------------
     -- Checks a rule set without storing or activating it (same check as SERVER_UPDATE_RULES).
     -- Returns NULL if it is valid, otherwise the reason. STABILITY: never raises.
     --------------------------------------------------------------------------
@@ -10103,6 +10380,7 @@ AS
         END IF;
 
         activateGroupRules(p_groupName, p_ruleSetName, p_ruleSetVersion);
+        purgeCrossStates(p_groupName, l_byCtx, l_byAction);
 
         -- notify the running servers of the group; a group without servers is not an error
         EXECUTE IMMEDIATE 'SELECT pipe_name FROM ' || C_LILAM_SERVER_REGISTRY || '
