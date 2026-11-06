@@ -11419,8 +11419,6 @@ BEGIN
     -- Basic response structure; 'status' is deliberately set ONLY ONCE,
     -- either below in the respective branch or in the ELSE fallback
     jsonPut(l_jsonHeader, 'header', l_jsonHeaderIn);
-    jsonPut(l_jsonPayload, 'returns', 'NO_VALUE');
-    jsonPut(l_jsonPayload, 'value', 'NULL');
 
     case l_api_call
         when 'SERVER_NEW_PROCESS' THEN
@@ -11548,6 +11546,12 @@ BEGIN
             jsonPut(l_jsonPayload, 'value', NUM_ERR_ILLEGAL_REQ);
     END CASE;
 
+    -- Only now: jsonPut appends, a default set earlier would stay in front of the real value
+    if l_jsonPayload is null then
+        jsonPut(l_jsonPayload, 'returns', 'NO_VALUE');
+        jsonPut(l_jsonPayload, 'value', 'NULL');
+    end if;
+
     jsonPut(p_respObject, 'header', l_jsonHeader);
     jsonPut(p_respObject, 'payload', l_jsonPayload);
 
@@ -11555,6 +11559,7 @@ EXCEPTION
     WHEN OTHERS THEN
     logLilamErr(sqlCode, sqlErrM, 'CALL_BY_JSON');
     jsonPut(l_jsonHeader, 'status', 'ERROR');
+    l_jsonPayload := null;
     jsonPut(l_jsonPayload, 'returns', 'ERR_NO');
     jsonPut(l_jsonPayload, 'value', NUM_ERR_UNKNOWN);
     jsonPut(p_respObject, 'header', l_jsonHeader);

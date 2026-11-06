@@ -353,6 +353,25 @@ begin
   l_txt := json_query(r_resp('J2'), '$.payload.value');
   lt.check_that(l_run, 'P10 JSON GET_ACTIVE_PROCESSES: Array mit der ID', l_txt = '[' || l_pid2 || ']', r_resp('J2'));
   lt.check_that(l_run, 'P10 JSON GET_ACTIVE_PROCESSES: returns', json_value(r_resp('J2'), '$.payload.returns') = 'PROCESS_IDS', r_resp('J2'));
+  -- returns/value genau einmal je Antwort (die Vorbelegung stand frueher vor dem echten Wert)
+  declare
+    l_resp varchar2(8000);
+  begin
+    lilam.call_by_json('{"header":{"api_call":"SERVER_NEW_PROCESS"},"params":{"process_name":"' || l_pfx
+                       || 'JSON2","group_name":"' || lt.c_group || '"}}', l_resp);
+    lt.check_that(l_run, 'P10 JSON SERVER_NEW_PROCESS: ID in value',
+                  to_number(json_value(l_resp, '$.payload.value' null on error)) > 0 and regexp_count(l_resp, '"value"') = 1, l_resp);
+    lilam.call_by_json('{"header":{"api_call":"NEW_PROCESS"},"params":{"process_name":"' || l_pfx || 'JSON3"}}', l_resp);
+    l_a := to_number(json_value(l_resp, '$.payload.value' null on error));
+    lt.check_that(l_run, 'P10 JSON NEW_PROCESS: ID in value', l_a > 0 and regexp_count(l_resp, '"value"') = 1, l_resp);
+    lilam.close_process(l_a);
+    lilam.call_by_json('{"header":{"api_call":"FLUSH"},"params":{}}', l_resp);
+    lt.check_that(l_run, 'P10 JSON ohne Rueckgabewert: NO_VALUE',
+                  json_value(l_resp, '$.payload.returns') = 'NO_VALUE' and regexp_count(l_resp, '"returns"') = 1, l_resp);
+    lilam.call_by_json('{"header":{"api_call":"GIBT_ES_NICHT"},"params":{}}', l_resp);
+    lt.check_that(l_run, 'P10 JSON unbekannter Aufruf: ERR_NO',
+                  json_value(l_resp, '$.payload.returns') = 'ERR_NO' and regexp_count(l_resp, '"returns"') = 1, l_resp);
+  end;
 
   -- P11 Fehlerfaelle
   req('E1', 'CONNECT_NOGROUP', l_pfx || 'FEHLER');
