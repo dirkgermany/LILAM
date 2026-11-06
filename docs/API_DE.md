@@ -231,6 +231,8 @@ Die Prozessverwaltung steuert den Lebenszyklus eines LILAM Prozesses.
 | --- | --- |
 | `NEW_PROCESS` | Startet einen LILAM Prozess im In-Session-Modus |
 | `SERVER_NEW_PROCESS` | Startet einen Prozess mit Verbindung zu einem LILAM Server |
+| `SERVER_CONNECT_PROCESS` | Verbindet mit dem aktiven Prozess dieses Namens oder legt ihn an, siehe [Prozess über den Namen finden](#prozess-über-den-namen-finden) |
+| `GET_ACTIVE_PROCESSES` | Liefert die IDs der aktiven Prozesse eines Namens |
 | `CLOSE_PROCESS` | Beendet einen Prozess und schreibt gepufferte Daten |
 | `FLUSH` | Schreibt alle gepufferten Daten der Datenbanksession sofort; die Prozesse bleiben offen |
 
@@ -1113,6 +1115,101 @@ BEGIN
 END;
 /
 ```
+
+### Prozess über den Namen finden
+Bei Connection Pooling läuft fast jeder Request in einer anderen physischen Session. Eine Anwendung, die die process_id nicht selbst verwaltet, findet den Prozess über seinen Namen: `SERVER_CONNECT_PROCESS` verbindet sich mit dem aktiven Prozess oder legt ihn an, `GET_ACTIVE_PROCESSES` liefert nur die IDs.
+
+Aktiv ist ein Prozess, solange er in der Prozessverwaltung eines laufenden Workers steht. Die Oracle-Session, die ihn angelegt hat, spielt dabei keine Rolle. Ein Prozess, den kein laufender Worker mehr hält, gilt als beendet, auch wenn er in `<Master>_PROC` noch offen aussieht.
+
+Die Anfrage geht an den Dispatcher, der sie an alle Worker seiner Gruppe weiterleitet. Die Worker antworten dem Client direkt. Ein In-Session-Prozess lebt nur im Speicher seiner Session und kann deshalb nicht aus einer anderen Session fortgesetzt werden.
+
+> [!NOTE]
+> Beliebig viele Clients dürfen sich mit demselben Prozess verbinden und ihn gemeinsam mit Daten versorgen; es gibt keine Reservierung. Der Prozessname muss dafür nicht je Client eindeutig sein.
+> `CLOSE_PROCESS` eines Clients beendet den Prozess für alle: Meldungen der anderen Clients werden danach ohne Fehler ignoriert, und der nächste `SERVER_CONNECT_PROCESS` legt einen neuen Prozess an.
+> Die Drosselung (`p_perfServer`) gilt je Client, viele Clients zusammen können also entsprechend mehr senden.
+
+### Function SERVER_CONNECT_PROCESS
+Verbindet die aktuelle Session mit dem aktiven Prozess dieses Namens. Gibt es keinen, legt die Funktion ihn wie `SERVER_NEW_PROCESS` an. Sie gilt nur für den entkoppelten Modus.
+
+Ist für die Gruppe in dieser Session kein Dispatcher gesetzt, sucht die Funktion ihn in der `LILAM_SERVER_REGISTRY` und setzt ihn selbst. Ein vorheriges `SET_DISPATCHER_PIPE` ist nicht nötig.
+
+```sql
+FUNCTION SERVER_CONNECT_PROCESS(
+  p_processName   VARCHAR2,
+  p_groupName     VARCHAR2,
+  p_logLevel      PLS_INTEGER DEFAULT logLevelMonitor,
+  p_procStepsToDo PLS_INTEGER DEFAULT NULL,
+  p_daysToKeep    PLS_INTEGER DEFAULT NULL,
+  p_tabNameMaster VARCHAR2    DEFAULT 'LILAM',
+  p_baselineScope VARCHAR2    DEFAULT NULL,
+  p_syncLevel     PLS_INTEGER DEFAULT logLevelError,
+  p_maxWaitMs     PLS_INTEGER DEFAULT C_ACTIVE_WAIT_MS
+) RETURN NUMBER
+```
+
+#### Parameter
+| Parameter | Typ | Bedeutung |
+| --------- | --- | --------- |
+| p_processName | varchar2 | Prozessname; Groß- und Kleinschreibung zählen nicht |
+| p_groupName | varchar2 | Servergruppe. Darüber findet LILAM den Dispatcher |
+| p_logLevel … p_syncLevel | | Wie bei `SERVER_NEW_PROCESS`. Sie gelten nur, wenn ein neuer Prozess entsteht, und ändern einen vorhandenen nicht |
+| p_maxWaitMs | pls_integer | Höchste Wartezeit je Suche auf die Antworten der Worker in Millisekunden. `NULL` oder ≤ 0 = `C_ACTIVE_WAIT_MS` (2000) |
+
+`p_maxWaitMs` begrenzt nur die Suche. Der Reconnect (bis 5 s) und das Anlegen (bis 3 s) behalten ihre eigenen Zeitlimits, in einem Aufruf können mehrere Suchen laufen. DBMS_PIPE wartet nur in ganzen Sekunden; die Wartezeit wird deshalb im Abstand von 10 ms geprüft und nicht auf die Millisekunde genau eingehalten.
+
+#### Rückgabe
+Die process_id oder, wie bei `SERVER_NEW_PROCESS`, ein negativer Code ohne Exception. Alle weiteren Aufrufe mit einem negativen Wert werden ignoriert.
+
+| Wert | Bedeutung |
+| ---- | --------- |
+| > 0 | Verbunden oder neu angelegt |
+| `NUM_ERR_NO_SERVER` | Kein aktiver Dispatcher für die Gruppe gefunden |
+| `NUM_ERR_PROCESS_TIMEOUT` | Kein Treffer, aber nicht alle Worker haben geantwortet, oder ein paralleler Request hat den Prozess nicht rechtzeitig angelegt |
+| `NUM_ERR_SERVER_PROC`, `NUM_ERR_PIPE_SERVER` | Treffer gefunden, Reconnect aber gescheitert |
+| `NUM_ERR_ILLEGAL_REQ` | Kein Prozessname angegeben |
+
+Dabei gilt:
+
+- Bei mehreren Treffern verbindet sich die Funktion mit der niedrigsten ID. So landen alle Clients beim selben Prozess.
+- Ein neuer Prozess entsteht nur, wenn alle Worker geantwortet haben. Ein Worker ohne Antwort könnte den Prozess halten; ein zweiter Prozess gleichen Namens wäre dann eine Dublette.
+- Parallele Requests legen den Prozess nur einmal an: Eine Sperre je Gruppe und Prozessname in `LILAM_ALERT_STATE` lässt einen Request anlegen, die anderen suchen weiter, bis der Prozess da ist. Fällt der Halter aus, läuft die Sperre von selbst ab.
+
+```sql
+-- Beispiel: APEX, in jedem Request; die Anwendung verwaltet keine process_id
+DECLARE
+  l_processId NUMBER;
+BEGIN
+  l_processId := lilam.server_connect_process('SALES_IMPORT', 'SALES');
+  lilam.info(l_processId, 'Seite ' || :APP_PAGE_ID);
+END;
+/
+```
+
+### Function GET_ACTIVE_PROCESSES
+Liefert die IDs der aktiven Prozesse dieses Namens, aufsteigend sortiert. Die Funktion verbindet nichts und reserviert nichts; mehrere Clients dürfen dieselben IDs erhalten.
+
+```sql
+FUNCTION GET_ACTIVE_PROCESSES(
+  p_processName VARCHAR2,
+  p_maxWaitMs   PLS_INTEGER DEFAULT C_ACTIVE_WAIT_MS
+) RETURN SYS.ODCINUMBERLIST
+```
+
+| Parameter | Typ | Bedeutung |
+| --------- | --- | --------- |
+| p_processName | varchar2 | Prozessname; Groß- und Kleinschreibung zählen nicht |
+| p_maxWaitMs | pls_integer | Wie bei `SERVER_CONNECT_PROCESS` |
+
+- Durchsucht werden die eigene Session und, wenn `SET_DISPATCHER_PIPE` gesetzt ist, die Worker des Standard-Dispatchers. Ohne Dispatcher liefert die Funktion nur Prozesse der eigenen Session.
+- Kein Treffer ergibt eine leere Liste, nie eine Exception. Antwortet ein Worker nicht rechtzeitig, zählt, was bis dahin da ist; bleibt die Liste dabei leer, steht das in `LILAM_LOG_INTERNAL`.
+- Die Liste ist eine Momentaufnahme. Ein Prozess kann gleich danach geschlossen werden.
+- Eine Worker-Antwort fasst einige Hundert IDs; was darüber hinausgeht, fehlt in der Liste. Für einen Reconnect genügt ein Treffer.
+
+```sql
+SELECT column_value AS process_id
+  FROM TABLE(lilam.get_active_processes('SALES_IMPORT'));
+```
+
 ---
 
 ## Anhang
@@ -1217,6 +1314,8 @@ LILAM JSON Requests bestehen aus einem Header und einem Parameterobjekt. Der Hea
 | --- | --- | --- |
 | `NEW_PROCESS` | `NEW_PROCESS` (Record) | `process_name`, `log_level`, `steps_todo`, `days_to_keep`, `process_immortal`, `tabname_master`, `baseline_scope`, `group_name` |
 | `SERVER_NEW_PROCESS` | `SERVER_NEW_PROCESS_JSON` | wie `SERVER_NEW_PROCESS`, siehe Tabelle dort |
+| `SERVER_CONNECT_PROCESS` | `SERVER_CONNECT_PROCESS` | wie `SERVER_NEW_PROCESS`, dazu `max_wait_ms` |
+| `GET_ACTIVE_PROCESSES` | `GET_ACTIVE_PROCESSES` | `process_name`, `max_wait_ms`; `returns` = `PROCESS_IDS`, `value` ist ein JSON-Array mit IDs |
 | `CLOSE_PROCESS` | `CLOSE_PROCESS` | `process_id` |
 | `FLUSH` | `FLUSH` | keine |
 | `SET_PROCESS_STATUS` | `SET_PROCESS_STATUS` | `process_id`, `process_status`, `process_info` |

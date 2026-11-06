@@ -405,6 +405,13 @@ flowchart TD
     LINK -- "unknown: block for 1 day<br/>no server / timeout: block for 10 s" --> IGN
 ```
 
+### Finding a Process by Name
+`GET_ACTIVE_PROCESSES` and `SERVER_CONNECT_PROCESS` search without a process ID. What counts is the process administration in the memory of the workers, not `<Master>_PROC`, where processes of a stopped or failed worker stay open. Active is therefore exactly what a reconnect accepts.
+
+As no route applies, the dispatcher sends the request to all workers of its group and tells the client how many it reached. Every worker answers directly, also without a hit. The client waits for all answers, at most `p_maxWaitMs`: an answer after the response pipe was removed would stay behind in an orphaned pipe. For the same reason workers discard expired requests (`expires_utc`).
+
+`SERVER_CONNECT_PROCESS` only creates a process if all workers answered. A lock per group and process name in `LILAM_ALERT_STATE` (kind `LOCK`, key `CONNECT|<name>`) rules out parallel requests; the holder searches once more after locking, the others keep searching until the process exists.
+
 ### Dispatcher Flow
 A dispatcher is a LILAM Server started with `p_isDispatcher => 1`. It processes nothing itself (except `SERVER_SHUTDOWN` and `SERVER_PING`), evaluates no rules and is never selected as a worker. It forwards every message unchanged, including the client's response channel, so workers answer the client directly.
 

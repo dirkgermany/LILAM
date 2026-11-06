@@ -431,6 +431,13 @@ flowchart TD
     LINK -- "unbekannt: 1 Tag sperren<br/>kein Server / Timeout: 10 s sperren" --> IGN
 ```
 
+### Prozess über den Namen finden
+`GET_ACTIVE_PROCESSES` und `SERVER_CONNECT_PROCESS` suchen ohne Prozess-ID. Maßgeblich ist die Prozessverwaltung im Speicher der Worker, nicht `<Master>_PROC`: Dort bleiben Prozesse offen, deren Worker gestoppt oder ausgefallen ist. Aktiv ist also genau das, was auch ein Reconnect annimmt.
+
+Da keine Route greift, schickt der Dispatcher die Anfrage an alle Worker seiner Gruppe und nennt dem Client die Zahl der erreichten Worker. Jeder Worker antwortet direkt, auch ohne Treffer. Der Client wartet auf alle Antworten, höchstens `p_maxWaitMs`: Eine Antwort nach dem Entfernen der Antwort-Pipe bliebe in einer verwaisten Pipe liegen. Aus demselben Grund verwerfen die Worker abgelaufene Anfragen (`expires_utc`).
+
+`SERVER_CONNECT_PROCESS` legt einen Prozess nur an, wenn alle Worker geantwortet haben. Parallele Requests schließt eine Sperre je Gruppe und Prozessname in `LILAM_ALERT_STATE` aus (Art `LOCK`, Schlüssel `CONNECT|<Name>`); der Halter sucht nach dem Sperren noch einmal, die anderen suchen weiter, bis der Prozess da ist.
+
 ### Ablauf im Dispatcher
 Ein Dispatcher ist ein LILAM Server, der mit `p_isDispatcher => 1` gestartet wurde. Er verarbeitet selbst nichts (außer `SERVER_SHUTDOWN` und `SERVER_PING`), wertet keine Regeln aus und wird nie als Worker gewählt. Er leitet jede Nachricht unverändert weiter, einschließlich des Antwortkanals des Clients, sodass Worker dem Client direkt antworten.
 

@@ -63,6 +63,9 @@ create or replace PACKAGE LILAM AS
     NUM_ERR_RULE_SET          CONSTANT PLS_INTEGER  := -20130;
     -- Communication error during creation: NUM_COMM_ERR (-20003)
 
+    -- Default wait for the answers of the workers (GET_ACTIVE_PROCESSES, SERVER_CONNECT_PROCESS)
+    C_ACTIVE_WAIT_MS    CONSTANT PLS_INTEGER  := 2000;
+
     -- Performance levels of a LILAM server (parameter p_perfServer of CREATE_SERVER/START_SERVER).
     -- Value = messages per second and process that a client may send without coordinating with the server.
     -- Any other values are allowed; 0 = no throttling; NULL or < 0 = C_SERVER_PERF_MID (default).
@@ -158,6 +161,19 @@ create or replace PACKAGE LILAM AS
         p_baselineScope VARCHAR2    DEFAULT NULL,
         p_syncLevel     PLS_INTEGER DEFAULT logLevelError) RETURN NUMBER;
     FUNCTION  SERVER_NEW_PROCESS_JSON(p_jsonObject JSON_OBJ_LILAM) RETURN NUMBER;
+    -- Connect to the active process of this name on a server of the group, otherwise create it (decoupled only).
+    -- Returns the process ID, or a negative code as SERVER_NEW_PROCESS does. Sets the dispatcher of the group
+    -- implicitly. p_maxWaitMs limits each search; the other parameters apply only to a new process
+    FUNCTION  SERVER_CONNECT_PROCESS(
+        p_processName   VARCHAR2,
+        p_groupName     VARCHAR2,
+        p_logLevel      PLS_INTEGER DEFAULT logLevelMonitor,
+        p_procStepsToDo PLS_INTEGER DEFAULT NULL,
+        p_daysToKeep    PLS_INTEGER DEFAULT NULL,
+        p_tabNameMaster VARCHAR2    DEFAULT 'LILAM',
+        p_baselineScope VARCHAR2    DEFAULT NULL,
+        p_syncLevel     PLS_INTEGER DEFAULT logLevelError,
+        p_maxWaitMs     PLS_INTEGER DEFAULT C_ACTIVE_WAIT_MS) RETURN NUMBER;
 
     PROCEDURE CLOSE_PROCESS(
         p_processId     NUMBER,
@@ -216,6 +232,9 @@ create or replace PACKAGE LILAM AS
     FUNCTION  GET_PROCESS_DATA_JSON(p_processId NUMBER) return varchar2;
     FUNCTION  GET_COUNTER_WARN(p_processId NUMBER) return PLS_INTEGER;
     FUNCTION  GET_COUNTER_ERROR(p_processId NUMBER) return PLS_INTEGER;
+    -- IDs of the active processes of this name: own session and the workers of the default dispatcher.
+    -- Does not connect and reserves nothing. No hit: empty list (never raises)
+    FUNCTION  GET_ACTIVE_PROCESSES(p_processName VARCHAR2, p_maxWaitMs PLS_INTEGER DEFAULT C_ACTIVE_WAIT_MS) RETURN SYS.ODCINUMBERLIST;
 
     ------------------
     -- Logging details

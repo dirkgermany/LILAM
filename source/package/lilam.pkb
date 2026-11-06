@@ -132,6 +132,11 @@ AS
     -- Other general Parameters
     ---------------------------------------------------------------
     C_TIMEOUT_NEW_PROCESS_SEC           CONSTANT NUMBER      := 3.0;  -- NEW_PROCESS max. time waiting for server response
+    C_ACTIVE_POLL_MS                    CONSTANT PLS_INTEGER := 10;    -- Search for active processes: DBMS_PIPE only waits in whole seconds
+    C_ACTIVE_LIST_MAX_LEN               CONSTANT PLS_INTEGER := 7000;  -- ID list of a message: stays within JSON_OBJ_LILAM, further IDs are left out
+    C_CONNECT_RETRY_MS                  CONSTANT PLS_INTEGER := 50;    -- SERVER_CONNECT_PROCESS: pause while another request creates the process
+    C_CONNECT_LOCK_PREFIX               CONSTANT VARCHAR2(10) := 'CONNECT|';  -- Key in LILAM_ALERT_STATE, kind LOCK
+    C_CONNECT_NO_GROUP                  CONSTANT VARCHAR2(10) := '#NONE';     -- group_name of this lock without group
     C_METRIC_ALERT_FACTOR_SEC           CONSTANT NUMBER      := 2.0;   -- Max. outlier in the duration of a processing step
     C_MAX_LOG_TEXT_LEN                  CONSTANT PLS_INTEGER := 1900;  -- Log texts are always truncated to this length (column INFO: 2000)
 
@@ -8571,10 +8576,68 @@ AS
         when others then
             logLilamErr(sqlCode, sqlErrM, 'doRemote_getProcessData'); 
             error(l_processId, 'Could not send process data to client: ' || sqlErrM);
-    end;    
+    end;
 
     --------------------------------------------------------------------------
-    
+
+    -- Processes of this name in the process administration of this session (worker: of this worker)
+    procedure collectLocalProcesses(p_processName varchar2, p_ids in out nocopy sys.odcinumberlist)
+    as
+        l_name varchar2(4000) := upper(trim(p_processName));
+        l_pid  number := v_indexSession.FIRST;
+    begin
+        while l_pid is not null loop
+            if l_pid != g_serverProcessId and g_process_cache.EXISTS(l_pid)
+               and upper(trim(g_process_cache(l_pid).processName)) = l_name then
+                p_ids.EXTEND;
+                p_ids(p_ids.LAST) := l_pid;
+            end if;
+            l_pid := v_indexSession.NEXT(l_pid);
+        end loop;
+    end;
+
+    --------------------------------------------------------------------------
+
+    -- '[1,2,3]'; IDs beyond C_ACTIVE_LIST_MAX_LEN are left out (one hit is enough for a reconnect)
+    function jsonIdList(p_ids sys.odcinumberlist) return varchar2
+    as
+        l_list varchar2(8000);
+    begin
+        for i in 1 .. p_ids.COUNT loop
+            exit when length(l_list) > C_ACTIVE_LIST_MAX_LEN;
+            l_list := l_list || case when i > 1 then ',' end || jNum(p_ids(i));
+        end loop;
+        return '[' || l_list || ']';
+    end;
+
+    --------------------------------------------------------------------------
+
+    -- Every worker answers, also without a hit: only so the client knows that the list is complete
+    procedure doRemote_getActiveProcesses(p_clientChannel varchar2, p_message varchar2)
+    as
+        l_payload JSON_OBJ_LILAM;
+        l_ids     sys.odcinumberlist := sys.odcinumberlist();
+        l_status  PLS_INTEGER;
+    begin
+        l_payload := payloadOf(p_message, 'doRemote_getActiveProcesses');
+        -- The client no longer waits: a response would only create an orphaned pipe
+        if jsonTime(l_payload, 'expires_utc') < sys_extract_utc(systimestamp) then
+            return;
+        end if;
+
+        collectLocalProcesses(jsonString(l_payload, 'process_name'), l_ids);
+
+        DBMS_PIPE.RESET_BUFFER;
+        DBMS_PIPE.PACK_MESSAGE('{"header":{"msg_type":"SERVER_RESPONSE","msg_name":"ACTIVE_PROCESSES"},"payload":{"ids":'
+            || jsonIdList(l_ids) || '}}');
+        l_status := DBMS_PIPE.SEND_MESSAGE(p_clientChannel, timeout => 0);
+    exception
+        when others then
+            logLilamErr(sqlCode, sqlErrM, 'doRemote_getActiveProcesses');
+    end;
+
+    --------------------------------------------------------------------------
+
     procedure registerProcessRoute(p_processId number, p_pipeName varchar2)
     as
         pragma autonomous_transaction;
@@ -9202,6 +9265,306 @@ AS
         logLilamErr(sqlCode, sqlErrM, 'SERVER_LINK'); 
 
     END;
+
+    --------------------------------------------------------------------------
+    -- Search for active processes by name (GET_ACTIVE_PROCESSES, SERVER_CONNECT_PROCESS)
+    --------------------------------------------------------------------------
+
+    function normWaitMs(p_maxWaitMs PLS_INTEGER) return PLS_INTEGER
+    as
+    begin
+        return case when nvl(p_maxWaitMs, 0) <= 0 then C_ACTIVE_WAIT_MS else p_maxWaitMs end;
+    end;
+
+    --------------------------------------------------------------------------
+
+    function elapsedMs(p_startCs number) return number
+    as
+    begin
+        return abs(dbms_utility.get_time - p_startCs) * 10;
+    end;
+
+    --------------------------------------------------------------------------
+
+    -- Asks the workers via the dispatcher and adds their hits to p_ids.
+    -- TRUE: every worker of the group answered, so p_ids is complete.
+    -- STABILITY: waits for all answers also after a hit. The return channel is removed afterwards;
+    -- a later answer would stay behind in an orphaned pipe.
+    function queryWorkers(p_processName varchar2, p_pipeName varchar2, p_maxWaitMs PLS_INTEGER,
+                          p_ids in out nocopy sys.odcinumberlist) return boolean
+    as
+        l_channel varchar2(50) := getClientPipe;
+        l_header  JSON_OBJ_LILAM;
+        l_payload JSON_OBJ_LILAM;
+        l_msg     JSON_OBJ_LILAM;
+        l_new     sys.odcinumberlist;
+        l_startCs number;
+        l_status  PLS_INTEGER;
+        l_workers PLS_INTEGER;
+        l_skipped PLS_INTEGER := 0;
+        l_answers PLS_INTEGER := 0;
+    begin
+        if not isServerPipeActive(p_pipeName) then
+            return false;
+        end if;
+
+        jsonPut(l_header, 'msg_type', 'API_CALL');
+        jsonPut(l_header, 'request', 'GET_ACTIVE_PROCESSES');
+        jsonPut(l_header, 'response', l_channel);
+        jsonPut(l_payload, 'process_name', p_processName);
+        jsonPut(l_payload, 'expires_utc', sys_extract_utc(systimestamp) + numtodsinterval(p_maxWaitMs / 1000, 'SECOND'));
+        jsonPut(l_msg, 'header', l_header);
+        jsonPut(l_msg, 'payload', l_payload);
+
+        DBMS_PIPE.RESET_BUFFER;
+        DBMS_PIPE.PACK_MESSAGE(l_msg);
+        l_status := DBMS_PIPE.SEND_MESSAGE(p_pipeName, timeout => 0);
+        if l_status != 0 then
+            DBMS_PIPE.RESET_BUFFER;
+            return false;
+        end if;
+
+        l_startCs := dbms_utility.get_time;
+        loop
+            l_status := DBMS_PIPE.RECEIVE_MESSAGE(l_channel, timeout => 0);
+            if l_status = 0 then
+                DBMS_PIPE.UNPACK_MESSAGE(l_msg);
+                if headerValue(l_msg, 'msg_name') = 'ACTIVE_WORKERS' then
+                    l_workers := jsonNumber(l_msg, 'payload.workers');
+                    l_skipped := nvl(jsonNumber(l_msg, 'payload.skipped'), 0);
+                else
+                    l_answers := l_answers + 1;
+                    select id bulk collect into l_new
+                      from json_table(l_msg, '$.payload.ids[*]' columns (id number path '$'));
+                    for i in 1 .. l_new.COUNT loop
+                        p_ids.EXTEND;
+                        p_ids(p_ids.LAST) := l_new(i);
+                    end loop;
+                end if;
+                exit when l_answers >= l_workers;
+            else
+                exit when elapsedMs(l_startCs) >= p_maxWaitMs;
+                dbms_session.sleep(C_ACTIVE_POLL_MS / 1000);
+            end if;
+        end loop;
+
+        DBMS_PIPE.PURGE(l_channel);
+        l_status := DBMS_PIPE.REMOVE_PIPE(l_channel);
+        return l_workers is not null and l_answers >= l_workers and l_skipped = 0;
+
+    exception
+        when others then
+            logLilamErr(sqlCode, sqlErrM, 'queryWorkers');
+            begin
+                DBMS_PIPE.PURGE(l_channel);
+                l_status := DBMS_PIPE.REMOVE_PIPE(l_channel);
+            exception
+                when others then null;
+            end;
+            return false;
+    end;
+
+    --------------------------------------------------------------------------
+
+    FUNCTION GET_ACTIVE_PROCESSES(p_processName VARCHAR2, p_maxWaitMs PLS_INTEGER DEFAULT C_ACTIVE_WAIT_MS) RETURN SYS.ODCINUMBERLIST
+    AS
+        l_ids    sys.odcinumberlist := sys.odcinumberlist();
+        l_sorted sys.odcinumberlist;
+    BEGIN
+        collectLocalProcesses(p_processName, l_ids);
+
+        if g_dispatcher_config.EXISTS('DEFAULT_DISPATCHER') then
+            if not queryWorkers(p_processName, g_dispatcher_config('DEFAULT_DISPATCHER'), normWaitMs(p_maxWaitMs), l_ids)
+               and l_ids.COUNT = 0 then
+                logLilamErr(NUM_ERR_PROCESS_TIMEOUT, 'No hit, but not all workers answered: ' || p_processName,
+                            'GET_ACTIVE_PROCESSES', 'INCOMPLETE');
+            end if;
+        end if;
+
+        select distinct column_value bulk collect into l_sorted from table(l_ids) order by 1;
+        return l_sorted;
+
+    EXCEPTION
+        WHEN OTHERS THEN
+            logLilamErr(sqlCode, sqlErrM, 'GET_ACTIVE_PROCESSES');
+            return sys.odcinumberlist();
+    END;
+
+    --------------------------------------------------------------------------
+
+    -- Dispatcher of the group, the same for all sessions (min)
+    function findDispatcher(p_groupName varchar2) return varchar2
+    as
+        l_pipe varchar2(100);
+    begin
+        execute immediate 'select min(pipe_name) from ' || C_LILAM_SERVER_REGISTRY || '
+                            where is_active = 1 and is_dispatcher = 1
+                              and last_activity > SYSTIMESTAMP - NUMTODSINTERVAL(:1, ''SECOND'')
+                              and (:2 is null or upper(group_name) = upper(:3))'
+            into l_pipe using C_MAX_REGISTRY_HEARTBEAT_AGE_SEC, p_groupName, p_groupName;
+        return l_pipe;
+    exception
+        when others then
+            logLilamErr(sqlCode, sqlErrM, 'findDispatcher');
+            return null;
+    end;
+
+    --------------------------------------------------------------------------
+
+    -- Dispatcher of this session for the group. Without one: found in the registry and set here.
+    -- An existing default dispatcher of another group stays (automatic reconnect uses only the default).
+    function connectDispatcher(p_groupName varchar2) return varchar2
+    as
+        l_pipe varchar2(100) := getDispatcherForGroup(p_groupName);
+    begin
+        if l_pipe is null then
+            l_pipe := findDispatcher(p_groupName);
+            if l_pipe is not null then
+                SET_DISPATCHER_PIPE(l_pipe, case when g_dispatcher_config.EXISTS('DEFAULT_DISPATCHER') then p_groupName
+                                                 else 'DEFAULT_DISPATCHER' end);
+            end if;
+        end if;
+        return l_pipe;
+    end;
+
+    --------------------------------------------------------------------------
+
+    -- Lowest ID first, so that all clients end up at the same process
+    function linkActiveProcess(p_ids sys.odcinumberlist, p_pipeName varchar2) return number
+    as
+        l_sorted sys.odcinumberlist;
+        l_result number := NUM_ERR_SERVER_PROC;
+    begin
+        select distinct column_value bulk collect into l_sorted from table(p_ids) order by 1;
+        for i in 1 .. l_sorted.COUNT loop
+            l_result := SERVER_LINK(l_sorted(i), p_pipeName);
+            exit when l_result = l_sorted(i);
+        end loop;
+        return l_result;
+    end;
+
+    --------------------------------------------------------------------------
+
+    -- STABILITY: parallel requests of one page must not create the process twice. The lock expires by
+    -- itself if its holder fails (purgeAlertLocks removes it).
+    function takeConnectLock(p_group varchar2, p_key varchar2, p_holdSec number) return boolean
+    as
+        pragma autonomous_transaction;
+        l_taken boolean;
+        l_last  timestamp;
+    begin
+        l_taken := acquireAlertLock(p_group, p_key, p_holdSec, sys_extract_utc(systimestamp), l_last);
+        commit;
+        return l_taken;
+    exception
+        when others then
+            rollback;
+            logLilamErr(sqlCode, sqlErrM, 'takeConnectLock');
+            return false;
+    end;
+
+    --------------------------------------------------------------------------
+
+    procedure releaseConnectLock(p_group varchar2, p_key varchar2)
+    as
+        pragma autonomous_transaction;
+    begin
+        execute immediate 'delete from ' || C_LILAM_ALERT_STATE_TABLE || '
+                            where group_name = :1 and state_kind = :2 and state_key = :3'
+            using p_group, C_STATE_LOCK, p_key;
+        commit;
+    exception
+        when others then
+            rollback;
+            logLilamErr(sqlCode, sqlErrM, 'releaseConnectLock');
+    end;
+
+    --------------------------------------------------------------------------
+
+    FUNCTION SERVER_CONNECT_PROCESS(
+        p_processName   VARCHAR2,
+        p_groupName     VARCHAR2,
+        p_logLevel      PLS_INTEGER DEFAULT logLevelMonitor,
+        p_procStepsToDo PLS_INTEGER DEFAULT NULL,
+        p_daysToKeep    PLS_INTEGER DEFAULT NULL,
+        p_tabNameMaster VARCHAR2    DEFAULT 'LILAM',
+        p_baselineScope VARCHAR2    DEFAULT NULL,
+        p_syncLevel     PLS_INTEGER DEFAULT logLevelError,
+        p_maxWaitMs     PLS_INTEGER DEFAULT C_ACTIVE_WAIT_MS) RETURN NUMBER
+    AS
+        l_ids      sys.odcinumberlist := sys.odcinumberlist();
+        l_waitMs   PLS_INTEGER := normWaitMs(p_maxWaitMs);
+        l_pipe     varchar2(100);
+        l_group    varchar2(50);
+        l_key      varchar2(1000);
+        l_startCs  number;
+        l_complete boolean;
+        l_locked   boolean := false;
+        l_result   number;
+    BEGIN
+        if trim(p_processName) is null then
+            return NUM_ERR_ILLEGAL_REQ;
+        end if;
+
+        l_pipe := connectDispatcher(p_groupName);
+        if l_pipe is null then
+            logLilamErr(NUM_ERR_NO_SERVER, 'No active dispatcher for group ' || p_groupName, 'SERVER_CONNECT_PROCESS');
+            return NUM_ERR_NO_SERVER;
+        end if;
+
+        l_complete := queryWorkers(p_processName, l_pipe, l_waitMs, l_ids);
+        if l_ids.COUNT > 0 then
+            return linkActiveProcess(l_ids, l_pipe);
+        end if;
+        -- STABILITY: a worker that did not answer may hold the process; creating it now would duplicate it
+        if not l_complete then
+            logLilamErr(NUM_ERR_PROCESS_TIMEOUT, 'No hit, but not all workers answered: ' || p_processName,
+                        'SERVER_CONNECT_PROCESS', 'INCOMPLETE');
+            return NUM_ERR_PROCESS_TIMEOUT;
+        end if;
+
+        l_group  := nvl(upper(trim(p_groupName)), C_CONNECT_NO_GROUP);
+        l_key    := C_CONNECT_LOCK_PREFIX || upper(trim(p_processName));
+        l_locked := takeConnectLock(l_group, l_key, ceil(l_waitMs / 1000) + ceil(C_TIMEOUT_NEW_PROCESS_SEC) + 1);
+
+        if not l_locked then
+            -- Another request creates the process: wait until it is there
+            l_startCs := dbms_utility.get_time;
+            while elapsedMs(l_startCs) < l_waitMs loop
+                dbms_session.sleep(C_CONNECT_RETRY_MS / 1000);
+                l_complete := queryWorkers(p_processName, l_pipe, greatest(l_waitMs - elapsedMs(l_startCs), C_ACTIVE_POLL_MS), l_ids);
+                if l_ids.COUNT > 0 then
+                    return linkActiveProcess(l_ids, l_pipe);
+                end if;
+            end loop;
+            logLilamErr(NUM_ERR_PROCESS_TIMEOUT, 'Process not created in time by another request: ' || p_processName,
+                        'SERVER_CONNECT_PROCESS', 'WAIT');
+            return NUM_ERR_PROCESS_TIMEOUT;
+        end if;
+
+        -- The previous holder may have finished just before this lock was taken
+        l_complete := queryWorkers(p_processName, l_pipe, l_waitMs, l_ids);
+        if l_ids.COUNT > 0 then
+            l_result := linkActiveProcess(l_ids, l_pipe);
+        elsif l_complete then
+            l_result := SERVER_NEW_PROCESS(p_processName, p_groupName, p_logLevel, p_procStepsToDo, p_daysToKeep,
+                                           p_tabNameMaster, p_baselineScope, p_syncLevel);
+        else
+            l_result := NUM_ERR_PROCESS_TIMEOUT;
+        end if;
+        releaseConnectLock(l_group, l_key);
+        return l_result;
+
+    EXCEPTION
+        WHEN OTHERS THEN
+            logLilamErr(sqlCode, sqlErrM, 'SERVER_CONNECT_PROCESS');
+            if l_locked then
+                releaseConnectLock(l_group, l_key);
+            end if;
+            return NUM_ERR_UNKNOWN;
+    END;
+
+    --------------------------------------------------------------------------
 
     PROCEDURE DUMP_BUFFER_STATS AS
         v_key VARCHAR2(100);
@@ -10643,15 +11006,57 @@ AS
 
     --------------------------------------------------------------------------
 
+    -- No process_id to route by: the request goes to all workers of the group, which answer the client directly.
+    -- The client learns how many answers to expect (workers) and how many workers were not reached (skipped).
+    procedure dispatchActiveProcesses(p_clientChannel varchar2, p_message varchar2)
+    as
+        l_pipes   sys.odcivarchar2list;
+        l_workers PLS_INTEGER := 0;
+        l_skipped PLS_INTEGER := 0;
+        l_status  PLS_INTEGER;
+    begin
+        execute immediate 'select pipe_name from ' || C_LILAM_SERVER_REGISTRY || '
+                            where is_active = 1 and nvl(is_dispatcher, 0) = 0
+                              and last_activity > SYSTIMESTAMP - NUMTODSINTERVAL(:1, ''SECOND'')
+                              and (:2 is null or upper(group_name) = upper(:3))'
+            bulk collect into l_pipes using C_MAX_REGISTRY_HEARTBEAT_AGE_SEC, g_serverGroupName, g_serverGroupName;
+
+        for i in 1 .. l_pipes.COUNT loop
+            DBMS_PIPE.RESET_BUFFER;
+            DBMS_PIPE.PACK_MESSAGE(p_message);
+            if forwardToWorker(l_pipes(i)) = 0 then
+                l_workers := l_workers + 1;
+            else
+                l_skipped := l_skipped + 1;
+            end if;
+        end loop;
+
+        DBMS_PIPE.RESET_BUFFER;
+        DBMS_PIPE.PACK_MESSAGE('{"header":{"msg_type":"SERVER_RESPONSE","msg_name":"ACTIVE_WORKERS"},"payload":{"workers":'
+            || l_workers || ',"skipped":' || l_skipped || '}}');
+        l_status := DBMS_PIPE.SEND_MESSAGE(p_clientChannel, timeout => 0);
+    exception
+        when others then
+            DBMS_PIPE.RESET_BUFFER;
+            logLilamErr(sqlCode, sqlErrM, 'dispatchActiveProcesses');
+    end;
+
+    --------------------------------------------------------------------------
+
     function processRequest(p_request varchar2, p_message varchar2, p_clientChannel varchar2, p_drain BOOLEAN DEFAULT FALSE) return boolean
     as
         l_targetPipe varchar2(100);
         l_processId  number (19,0);
-        l_status PLS_INTEGER;        
+        l_status PLS_INTEGER;
     begin
         -- Dispatcher mode: forward everything, process nothing itself
         -- Exception: SERVER_SHUTDOWN is meant for the dispatcher itself (otherwise it cannot be stopped)
         if g_serverIsDispatcher and p_request not in ('SERVER_SHUTDOWN', 'SERVER_PING') then
+            if p_request = 'GET_ACTIVE_PROCESSES' then
+                dispatchActiveProcesses(p_clientChannel, p_message);
+                return false;
+            end if;
+
             if p_request in ('NEW_SESSION', 'SERVER_NEW_SESSION') then
                 -- No process_id yet; selection purely load-based
                 l_targetPipe := getServerPipeAvailable(g_serverGroupName);
@@ -10762,6 +11167,9 @@ AS
 
             WHEN 'GET_PROCESS_DATA' then
                 doRemote_getProcessData(p_clientChannel, p_message);
+
+            WHEN 'GET_ACTIVE_PROCESSES' then
+                doRemote_getActiveProcesses(p_clientChannel, p_message);
 
             WHEN C_MARK_EVENT then
                 doRemote_markEvent(p_message);
@@ -11056,6 +11464,25 @@ BEGIN
 
         when 'CLOSE_PROCESS' THEN
             CLOSE_PROCESS(jsonNumber(l_jsonParams, 'process_id'));
+            jsonPut(l_jsonHeader, 'status', 'SUCCESS');
+
+        when 'GET_ACTIVE_PROCESSES' THEN
+            l_jsonPayload := '{"returns":"PROCESS_IDS","value":'
+                || jsonIdList(GET_ACTIVE_PROCESSES(jsonString(l_jsonParams, 'process_name'), jsonNumber(l_jsonParams, 'max_wait_ms'))) || '}';
+            jsonPut(l_jsonHeader, 'status', 'SUCCESS');
+
+        when 'SERVER_CONNECT_PROCESS' THEN
+            l_proc_id := SERVER_CONNECT_PROCESS(
+                p_processName   => jsonString(l_jsonParams, 'process_name'),
+                p_groupName     => jsonString(l_jsonParams, 'group_name'),
+                p_logLevel      => nvl(jsonNumber(l_jsonParams, 'log_level'), logLevelMonitor),
+                p_procStepsToDo => jsonNumber(l_jsonParams, 'steps_todo'),
+                p_daysToKeep    => jsonNumber(l_jsonParams, 'days_to_keep'),
+                p_tabNameMaster => nvl(jsonString(l_jsonParams, 'tabname_master'), 'LILAM'),
+                p_baselineScope => jsonString(l_jsonParams, 'baseline_scope'),
+                p_syncLevel     => nvl(jsonNumber(l_jsonParams, 'sync_level'), logLevelError),
+                p_maxWaitMs     => jsonNumber(l_jsonParams, 'max_wait_ms'));
+            l_jsonPayload := '{"returns":"PROCESS_ID","value":' || jNum(l_proc_id) || '}';
             jsonPut(l_jsonHeader, 'status', 'SUCCESS');
 
         when 'FLUSH' THEN
