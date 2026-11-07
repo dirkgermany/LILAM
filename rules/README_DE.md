@@ -1,5 +1,7 @@
 # Asynchrone Alerting-Architektur
 
+[English](README.md) | **Deutsch**
+
 ## Überblick
 
 Um einen hohen Durchsatz (> 2.500 EPS) zu halten, trennt LILAM die Analyse von Events strikt vom Versand der Benachrichtigungen. So können externe Latenzen (z. B. SMTP-Handshakes) die zentrale Verarbeitungsschleife nicht beeinträchtigen.

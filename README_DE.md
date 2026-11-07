@@ -8,7 +8,7 @@ LILAM = "**L**ILAM **I**s **L**ogging **A**nd **M**onitoring"
 [![Status](https://img.shields.io/badge/Status-Production--Ready-brightgreen)](https://github.com/dirkgermany/LILAM)
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 [![License: Enterprise](https://img.shields.io/badge/License-Enterprise-brightgreen.svg)](LICENSE_ENTERPRISE.md)
-[![Größe](https://img.shields.io/github/repo-size/dirkgermany/LILAM)](https://https://github.com/dirkgermany/LILAM)
+[![Größe](https://img.shields.io/github/repo-size/dirkgermany/LILAM)](https://github.com/dirkgermany/LILAM)
 [![Sponsor](https://img.shields.io/badge/Sponsor-LILAM-purple?style=flat-square&logo=github-sponsors)](https://github.com/sponsors/dirkgermany)
 
 

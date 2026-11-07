@@ -1,5 +1,7 @@
 # Asynchronous Alerting Architecture
 
+**English** | [Deutsch](README_DE.md)
+
 ## Overview
 
 To maintain high throughput (> 2,500 EPS), LILAM strictly decouples event analysis from notification dispatch. This prevents external latencies (e.g., SMTP handshakes) from impacting the core processing loop.
