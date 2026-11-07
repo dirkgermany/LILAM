@@ -243,8 +243,6 @@ begin
   lt.check_that(l_run, 'P2 zweite Session: dieselbe ID', r_pid('C2') = l_pid, r_pid('C2'));
   lt.check_that(l_run, 'P2 Kleinschreibung: dieselbe ID', r_pid('C3') = l_pid, r_pid('C3'));
   lt.metric(l_run, 'connect_treffer_ms', r_ms('C2'), 'ms');
-  select count(distinct sid) into l_cnt from lt_ps_result where step in ('C1', 'C2', 'C3');
-  lt.check_that(l_run, 'P2 mehrere Sessions', l_cnt > 1, l_cnt || ' Sessions');
   l_num := lt.wait_count(l_pfx || 'EINS', 'LOG', 3, 10);
   l_cnt := lt.count_lilam(l_pfx || 'EINS', 'LOG');
   lt.check_that(l_run, 'P2 Logs aller drei Sessions im selben Prozess', l_cnt = 3, l_cnt);
@@ -290,6 +288,9 @@ begin
         from lt_ps_result where step in (select column_value from table(l_steps));
       lt.check_that(l_run, 'P6 Runde ' || r || ': alle sechs Requests dieselbe ID', l_cnt = 1 and l_seq = 6 and l_pid2 > 0,
                     l_cnt || ' IDs, ' || l_seq || ' Antworten, min ' || l_pid2);
+      -- nacheinander gestartete Jobs koennen im selben Job-Slave laufen, parallele nicht
+      select count(distinct sid) into l_cnt from lt_ps_result where step in (select column_value from table(l_steps));
+      lt.check_that(l_run, 'P6 Runde ' || r || ': mehrere Sessions', l_cnt > 1, l_cnt || ' Sessions');
       lt.metric(l_run, 'connect_parallel_max_ms', l_num, 'ms', r);
       l_cnt := lt.count_lilam(l_name, 'PROC');
       lt.check_that(l_run, 'P6 Runde ' || r || ': genau ein Prozess', l_cnt = 1, l_cnt);
@@ -386,6 +387,9 @@ begin
   select count(*) into l_cnt from lilam_alert_state where state_key like 'CONNECT|%';
   lt.check_that(l_run, 'P12 keine Sperre uebrig', l_cnt = 0, l_cnt);
 
+  -- Dispatcher-Einstellung der Session aufheben: sonst gehen spaetere NEW_PROCESS dieser Session
+  -- an den gleich gestoppten LT_DISP (Regression run 2533/2534)
+  lilam.set_dispatcher_pipe(null);
   lt.stop_all_servers;
 
   select count(*) into l_cnt from lilam_server_registry
@@ -403,6 +407,7 @@ begin
 exception
   when others then
     dbms_output.put_line('ABBRUCH: ' || sqlerrm || ' ' || dbms_utility.format_error_backtrace);
+    lilam.set_dispatcher_pipe(null);
     lt.stop_all_servers;
     raise;
 end;
