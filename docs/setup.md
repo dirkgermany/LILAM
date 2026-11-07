@@ -5,7 +5,7 @@
 Since LILAM is a pure PL/SQL package, deploying and using it requires only a few simple steps.
 
 The framework relies on the following database objects:
-* Three tables
+* A few tables
 * One sequence
 
 All objects are created automatically upon the first API call. Even if you choose custom names for the log tables (which can optionally be passed to the API), LILAM handles their creation on the fly. Please note that the sequence name is mandatory and must be provided.

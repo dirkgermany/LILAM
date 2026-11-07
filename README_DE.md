@@ -86,7 +86,7 @@ LILAM wird von einem Entwickler entwickelt, der überladene Werkzeuge hasst. Der
 7. **Automatische Kontexterfassung:** Erfasst abhängig vom Log-Level automatisch ERR_STACK, ERR_BACKTRACE und ERR_CALLSTACK: tiefe Einblicke ohne manuellen Aufwand
 8. **Optionale Selbstbereinigung:** Entfernt beim Prozessstart automatisch abgelaufene Logs je Anwendung, ohne Hintergrundjobs oder Scheduler
 9. **Zukunftssicher:** Entwickelt und getestet unter der aktuellen Oracle 26ai (2026) und unter 19c
-10. **In sich geschlossen:** Ein Package ohne Abhängigkeiten von anderen Packages oder externen Bibliotheken; es nutzt nur Oracle-Bordmittel wie `DBMS_PIPE`, `DBMS_ALERT` und `DBMS_SCHEDULER`. Mit Server-Failover, Messwerten und Rule Engine ist der Code auf etwa 7.800 logische PL/SQL-Zeilen gewachsen (ohne Leer- und Kommentarzeilen); Qualitäts- und Sicherheitsprüfungen betreffen weiterhin ein einziges Package
+10. **In sich geschlossen:** Ein Package ohne Abhängigkeiten von anderen Packages oder externen Bibliotheken; es nutzt nur Oracle-Bordmittel wie `DBMS_PIPE`, `DBMS_ALERT` und `DBMS_SCHEDULER`. Mit Server-Failover, Messwerten und Rule Engine ist der Code auf etwa 8.800 logische PL/SQL-Zeilen gewachsen (ohne Leer- und Kommentarzeilen); Qualitäts- und Sicherheitsprüfungen betreffen weiterhin ein einziges Package
 
 ---
 ## Vergleich

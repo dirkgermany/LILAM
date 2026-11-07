@@ -15,8 +15,8 @@
   - Uses `PRAGMA AUTONOMOUS_TRANSACTION` for persistent logging.
   - Utilizes `UTL_CALL_STACK` for deep context analysis.
   - Implements a high-performance buffering mechanism.
-  - Focuses on "Observability" and "Performance Metrics" (Step Monitoring).
-  - **Performance Metrics:** Implements `MARK_STEP` to monitor execution time, averages, and iteration counts, strictly isolated by **action names**.
+  - Focuses on "Observability" and "Performance Metrics" (Event and Trace Monitoring).
+  - **Performance Metrics:** Implements `MARK_EVENT` and `TRACE_START`/`TRACE_STOP` to monitor execution time, averages, and iteration counts, strictly isolated by **action names**.
   - **Granularity:** All metrics are calculated and stored per-action, allowing independent analysis of different business logic segments.
 
   
@@ -31,7 +31,7 @@
 
 ## Coding Standards
 - When suggesting code or explaining features, always use PL/SQL syntax.
-- Ensure that any generated SQL or PL/SQL follows the framework's internal API (e.g., using `lilam.info` or `lilam.mark_step`).
+- Ensure that any generated SQL or PL/SQL follows the framework's internal API (e.g., using `lilam.info` or `lilam.mark_event`).
 - Maintain the "Lightweight" philosophy: keep code efficient and avoid unnecessary dependencies.
 
 ## Documentation Reference

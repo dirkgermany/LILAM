@@ -43,6 +43,7 @@
   - [Logging](#logging-1)
   - [Metrics](#metrics-1)
   - [Server Control](#server-control)
+  - [Further Calls](#further-calls)
 
 </details>
 
@@ -52,7 +53,7 @@ LILAM utilizes the core functionalities made available by Oracle through PL/SQL 
 
 This means LILAM is the opposite of "black magic" or over-the-top engineering. With few database objects, LILAM pursues a consistent zero-dependency strategy. The security of process, log and metric data is guaranteed by autonomous transactions. These are strictly separated from data in memory and from the transactions of other applications, and they ensure their own COMMIT even if the application had to perform a rollback.
 
-LILAM itself is a PL/SQL package consisting of the usual specification (.pks) and the body (.pkb). The code consists of only a few thousand real lines of code; in version 2.0 it is around 4,500 LOC. This fully covers the functionalities of the LILAM client, the LILAM server and the LILAM dispatcher.
+LILAM itself is a PL/SQL package consisting of the usual specification (.pks) and the body (.pkb). The code consists of only a few thousand real lines of code; in version 2.0 the body has around 8,800 LOC (without blank and comment lines). This fully covers the functionalities of the LILAM client, the LILAM server and the LILAM dispatcher.
 
 For installation, the code must be copied into a suitable DB schema and compiled, and a few privileges must be granted. More on this in setup.md.
 
@@ -302,7 +303,7 @@ Rules for other actions cost nothing. Multiple rules can be assigned to the same
 
 For `LOG_CONTAINS` the first part of the value counts as a level only if it is one of the five levels; otherwise the whole value is the text (max. 100 characters).
 
-Only events and traces count as predecessors for `PRECEDED_BY`, not log messages. The order is checked when an action starts; `PRECEDED_BY*` with `TRACE_STOP` is rejected at load time, because there the predecessor would usually be the trace's own `TRACE_START`. Rules are evaluated when a signal arrives; there is no timer-based evaluation, so missing signals (a hanging process, an event that never arrives) are not detected.
+Only events and traces count as predecessors for `PRECEDED_BY`, not log messages. The order is checked when an action starts; `PRECEDED_BY*` with `TRACE_STOP` is rejected at load time, because there the predecessor would usually be the trace's own `TRACE_START`. Rules are evaluated when a signal arrives. The only exception is `TIME_MAX_SILENCE_SECONDS`: only this rule is checked on a timer and thus detects missing signals (a hanging process, an event that never arrives); see "Missing signals" further below.
 
 ### JSON Structure
 The JSON object is divided into a header for metadata and an array of individual rules. Alert throttling is managed in seconds:
@@ -354,11 +355,15 @@ The opposite of synchronous execution in In-Session mode is the **asynchronous**
 
 In this mode, LILAM functions as a **LILAM Server**, which writes status changes, logs, and metrics into the log tables independently of the calling program—the **LILAM Client**. Using 'Fire & Forget' via pipes, the LILAM Client can deliver large amounts of data in a very short time without being slowed down itself.
 
-Two exceptions must be considered here:
+Three exceptions must be considered here:
 
 1. LILAM Clients that threaten to flood the channel to the LILAM Server due to an excessively high reporting rate are gently and temporarily—and barely noticeably—throttled until the LILAM Server has processed the bulk of the load (Backpressure Management). Mind you, we are talking about magnitudes in the millisecond range. The limit is a property of the LILAM Server: it is set with `p_perfServer` when the server is started (`C_SERVER_PERF_LOW` = 500, `C_SERVER_PERF_MID` = 1500 (default), `C_SERVER_PERF_HIGH` = 2500 messages per process and second, or any other value; `0` disables the mechanism) and is passed to the client when a process is created or reconnected.
 
 2. Creating a process (`SERVER_NEW_PROCESS`) is synchronous, since the application needs the process ID. To keep this fast under load, each LILAM Server has a separate control pipe (`<pipe name>_CTL`) that it checks before every data message. Creating a process therefore never queues behind the messages of other applications.
+
+3. Calls that request data packets from the LILAM Server are necessarily synchronous if the application wants to process the response itself afterwards. However, scenarios are also conceivable here in which, for example, LILAM Client 'A' requests a data packet from the LILAM Server on behalf of LILAM Client 'B'. 
+
+This would turn LILAM Client 'A' into a producer, the LILAM Server into a dispatcher, and LILAM Client 'B' into a consumer. **A lightweight message broker pattern**
 
 **Server loop.** After a message the server checks its data pipe once without waiting; if it is empty, it waits 1 s, then 2 s, then 5 s each time (eco mode). An arriving message wakes it immediately. `DBMS_PIPE` timeouts are whole seconds; fractions are rounded silently (0.2 becomes 0), which is why the steps are integers. Housekeeping (registry entry with message rate, `SYNC_ALL_DIRTY`) is time-controlled: every 500 ms, also while messages keep arriving, and when idle at the next wake-up.
 
@@ -366,9 +371,6 @@ Two exceptions must be considered here:
 
 **Shutdown.** On `SERVER_SHUTDOWN` the server first marks itself inactive in the registry, so it is no longer chosen. In the drain phase it then processes the messages that clients have already sent, until the data pipe stays empty for 1 s (at most about 5 s in total). Afterwards it writes all buffers and removes its pipes.
 
-3. Calls that request data packets from the LILAM Server are necessarily synchronous if the application wants to process the response itself afterwards. However, scenarios are also conceivable here in which, for example, LILAM Client 'A' requests a data packet from the LILAM Server on behalf of LILAM Client 'B'. 
-
-This would turn LILAM Client 'A' into a producer, the LILAM Server into a dispatcher, and LILAM Client 'C' into a consumer. **A lightweight message broker pattern**
 
 With the possibility of using several LILAM Servers in parallel and simultaneously allowing individual clients to speak with multiple LILAM Servers (and additionally integrating LILAM as a library), the use of LILAM is conceivable in a wide variety of scenarios. Load balancing, separation of mission-critical and less critical applications, division into departments or teams, multi-tenancy...
 
@@ -452,7 +454,7 @@ sequenceDiagram
 
     Note over C,W: Create a process
     C->>D: NEW_PROCESS into control pipe DISPATCHER_CTL + SERVER_PING
-    D->>R: getServerPipeAvailable(group)<br/>fewest messages, then fewest processes,<br/>dispatchers excluded
+    D->>R: getServerPipeAvailable(group)<br/>fewest open processes, then lowest message rate,<br/>dispatchers excluded
     R-->>D: worker pipe
     D->>W: forward into control pipe WORKER_CTL + SERVER_PING
     W->>W: NEW_PROCESS, unless expires_utc has passed
@@ -536,7 +538,7 @@ For example, if `tabNameMaster` is set to `MY_APPLICATION`, LILAM uses:
 > Only the master name is configurable. The suffixes `_PROC`, `_LOG`, and `_MON` are fixed and define the relationship between these tables.
 
 This allows different applications, processes, or environments to use separate sets of LILAM tables without requiring additional configuration tables.
-A total of four tables are required for operation and user data, one of which serves solely for the internal synchronization of multiple LILAM servers (more on this later). The detailed structure of these tables is described in the README file of the LILAM project on GitHub.
+For operation and user data, LILAM gets by with just a few tables: the three named above per application and the fixed internal tables for rules, alerts, baselines and the server infrastructure. The structure of the most important tables is described in the following sections.
 
 
 #### Fixed Internal Tables
@@ -546,7 +548,11 @@ In addition to the process-specific tables, LILAM uses internal tables whose nam
 | --- | --- |
 | `LILAM_SERVER_REGISTRY` | Maintains server registration, availability, heartbeat, load, and currently active Rule Set information. |
 | `LILAM_RULES` | Stores versioned Rule Sets per group (servers and INSESSION processes), one of them active per group. |
+| `LILAM_ALERTS` | Stores the triggered alerts with process, action, context, group and triggering rule. |
 | `LILAM_ALERT_STATE` | State of the alerts per group: locks of the throttling (`throttle_seconds`, kind `LOCK`: per scope or process, rule, action and context the time of the last alert) "last seen" of the targets of silence rules (kinds `START`, `EVENT`, `TRACE`, `RUN`) and fired threshold rules (kind `CROSS`, with own columns for rule, scope, action, context, operator and limits). Times in UTC. Expired locks are deleted by the housekeeping, rows without rule by the check of the silence rules. `CROSS` rows do not expire: they are deleted by the return, `RESET_BASELINE`, `SERVER_UPDATE_RULES` (rule removed), the closing of a process without scope, and by the housekeeping after 30 days if such a process never closed. |
+| `LILAM_SCOPES` | Maps the name of a baseline scope to its ID. |
+| `LILAM_BASELINES` | Holds, per scope, action and context, the current cross-process averages (EWMA) of the time series and the value series. |
+| `LILAM_PROCESS_ROUTE` | Maps each process ID to the pipe of the responsible worker. |
 | `LILAM_WATERMARK` | Watermarks for failover: per process and client session the highest sequence number up to which logs, metrics and process data are committed. The server writes them in the same commit as the data. |
 | `LILAM_LOG_INTERNAL` | Provides independent fallback logging for internal LILAM framework errors. |
 
@@ -634,7 +640,7 @@ The `LILAM_SERVER_REGISTRY` table maintains the runtime state of registered LILA
 
 Each active LILAM server registers itself in this table and periodically updates its activity information. Clients (and dispatchers) use the registry to discover suitable servers and to select a server based on its current load: first the number of open processes (`CURRENT_PROCESSES`), then the message rate of the last housekeeping window (`MSG_RATE`, in buckets of 100 messages per second; a rate whose `RATE_TS` is older than 1.5 s counts as 0), and finally the server that has been idle longest (oldest `LAST_ACTIVITY`). If open processes and rate are equal, the caller alternates between the servers (round robin per database session). A server updates its entry every 500 ms during housekeeping and additionally right after each new and each closed process, so that processes created in quick succession are spread across the servers.
 
-Until October 2026 the raw message count `PROCESSING` was the first criterion. Because each server writes it for its own, unaligned window, a server with a smaller but older count received every new process until it wrote its own count again; bursts of new processes could end up 19:1 on one server (diagnosis in `test/autotest/FEATURES/SERVERAUSWAHL/results/2026-10-06_serverauswahl_provokation_ergebnis.md`).
+Until October 2026 the raw message count `PROCESSING` was the first criterion. Because each server writes it for its own, unaligned window, a server with a smaller but older count received every new process until it wrote its own count again; bursts of new processes could end up 19:1 on one server.
 
 If `SERVER_NEW_PROCESS` is called with a `p_groupName`, only servers registered for the requested group are considered.
 
@@ -706,14 +712,18 @@ Internal framework errors must not be processed through LILAM's regular logging 
 
 ---
 ## API
-The LILAM API consists of approximately 35 procedures and functions, some of which are overloaded. Since static polymorphism does not change the outcome of the API calls, I am listing only the names of the procedures and functions below. The API can be divided into five groups. For a more detailed view, see the ["API.md"](API.md).
+The LILAM API consists of 43 procedures and functions, some of which are overloaded. Since static polymorphism does not change the outcome of the API calls, I am listing only the names of the procedures and functions below. The API can be divided into six groups. For a more detailed view, see the ["API.md"](API.md).
 
 **API overview:**
 
 ### Process Management
 * **NEW_PROCESS:** Starts a new process in in-session mode.
 * **SERVER_NEW_PROCESS:** Starts a new process handled by a LILAM server (decoupled mode).
+* **SERVER_NEW_PROCESS_JSON:** Like `SERVER_NEW_PROCESS`, but takes the parameters as a JSON object.
+* **SERVER_CONNECT_PROCESS:** Connects to the active process of this name or creates it (decoupled mode).
+* **GET_ACTIVE_PROCESSES:** Returns the IDs of the active processes of a name.
 * **CLOSE_PROCESS:** Ends the process and writes its buffered data.
+* **FLUSH:** Immediately writes all buffered data of the database session; the processes stay open.
 
 ### Process Control
 #### Setting Values
@@ -721,6 +731,7 @@ The LILAM API consists of approximately 35 procedures and functions, some of whi
 * **SET_PROC_STEPS_TODO:** Sets the (initial) value of the expected work steps for the process.
 * **SET_PROC_STEPS_DONE:** Sets the number of work steps completed (so far).
 * **PROC_STEP_DONE:** Increments the counter for completed work steps (Steps Done).
+* **SET_PROC_IMMORTAL:** Protects a process from automatic cleanup.
 
 #### Querying Values
 * **GET_PROC_STEPS_DONE:** Determines the total number of work steps completed for the process so far.
@@ -731,6 +742,8 @@ The LILAM API consists of approximately 35 procedures and functions, some of whi
 * **GET_PROCESS_INFO:** Provides process information; outside of LILAMs control.
 * **GET_PROCESS_DATA:** Returns all process data in a specific structure.
 * **GET_PROCESS_DATA_JSON:** Returns all process data in JSON format.
+* **GET_COUNTER_WARN:** Returns the number of `WARN` calls for the process since it started.
+* **GET_COUNTER_ERROR:** Returns the number of `ERROR` calls for the process since it started.
 
 ### Logging
 * **INFO:** Reports a message with severity 'Info'.
@@ -743,9 +756,11 @@ The LILAM API consists of approximately 35 procedures and functions, some of whi
 * **MARK_EVENT:** Documents a completed work step for an action and triggers the sum and time calculations for those actions.
 * **TRACE_START:** Initializes a duration measurement for a specific work step (trace) by capturing the start timestamp in the session memory.
 * **TRACE_STOP:** Ends the measurement for a specific work step (trace) and persists it to the monitor table.
+* **RESET_BASELINE:** Resets the cross-process baseline of a metric in a baseline scope.
 
 #### Querying Values
 * **GET_METRIC_AVG_DURATION:** Returns the average processing duration for actions with the same name within a process.
+* **GET_METRIC_AVG_VALUE:** Returns the moving average (EWMA) of the measured values (`MARK_EVENT` with `p_value`) of a metric.
 * **GET_METRIC_STEPS:** Returns the current number of completed work steps for actions with the same name within a process.
 
 ### Server Control
@@ -756,4 +771,9 @@ The LILAM API consists of approximately 35 procedures and functions, some of whi
 * **SERVER_UPDATE_RULES:** Implements or changes the used rule set
 * **CHECK_RULE_SET:** Checks a rule set without storing or activating it (`NULL` = valid, otherwise the reason)
 * **CHECK_SILENCE:** Checks the silence rules (`TIME_MAX_SILENCE_SECONDS`) of a group, e.g. from a scheduler job of the application
+* **SET_DISPATCHER_PIPE:** Configures a dispatcher for automatic routing and reconnect
+
+### Further Calls
+* **CALL_BY_JSON:** Accepts the most important API calls as JSON.
+* **IS_ALIVE:** Simple functional test after installation.
 

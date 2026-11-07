@@ -86,7 +86,7 @@ LILAM is developed by a developer who hates over-engineered tools. Focus: 5 minu
 7. **Smart Context Capture:** Automatically records ERR_STACK,  ERR_BACKTRACE, and ERR_CALLSTACK based on log level—deep insights with zero manual effort
 8. **Optional self-cleaning:** Automatically purges expired logs per application during session start—no background jobs or schedulers required
 9. **Future Ready:** Built and tested in latest Oracle 26ai (2026) and 19c environment
-10. **Self-Contained:** One package without dependencies on other packages or external libraries; it uses only Oracle built-ins such as `DBMS_PIPE`, `DBMS_ALERT` and `DBMS_SCHEDULER`. With server failover, measured values and the rule engine the code has grown to about 7,800 lines of logical PL/SQL code (without blank and comment lines); quality and security reviews still cover a single package
+10. **Self-Contained:** One package without dependencies on other packages or external libraries; it uses only Oracle built-ins such as `DBMS_PIPE`, `DBMS_ALERT` and `DBMS_SCHEDULER`. With server failover, measured values and the rule engine the code has grown to about 8,800 lines of logical PL/SQL code (without blank and comment lines); quality and security reviews still cover a single package
 
 ---
 ## Comparison
