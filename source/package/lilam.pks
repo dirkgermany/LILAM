@@ -141,6 +141,7 @@ create or replace PACKAGE LILAM AS
     -- Life cycle of a process
     -----------------------------
     FUNCTION  NEW_PROCESS(p_process_init t_process_init) RETURN NUMBER;
+
     FUNCTION  NEW_PROCESS(
         p_processName   VARCHAR2,
         p_logLevel      PLS_INTEGER DEFAULT logLevelMonitor,
@@ -160,7 +161,9 @@ create or replace PACKAGE LILAM AS
         p_tabNameMaster VARCHAR2    DEFAULT 'LILAM',
         p_baselineScope VARCHAR2    DEFAULT NULL,
         p_syncLevel     PLS_INTEGER DEFAULT logLevelError) RETURN NUMBER;
+
     FUNCTION  SERVER_NEW_PROCESS_JSON(p_jsonObject JSON_OBJ_LILAM) RETURN NUMBER;
+
     -- Connect to the active process of this name on a server of the group, otherwise create it (decoupled only).
     -- Returns the process ID, or a negative code as SERVER_NEW_PROCESS does. Sets the dispatcher of the group
     -- implicitly. p_maxWaitMs limits each search; the other parameters apply only to a new process
@@ -176,34 +179,6 @@ create or replace PACKAGE LILAM AS
         p_maxWaitMs     PLS_INTEGER DEFAULT C_ACTIVE_WAIT_MS) RETURN NUMBER;
 
     PROCEDURE CLOSE_PROCESS(
-        p_processId     NUMBER,
-        p_processInfo   VARCHAR2    DEFAULT NULL,
-        p_processStatus PLS_INTEGER DEFAULT NULL,
-        p_procStepsDone PLS_INTEGER DEFAULT NULL,
-        p_procStepsToDo PLS_INTEGER DEFAULT NULL);
-
-    -- Former names (compatibility): same behaviour as NEW_PROCESS, SERVER_NEW_PROCESS(_JSON), CLOSE_PROCESS
-    FUNCTION  NEW_SESSION(p_session_init t_session_init) RETURN NUMBER;
-    FUNCTION  NEW_SESSION(
-        p_processName   VARCHAR2,
-        p_logLevel      PLS_INTEGER DEFAULT logLevelMonitor,
-        p_procStepsToDo PLS_INTEGER DEFAULT NULL,
-        p_daysToKeep    PLS_INTEGER DEFAULT NULL,
-        p_tabNameMaster VARCHAR2    DEFAULT 'LILAM',
-        p_baselineScope VARCHAR2    DEFAULT NULL,
-        p_groupName     VARCHAR2    DEFAULT NULL,
-        p_syncLevel     PLS_INTEGER DEFAULT logLevelError) RETURN NUMBER;
-    FUNCTION  SERVER_NEW_SESSION(
-        p_processName   VARCHAR2,
-        p_groupName     VARCHAR2    DEFAULT NULL,
-        p_logLevel      PLS_INTEGER DEFAULT logLevelMonitor,
-        p_procStepsToDo PLS_INTEGER DEFAULT NULL,
-        p_daysToKeep    PLS_INTEGER DEFAULT NULL,
-        p_tabNameMaster VARCHAR2    DEFAULT 'LILAM',
-        p_baselineScope VARCHAR2    DEFAULT NULL,
-        p_syncLevel     PLS_INTEGER DEFAULT logLevelError) RETURN NUMBER;
-    FUNCTION  SERVER_NEW_SESSION_JSON(p_jsonObject JSON_OBJ_LILAM) RETURN NUMBER;
-    PROCEDURE CLOSE_SESSION(
         p_processId     NUMBER,
         p_processInfo   VARCHAR2    DEFAULT NULL,
         p_processStatus PLS_INTEGER DEFAULT NULL,
@@ -275,7 +250,6 @@ create or replace PACKAGE LILAM AS
     -- Dispatcher of this session. Default: used for NEW_PROCESS without group or of the dispatcher's group (registry),
     -- other groups go to their own servers; p_groupName = group: only for NEW_PROCESS of this group; p_pipeName NULL removes it
     PROCEDURE SET_DISPATCHER_PIPE(p_pipeName varchar2, p_groupName varchar2 DEFAULT 'DEFAULT_DISPATCHER', p_processId number DEFAULT null);
-
 
     PROCEDURE CALL_BY_JSON(p_callObject  IN  JSON_OBJECT_T, p_respObject  OUT JSON_OBJECT_T);
     PROCEDURE CALL_BY_JSON(p_callObject  IN  JSON_OBJ_LILAM, p_respObject  OUT JSON_OBJ_LILAM);
