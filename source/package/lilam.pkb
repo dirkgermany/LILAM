@@ -789,6 +789,7 @@ AS
             
     EXCEPTION
         when others then
+        rollback;
         begin
             dbms_output.enable();
             dbms_output.put_line('LILAM INTERNAL ERROR in Procedure logLilamErr: ' || substr(sqlErrM, 1, 1000));
