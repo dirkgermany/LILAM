@@ -11407,10 +11407,7 @@ BEGIN
     -- Extract header and params from the request
     l_jsonHeaderIn := jsonObject(l_InObject, 'header');
     l_api_call     := jsonString(l_jsonHeaderIn, 'api_call');
-    -- Former names of the API calls are still accepted
     l_api_call     := case l_api_call
-                          when 'NEW_SESSION'        then 'NEW_PROCESS'
-                          when 'SERVER_NEW_SESSION' then 'SERVER_NEW_PROCESS'
                           when 'CLOSE_SESSION'      then 'CLOSE_PROCESS'
                           else l_api_call
                       end;
@@ -11645,66 +11642,6 @@ END;
     as
     begin
         SYNC_ALL_DIRTY(true);
-    end;
-
-    ------------------------------------------------------------------------
-    -- Former names (compatibility)
-    ------------------------------------------------------------------------
-
-    FUNCTION NEW_SESSION(p_session_init t_session_init) RETURN NUMBER
-    as
-    begin
-        return NEW_PROCESS(p_session_init);
-    end;
-
-    FUNCTION NEW_SESSION(
-        p_processName   VARCHAR2,
-        p_logLevel      PLS_INTEGER DEFAULT logLevelMonitor,
-        p_procStepsToDo PLS_INTEGER DEFAULT NULL,
-        p_daysToKeep    PLS_INTEGER DEFAULT NULL,
-        p_tabNameMaster VARCHAR2    DEFAULT 'LILAM',
-        p_baselineScope VARCHAR2    DEFAULT NULL,
-        p_groupName     VARCHAR2    DEFAULT NULL,
-        p_syncLevel     PLS_INTEGER DEFAULT logLevelError) RETURN NUMBER
-    as
-    begin
-        return NEW_PROCESS(p_processName => p_processName, p_logLevel => p_logLevel, p_procStepsToDo => p_procStepsToDo,
-                           p_daysToKeep => p_daysToKeep, p_tabNameMaster => p_tabNameMaster, p_baselineScope => p_baselineScope,
-                           p_groupName => p_groupName, p_syncLevel => p_syncLevel);
-    end;
-
-    FUNCTION SERVER_NEW_SESSION(
-        p_processName   VARCHAR2,
-        p_groupName     VARCHAR2    DEFAULT NULL,
-        p_logLevel      PLS_INTEGER DEFAULT logLevelMonitor,
-        p_procStepsToDo PLS_INTEGER DEFAULT NULL,
-        p_daysToKeep    PLS_INTEGER DEFAULT NULL,
-        p_tabNameMaster VARCHAR2    DEFAULT 'LILAM',
-        p_baselineScope VARCHAR2    DEFAULT NULL,
-        p_syncLevel     PLS_INTEGER DEFAULT logLevelError) RETURN NUMBER
-    as
-    begin
-        return SERVER_NEW_PROCESS(p_processName => p_processName, p_groupName => p_groupName, p_logLevel => p_logLevel,
-                                  p_procStepsToDo => p_procStepsToDo, p_daysToKeep => p_daysToKeep, p_tabNameMaster => p_tabNameMaster,
-                                  p_baselineScope => p_baselineScope, p_syncLevel => p_syncLevel);
-    end;
-
-    FUNCTION SERVER_NEW_SESSION_JSON(p_jsonObject JSON_OBJ_LILAM) RETURN NUMBER
-    as
-    begin
-        return SERVER_NEW_PROCESS_JSON(p_jsonObject);
-    end;
-
-    PROCEDURE CLOSE_SESSION(
-        p_processId     NUMBER,
-        p_processInfo   VARCHAR2    DEFAULT NULL,
-        p_processStatus PLS_INTEGER DEFAULT NULL,
-        p_procStepsDone PLS_INTEGER DEFAULT NULL,
-        p_procStepsToDo PLS_INTEGER DEFAULT NULL)
-    as
-    begin
-        CLOSE_PROCESS(p_processId => p_processId, p_processInfo => p_processInfo, p_processStatus => p_processStatus,
-                      p_procStepsDone => p_procStepsDone, p_procStepsToDo => p_procStepsToDo);
     end;
 
     ------------------------------------------------------------------------
